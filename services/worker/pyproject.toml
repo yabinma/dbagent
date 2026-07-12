@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rca-worker"
+version = "0.1.0"
+description = "Temporal worker process hosting workflows/activities (design.md Section 5, 11). M1 scope: minimal PingWorkflow + LLM demo activity; the full InvestigationWorkflow is M3."
+requires-python = ">=3.11"
+dependencies = [
+    "temporalio>=1.7,<2",
+    "rca-common",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "testcontainers>=4.0,<5",
+    "PyYAML>=6.0,<7",
+]
+
+[tool.setuptools.packages.find]
+include = ["worker*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

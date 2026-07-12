@@ -1,0 +1,85 @@
+{
+  "$id": "tools.presto.runtime",
+  "$comment": "Machine-readable copy of Appendix B.2 Runtime Tools' params schemas. pod_logs/container_logs, k8s_pods/swarm_tasks, k8s_describe/docker_inspect, and k8s_events/docker_events are deployment-kind-specific names for the same underlying RuntimeEnv operation; both are listed here even though a given probe deployment only ever registers one of each pair (design.md Appendix A Capabilities.tools reflects only the active deployment kind).",
+  "tools": {
+    "pod_logs": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string"},
+        "container": {"type": "string"},
+        "since": {"type": "string", "pattern": "^\\d+[smhd]$", "default": "30m"},
+        "lines": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 1000},
+        "grep": {"type": "string"},
+        "previous": {"type": "boolean", "default": false}
+      },
+      "additionalProperties": false
+    },
+    "container_logs": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string"},
+        "container": {"type": "string"},
+        "since": {"type": "string", "pattern": "^\\d+[smhd]$", "default": "30m"},
+        "lines": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 1000},
+        "grep": {"type": "string"},
+        "previous": {"type": "boolean", "default": false}
+      },
+      "additionalProperties": false
+    },
+    "k8s_pods": {
+      "type": "object",
+      "properties": {
+        "selector": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "swarm_tasks": {
+      "type": "object",
+      "properties": {
+        "selector": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "k8s_describe": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "docker_inspect": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "k8s_events": {
+      "type": "object",
+      "properties": {
+        "since": {"type": "string", "pattern": "^\\d+[smhd]$", "default": "1h"},
+        "type": {"enum": ["all", "warning"], "default": "warning"}
+      },
+      "additionalProperties": false
+    },
+    "docker_events": {
+      "type": "object",
+      "properties": {
+        "since": {"type": "string", "pattern": "^\\d+[smhd]$", "default": "1h"},
+        "type": {"enum": ["all", "warning"], "default": "warning"}
+      },
+      "additionalProperties": false
+    },
+    "resource_usage": {
+      "type": "object",
+      "properties": {
+        "selector": {"type": "string", "default": "all"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

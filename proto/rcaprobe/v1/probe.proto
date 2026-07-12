@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package rcaprobe.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/yabinma/dbagent/gen/go/rcaprobe/v1;rcaprobev1";
+
+// The probe initiates one outbound bidirectional stream to the gateway and
+// keeps it open. All task dispatch and results flow over this session.
+service ProbeGateway {
+  rpc Session (stream ProbeMessage) returns (stream GatewayMessage);
+}
+
+// ---------------------------------------------------------------- probe → gateway
+
+message ProbeMessage {
+  oneof msg {
+    Register        register  = 1;  // first frame of every session
+    Heartbeat       heartbeat = 2;  // every 15 s
+    TaskResult      result    = 3;
+    TaskOutputChunk chunk     = 4;  // large outputs stream in chunks before result
+  }
+}
+
+message Register {
+  string       platform_key    = 1;
+  string       probe_version   = 2;
+  string       bootstrap_token = 3;  // first registration only; empty once mTLS identity exists
+  Capabilities capabilities    = 4;
+}
+
+message Capabilities {
+  string                 platform_type  = 1;  // "presto"
+  string                 deployment     = 2;  // "k8s" | "swarm"
+  string                 engine_version = 3;  // detected Presto version, e.g. "0.298"
+  repeated ToolDescriptor tools         = 5;
+  repeated string        write_ops      = 6;  // empty = write channel disabled
+  AuthStatus             auth           = 7;
+}
+
+message AuthStatus {
+  string          scheme  = 1;  // NONE | PASSWORD | LDAP | KERBEROS
+  bool            https   = 2;
+  string          access  = 3;  // full | unauthenticated | unsupported
+  repeated string missing = 4;  // e.g. ["credentials", "tls_ca"]
+}
+
+message ToolDescriptor {
+  string name               = 1;
+  string params_schema_json = 2;  // JSON Schema as a string
+  string category           = 3;  // engine | runtime | host
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp at     = 1;
+  string                    status = 2;  // ok | degraded
+}
+
+message TaskResult {
+  string task_id     = 1;
+  int32  exit_code   = 2;
+  bool   truncated   = 3;
+  bool   redacted    = 4;
+  string error       = 5;
+  uint32 chunk_count = 6;  // total chunks sent for this task (integrity check)
+}
+
+message TaskOutputChunk {
+  string task_id = 1;
+  uint32 seq     = 2;   // 0-based, strictly increasing
+  bytes  data    = 3;   // ≤ 256 KiB per chunk
+  bool   last    = 4;
+}
+
+// ---------------------------------------------------------------- gateway → probe
+
+message GatewayMessage {
+  oneof msg {
+    RegisterAck     ack     = 1;
+    TaskRequest     task    = 2;
+    CancelTask      cancel  = 3;
+    ManifestRefresh refresh = 4;  // gateway asks the probe to re-run Detect
+  }
+}
+
+message RegisterAck {
+  string probe_id           = 1;
+  bool   accepted           = 2;
+  string reason             = 3;  // populated when accepted = false
+  bytes  signing_public_key = 4;  // control-plane ed25519 public key (D14);
+                                  // refreshed on every reconnect; probe holds
+                                  // old + new keys for a 10-minute grace window
+                                  // during rotation
+}
+
+message TaskRequest {
+  string task_id          = 1;
+  string investigation_id = 2;
+  oneof kind {
+    ToolCall        tool   = 3;
+    RawCommand      raw    = 4;
+    RemediationStep write  = 5;
+    HealthCheck     health = 6;
+  }
+  uint32 timeout_seconds  = 7;  // default 60
+  uint64 max_output_bytes = 8;  // default 1 MiB (1048576)
+}
+
+message ToolCall {
+  string                 tool_name = 1;
+  google.protobuf.Struct args      = 2;  // validated against the tool's JSON Schema
+}
+
+message RawCommand {
+  string command     = 1;  // probe re-validates against its local allowlist
+  string approval_id = 2;  // links to the approvals record (audit)
+}
+
+message RemediationStep {
+  string                 playbook_id             = 1;
+  uint32                 step_index              = 2;
+  string                 op                      = 3;  // write-op primitive name (Section 9.1)
+  google.protobuf.Struct params                  = 4;
+  string                 execution_id            = 5;  // remediation_executions.execution_id
+  bytes                  control_plane_signature = 6;
+  // signature = ed25519_sign(private_key,
+  //   sha256(execution_id | playbook_id | step_index | op |
+  //          canonical_json(params)))
+  // canonical_json: RFC 8785 (JCS). Probe executes only if the signature
+  // verifies against the current (or grace-window) public key AND its
+  // deployment has write_enabled=true.
+}
+
+message HealthCheck {
+  bool   builtin      = 1;  // /v1/info + trivial SQL probe
+  string custom_query = 2;  // per-platform configured health_query
+  uint32 wait_seconds = 3;  // wait window before running (post-restart settling)
+}
+
+message CancelTask {
+  string task_id = 1;
+}
+
+message ManifestRefresh {}

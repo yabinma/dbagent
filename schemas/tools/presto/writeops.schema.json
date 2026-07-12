@@ -1,0 +1,82 @@
+{
+  "$id": "tools.presto.writeops",
+  "$comment": "Machine-readable copy of Appendix B.5 Write-Op Primitive Parameter Schemas (design.md Section 9.1). Execution of these ops is M5 scope; M2 implements signature verification/gating (probe/internal/writeops) and validates RemediationStep.params against these schemas plus the presto.adjust_memory_config key whitelist ahead of the (stubbed, M2) ExecuteWrite call, since that validation is an explicit Section 14.2 probe unit-test target ('memory-config parameter whitelist').",
+  "ops": {
+    "k8s_patch_configmap": {
+      "type": "object",
+      "required": ["name", "namespace", "patches"],
+      "properties": {
+        "name": {"type": "string"},
+        "namespace": {"type": "string"},
+        "patches": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "value"],
+            "properties": {"key": {"type": "string"}, "value": {"type": "string"}},
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "k8s_rollout_restart": {
+      "type": "object",
+      "required": ["kind", "name", "namespace"],
+      "properties": {
+        "kind": {"enum": ["deployment", "statefulset"]},
+        "name": {"type": "string"},
+        "namespace": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "k8s_delete_pod": {
+      "type": "object",
+      "required": ["name", "namespace"],
+      "properties": {
+        "name": {"type": "string"},
+        "namespace": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "swarm_update_service_env": {
+      "type": "object",
+      "required": ["service", "env"],
+      "properties": {
+        "service": {"type": "string"},
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "value"],
+            "properties": {"key": {"type": "string"}, "value": {"type": "string"}},
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "swarm_restart_service": {
+      "type": "object",
+      "required": ["service"],
+      "properties": {
+        "service": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "presto_kill_query": {
+      "type": "object",
+      "required": ["query_id"],
+      "properties": {
+        "query_id": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "presto_adjust_memory_config_key_whitelist": [
+    "query.max-memory",
+    "query.max-memory-per-node",
+    "query.max-total-memory-per-node",
+    "memory.heap-headroom-per-node"
+  ]
+}

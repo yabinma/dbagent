@@ -1,0 +1,75 @@
+{
+  "$id": "tools.presto.engine",
+  "$comment": "Machine-readable copy of Appendix B.1 Engine Tools' params schemas (normative content is the Appendix B tables in design/spec-appendices.md). Consolidated into one file per tool category (engine/runtime/host/writeops) rather than one-file-per-tool -- a documented M2 layout decision; still matches the 'schemas/tools/presto/*.json' glob Appendix B references. Each top-level key is a tool name; its value is that tool's params JSON Schema, per Appendix B's own notation ('additionalProperties: false' on every tool).",
+  "tools": {
+    "presto_cluster_info": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "presto_nodes": {
+      "type": "object",
+      "properties": {
+        "include_failed": {"type": "boolean", "default": true}
+      },
+      "additionalProperties": false
+    },
+    "presto_list_queries": {
+      "type": "object",
+      "properties": {
+        "state": {"enum": ["RUNNING", "QUEUED", "FINISHED", "FAILED", "ALL"], "default": "ALL"},
+        "since": {"type": "string", "pattern": "^\\d+[smhd]$", "default": "1h"},
+        "user": {"type": "string"},
+        "query_substr": {"type": "string", "maxLength": 200},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+      },
+      "additionalProperties": false
+    },
+    "presto_query_detail": {
+      "type": "object",
+      "required": ["query_id"],
+      "properties": {
+        "query_id": {"type": "string"},
+        "sections": {
+          "type": "array",
+          "items": {"enum": ["basic", "error", "stats", "stages", "session"]},
+          "default": ["basic", "error", "stats"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "presto_query_json_section": {
+      "type": "object",
+      "required": ["query_id", "jsonpath"],
+      "properties": {
+        "query_id": {"type": "string"},
+        "jsonpath": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "presto_config": {
+      "type": "object",
+      "required": ["component", "file"],
+      "properties": {
+        "component": {"enum": ["coordinator", "worker"]},
+        "file": {"type": "string", "pattern": "^(config|jvm|node|catalog:.+)$"},
+        "target": {"type": "string", "default": "any"}
+      },
+      "additionalProperties": false
+    },
+    "presto_session_properties": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "presto_jmx": {
+      "type": "object",
+      "required": ["mbean"],
+      "properties": {
+        "mbean": {"type": "string"},
+        "attributes": {"type": "array", "items": {"type": "string"}, "default": []}
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@rca-agent/schemas-codegen",
+  "private": true,
+  "version": "0.0.0",
+  "description": "TypeScript type generation from the JSON Schema source of truth (design.md Section 11).",
+  "scripts": {
+    "gen": "node generate-ts.js"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "^15.0.0"
+  }
+}

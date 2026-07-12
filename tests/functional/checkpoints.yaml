@@ -1,0 +1,207 @@
+# Functional checkpoint manifest (design.md Section 14.3). Every checkpoint
+# F1-F16 from the Section 14.3 table is listed here. "Checkpoint coverage is
+# exhaustive by construction: ... every row must map to at least one
+# functional test, and CI runs a manifest check ... that fails if any
+# checkpoint has no linked test" -- that CI manifest-check script is part of
+# the M6 delivery/CI packaging work (design.md Section 14.5); until it lands,
+# this file is the authoritative, human/CI-readable inventory. Each entry's
+# `status` distinguishes "covered now" from "the owning milestone hasn't
+# built the checkpointed behavior yet", so the eventual manifest check can be
+# written to only require `tests` to be non-empty for checkpoints whose
+# `owning_milestone` has already shipped.
+
+schema_version: 1
+
+checkpoints:
+  - id: F1
+    description: "Webhook ingest (design.md 4.1)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
+
+  - id: F2
+    description: "State machine (design.md 5.1)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
+
+  - id: F3
+    description: "Investigation loop (design.md 5.2, 5.3)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
+
+  - id: F4
+    description: "Budget enforcement (design.md D12)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
+
+  - id: F5
+    description: "Raw-command gate (design.md 8.2)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
+
+  - id: F6
+    description: "Human-in-the-loop signals (design.md 5.1, D.2, D.4)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
+
+  - id: F7
+    description: "Structured output discipline (design.md 6)"
+    owning_milestone: M3
+    status: partial
+    tests: []
+    notes: >
+      The retry-once-then-fail mechanism itself lives in
+      rca_common.llmclient.client.LLMClient.generate() and is fully unit-
+      tested in M1 (libs/py/rca_common/tests/test_llmclient.py ::
+      test_generate_retries_once_on_schema_failure_then_succeeds,
+      test_generate_raises_llm_output_error_after_second_schema_failure).
+      F7 as a *functional* checkpoint additionally requires observing the
+      Activity-failure propagation into a real Workflow, which needs
+      InvestigationWorkflow (M3).
+
+  - id: F8
+    description: "Registration flow v3 (design.md 8.4)"
+    owning_milestone: M2
+    status: covered
+    tests:
+      - tests/functional/m2_probe_link/registration_test.go::TestF8_RegistrationFlow_NoneAuth_BecomesOnline
+      - tests/functional/m2_probe_link/registration_test.go::TestF8_RegistrationFlow_PasswordAuthNoCredentials_BecomesPendingCredentials
+      - tests/functional/m2_probe_link/registration_test.go::TestF8_BootstrapTokenSingleUse_SecondEnrollWithSameTokenFails
+      - tests/functional/m2_probe_link/registration_test.go::TestF8_HeartbeatTimeout_MarksProbeOffline
+      - services/probe-gateway/internal/gwserver/server_test.go (auth-scheme -> platform-status mapping, incl. KERBEROS "unsupported" -> degraded)
+      - services/probe-gateway/internal/bootstrapsrv/server_test.go (bootstrap token validation matrix)
+      - probe/cmd/probe/main_test.go::TestEnsureEnrolled_* (enroll/persist/reuse/failure paths)
+    notes: >
+      Covered via real compiled `probe` + `probe-gateway` binaries run as
+      OS subprocesses talking over real mTLS (bootstrap CA issued/loaded
+      for real, client certs signed for real), against a real ephemeral
+      Postgres migrated with the exact M1 alembic migration, with only the
+      platform-side externals mocked (fake Presto REST + fake Docker
+      Engine API, both httptest) -- this is what "cross-service tier" (
+      design.md Section 11) means for M2, since Go's internal-package
+      visibility rules don't let one test file import both probe/internal/...
+      and services/probe-gateway/internal/... (see impl-progress.md).
+      Steps 1-2 (dashboard creates platform + bootstrap token) are
+      dashboard-api's job (M4, not built yet); this tier's tests seed that
+      precondition directly via SQL, matching how M1 treated
+      dashboard-dependent preconditions. TLS CA resolution order and the
+      Swarm `docker secret create`/`service update` credential-rotation
+      path are unit-tested (probe/internal/credentials,
+      probe/internal/adapter/presto/auth_test.go) but not re-proven at the
+      subprocess level (redundant with the unit coverage already there).
+
+  - id: F9
+    description: "Toolpack dispatch (design.md 8.5, Appendix A/B)"
+    owning_milestone: M2
+    status: partial
+    tests:
+      - probe/internal/sessionclient/dispatch_test.go (every TaskRequest kind incl. ToolCall/RawCommand/RemediationStep/HealthCheck; per-tool coverage via probe/internal/adapter/presto's ~50 tests)
+      - probe/internal/sessionclient/client_test.go::TestClient_DispatchesTaskAndSendsChunkedResult (real chunk encoding + envelope JSON)
+      - services/probe-gateway/internal/gwserver/server_test.go::TestDispatch_ReassemblesMultipleChunksInOrder (chunk order)
+      - services/probe-gateway/internal/gwserver/server_test.go::TestDispatch_ChunkCountMismatchIsSurfacedAsError (chunk_count integrity)
+      - services/probe-gateway/internal/gwserver/server_test.go::TestDispatch_MissingChunkSeqIsSurfacedAsError (missing chunk)
+      - services/probe-gateway/internal/gwserver/server_test.go::TestDispatch_TimesOutWhenProbeDoesNotReply (task timeout)
+      - services/probe-gateway/internal/gwserver/server_test.go::TestCancelTask_DeliversCancelFrame (CancelTask)
+      - probe/internal/adapter/presto/adapter_test.go::TestExecute_ConfigToolRedaction (redaction of catalog secrets in presto_config)
+      - probe/internal/sessionclient/dispatch_test.go::TestHandleTask_ToolCall_TruncatesAtMaxOutputBytes (truncated=true at output cap)
+    notes: >
+      Covered: every element design.md Section 14.3 names for F9 --
+      per-tool envelope correctness (all ~20 Toolpack tools, via the
+      presto adapter test suite), chunked reassembly (order/integrity/
+      missing-chunk), redaction, truncation, task timeout, CancelTask --
+      each proven with REAL production code on both sides (real
+      sessionclient.HandleTask/ChunkPayload on the probe side, real
+      gwserver.Dispatch/chunk-reassembly on the gateway side), following
+      design.md Section 14.3's own "a fake probe (in-process ... with a
+      scripted PlatformAdapter returning fixture data)" pattern -- just
+      split across two co-located test suites (one per service) rather
+      than one file, since Go's internal-package rules don't allow a
+      single test to import both sides' internals (see F8's notes and
+      impl-progress.md).
+      Not yet covered: a single test with the REAL probe binary AND real
+      probe-gateway binary AND a third-party caller triggering dispatch
+      end to end in three separate processes. `gwserver.Server.Dispatch`
+      has no external (gRPC/HTTP) trigger surface yet -- design.md Section
+      3.2's "exposes internal ExecuteTool(platform_key, task) API for
+      Activities" is explicitly deferred to M3, since no Activity exists
+      yet to call it (documented decision, gwserver.go's own doc comment).
+      Also not yet covered: S3 storage + `evidence` row persistence for
+      dispatched results -- that's the M3 Activity's job once it exists,
+      not probe-gateway's.
+
+  - id: F10
+    description: "Remediation + signing (design.md 9)"
+    owning_milestone: M5
+    status: deferred
+    tests: []
+
+  - id: F11
+    description: "Playbook catalog (design.md 9.2)"
+    owning_milestone: M5
+    status: deferred
+    tests: []
+
+  - id: F12
+    description: "Dashboard API (Appendix D)"
+    owning_milestone: M4
+    status: deferred
+    tests: []
+
+  - id: F13
+    description: "Notifications (design.md 10.1)"
+    owning_milestone: M5
+    status: deferred
+    tests: []
+
+  - id: F14
+    description: "Tracing (design.md D5, 7)"
+    owning_milestone: M1
+    status: partial
+    tests:
+      - tests/functional/test_m1_foundation.py::test_one_model_call_produces_llm_calls_row_and_s3_objects
+    notes: >
+      Covered now: "builtin" backend -- one real model call (against the
+      mocked LLM provider) produces a real `llm_calls` row (ephemeral
+      Postgres, migrated schema) and real prompt/response objects
+      (ephemeral MinIO). This is M1's Section 12 acceptance criterion.
+      Not yet covered functionally: the "both"/Langfuse-mock-receiver case
+      and cross-investigation spend aggregation. The dual-write matrix
+      itself (builtin/langfuse/both) is unit-tested
+      (libs/py/rca_common/tests/test_llmclient.py ::
+      test_generate_dual_write_matrix); wiring a real Langfuse mock
+      receiver into the functional tier is deferred alongside the rest of
+      the notification/observability-adjacent functional surface (no
+      milestone explicitly owns it yet; revisit at M3 when
+      InvestigationWorkflow starts making real multi-round model calls).
+
+  - id: F15
+    description: "Config & policy (Appendix E)"
+    owning_milestone: M1
+    status: partial
+    tests: []
+    notes: >
+      `data_egress_policy: local_only` startup validation and env-var
+      interpolation are unit-tested in M1
+      (libs/py/rca_common/tests/test_config.py). `platforms.config` (JSONB)
+      is now populated for real as of M2 (services/probe-gateway/internal/
+      registry.CreatePlatform, currently storing the bootstrap-token
+      bookkeeping this session added -- see F8's notes), and
+      per-platform-config *reads* work as plain JSONB round-trips
+      (registry/pg_test.go). What's still missing: the specific
+      budget/model/data_egress_policy/health_query *override* semantics
+      Appendix E describes (control-plane code that actually reads
+      `platforms.config` and merges it over the deployment-wide YAML
+      defaults) -- that consumer doesn't exist until temporal-worker's
+      Activities do (M3), so the override-precedence slice of F15 stays
+      deferred to M3.
+
+  - id: F16
+    description: "Audit completeness (design.md 4.3)"
+    owning_milestone: M3
+    status: deferred
+    tests: []
