@@ -17,7 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from rca_common.llmclient.objectstore import FakeObjectStore
 
 from dashboard_api.app import DashboardAppConfig, create_app
-from helpers import JWT_SECRET
+from dashboard_helpers import JWT_SECRET
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RCA_COMMON_DIR = REPO_ROOT / "libs" / "py" / "rca_common"

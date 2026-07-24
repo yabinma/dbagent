@@ -91,6 +91,29 @@ type RuntimeEnv interface {
 	// label selector / Swarm service name, design.md Section 8.4 step 2)
 	// to a reachable HTTP(S) base URL for the Presto REST client.
 	CoordinatorBaseURL(ctx context.Context) (string, error)
+
+	// --- Write methods (M5, design.md Section 9.5.3) -------------------------
+
+	// PatchConfigMap strategic-merges dataPatches into a ConfigMap's data
+	// keys (k8s only; swarm returns an error).
+	PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error
+
+	// RolloutRestart triggers a rolling restart of a Deployment or
+	// StatefulSet by setting the pod-template annotation
+	// kubectl.kubernetes.io/restartedAt (exactly what `kubectl rollout
+	// restart` does). kind is "deployment" or "statefulset".
+	RolloutRestart(ctx context.Context, namespace, kind, name string) error
+
+	// DeletePod deletes one pod (the controller recreates it).
+	DeletePod(ctx context.Context, namespace, name string) error
+
+	// UpdateServiceEnv merges env into a Swarm service's
+	// TaskTemplate.ContainerSpec.Env (swarm only; k8s returns an error).
+	UpdateServiceEnv(ctx context.Context, service string, env map[string]string) error
+
+	// RestartService force-recreates a Swarm service's tasks by bumping
+	// TaskTemplate.ForceUpdate (swarm only; k8s returns an error).
+	RestartService(ctx context.Context, service string) error
 }
 
 // --- RuntimeEnv supporting types -------------------------------------------------

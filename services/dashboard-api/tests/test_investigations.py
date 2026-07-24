@@ -17,7 +17,7 @@ from rca_common.db.models import (
     Platform,
     Playbook,
 )
-from helpers import login, seed_user
+from dashboard_helpers import login, seed_user
 
 
 def _seed_platform(sf, key="presto-us1"):

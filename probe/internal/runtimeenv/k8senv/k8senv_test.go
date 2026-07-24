@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -355,5 +356,73 @@ func TestKind(t *testing.T) {
 	env := New(fakeclientset.NewSimpleClientset(), nil, Config{}, nil)
 	if env.Kind() != platform.EnvKindK8s {
 		t.Fatalf("expected EnvKindK8s")
+	}
+}
+
+
+func TestPatchConfigMap(t *testing.T) {
+	cs := fakeclientset.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm1", Namespace: "ns"},
+		Data:       map[string]string{"config.properties": "a=1\n"},
+	})
+	env := New(cs, nil, Config{Namespace: "ns"}, nil)
+	err := env.PatchConfigMap(context.Background(), "ns", "cm1", map[string]string{"config.properties": "a=2\n"})
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	cm, err := cs.CoreV1().ConfigMaps("ns").Get(context.Background(), "cm1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if cm.Data["config.properties"] != "a=2\n" {
+		t.Fatalf("got %q", cm.Data["config.properties"])
+	}
+}
+
+func TestRolloutRestartDeployment(t *testing.T) {
+	cs := fakeclientset.NewSimpleClientset(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "presto-worker", Namespace: "ns"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "presto"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "presto"}, Annotations: map[string]string{}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "presto", Image: "presto:0.298"}}},
+			},
+		},
+	})
+	env := New(cs, nil, Config{Namespace: "ns"}, nil)
+	if err := env.RolloutRestart(context.Background(), "ns", "deployment", "presto-worker"); err != nil {
+		t.Fatalf("%v", err)
+	}
+	d, err := cs.AppsV1().Deployments("ns").Get(context.Background(), "presto-worker", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if d.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] == "" {
+		t.Fatalf("restart annotation missing: %+v", d.Spec.Template.Annotations)
+	}
+}
+
+func TestDeletePod(t *testing.T) {
+	cs := fakeclientset.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "ns"},
+	})
+	env := New(cs, nil, Config{Namespace: "ns"}, nil)
+	if err := env.DeletePod(context.Background(), "ns", "pod1"); err != nil {
+		t.Fatalf("%v", err)
+	}
+	_, err := cs.CoreV1().Pods("ns").Get(context.Background(), "pod1", metav1.GetOptions{})
+	if err == nil {
+		t.Fatalf("expected pod deleted")
+	}
+}
+
+func TestK8sSwarmOnlyWriteMethodsError(t *testing.T) {
+	env := New(fakeclientset.NewSimpleClientset(), nil, Config{Namespace: "ns"}, nil)
+	if err := env.UpdateServiceEnv(context.Background(), "svc", map[string]string{"A": "1"}); err == nil {
+		t.Fatalf("expected swarm-only error")
+	}
+	if err := env.RestartService(context.Background(), "svc"); err == nil {
+		t.Fatalf("expected swarm-only error")
 	}
 }

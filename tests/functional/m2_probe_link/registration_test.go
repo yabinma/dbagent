@@ -215,21 +215,54 @@ type gatewayProcess struct {
 	cmd           *exec.Cmd
 	sessionAddr   string
 	bootstrapAddr string
+	internalAddr  string // HTTP POST /internal/v1/execute (empty if disabled)
 	stateDir      string
 }
 
+// gatewayStartOpts customizes startGatewaySubprocess. Zero value preserves
+// historical F8 registration-only behavior (random pub key, no internal
+// HTTP listener). Write-path tests supply a real signing public-key sidecar
+// and EnableInternalHTTP so temporal-worker-shaped callers can POST writes.
+type gatewayStartOpts struct {
+	// SigningPubKeyPath is the control-plane `{key}.pub` sidecar (base64
+	// raw ed25519 public key). Empty → generate a random 32-byte key so
+	// registration still works for non-write tests.
+	SigningPubKeyPath string
+	// EnableInternalHTTP binds POST /internal/v1/execute (design.md §3.2 / M5 write wire).
+	EnableInternalHTTP bool
+}
+
 func startGatewaySubprocess(t *testing.T, gatewayBin, dsn string) *gatewayProcess {
+	return startGatewaySubprocessOpts(t, gatewayBin, dsn, gatewayStartOpts{})
+}
+
+func startGatewaySubprocessOpts(t *testing.T, gatewayBin, dsn string, opts gatewayStartOpts) *gatewayProcess {
 	t.Helper()
 	dir := t.TempDir()
 
 	sessionAddr := freePort(t)
 	bootstrapAddr := freePort(t)
+	var internalAddr string
+	if opts.EnableInternalHTTP {
+		internalAddr = freePort(t)
+	}
 
-	pubKeyPath := filepath.Join(dir, "signing.key.pub")
-	pub := make([]byte, 32)
-	_, _ = rand.Read(pub)
-	if err := os.WriteFile(pubKeyPath, []byte(base64.StdEncoding.EncodeToString(pub)), 0o644); err != nil {
-		t.Fatalf("write signing pub key: %v", err)
+	pubKeyPath := opts.SigningPubKeyPath
+	if pubKeyPath == "" {
+		pubKeyPath = filepath.Join(dir, "signing.key.pub")
+		pub := make([]byte, 32)
+		_, _ = rand.Read(pub)
+		if err := os.WriteFile(pubKeyPath, []byte(base64.StdEncoding.EncodeToString(pub)), 0o644); err != nil {
+			t.Fatalf("write signing pub key: %v", err)
+		}
+	}
+
+	internalLine := ""
+	if opts.EnableInternalHTTP {
+		internalLine = fmt.Sprintf("internal_listen_addr: %q\n", internalAddr)
+	} else {
+		// Empty disables the listener (config defaults would otherwise bind :8080).
+		internalLine = "internal_listen_addr: \"\"\n"
 	}
 
 	cfg := fmt.Sprintf(`
@@ -244,10 +277,12 @@ heartbeat_timeout: 3s
 heartbeat_check_interval: 1s
 signing_key_poll_interval: 1h
 server_cert_sans: ["127.0.0.1"]
+%s
 `,
 		sessionAddr, bootstrapAddr, dsn,
 		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
 		pubKeyPath,
+		internalLine,
 	)
 	cfgPath := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
@@ -277,8 +312,14 @@ server_cert_sans: ["127.0.0.1"]
 
 	waitForTCP(t, sessionAddr)
 	waitForTCP(t, bootstrapAddr)
+	if opts.EnableInternalHTTP {
+		waitForTCP(t, internalAddr)
+	}
 
-	return &gatewayProcess{cmd: cmd, sessionAddr: sessionAddr, bootstrapAddr: bootstrapAddr, stateDir: dir}
+	return &gatewayProcess{
+		cmd: cmd, sessionAddr: sessionAddr, bootstrapAddr: bootstrapAddr,
+		internalAddr: internalAddr, stateDir: dir,
+	}
 }
 
 func freePort(t *testing.T) string {
@@ -316,6 +357,10 @@ type probeConfig struct {
 	PrestoURL        string
 	DockerAPIURL     string
 	CredentialsMount string
+	// WriteEnabled gates the probe-side write channel (design.md §9.3 /
+	// write_enabled deployment flag). Default false matches production-safe
+	// registration tests; M5 write-path tests set true.
+	WriteEnabled bool
 }
 
 func startProbeSubprocess(t *testing.T, probeBin string, pc probeConfig) *exec.Cmd {
@@ -345,10 +390,11 @@ coordinator_port: %s
 docker_api_base_url: %q
 credentials_mount: %q
 state_dir: %q
-write_enabled: false
+write_enabled: %t
 `,
 		pc.PlatformKey, pc.GatewayAddr, pc.BootstrapAddr, pc.BootstrapToken,
 		prestoPort, pc.DockerAPIURL, pc.CredentialsMount, filepath.Join(dir, "state"),
+		pc.WriteEnabled,
 	)
 	cfgPath := filepath.Join(dir, "probe.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {

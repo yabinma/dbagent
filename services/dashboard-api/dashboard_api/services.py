@@ -855,28 +855,21 @@ def metrics_summary(session: Session, window: str = "7d") -> dict[str, Any]:
 
 
 async def test_notifications(webhooks: list[dict[str, Any]], actor_id: uuid.UUID, session: Session) -> dict[str, Any]:
-    """POST a test payload to each configured outbound webhook."""
-    import httpx
+    """POST a test payload to each configured outbound webhook.
 
-    results = []
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for wh in webhooks:
-            name = wh.get("name") or wh.get("url") or "unknown"
-            url = wh.get("url") or ""
-            payload = {
-                "event": "notification_test",
-                "investigation_id": None,
-                "summary": "dashboard notification test",
-                "occurred_at": _now().isoformat(),
-            }
-            if not url:
-                results.append({"name": name, "ok": False, "error": "empty url"})
-                continue
-            try:
-                resp = await client.post(url, json=payload)
-                results.append({"name": name, "ok": 200 <= resp.status_code < 300, "status_code": resp.status_code})
-            except Exception as exc:  # noqa: BLE001
-                results.append({"name": name, "ok": False, "error": str(exc)})
+    Uses the shared ``rca_common.notifications`` module (Section 9.5.3 /
+    FP-M4-13 refactor onto the M5 shared formatter/sender).
+    """
+    from rca_common.notifications import send_to_webhooks
+
+    payload = {
+        "event": "notification_test",
+        "investigation_id": None,
+        "summary": "dashboard notification test",
+        "severity": "low",
+        "occurred_at": _now().isoformat(),
+    }
+    results = await send_to_webhooks(webhooks, "notification_test", payload)
     write_audit(
         session,
         action="admin_config_changed",

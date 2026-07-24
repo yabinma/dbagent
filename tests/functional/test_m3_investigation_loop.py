@@ -150,6 +150,16 @@ def _scenario_scripts(scenario: str) -> dict:
     }[scenario]
 
     if playbook:
+        # Semantic params must be supplied by the LLM/fixture — builders fail
+        # closed on missing params (C1: no fabricated memory defaults).
+        if playbook == "presto.kill_query":
+            pb_params = {"query_id": "20260711_q1"}
+        elif playbook == "presto.adjust_memory_config":
+            pb_params = {
+                "patches": [{"key": "query.max-memory", "value": "50GB"}],
+            }
+        else:
+            pb_params = {}
         remediation = {
             "proposed_actions": [
                 {
@@ -157,9 +167,12 @@ def _scenario_scripts(scenario: str) -> dict:
                     "playbook_id": playbook,
                     "risk_level": "R1" if playbook == "presto.kill_query" else "R2",
                     "description": f"run {playbook}",
-                    "playbook_params": {"query_id": "20260711_q1"} if playbook == "presto.kill_query" else {},
+                    "playbook_params": pb_params,
                     "verification_plan": ["presto_cluster_info"],
                     "description_compact": f"Apply {playbook}",
+                    # Keep settle short for functional time-skipping paths that
+                    # still exercise the timer (platform default is 120s).
+                    "settle_seconds": 0,
                 }
             ],
             "rca_compact": concluded["rca_compact"],
@@ -216,10 +229,14 @@ def _probe_script(scenario: str) -> dict:
         "presto_config": {
             "exit_code": 0,
             "redacted": True,
-            "data": {"hive.password": "***REDACTED***"},
+            "data": {
+                "content": "query.max-memory=50GB\nhive.password=***REDACTED***\n",
+            },
         },
         "jvm_thread_dump": {"exit_code": 0, "data": {"dump": "Full GC"}},
         "presto_jmx": {"exit_code": 0, "data": {"heap": {"used": 0.95}}},
+        "health": {"ok": True, "exit_code": 0},
+        "write": {"ok": True, "exit_code": 0},
     }
 
 
@@ -260,15 +277,22 @@ async def _signal_approval(
 
 
 async def _run_investigation(session_factory, scenario: str, auto_approve: bool = True):
+    import tempfile
+    from rca_common.signing.signer import bootstrap_signing_key
+
     llm = ScriptedLLM(_scenario_scripts(scenario))
     probe = FakeProbeGatewayClient(_probe_script(scenario))
     store = FakeObjectStore()
+    # Persistent (temp) signer — no ephemeral fallback without allow_ephemeral (W1).
+    key_dir = tempfile.mkdtemp(prefix="m3-signer-")
+    signer = bootstrap_signing_key(f"{key_dir}/ed25519.key")
     acts = InvestigationActivities(
         session_factory=session_factory,
         llm_client=llm,
         probe_client=probe,
         object_store=store,
         config=None,
+        signer=signer,
     )
     event = {
         "event_id": str(uuid.uuid4()),
@@ -769,39 +793,52 @@ async def test_f4_platform_budget_override(m3_session_factory):
         )
         session.commit()
 
-    scripts = _scenario_scripts("worker_oom")
-    scripts["rca"] = {
-        "status": "need_more_data",
-        "confidence": 0.3,
-        "missing_info": [{"what": "more", "why": "need"}],
-    }
-    llm = ScriptedLLM(scripts)
-    acts = InvestigationActivities(
-        session_factory=m3_session_factory,
-        llm_client=llm,
-        probe_client=FakeProbeGatewayClient(_probe_script("worker_oom")),
-        object_store=FakeObjectStore(),
-    )
-    event = {
-        "event_id": str(uuid.uuid4()),
-        "source": "manual",
-        "platform_key": "presto-us1",
-        "error_summary": "budget-test",
-        "occurred_at": "2026-07-11T00:00:00Z",
-        "fingerprint": compute_fingerprint("presto-us1", "budget-test"),
-    }
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        async with Worker(
-            env.client,
-            task_queue=TASK_QUEUE,
-            workflows=[InvestigationWorkflow],
-            activities=investigation_activity_list(acts),
-        ):
-            result = await env.client.execute_workflow(
-                InvestigationWorkflow.run,
-                {"event": event, "investigation_id": str(uuid.uuid4())},
-                id=f"m3-budget-{uuid.uuid4()}",
+    try:
+        scripts = _scenario_scripts("worker_oom")
+        scripts["rca"] = {
+            "status": "need_more_data",
+            "confidence": 0.3,
+            "missing_info": [{"what": "more", "why": "need"}],
+        }
+        llm = ScriptedLLM(scripts)
+        acts = InvestigationActivities(
+            session_factory=m3_session_factory,
+            llm_client=llm,
+            probe_client=FakeProbeGatewayClient(_probe_script("worker_oom")),
+            object_store=FakeObjectStore(),
+        )
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "source": "manual",
+            "platform_key": "presto-us1",
+            "error_summary": "budget-test",
+            "occurred_at": "2026-07-11T00:00:00Z",
+            "fingerprint": compute_fingerprint("presto-us1", "budget-test"),
+        }
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with Worker(
+                env.client,
                 task_queue=TASK_QUEUE,
+                workflows=[InvestigationWorkflow],
+                activities=investigation_activity_list(acts),
+            ):
+                result = await env.client.execute_workflow(
+                    InvestigationWorkflow.run,
+                    {"event": event, "investigation_id": str(uuid.uuid4())},
+                    id=f"m3-budget-{uuid.uuid4()}",
+                    task_queue=TASK_QUEUE,
+                )
+        assert result["status"] == "NEEDS_HUMAN"
+        assert result["reason"] == "round_budget"
+    finally:
+        # Session-scoped PG is shared across the functional tier — restore
+        # platform config so later suites (e.g. M4 need_more) don't inherit
+        # max_rounds=1 (review N1 fixture isolation).
+        with m3_session_factory() as session:
+            session.execute(
+                text(
+                    "UPDATE platforms SET config = CAST(:cfg AS jsonb) WHERE platform_key='presto-us1'"
+                ),
+                {"cfg": json.dumps({})},
             )
-    assert result["status"] == "NEEDS_HUMAN"
-    assert result["reason"] == "round_budget"
+            session.commit()

@@ -97,13 +97,12 @@ benchmarks:
   description: ed25519 sign + verify per RemediationStep incl. RFC 8785 canonical JSON
   threshold: < 10 ms round trip
   owning_milestone: M5
-  status: deferred
-  tests: []
-  notes: 'libs/py/rca_common/rca_common/signing/signer.py (canonical_step_hash, Signer.sign, verify) already
-    exists and is unit-tested (M1), but the benchmark itself is deferred to M5 alongside the rest of the
-    write channel / remediation-signing critical path it''s meant to protect.
+  status: covered
+  tests:
+  - tests/functional/test_m5_closed_loop.py::test_b7_sign_verify_roundtrip_under_10ms
+  notes: 'M5: threshold-asserting micro-bench over canonical_step_hash + ed25519 sign + verify <10ms.'
 
-    '
+
 - id: B8
   description: 'Evidence summary path: S3 write + evidence insert + summary-model call (mocked model,
     fixed latency) at max_calls_per_round=8 parallelism'

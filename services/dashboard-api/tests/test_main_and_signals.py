@@ -10,7 +10,7 @@ import pytest
 from dashboard_api.bootstrap_admin import bootstrap_admin, main as bootstrap_main
 from dashboard_api.temporal_signals import WorkflowNotRunning, signal_workflow
 from dashboard_api import services as svc
-from helpers import seed_user
+from dashboard_helpers import seed_user
 
 
 @pytest.mark.asyncio
@@ -196,7 +196,7 @@ async def test_list_llm_calls_and_audit_cursor(client, session_factory, object_s
     from datetime import datetime, timezone
     import uuid
     from rca_common.db.models import AuditLog, LLMCall, Platform
-    from helpers import login
+    from dashboard_helpers import login
 
     seed_user(session_factory, username="ad", password="admin-pass-123", role="admin")
     inv = uuid.uuid4()
@@ -263,7 +263,7 @@ async def test_list_llm_calls_and_audit_cursor(client, session_factory, object_s
 
 @pytest.mark.asyncio
 async def test_unknown_approval_and_investigation_404(client, session_factory):
-    from helpers import login
+    from dashboard_helpers import login
     import uuid
 
     seed_user(session_factory, username="a", password="approver-pass12", role="approver")
@@ -290,7 +290,7 @@ async def test_workflow_closed_on_decision_returns_409(
     from datetime import datetime, timezone
     import uuid
     from rca_common.db.models import Approval, Investigation, Platform
-    from helpers import login
+    from dashboard_helpers import login
 
     seed_user(session_factory, username="a", password="approver-pass12", role="approver")
     inv_id = uuid.uuid4()

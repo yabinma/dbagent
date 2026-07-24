@@ -66,6 +66,7 @@ def build_investigation_activities(
     probe_client=None,
     session_factory=None,
     object_store=None,
+    signer=None,
 ) -> InvestigationActivities:
     """Wire InvestigationActivities for production or tests."""
     if llm_client is None:
@@ -86,12 +87,37 @@ def build_investigation_activities(
             config.probe_gateway.url,
             timeout_seconds=config.probe_gateway.timeout_seconds,
         )
+    if signer is None:
+        from rca_common.signing.signer import MountedEd25519Signer, bootstrap_signing_key
+        import nacl.signing
+
+        try:
+            signer = bootstrap_signing_key(config.signing.key_path)
+        except OSError:
+            # Fail closed unless config.signing.allow_ephemeral is set (review W1).
+            # Production mounts a writable path; silent ephemeral keys must not
+            # substitute in prod (probe would reject unknown-key signatures).
+            if getattr(config.signing, "allow_ephemeral", False):
+                logger.warning(
+                    "signing key path %s not writable; using ephemeral signer "
+                    "(allow_ephemeral=true)",
+                    config.signing.key_path,
+                )
+                signer = MountedEd25519Signer(nacl.signing.SigningKey.generate())
+            else:
+                logger.error(
+                    "signing key path %s not writable and allow_ephemeral is false; "
+                    "refusing to start with an ephemeral key",
+                    config.signing.key_path,
+                )
+                raise
     return InvestigationActivities(
         session_factory=session_factory,
         llm_client=llm_client,
         probe_client=probe_client,
         object_store=object_store,
         config=config,
+        signer=signer,
     )
 
 
@@ -112,6 +138,7 @@ def investigation_activity_list(acts: InvestigationActivities) -> list:
         acts.plan_remediation,
         acts.execute_playbook,
         acts.verify_fix,
+        acts.send_notifications,
         acts.close_with_summary,
         acts.close_resolved,
         acts.to_needs_human,

@@ -11,12 +11,14 @@ package k8senv
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
 
@@ -363,4 +365,83 @@ func grepLines(lines []string, needle string) []string {
 		}
 	}
 	return out
+}
+
+// --- Write methods (M5, design.md Section 9.5.3) -------------------------------------
+
+func (e *Env) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
+	if namespace == "" {
+		namespace = e.Cfg.Namespace
+	}
+	// Strategic-merge patch over data keys (Appendix B.5 literal: value = full file content).
+	patch := map[string]any{"data": dataPatches}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("k8senv: marshal configmap patch: %w", err)
+	}
+	_, err = e.Clientset.CoreV1().ConfigMaps(namespace).Patch(
+		ctx, name, types.StrategicMergePatchType, raw, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("k8senv: patch configmap %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func (e *Env) RolloutRestart(ctx context.Context, namespace, kind, name string) error {
+	if namespace == "" {
+		namespace = e.Cfg.Namespace
+	}
+	// Exactly what `kubectl rollout restart` does: set pod-template annotation.
+	restartedAt := time.Now().UTC().Format(time.RFC3339)
+	patch := map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"annotations": map[string]string{
+						"kubectl.kubernetes.io/restartedAt": restartedAt,
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("k8senv: marshal rollout restart patch: %w", err)
+	}
+	switch strings.ToLower(kind) {
+	case "deployment":
+		_, err = e.Clientset.AppsV1().Deployments(namespace).Patch(
+			ctx, name, types.StrategicMergePatchType, raw, metav1.PatchOptions{},
+		)
+	case "statefulset":
+		_, err = e.Clientset.AppsV1().StatefulSets(namespace).Patch(
+			ctx, name, types.StrategicMergePatchType, raw, metav1.PatchOptions{},
+		)
+	default:
+		return fmt.Errorf("k8senv: rollout restart: unknown kind %q (want deployment|statefulset)", kind)
+	}
+	if err != nil {
+		return fmt.Errorf("k8senv: rollout restart %s/%s/%s: %w", kind, namespace, name, err)
+	}
+	return nil
+}
+
+func (e *Env) DeletePod(ctx context.Context, namespace, name string) error {
+	if namespace == "" {
+		namespace = e.Cfg.Namespace
+	}
+	err := e.Clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil {
+		return fmt.Errorf("k8senv: delete pod %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func (e *Env) UpdateServiceEnv(ctx context.Context, service string, env map[string]string) error {
+	return fmt.Errorf("k8senv: UpdateServiceEnv is swarm-only")
+}
+
+func (e *Env) RestartService(ctx context.Context, service string) error {
+	return fmt.Errorf("k8senv: RestartService is swarm-only")
 }

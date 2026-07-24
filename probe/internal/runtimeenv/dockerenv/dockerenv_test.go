@@ -2,6 +2,7 @@ package dockerenv
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -312,5 +313,47 @@ func TestCoordinatorBaseURL_NotConfigured(t *testing.T) {
 	_, err := env.CoordinatorBaseURL(context.Background())
 	if err == nil {
 		t.Fatalf("expected error when coordinator service is not configured")
+	}
+}
+
+func TestUpdateServiceEnvAndRestart(t *testing.T) {
+	var force uint64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/services/presto-worker", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ID": "svc1",
+			"Version": map[string]any{"Index": 3},
+			"Spec": map[string]any{
+				"Name": "presto-worker",
+				"TaskTemplate": map[string]any{
+					"ContainerSpec": map[string]any{"Env": []string{"X=1"}},
+					"ForceUpdate":   force,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/services/svc1/update", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		tt := body["TaskTemplate"].(map[string]any)
+		if fu, ok := tt["ForceUpdate"].(float64); ok {
+			force = uint64(fu)
+		}
+		w.WriteHeader(200)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	env := New(dockerapi.New(srv.URL, srv.Client()), Config{WorkerService: "presto-worker"})
+	if err := env.UpdateServiceEnv(context.Background(), "presto-worker", map[string]string{"Y": "2"}); err != nil {
+		t.Fatalf("update env: %v", err)
+	}
+	if err := env.RestartService(context.Background(), "presto-worker"); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if force < 1 {
+		t.Fatalf("expected ForceUpdate bumped, got %d", force)
+	}
+	if err := env.PatchConfigMap(context.Background(), "ns", "cm", nil); err == nil {
+		t.Fatalf("expected k8s-only error")
 	}
 }

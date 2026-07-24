@@ -64,6 +64,11 @@ class SigningConfig:
     backend: str = "mounted"  # mounted | vault | aws_kms
     key_path: str = "/etc/rca-agent/signing/ed25519.key"
     rotation_grace_seconds: int = 600
+    # When True, an unwritable key_path may fall back to an in-process
+    # ephemeral key (dev/test only). Production must leave this False so
+    # misconfigured mounts fail worker startup instead of silently signing
+    # with a non-persistent key probes will never accept (review W1).
+    allow_ephemeral: bool = False
 
 
 @dataclass
@@ -125,6 +130,23 @@ class DashboardConfig:
     bootstrap_ca_cert_path: str = ""
 
 
+
+@dataclass
+class OutboundWebhook:
+    name: str = ""
+    url: str = ""
+    format: str = "generic"  # slack | generic
+    events: list[str] = field(default_factory=list)
+    min_severity: str = "low"
+
+
+@dataclass
+class NotificationsConfig:
+    """Outbound notification webhooks (Section 6 ``notifications:`` / 9.5.3)."""
+
+    outbound_webhooks: list[OutboundWebhook] = field(default_factory=list)
+
+
 @dataclass
 class AppConfig:
     models: dict[str, ModelRoute] = field(default_factory=dict)
@@ -142,6 +164,7 @@ class AppConfig:
     raw_commands: RawCommandsConfig = field(default_factory=RawCommandsConfig)
     probe_gateway: ProbeGatewayConfig = field(default_factory=ProbeGatewayConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def validate_egress_policy(self) -> None:
@@ -192,6 +215,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         backend=sg.get("backend", "mounted"),
         key_path=sg.get("key_path", "/etc/rca-agent/signing/ed25519.key"),
         rotation_grace_seconds=sg.get("rotation_grace_seconds", 600),
+        allow_ephemeral=bool(sg.get("allow_ephemeral", False)),
     )
 
     st = raw.get("storage") or {}
@@ -247,6 +271,21 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         bootstrap_ca_cert_path=db_cfg.get("bootstrap_ca_cert_path", "") or "",
     )
 
+
+    ncfg = raw.get("notifications") or {}
+    outbound = []
+    for wh in ncfg.get("outbound_webhooks") or []:
+        outbound.append(
+            OutboundWebhook(
+                name=wh.get("name", "") or "",
+                url=wh.get("url", "") or "",
+                format=wh.get("format", "generic") or "generic",
+                events=list(wh.get("events") or []),
+                min_severity=wh.get("min_severity", "low") or "low",
+            )
+        )
+    notifications = NotificationsConfig(outbound_webhooks=outbound)
+
     cfg = AppConfig(
         models=models,
         budget_defaults=budget_defaults,
@@ -263,6 +302,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         raw_commands=raw_commands,
         probe_gateway=probe_gateway,
         dashboard=dashboard,
+        notifications=notifications,
         raw=raw,
     )
     cfg.validate_egress_policy()

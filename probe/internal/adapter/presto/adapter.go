@@ -335,24 +335,7 @@ func (a *Adapter) WriteOps() []platform.WriteOpSpec {
 	return out
 }
 
-// ExecuteWrite implements platform.PlatformAdapter. Full write-op
-// execution is M5 scope (design.md Section 9); M2 implements and fully
-// tests the signature-verification/gating path the write channel depends
-// on (probe/internal/writeops) up to this call, but the op execution
-// itself is intentionally not implemented yet -- see design-questions /
-// impl-progress.md for the documented M2/M5 scope boundary.
-func (a *Adapter) ExecuteWrite(ctx context.Context, step platform.RemediationStep) (platform.WriteResult, error) {
-	if !a.Cfg.WriteEnabled {
-		return platform.WriteResult{OK: false, Error: "write channel disabled for this deployment"}, nil
-	}
-	if !step.SignatureOK {
-		return platform.WriteResult{OK: false, Error: "signature not verified"}, nil
-	}
-	return platform.WriteResult{
-		OK:    false,
-		Error: fmt.Sprintf("write-op %q execution not implemented until M5", step.Op),
-	}, nil
-}
+// ExecuteWrite is implemented in writeops.go (M5, design.md Section 9.5.3).
 
 func writeOpNames(specs []platform.WriteOpSpec) []string {
 	out := make([]string, 0, len(specs))

@@ -61,6 +61,10 @@ def _seed_platform(sf, key="presto-us1", status="online"):
             )
         else:
             existing.status = status
+            # Reset config on re-seed so session-scoped PG leaks from earlier
+            # suites (e.g. M3 budget override) cannot cap workflow rounds
+            # (review N1 fixture isolation).
+            existing.config = {}
         s.commit()
 
 
@@ -688,13 +692,26 @@ async def test_m4_approval_decision_end_to_end(postgres_dsn, temporal_env):
             },
         }
     )
-    probe = FakeProbeGatewayClient()
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_cluster_info": {"exit_code": 0, "data": {}},
+            "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
+            "presto_query_detail": {"exit_code": 0, "data": {}},
+            "health": {"ok": True, "exit_code": 0},
+            "write": {"ok": True, "exit_code": 0},
+        }
+    )
+    import tempfile
+    from rca_common.signing.signer import bootstrap_signing_key
+
+    signer = bootstrap_signing_key(tempfile.mkdtemp() + "/ed25519.key")
     acts = InvestigationActivities(
         session_factory=sf,
         llm_client=llm,
         probe_client=probe,
         object_store=FakeObjectStore(),
         config=None,
+        signer=signer,
     )
     client = temporal_env.client
     app = _make_app(sf, temporal_client=client)

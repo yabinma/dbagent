@@ -14,8 +14,8 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    # Activity names are strings; imports only for type checkers / registration.
-    pass
+    # Deterministic pure helpers (no I/O); sandbox-safe for replay.
+    from worker.playbooks import resolve_action_settle_seconds
 
 
 _DEFAULT_RETRY = RetryPolicy(maximum_attempts=3)
@@ -36,6 +36,8 @@ class InvestigationWorkflow:
         self._status = "RECEIVED"
         self._last_report: dict[str, Any] | None = None
         self._terminal_reason: str | None = None
+        self._platform_key: str | None = None
+        self._severity: str | None = None
 
     # ---- signals (Section 5.1 / Appendix D.2 / F6) ------------------------
     @workflow.signal
@@ -105,6 +107,36 @@ class InvestigationWorkflow:
         threshold = float(case.get("confidence_threshold") or 0.85)
         max_calls = int(case.get("max_calls_per_round") or 8)
         self._status = "OPEN"
+        self._platform_key = case.get("platform_key") or event.get("platform_key")
+        self._severity = event.get("severity") or "unknown"
+
+        # Defense in depth: gateway rejects non-ONLINE platforms before start,
+        # but if create_case still reports rejection, terminate as REJECTED and
+        # fire case_rejected (FP-M5-10 / Section 9.5.3).
+        if case.get("rejected"):
+            reason = case.get("reject_reason") or "platform_not_ready"
+            result = await workflow.execute_activity(
+                "reject_case",
+                {
+                    "investigation_id": investigation_id,
+                    "reason": reason,
+                },
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=_DEFAULT_RETRY,
+            )
+            self._status = "REJECTED"
+            self._terminal_reason = reason
+            await self._notify(
+                "case_rejected",
+                {
+                    "investigation_id": investigation_id,
+                    "platform_key": case.get("platform_key") or event.get("platform_key"),
+                    "severity": event.get("severity"),
+                    "reason": reason,
+                    "summary": f"rejected: {reason}",
+                },
+            )
+            return result
 
         ctx: dict[str, Any] = {
             "event": event,
@@ -114,6 +146,15 @@ class InvestigationWorkflow:
             "platform_key": case["platform_key"],
             # M4 need_more / denied comments for the next RCA round (Section 10.2.3)
             "approver_feedback": [],
+            # Optional platform overrides for settle window (M5).
+            "deployment": case.get("deployment") or input.get("deployment"),
+            # Full remediation config block for settle_seconds() (FP-M5-8).
+            "remediation": dict(case.get("remediation") or {}),
+            # Explicit workflow-input override only when the caller set it
+            # (None means "use playbook / platform defaults").
+            "settle_seconds_override": (
+                input["settle_seconds"] if "settle_seconds" in input else None
+            ),
         }
 
         plan = await workflow.execute_activity(
@@ -314,6 +355,7 @@ class InvestigationWorkflow:
         # (design.md v1.8 Section 5.1/5.2 `executed_any` gate). Deny/timeout of
         # every playbook closes via close_with_summary → CLOSED_SUMMARY.
         executed_any = False
+        applied_playbooks: list[str] = []
         for action in [a for a in actions if a.get("kind") == "playbook"]:
             decision = await self._request_approval(
                 "remediation",
@@ -328,18 +370,36 @@ class InvestigationWorkflow:
                 {
                     "investigation_id": investigation_id,
                     "action": action,
+                    "platform_key": ctx.get("platform_key"),
+                    "deployment": ctx.get("deployment"),
+                    "approved_by": decision.get("decided_by"),
                 },
                 start_to_close_timeout=timedelta(minutes=15),
                 retry_policy=_NO_RETRY,
             )
             if not playbook_result.get("ok"):
                 return await self._needs_human(ctx, "playbook_failed")
+            # Settle wait window as a durable Temporal timer (Section 9.5.3 / FP-M5-8).
+            # Defaults: 120 s for restart playbooks, 0 s for kill_query (see
+            # worker.playbooks.resolve_action_settle_seconds).
+            settle = resolve_action_settle_seconds(
+                action,
+                remediation_config=ctx.get("remediation") or {},
+                input_override=ctx.get("settle_seconds_override"),
+            )
+            if settle > 0:
+                await workflow.sleep(timedelta(seconds=settle))
             verified = await workflow.execute_activity(
                 "verify_fix",
                 {
                     "investigation_id": investigation_id,
                     "verification_plan": action.get("verification_plan") or [],
                     "force_fail": action.get("_force_verify_fail", False),
+                    "execution_id": playbook_result.get("execution_id"),
+                    "playbook_id": action.get("playbook_id"),
+                    "action": action,
+                    "platform_key": ctx.get("platform_key"),
+                    "params": action.get("playbook_params") or {},
                 },
                 start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=_DEFAULT_RETRY,
@@ -347,6 +407,8 @@ class InvestigationWorkflow:
             if not verified.get("ok"):
                 return await self._needs_human(ctx, "verification_failed")
             executed_any = True
+            if action.get("playbook_id"):
+                applied_playbooks.append(action["playbook_id"])
 
         if executed_any:
             result = await workflow.execute_activity(
@@ -359,6 +421,17 @@ class InvestigationWorkflow:
                 retry_policy=_DEFAULT_RETRY,
             )
             self._status = "RESOLVED"
+            await self._notify(
+                "case_resolved",
+                {
+                    "investigation_id": investigation_id,
+                    "platform_key": ctx.get("platform_key"),
+                    "severity": (ctx.get("event") or {}).get("severity"),
+                    "rca_compact": (self._last_report or {}).get("rca_compact"),
+                    "summary": (self._last_report or {}).get("rca_compact"),
+                    "playbooks": applied_playbooks,
+                },
+            )
             return {**result, "rca_report": self._last_report}
 
         result = await workflow.execute_activity(
@@ -401,6 +474,18 @@ class InvestigationWorkflow:
         approval_id = str(approval["approval_id"])
         self._awaiting_approval_id = approval_id
         self._status = "AWAITING_APPROVAL"
+        # Non-blocking notification (Section 9.5.3); failures are swallowed.
+        await self._notify(
+            "approval_requested",
+            {
+                "investigation_id": investigation_id,
+                "platform_key": self._platform_key,
+                "severity": self._severity,
+                "summary": f"{kind} approval requested",
+                "digest": subject.get("playbook_id") or subject.get("command") or kind,
+                "approval_kind": kind,
+            },
+        )
         try:
             # Gate on matching approval_id so a late/duplicate signal for a
             # *prior* approval that landed during create_approval (when
@@ -454,7 +539,30 @@ class InvestigationWorkflow:
         )
         self._status = "NEEDS_HUMAN"
         self._terminal_reason = reason
+        await self._notify(
+            "case_needs_human",
+            {
+                "investigation_id": ctx.get("investigation_id"),
+                "platform_key": ctx.get("platform_key"),
+                "severity": (ctx.get("event") or {}).get("severity"),
+                "reason": reason,
+                "rca_compact": (self._last_report or {}).get("rca_compact"),
+                "summary": f"needs human: {reason}",
+            },
+        )
         return {**result, "rca_report": self._last_report}
+
+    async def _notify(self, event: str, payload: dict[str, Any]) -> None:
+        """Schedule send_notifications; never fail the main flow (Section 10.1)."""
+        try:
+            await workflow.execute_activity(
+                "send_notifications",
+                {"event": event, "payload": payload},
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception:  # noqa: BLE001 — never block the main flow
+            pass
 
 
 _TERMINAL = frozenset({"REJECTED", "NEEDS_HUMAN", "CLOSED_SUMMARY", "RESOLVED"})

@@ -132,13 +132,27 @@ checkpoints:
 - id: F10
   description: Remediation + signing (design.md 9)
   owning_milestone: M5
-  status: deferred
-  tests: []
+  status: covered
+  tests:
+  - tests/functional/test_m5_closed_loop.py
+  - tests/functional/m2_probe_link/write_dispatch_test.go
+  - services/worker/tests/test_playbooks_and_verification.py
+  - probe/internal/writeops/
+  - probe/internal/adapter/presto/
+  notes: 'M5: real write-op primitives, D14 per-step signing, execute_playbook/verify_fix closed loop.
+    Cross-process write path (FP-M5-1/2/12): m2_probe_link subprocess harness posts Python-signed
+    kind=write through real probe-gateway HTTP → real probe → httptest Presto (presto_kill_query).'
+
 - id: F11
   description: Playbook catalog (design.md 9.2)
   owning_milestone: M5
-  status: deferred
-  tests: []
+  status: covered
+  tests:
+  - tests/functional/test_m5_closed_loop.py::test_m5_five_playbooks_primitive_sequences
+  - tests/functional/test_m5_closed_loop.py::test_m5_seed_playbooks_idempotent
+  - services/worker/tests/test_seed_playbooks.py
+  notes: 'M5: 5 MVP playbooks seeded idempotently; step registry per deployment.'
+
 - id: F12
   description: Dashboard API (Appendix D)
   owning_milestone: M4
@@ -155,8 +169,13 @@ checkpoints:
 - id: F13
   description: Notifications (design.md 10.1)
   owning_milestone: M5
-  status: deferred
-  tests: []
+  status: covered
+  tests:
+  - tests/functional/test_m5_closed_loop.py::test_m5_notifications_slack_and_generic_filtered_and_retried
+  - tests/functional/test_m5_closed_loop.py::test_m5_closed_loop_e2e
+  - libs/py/rca_common/tests/test_notifications.py
+  notes: 'M5: shared notifications.py, send_notifications Activity, notification_sent audits.'
+
 - id: F14
   description: Tracing (design.md D5, 7)
   owning_milestone: M1
@@ -188,6 +207,5 @@ checkpoints:
   status: partial
   tests:
   - tests/functional/test_m3_investigation_loop.py::test_f16_audit_actions_emitted
-  notes: 'M3 walks every M3-emittable audit action enum with actor-field assertions. Out of M3 reach:
-    notification_sent (M5/F13), credentials_detected / credentials_verified / credentials_test_failed (M2
-    probe credentials path).'
+  - tests/functional/test_m5_closed_loop.py::test_m5_closed_loop_e2e
+  notes: 'M3 walks M3-emittable audits; M5 e2e asserts notification_sent. Still partial: credentials_* (M2).'

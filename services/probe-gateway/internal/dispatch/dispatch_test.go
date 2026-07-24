@@ -3,6 +3,7 @@ package dispatch_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -435,5 +436,90 @@ func TestListenAndServe_Lifecycle(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("ListenAndServe did not return after Shutdown")
+	}
+}
+
+
+
+func TestHandleExecute_WriteKind(t *testing.T) {
+	fd := &fakeDispatcher{
+		result: &rcaprobev1.TaskResult{TaskId: "tw", ExitCode: 0},
+		data:   []byte(`{"OK":true,"Detail":"killed query q1"}`),
+	}
+	srv := dispatch.New(fd)
+	sigB64 := base64.StdEncoding.EncodeToString(make([]byte, 64))
+	body := map[string]any{
+		"platform_key":            "p1",
+		"task_id":                 "tw",
+		"kind":                    "write",
+		"playbook_id":             "presto.kill_query",
+		"step_index":              0,
+		"op":                      "presto_kill_query",
+		"params":                  map[string]any{"query_id": "q1"},
+		"execution_id":            "exec-1",
+		"control_plane_signature": sigB64,
+		"timeout_seconds":         30,
+	}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/execute", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", rr.Code, rr.Body.String())
+	}
+	if fd.lastTask == nil || fd.lastTask.GetWrite() == nil {
+		t.Fatalf("expected write task, got %+v", fd.lastTask)
+	}
+	w := fd.lastTask.GetWrite()
+	if w.GetOp() != "presto_kill_query" || w.GetPlaybookId() != "presto.kill_query" {
+		t.Fatalf("unexpected write: %+v", w)
+	}
+	if len(w.GetControlPlaneSignature()) != 64 {
+		t.Fatalf("sig len %d", len(w.GetControlPlaneSignature()))
+	}
+}
+
+func TestHandleExecute_WriteMissingFields(t *testing.T) {
+	fd := &fakeDispatcher{}
+	srv := dispatch.New(fd)
+	body := map[string]any{
+		"platform_key": "p1",
+		"task_id":      "t",
+		"kind":         "write",
+		"playbook_id":  "presto.kill_query",
+		"execution_id": "e",
+	}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/execute", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestHandleExecute_HealthKind(t *testing.T) {
+	fd := &fakeDispatcher{
+		result: &rcaprobev1.TaskResult{ExitCode: 0},
+		data:   []byte(`{"OK":true}`),
+	}
+	srv := dispatch.New(fd)
+	body := map[string]any{
+		"platform_key": "p1",
+		"task_id":      "th",
+		"kind":         "health",
+		"builtin":      true,
+		"custom_query": "SELECT 1",
+		"wait_seconds": 0,
+	}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/execute", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", rr.Code, rr.Body.String())
+	}
+	if fd.lastTask.GetHealth() == nil {
+		t.Fatalf("expected health task")
 	}
 }

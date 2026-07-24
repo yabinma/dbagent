@@ -216,6 +216,79 @@ func (c *Client) Exec(ctx context.Context, containerID string, cmd []string) (st
 	return stdout, stderr, inspect.ExitCode, nil
 }
 
+// --- Swarm services (M5 write ops) ---------------------------------------------------
+
+// Service is the subset of Docker Engine Service JSON the write ops need
+// (ServiceInspect / ServiceUpdate).
+type Service struct {
+	ID      string         `json:"ID"`
+	Version ServiceVersion `json:"Version"`
+	Spec    ServiceSpec    `json:"Spec"`
+}
+
+type ServiceVersion struct {
+	Index uint64 `json:"Index"`
+}
+
+type ServiceSpec struct {
+	Name         string            `json:"Name,omitempty"`
+	Labels       map[string]string `json:"Labels,omitempty"`
+	TaskTemplate TaskSpec          `json:"TaskTemplate"`
+	Mode         any               `json:"Mode,omitempty"`
+	// Preserve unknown top-level fields the Engine returns so a round-trip
+	// ServiceUpdate does not strip them.
+	EndpointSpec any `json:"EndpointSpec,omitempty"`
+	UpdateConfig any `json:"UpdateConfig,omitempty"`
+}
+
+type TaskSpec struct {
+	ContainerSpec ContainerSpec `json:"ContainerSpec"`
+	// ForceUpdate bumps to force task recreation (swarm_restart_service).
+	ForceUpdate   uint64 `json:"ForceUpdate,omitempty"`
+	Resources     any    `json:"Resources,omitempty"`
+	RestartPolicy any    `json:"RestartPolicy,omitempty"`
+	Placement     any    `json:"Placement,omitempty"`
+	Networks      any    `json:"Networks,omitempty"`
+}
+
+type ContainerSpec struct {
+	Image  string            `json:"Image,omitempty"`
+	Env    []string          `json:"Env,omitempty"`
+	Labels map[string]string `json:"Labels,omitempty"`
+	// Preserve fields we do not mutate.
+	Command    any `json:"Command,omitempty"`
+	Args       any `json:"Args,omitempty"`
+	Hostname   any `json:"Hostname,omitempty"`
+	Mounts     any `json:"Mounts,omitempty"`
+	Secrets    any `json:"Secrets,omitempty"`
+	Configs    any `json:"Configs,omitempty"`
+	User       any `json:"User,omitempty"`
+	Dir        any `json:"Dir,omitempty"`
+	Privileges any `json:"Privileges,omitempty"`
+}
+
+// ServiceInspect returns a Swarm service by name or ID
+// (GET /services/{id}).
+func (c *Client) ServiceInspect(ctx context.Context, idOrName string) (*Service, error) {
+	var svc Service
+	if err := c.getJSON(ctx, "/services/"+url.PathEscape(idOrName), &svc); err != nil {
+		return nil, err
+	}
+	return &svc, nil
+}
+
+// ServiceUpdate applies a new ServiceSpec at the given version
+// (POST /services/{id}/update?version=N).
+func (c *Client) ServiceUpdate(ctx context.Context, id string, version uint64, spec ServiceSpec) error {
+	body, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/services/%s/update?version=%d", url.PathEscape(id), version)
+	_, err = c.post(ctx, path, body)
+	return err
+}
+
 // --- low-level helpers ---------------------------------------------------------------
 
 func (c *Client) get(ctx context.Context, path string) ([]byte, error) {

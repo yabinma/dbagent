@@ -140,6 +140,17 @@ func (f *fakeExecEnv) ReadConfig(ctx context.Context, component, file, target st
 }
 func (f *fakeExecEnv) CoordinatorBaseURL(ctx context.Context) (string, error) { return "", nil }
 
+func (f *fakeExecEnv) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
+	return nil
+}
+func (f *fakeExecEnv) RolloutRestart(ctx context.Context, namespace, kind, name string) error { return nil }
+func (f *fakeExecEnv) DeletePod(ctx context.Context, namespace, name string) error { return nil }
+func (f *fakeExecEnv) UpdateServiceEnv(ctx context.Context, service string, env map[string]string) error {
+	return nil
+}
+func (f *fakeExecEnv) RestartService(ctx context.Context, service string) error { return nil }
+
+
 func TestExecute_RunsValidCommand(t *testing.T) {
 	env := &fakeExecEnv{result: platform.ExecResult{Stdout: "output here", ExitCode: 0}}
 	result, err := Execute(context.Background(), env, "coordinator-0", "presto", "ps aux", 0, 0)

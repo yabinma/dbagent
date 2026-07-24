@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yabinma/dbagent/probe/internal/platform"
+	"github.com/yabinma/dbagent/probe/internal/prestoclient"
 )
 
 // fakeEnv is a lightweight platform.RuntimeEnv double for adapter-level
@@ -34,6 +35,24 @@ type fakeEnv struct {
 	usage    []platform.ResourceUsageInfo
 	execRes  platform.ExecResult
 	execErr  error
+
+	// Write-method call records / injected errors (M5).
+	lastPatchCM    struct {
+		ns, name string
+		patches  map[string]string
+	}
+	patchCMErr     error
+	lastRestart    struct{ ns, kind, name string }
+	restartErr     error
+	lastDeletePod  struct{ ns, name string }
+	deletePodErr   error
+	lastUpdateEnv  struct {
+		service string
+		env     map[string]string
+	}
+	updateEnvErr   error
+	lastRestartSvc string
+	restartSvcErr  error
 }
 
 func (f *fakeEnv) Kind() platform.EnvKind { return f.kind }
@@ -60,6 +79,34 @@ func (f *fakeEnv) ReadConfig(ctx context.Context, component, file, target string
 }
 func (f *fakeEnv) CoordinatorBaseURL(ctx context.Context) (string, error) {
 	return f.baseURL, f.baseURLErr
+}
+
+// Write methods (M5) — recorded for ExecuteWrite unit tests.
+func (f *fakeEnv) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
+	f.lastPatchCM = struct {
+		ns, name string
+		patches  map[string]string
+	}{namespace, name, dataPatches}
+	return f.patchCMErr
+}
+func (f *fakeEnv) RolloutRestart(ctx context.Context, namespace, kind, name string) error {
+	f.lastRestart = struct{ ns, kind, name string }{namespace, kind, name}
+	return f.restartErr
+}
+func (f *fakeEnv) DeletePod(ctx context.Context, namespace, name string) error {
+	f.lastDeletePod = struct{ ns, name string }{namespace, name}
+	return f.deletePodErr
+}
+func (f *fakeEnv) UpdateServiceEnv(ctx context.Context, service string, env map[string]string) error {
+	f.lastUpdateEnv = struct {
+		service string
+		env     map[string]string
+	}{service, env}
+	return f.updateEnvErr
+}
+func (f *fakeEnv) RestartService(ctx context.Context, service string) error {
+	f.lastRestartSvc = service
+	return f.restartSvcErr
 }
 
 // newPrestoTestServer returns an httptest server that answers the REST
@@ -484,17 +531,138 @@ func TestExecuteWrite_SignatureNotVerified(t *testing.T) {
 	}
 }
 
-func TestExecuteWrite_NotImplementedStub(t *testing.T) {
+func TestExecuteWrite_RequiresEnv(t *testing.T) {
 	a := New(Config{WriteEnabled: true})
-	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{Op: "presto_kill_query", SignatureOK: true})
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "presto_kill_query", SignatureOK: true,
+		Params: map[string]any{"query_id": "q1"},
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.OK {
-		t.Fatalf("expected 'not implemented until M5' stub result")
+		t.Fatalf("expected failure when env is nil")
 	}
-	if result.Error == "" {
-		t.Fatalf("expected an explanatory error message")
+}
+
+func TestExecuteWrite_PrestoKillQuery(t *testing.T) {
+	var deleted string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/query/") {
+			deleted = strings.TrimPrefix(r.URL.Path, "/v1/query/")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	env := &fakeEnv{kind: platform.EnvKindK8s, configText: "http-server.http.port=8080\n", baseURL: srv.URL}
+	a := New(Config{WriteEnabled: true, PlatformKey: "p1", InsecureSkipVerify: true})
+	if _, err := a.Detect(context.Background(), env); err != nil {
+		// Detect may fail without full Presto; set env+client manually for unit focus.
+		a.env = env
+		a.presto = prestoclient.New(srv.URL, srv.Client())
+	}
+	// Ensure env+client wired even if Detect partially failed.
+	a.env = env
+	if a.presto == nil {
+		a.presto = prestoclient.New(srv.URL, srv.Client())
+	}
+
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "presto_kill_query", SignatureOK: true,
+		Params: map[string]any{"query_id": "20240101_q1"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("expected OK, got error=%s", result.Error)
+	}
+	if deleted != "20240101_q1" {
+		t.Fatalf("expected DELETE for query, got %q", deleted)
+	}
+}
+
+func TestExecuteWrite_K8sPatchConfigMap(t *testing.T) {
+	env := &fakeEnv{kind: platform.EnvKindK8s}
+	a := New(Config{WriteEnabled: true})
+	a.env = env
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "k8s_patch_configmap", SignatureOK: true,
+		Params: map[string]any{
+			"name": "presto-worker-config", "namespace": "presto",
+			"patches": []any{map[string]any{"key": "config.properties", "value": "x=1\n"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("expected OK, got %s", result.Error)
+	}
+	if env.lastPatchCM.name != "presto-worker-config" {
+		t.Fatalf("patch not recorded: %+v", env.lastPatchCM)
+	}
+}
+
+func TestExecuteWrite_ParamValidationRejects(t *testing.T) {
+	a := New(Config{WriteEnabled: true})
+	a.env = &fakeEnv{kind: platform.EnvKindK8s}
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "presto_kill_query", SignatureOK: true,
+		Params: map[string]any{}, // missing query_id
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("expected param validation failure")
+	}
+}
+
+func TestExecuteWrite_AdjustMemoryConfigWhitelistRejects(t *testing.T) {
+	a := New(Config{WriteEnabled: true})
+	a.env = &fakeEnv{kind: platform.EnvKindK8s, configText: "query.max-memory=10GB\n"}
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		PlaybookID: "presto.adjust_memory_config",
+		Op:         "k8s_patch_configmap", SignatureOK: true,
+		Params: map[string]any{
+			"name": "cm", "namespace": "ns",
+			"patches": []any{map[string]any{"key": "evil.key", "value": "1"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("expected whitelist reject, got OK detail=%s", result.Detail)
+	}
+}
+
+func TestExecuteWrite_AdjustMemoryConfigWhitelistAccept(t *testing.T) {
+	env := &fakeEnv{kind: platform.EnvKindK8s, configText: "query.max-memory=10GB\nother=1\n"}
+	a := New(Config{WriteEnabled: true})
+	a.env = env
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		PlaybookID: "presto.adjust_memory_config",
+		Op:         "k8s_patch_configmap", SignatureOK: true,
+		Params: map[string]any{
+			"name": "cm", "namespace": "ns",
+			"patches": []any{map[string]any{"key": "query.max-memory", "value": "50GB"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("expected OK, got %s", result.Error)
+	}
+	// Merged content should include the new value.
+	got := env.lastPatchCM.patches["config.properties"]
+	if !strings.Contains(got, "query.max-memory=50GB") {
+		t.Fatalf("expected merged memory config, got %q", got)
 	}
 }
 
@@ -502,3 +670,111 @@ type simpleErr string
 
 func (e simpleErr) Error() string { return string(e) }
 func assertErr(s string) error    { return simpleErr(s) }
+
+func TestExecuteWrite_K8sRolloutRestartAndDeletePod(t *testing.T) {
+	env := &fakeEnv{kind: platform.EnvKindK8s}
+	a := New(Config{WriteEnabled: true})
+	a.env = env
+	r, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "k8s_rollout_restart", SignatureOK: true,
+		Params: map[string]any{"kind": "deployment", "name": "w", "namespace": "ns"},
+	})
+	if err != nil || !r.OK {
+		t.Fatalf("rollout: %+v err=%v", r, err)
+	}
+	if env.lastRestart.name != "w" {
+		t.Fatalf("restart not recorded")
+	}
+	r, err = a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "k8s_delete_pod", SignatureOK: true,
+		Params: map[string]any{"name": "pod1", "namespace": "ns"},
+	})
+	if err != nil || !r.OK {
+		t.Fatalf("delete: %+v err=%v", r, err)
+	}
+}
+
+func TestExecuteWrite_SwarmOps(t *testing.T) {
+	env := &fakeEnv{kind: platform.EnvKindSwarm}
+	a := New(Config{WriteEnabled: true})
+	a.env = env
+	r, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "swarm_update_service_env", SignatureOK: true,
+		Params: map[string]any{
+			"service": "presto-worker",
+			"env":     []any{map[string]any{"key": "A", "value": "1"}},
+		},
+	})
+	if err != nil || !r.OK {
+		t.Fatalf("update env: %+v err=%v", r, err)
+	}
+	r, err = a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "swarm_restart_service", SignatureOK: true,
+		Params: map[string]any{"service": "presto-worker"},
+	})
+	if err != nil || !r.OK {
+		t.Fatalf("restart svc: %+v err=%v", r, err)
+	}
+}
+
+func TestExecuteWrite_PrimitiveFailure(t *testing.T) {
+	env := &fakeEnv{kind: platform.EnvKindK8s, deletePodErr: assertErr("nope")}
+	a := New(Config{WriteEnabled: true})
+	a.env = env
+	r, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "k8s_delete_pod", SignatureOK: true,
+		Params: map[string]any{"name": "p", "namespace": "ns"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if r.OK {
+		t.Fatalf("expected failure")
+	}
+}
+
+func TestExecuteWrite_UnknownOp(t *testing.T) {
+	a := New(Config{WriteEnabled: true})
+	a.env = &fakeEnv{}
+	// unknown op fails schema load / not in catalog
+	r, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "not_a_real_op", SignatureOK: true, Params: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if r.OK {
+		t.Fatalf("expected unknown op reject")
+	}
+}
+
+func TestExecuteWrite_AdjustMemorySwarm(t *testing.T) {
+	env := &fakeEnv{kind: platform.EnvKindSwarm, configText: "query.max-memory=10GB\n"}
+	a := New(Config{WriteEnabled: true})
+	a.env = env
+	r, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		PlaybookID: "presto.adjust_memory_config",
+		Op:         "swarm_update_service_env", SignatureOK: true,
+		Params: map[string]any{
+			"service": "presto-worker",
+			"env":     []any{map[string]any{"key": "query.max-memory", "value": "50GB"}},
+		},
+	})
+	if err != nil || !r.OK {
+		t.Fatalf("got %+v err=%v", r, err)
+	}
+	if env.lastUpdateEnv.env["query.max-memory"] != "50GB" {
+		t.Fatalf("env not updated: %+v", env.lastUpdateEnv)
+	}
+}
+
+func TestMergePropertiesHelpers(t *testing.T) {
+	got := mergeProperties("a=1\nb=2\n", map[string]string{"a": "9"})
+	if !strings.Contains(got, "a=9") {
+		t.Fatalf("got %q", got)
+	}
+	got = setProperty("", "k", "v")
+	if !strings.Contains(got, "k=v") {
+		t.Fatalf("got %q", got)
+	}
+}

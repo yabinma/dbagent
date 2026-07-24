@@ -297,3 +297,67 @@ func grepLines(lines []string, needle string) []string {
 	}
 	return out
 }
+
+// --- Write methods (M5, design.md Section 9.5.3) -------------------------------------
+
+func (e *Env) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
+	return fmt.Errorf("dockerenv: PatchConfigMap is k8s-only")
+}
+
+func (e *Env) RolloutRestart(ctx context.Context, namespace, kind, name string) error {
+	return fmt.Errorf("dockerenv: RolloutRestart is k8s-only")
+}
+
+func (e *Env) DeletePod(ctx context.Context, namespace, name string) error {
+	return fmt.Errorf("dockerenv: DeletePod is k8s-only")
+}
+
+func (e *Env) UpdateServiceEnv(ctx context.Context, service string, env map[string]string) error {
+	svc, err := e.Docker.ServiceInspect(ctx, service)
+	if err != nil {
+		return fmt.Errorf("dockerenv: update service env inspect: %w", err)
+	}
+	// Merge into TaskTemplate.ContainerSpec.Env (KEY=VALUE entries).
+	merged := mergeEnv(svc.Spec.TaskTemplate.ContainerSpec.Env, env)
+	svc.Spec.TaskTemplate.ContainerSpec.Env = merged
+	if err := e.Docker.ServiceUpdate(ctx, svc.ID, svc.Version.Index, svc.Spec); err != nil {
+		return fmt.Errorf("dockerenv: update service env: %w", err)
+	}
+	return nil
+}
+
+func (e *Env) RestartService(ctx context.Context, service string) error {
+	svc, err := e.Docker.ServiceInspect(ctx, service)
+	if err != nil {
+		return fmt.Errorf("dockerenv: restart service inspect: %w", err)
+	}
+	svc.Spec.TaskTemplate.ForceUpdate++
+	if err := e.Docker.ServiceUpdate(ctx, svc.ID, svc.Version.Index, svc.Spec); err != nil {
+		return fmt.Errorf("dockerenv: restart service: %w", err)
+	}
+	return nil
+}
+
+// mergeEnv overlays key=value pairs onto an existing Docker Env list.
+func mergeEnv(existing []string, patches map[string]string) []string {
+	index := map[string]int{}
+	out := make([]string, 0, len(existing)+len(patches))
+	for _, e := range existing {
+		key := e
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			key = e[:i]
+		}
+		index[key] = len(out)
+		out = append(out, e)
+	}
+	for k, v := range patches {
+		entry := k + "=" + v
+		if i, ok := index[k]; ok {
+			out[i] = entry
+		} else {
+			index[k] = len(out)
+			out = append(out, entry)
+		}
+	}
+	return out
+}

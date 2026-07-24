@@ -240,3 +240,57 @@ func TestGetJSON_ErrorStatusPropagates(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 }
+
+func TestServiceInspectAndUpdate(t *testing.T) {
+	var updated bool
+	var updateBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/services/presto-worker", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", 405)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ID": "svc1",
+			"Version": map[string]any{"Index": 7},
+			"Spec": map[string]any{
+				"Name": "presto-worker",
+				"TaskTemplate": map[string]any{
+					"ContainerSpec": map[string]any{
+						"Image": "presto:0.298",
+						"Env":   []string{"A=1"},
+					},
+					"ForceUpdate": 0,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/services/svc1/update", func(w http.ResponseWriter, r *http.Request) {
+		updated = true
+		defer r.Body.Close()
+		_ = json.NewDecoder(r.Body).Decode(&updateBody)
+		if r.URL.Query().Get("version") != "7" {
+			http.Error(w, "bad version", 400)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, srv.Client())
+	svc, err := c.ServiceInspect(context.Background(), "presto-worker")
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if svc.ID != "svc1" || svc.Version.Index != 7 {
+		t.Fatalf("unexpected service: %+v", svc)
+	}
+	svc.Spec.TaskTemplate.ContainerSpec.Env = []string{"A=1", "B=2"}
+	svc.Spec.TaskTemplate.ForceUpdate = 1
+	if err := c.ServiceUpdate(context.Background(), svc.ID, svc.Version.Index, svc.Spec); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !updated {
+		t.Fatalf("update not called")
+	}
+}

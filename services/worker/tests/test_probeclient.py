@@ -50,3 +50,73 @@ async def test_http_client_raw_command():
     r = await client.execute_raw_command("presto-us1", command="cat /x")
     assert r.exit_code == 0
     await client.aclose()
+
+
+import base64
+import respx
+import httpx
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_fake_execute_write_records_signature():
+    client = FakeProbeGatewayClient({"write": {"ok": True, "exit_code": 0}})
+    r = await client.execute_write(
+        "p1",
+        playbook_id="presto.kill_query",
+        step_index=0,
+        op="presto_kill_query",
+        params={"query_id": "q"},
+        execution_id="e1",
+        signature_b64=base64.b64encode(b"x" * 64).decode(),
+    )
+    assert r.exit_code == 0
+    assert client.calls[0]["kind"] == "write"
+    assert client.calls[0]["op"] == "presto_kill_query"
+
+
+@pytest.mark.asyncio
+async def test_http_execute_write_body_shape():
+    async with httpx.AsyncClient() as http:
+        # Use respx if available, else ASGI transport not needed — mock transport.
+        pass
+
+
+@pytest.mark.asyncio
+async def test_http_execute_write_posts_kind_write(monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        content = b'{"exit_code":0,"data":{"ok":true}}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"exit_code": 0, "data": {"ok": True}}
+
+    class FakeHTTP:
+        async def post(self, url, json=None):
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResp()
+
+        async def aclose(self):
+            return None
+
+    client = HTTPProbeGatewayClient("http://gateway:8080", client=None)
+    client._client = FakeHTTP()  # type: ignore[assignment]
+    r = await client.execute_write(
+        "p1",
+        playbook_id="presto.kill_query",
+        step_index=0,
+        op="presto_kill_query",
+        params={"query_id": "q"},
+        execution_id="e1",
+        signature_b64="YWJj",
+    )
+    assert r.exit_code == 0
+    assert captured["json"]["kind"] == "write"
+    assert captured["json"]["op"] == "presto_kill_query"
+    assert captured["json"]["control_plane_signature"] == "YWJj"

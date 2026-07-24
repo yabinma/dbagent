@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import pytest
 
 from rca_common.db.models import Approval, Investigation, Platform
-from helpers import login, seed_user
+from dashboard_helpers import login, seed_user
 
 
 def _seed(sf, n_inv=30, n_pending=10):

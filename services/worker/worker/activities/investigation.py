@@ -48,6 +48,8 @@ class InvestigationActivities:
         config=None,
         source_store=None,
         model_overrides: dict[str, dict[str, Any]] | None = None,
+        signer=None,
+        dashboard_base_url: str = "",
     ):
         self._session_factory = session_factory
         self._llm = llm_client
@@ -56,6 +58,22 @@ class InvestigationActivities:
         self._config = config
         self._source_store = source_store or FakeSourceStore()
         self._model_overrides = model_overrides or {}
+        if signer is None:
+            # Fail closed unless explicitly allowed (review W1). Production
+            # mounts a persistent key via worker_main; tests pass a real
+            # signer or set config.signing.allow_ephemeral=true.
+            allow_ephemeral = False
+            if config is not None:
+                signing = getattr(config, "signing", None)
+                allow_ephemeral = bool(getattr(signing, "allow_ephemeral", False))
+            if allow_ephemeral:
+                import nacl.signing
+                from rca_common.signing.signer import MountedEd25519Signer
+
+                signer = MountedEd25519Signer(nacl.signing.SigningKey.generate())
+            # else leave None — execute_playbook fails closed with "signer not configured"
+        self._signer = signer
+        self._dashboard_base_url = dashboard_base_url
 
     # ------------------------------------------------------------------ helpers
     def _model_for(self, role: str) -> tuple[str, int]:
@@ -141,12 +159,31 @@ class InvestigationActivities:
                     investigation_id=investigation_id,
                 )
             session.commit()
+        deployment = "k8s"
+        remediation: dict[str, Any] = {}
+        rejected = False
+        reject_reason: str | None = None
+        if platform is not None:
+            deployment = getattr(platform, "deployment", None) or deployment
+            if platform.config:
+                remediation = dict((platform.config or {}).get("remediation") or {})
+            # RECEIVED → REJECTED when platform is not ONLINE (Section 5.1 / 8.3).
+            # Gateway already rejects most cases; this is defense in depth for
+            # direct workflow starts and races (FP-M5-10 case_rejected).
+            status = (getattr(platform, "status", None) or "").lower()
+            if status and status != "online":
+                rejected = True
+                reject_reason = "platform_not_ready"
         return {
             "investigation_id": str(investigation_id),
             "platform_key": event["platform_key"],
             "budget": budget,
             "confidence_threshold": self._confidence_threshold(),
             "max_calls_per_round": self._max_calls(),
+            "deployment": deployment,
+            "remediation": remediation,
+            "rejected": rejected,
+            "reject_reason": reject_reason,
         }
 
     @activity.defn(name="get_spend")
@@ -665,60 +702,432 @@ class InvestigationActivities:
 
     @activity.defn(name="execute_playbook")
     async def execute_playbook(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch signed write steps via probe-gateway (M5 deepens op execution).
+        """Real closed-loop playbook execution (design.md Section 9.5.3).
 
-        M3 implements the Activity contract and audit trail so the state
-        machine can reach RESOLVED; the probe write-channel gate (M2) verifies
-        signatures. Full k8s/swarm primitive execution remains M5.
+        Resolves ordered steps from ``worker.playbooks.PLAYBOOK_STEPS``, signs
+        each step (D14) at execution time, dispatches via probe-gateway
+        ``kind=write``, captures pre-snapshot, and manages
+        ``remediation_executions`` lifecycle + maturity counters.
         """
+        import base64
+
+        from rca_common.db.models import Playbook, RemediationExecution
+        from rca_common.signing.signer import canonical_step_hash
+        from worker.playbooks import (
+            PLAYBOOK_STEPS,
+            PRE_SNAPSHOT_TOOLS,
+            resolve_locators,
+            resolve_runtime_tool,
+        )
+
         investigation_id = payload.get("investigation_id")
         action = payload.get("action") or {}
+        playbook_id = action.get("playbook_id")
+        params = dict(action.get("playbook_params") or action.get("params") or {})
+        approved_by = payload.get("approved_by")
+        execution_id = uuid.UUID(str(payload.get("execution_id") or uuid.uuid4()))
+
+        # Resolve platform deployment + locators.
+        platform_key = payload.get("platform_key")
+        deployment = payload.get("deployment") or "k8s"
+        platform_config: dict[str, Any] = {}
         with self._session_factory() as session:
+            inv = None
+            try:
+                from rca_common.db.models import Investigation
+
+                inv = session.get(Investigation, uuid.UUID(str(investigation_id)))
+            except Exception:  # noqa: BLE001
+                inv = None
+            if inv is not None:
+                platform_key = platform_key or getattr(inv, "platform_key", None)
+                plat = get_platform(session, platform_key) if platform_key else None
+                if plat is not None:
+                    deployment = payload.get("deployment") or getattr(plat, "deployment", None) or deployment
+                    platform_config = dict(plat.config or {})
             write_audit(
                 session,
                 action="remediation_started",
                 actor=actor_system(),
                 investigation_id=investigation_id,
-                detail={"playbook_id": action.get("playbook_id"), "params": action.get("playbook_params")},
+                detail={"playbook_id": playbook_id, "params": params, "execution_id": str(execution_id)},
             )
             update_investigation_status(
                 session, uuid.UUID(str(investigation_id)), "EXECUTING"
             )
+            # Ensure playbook catalog row exists (FK) — seed on the fly if missing
+            # so M3 fixtures and dashboard catalog stay consistent without a
+            # hard dependency on the install-time seed job in every test.
+            if playbook_id:
+                pb = session.get(Playbook, playbook_id)
+                if pb is None:
+                    from worker.playbooks import PLAYBOOK_CATALOG
+
+                    entry = next(
+                        (e for e in PLAYBOOK_CATALOG if e["playbook_id"] == playbook_id),
+                        None,
+                    )
+                    pb = Playbook(
+                        playbook_id=playbook_id,
+                        platform_type=(entry or {}).get("platform_type") or "presto",
+                        risk_level=(entry or {}).get("risk_level") or "R2",
+                        params_schema=(entry or {}).get("params_schema") or {},
+                        steps=(entry or {}).get("steps") or {},
+                        verification=(entry or {}).get("verification") or {},
+                        auto_eligible=False,
+                        maturity={"approved_runs": 0, "success": 0, "rollbacks": 0},
+                    )
+                    session.add(pb)
+                    session.flush()
+                mat = dict(pb.maturity or {"approved_runs": 0, "success": 0, "rollbacks": 0})
+                mat["approved_runs"] = int(mat.get("approved_runs") or 0) + 1
+                pb.maturity = mat
+                session.add(pb)
+            # Insert remediation_executions row (running).
+            row = RemediationExecution(
+                execution_id=execution_id,
+                investigation_id=uuid.UUID(str(investigation_id)),
+                playbook_id=playbook_id,
+                params=params,
+                mode="approved",
+                approved_by=uuid.UUID(str(approved_by)) if approved_by else None,
+                status="running",
+                pre_snapshot=None,
+                verification_result=None,
+                started_at=datetime.now(timezone.utc),
+                finished_at=None,
+            )
+            session.merge(row)
             session.commit()
-        # M3: treat playbook dispatch as successful when the action is well-formed.
-        # A fake probe client may also record the call for assertions.
-        ok = bool(action.get("playbook_id"))
+
+        if not playbook_id or playbook_id not in PLAYBOOK_STEPS:
+            with self._session_factory() as session:
+                self._finish_execution(
+                    session,
+                    execution_id,
+                    status="failed",
+                    verification_result={"rollback_note": action.get("rollback_note"), "error": "unknown playbook"},
+                )
+                write_audit(
+                    session,
+                    action="remediation_finished",
+                    actor=actor_system(),
+                    investigation_id=investigation_id,
+                    detail={"playbook_id": playbook_id, "ok": False, "error": "unknown playbook"},
+                )
+                session.commit()
+            return {"ok": False, "playbook_id": playbook_id, "execution_id": str(execution_id), "pre_snapshot": {}}
+
+        locators = resolve_locators(deployment, platform_config)
+        try:
+            steps = PLAYBOOK_STEPS[playbook_id](deployment, params, locators)
+        except Exception as exc:  # noqa: BLE001
+            with self._session_factory() as session:
+                self._finish_execution(
+                    session,
+                    execution_id,
+                    status="failed",
+                    verification_result={
+                        "rollback_note": action.get("rollback_note"),
+                        "error": str(exc),
+                    },
+                )
+                write_audit(
+                    session,
+                    action="remediation_finished",
+                    actor=actor_system(),
+                    investigation_id=investigation_id,
+                    detail={"playbook_id": playbook_id, "ok": False, "error": str(exc)},
+                )
+                session.commit()
+            return {
+                "ok": False,
+                "playbook_id": playbook_id,
+                "execution_id": str(execution_id),
+                "pre_snapshot": {},
+                "error": str(exc),
+            }
+
+        # Pre-snapshot via read-only Toolpack (kind=tool).
+        pre_snapshot: dict[str, Any] = {}
+        if platform_key and self._probe is not None:
+            for entry in PRE_SNAPSHOT_TOOLS.get(playbook_id, []):
+                tool = resolve_runtime_tool(entry["tool"], deployment)
+                args = dict(entry.get("args") or {})
+                for k in entry.get("args_from") or []:
+                    if k in params:
+                        args[k] = params[k]
+                try:
+                    res = await self._probe.execute_tool(platform_key, tool=tool, args=args)
+                    pre_snapshot[tool] = res.data
+                except Exception as exc:  # noqa: BLE001
+                    pre_snapshot[tool] = {"error": str(exc)}
         with self._session_factory() as session:
+            row = session.get(RemediationExecution, execution_id)
+            if row is not None:
+                row.pre_snapshot = pre_snapshot
+                session.add(row)
+                session.commit()
+
+        # Per-step sign + dispatch.
+        if self._signer is None:
+            with self._session_factory() as session:
+                self._finish_execution(
+                    session,
+                    execution_id,
+                    status="failed",
+                    verification_result={
+                        "rollback_note": action.get("rollback_note"),
+                        "error": "signer not configured",
+                    },
+                    pre_snapshot=pre_snapshot,
+                )
+                write_audit(
+                    session,
+                    action="remediation_finished",
+                    actor=actor_system(),
+                    investigation_id=investigation_id,
+                    detail={"playbook_id": playbook_id, "ok": False, "error": "no signer"},
+                )
+                session.commit()
+            return {
+                "ok": False,
+                "playbook_id": playbook_id,
+                "execution_id": str(execution_id),
+                "pre_snapshot": pre_snapshot,
+                "error": "signer not configured",
+            }
+
+        for idx, step in enumerate(steps):
+            op = step["op"]
+            step_params = step.get("params") or {}
+            digest = canonical_step_hash(
+                str(execution_id), playbook_id, idx, op, step_params
+            )
+            sig = self._signer.sign(digest)
+            sig_b64 = base64.b64encode(sig).decode("ascii")
+            try:
+                result = await self._probe.execute_write(
+                    platform_key or "",
+                    playbook_id=playbook_id,
+                    step_index=idx,
+                    op=op,
+                    params=step_params,
+                    execution_id=str(execution_id),
+                    signature_b64=sig_b64,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result_ok = False
+                err = str(exc)
+            else:
+                result_ok = result.exit_code == 0 and not result.error
+                if isinstance(result.data, dict) and result.data.get("ok") is False:
+                    result_ok = False
+                err = result.error or (result.data.get("error") if isinstance(result.data, dict) else None)
+
+            if not result_ok:
+                rollback_note = action.get("rollback_note") or (
+                    f"step {idx} ({op}) failed; manual rollback may be required"
+                )
+                with self._session_factory() as session:
+                    self._finish_execution(
+                        session,
+                        execution_id,
+                        status="failed",
+                        verification_result={
+                            "rollback_note": rollback_note,
+                            "failed_step": {"index": idx, "op": op, "error": err},
+                        },
+                        pre_snapshot=pre_snapshot,
+                    )
+                    write_audit(
+                        session,
+                        action="remediation_finished",
+                        actor=actor_system(),
+                        investigation_id=investigation_id,
+                        detail={
+                            "playbook_id": playbook_id,
+                            "ok": False,
+                            "failed_step": idx,
+                            "op": op,
+                            "error": err,
+                            "rollback_note": rollback_note,
+                        },
+                    )
+                    session.commit()
+                return {
+                    "ok": False,
+                    "playbook_id": playbook_id,
+                    "execution_id": str(execution_id),
+                    "pre_snapshot": pre_snapshot,
+                    "failed_step": idx,
+                    "error": err,
+                    "rollback_note": rollback_note,
+                }
+
+        with self._session_factory() as session:
+            # Leave status=running until verify_fix finalizes succeeded/failed.
             write_audit(
                 session,
                 action="remediation_finished",
                 actor=actor_system(),
                 investigation_id=investigation_id,
-                detail={"playbook_id": action.get("playbook_id"), "ok": ok},
+                detail={"playbook_id": playbook_id, "ok": True, "steps": len(steps)},
             )
             session.commit()
-        return {"ok": ok, "playbook_id": action.get("playbook_id"), "pre_snapshot": {}}
+        return {
+            "ok": True,
+            "playbook_id": playbook_id,
+            "execution_id": str(execution_id),
+            "pre_snapshot": pre_snapshot,
+            "steps": len(steps),
+        }
+
+    def _finish_execution(
+        self,
+        session,
+        execution_id: uuid.UUID,
+        *,
+        status: str,
+        verification_result: dict[str, Any] | None = None,
+        pre_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        from rca_common.db.models import RemediationExecution
+
+        row = session.get(RemediationExecution, execution_id)
+        if row is None:
+            return
+        row.status = status
+        row.finished_at = datetime.now(timezone.utc)
+        if verification_result is not None:
+            row.verification_result = verification_result
+        if pre_snapshot is not None and row.pre_snapshot is None:
+            row.pre_snapshot = pre_snapshot
+        session.add(row)
 
     @activity.defn(name="verify_fix")
     async def verify_fix(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Real verify_fix: playbook defaults ∪ RCA plan ∪ canary (Section 9.5.3)."""
+        from rca_common.db.models import Playbook, RemediationExecution
+        from worker.verification import run_verification
+
         plan = payload.get("verification_plan") or []
-        # M3: verification succeeds when the plan is present (or empty defaults).
-        # Functional tests can force failure via payload["force_fail"].
-        ok = not bool(payload.get("force_fail"))
+        investigation_id = payload.get("investigation_id")
+        execution_id = payload.get("execution_id")
+        playbook_id = payload.get("playbook_id") or (payload.get("action") or {}).get("playbook_id")
+        params = dict(
+            payload.get("params")
+            or (payload.get("action") or {}).get("playbook_params")
+            or {}
+        )
+        # Functional/unit tests can still force failure.
+        if payload.get("force_fail"):
+            ok = False
+            result = {"ok": False, "checks": [{"name": "force_fail", "ok": False}]}
+        else:
+            platform_key = payload.get("platform_key")
+            health_query = payload.get("health_query")
+            with self._session_factory() as session:
+                if not platform_key:
+                    try:
+                        from rca_common.db.models import Investigation
+
+                        inv = session.get(Investigation, uuid.UUID(str(investigation_id)))
+                        if inv is not None:
+                            platform_key = inv.platform_key
+                            plat = get_platform(session, platform_key)
+                            if plat is not None and plat.config:
+                                health_query = health_query or (plat.config or {}).get("health_query")
+                    except Exception:  # noqa: BLE001
+                        pass
+            if platform_key and self._probe is not None and playbook_id:
+                result = await run_verification(
+                    self._probe,
+                    platform_key,
+                    playbook_id=playbook_id,
+                    params=params,
+                    verification_plan=plan,
+                    health_query=health_query,
+                )
+                ok = bool(result.get("ok"))
+            else:
+                # Backward-compatible M3 path when no probe/playbook bound.
+                ok = True
+                result = {"ok": True, "checks": [], "plan": plan}
+
         with self._session_factory() as session:
             write_audit(
                 session,
                 action="verification_run",
                 actor=actor_system(),
-                investigation_id=payload.get("investigation_id"),
-                detail={"plan": plan, "ok": ok},
+                investigation_id=investigation_id,
+                detail={"plan": plan, "ok": ok, "result": result},
             )
+            if execution_id:
+                try:
+                    eid = uuid.UUID(str(execution_id))
+                except Exception:  # noqa: BLE001
+                    eid = None
+                if eid is not None:
+                    row = session.get(RemediationExecution, eid)
+                    if row is not None:
+                        row.verification_result = result
+                        row.status = "succeeded" if ok else "failed"
+                        row.finished_at = datetime.now(timezone.utc)
+                        session.add(row)
+                        if ok and row.playbook_id:
+                            pb = session.get(Playbook, row.playbook_id)
+                            if pb is not None:
+                                mat = dict(pb.maturity or {})
+                                mat["success"] = int(mat.get("success") or 0) + 1
+                                pb.maturity = mat
+                                session.add(pb)
             if ok:
                 update_investigation_status(
                     session, uuid.UUID(str(payload["investigation_id"])), "VERIFYING"
                 )
             session.commit()
-        return {"ok": ok, "plan": plan}
+        return {"ok": ok, "plan": plan, **result}
+
+    @activity.defn(name="send_notifications")
+    async def send_notifications(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Isolated notification Activity (Section 10.1 / 9.5.3). Never fails the run."""
+        from rca_common.notifications import send_to_webhooks
+
+        event = payload.get("event") or "case_resolved"
+        notif_payload = dict(payload.get("payload") or payload)
+        webhooks: list[Any] = []
+        if self._config is not None and getattr(self._config, "notifications", None):
+            webhooks = list(self._config.notifications.outbound_webhooks or [])
+        if payload.get("webhooks"):
+            webhooks = list(payload["webhooks"])
+        # Inject dashboard deep link if missing.
+        if not notif_payload.get("dashboard_url") and self._dashboard_base_url:
+            inv = notif_payload.get("investigation_id")
+            notif_payload["dashboard_url"] = (
+                f"{self._dashboard_base_url.rstrip('/')}/cases/{inv}" if inv else self._dashboard_base_url
+            )
+        try:
+            results = await send_to_webhooks(webhooks, event, notif_payload)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "results": []}
+
+        with self._session_factory() as session:
+            for r in results:
+                if r.get("ok"):
+                    write_audit(
+                        session,
+                        action="notification_sent",
+                        actor=actor_system(),
+                        investigation_id=notif_payload.get("investigation_id"),
+                        detail={
+                            "event": event,
+                            "webhook": r.get("name"),
+                            "status_code": r.get("status_code"),
+                        },
+                    )
+            session.commit()
+        return {"ok": True, "results": results}
 
     @activity.defn(name="close_with_summary")
     async def close_with_summary(self, payload: dict[str, Any]) -> dict[str, Any]:

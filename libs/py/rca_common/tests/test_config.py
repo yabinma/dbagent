@@ -36,6 +36,7 @@ def test_defaults_applied():
     assert cfg.data_egress_policy == "allow_remote"
     assert cfg.tracing.backend == "builtin"
     assert cfg.signing.backend == "mounted"
+    assert cfg.signing.allow_ephemeral is False
     assert cfg.temporal.address == "localhost:7233"
     assert cfg.temporal.namespace == "default"
     assert cfg.ingest.correlation_window_seconds == 1800
@@ -58,7 +59,12 @@ def test_full_config_roundtrip():
         "display_verbosity": "full",
         "data_egress_policy": "allow_remote",
         "tracing": {"backend": "both", "langfuse": {"host": "h", "public_key": "p", "secret_key": "s"}},
-        "signing": {"backend": "mounted", "key_path": "/tmp/k", "rotation_grace_seconds": 60},
+        "signing": {
+            "backend": "mounted",
+            "key_path": "/tmp/k",
+            "rotation_grace_seconds": 60,
+            "allow_ephemeral": True,
+        },
         "storage": {
             "postgres_dsn": "postgresql://x",
             "s3": {"endpoint": "http://minio:9000", "bucket": "b", "access_key": "a", "secret_key": "s"},
@@ -86,6 +92,7 @@ def test_full_config_roundtrip():
     assert cfg.tracing.backend == "both"
     assert cfg.tracing.langfuse_host == "h"
     assert cfg.signing.key_path == "/tmp/k"
+    assert cfg.signing.allow_ephemeral is True
     assert cfg.storage.s3_bucket == "b"
     assert cfg.model_gateway.master_key == "mk"
     assert cfg.dashboard.jwt_secret == "s3cret"
@@ -134,3 +141,25 @@ def test_load_config_from_file(tmp_path):
 
     cfg = load_config(str(cfg_file))
     assert cfg.budget_defaults.max_rounds == 7
+
+
+def test_notifications_config_parsed():
+    cfg = parse_config({
+        "notifications": {
+            "outbound_webhooks": [
+                {
+                    "name": "team-slack",
+                    "url": "https://hooks.example/abc",
+                    "format": "slack",
+                    "events": ["approval_requested", "case_resolved"],
+                    "min_severity": "high",
+                }
+            ]
+        }
+    })
+    assert len(cfg.notifications.outbound_webhooks) == 1
+    wh = cfg.notifications.outbound_webhooks[0]
+    assert wh.name == "team-slack"
+    assert wh.format == "slack"
+    assert "case_resolved" in wh.events
+    assert wh.min_severity == "high"

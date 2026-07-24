@@ -6,6 +6,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -66,11 +67,24 @@ func (s *Server) Handler() http.Handler {
 type executeRequest struct {
 	PlatformKey    string         `json:"platform_key"`
 	TaskID         string         `json:"task_id"`
-	Kind           string         `json:"kind"` // "tool" | "raw_command"
+	Kind           string         `json:"kind"` // "tool" | "raw_command" | "write" | "health"
 	Tool           string         `json:"tool,omitempty"`
 	Args           map[string]any `json:"args,omitempty"`
 	Command        string         `json:"command,omitempty"`
 	TimeoutSeconds uint32         `json:"timeout_seconds,omitempty"`
+
+	// kind=write (M5, design.md Section 9.5.3)
+	PlaybookID               string         `json:"playbook_id,omitempty"`
+	StepIndex                uint32         `json:"step_index,omitempty"`
+	Op                       string         `json:"op,omitempty"`
+	Params                   map[string]any `json:"params,omitempty"`
+	ExecutionID              string         `json:"execution_id,omitempty"`
+	ControlPlaneSignatureB64 string         `json:"control_plane_signature,omitempty"` // base64
+
+	// kind=health (M5 verify_fix canary)
+	Builtin     *bool  `json:"builtin,omitempty"`
+	CustomQuery string `json:"custom_query,omitempty"`
+	WaitSeconds uint32 `json:"wait_seconds,omitempty"`
 }
 
 type executeResponse struct {
@@ -185,6 +199,51 @@ func buildTaskRequest(req executeRequest) (*rcaprobev1.TaskRequest, error) {
 		task.Kind = &rcaprobev1.TaskRequest_Raw{
 			Raw: &rcaprobev1.RawCommand{
 				Command: req.Command,
+			},
+		}
+	case "write":
+		if req.Op == "" {
+			return nil, fmt.Errorf("op required for kind=write")
+		}
+		if req.ExecutionID == "" || req.PlaybookID == "" {
+			return nil, fmt.Errorf("execution_id and playbook_id required for kind=write")
+		}
+		var paramsStruct *structpb.Struct
+		if req.Params != nil {
+			s, err := structpb.NewStruct(req.Params)
+			if err != nil {
+				return nil, fmt.Errorf("params: %w", err)
+			}
+			paramsStruct = s
+		}
+		sig, err := base64.StdEncoding.DecodeString(req.ControlPlaneSignatureB64)
+		if err != nil {
+			// Also accept raw URL-safe base64 (some clients use it).
+			sig, err = base64.RawStdEncoding.DecodeString(req.ControlPlaneSignatureB64)
+			if err != nil {
+				return nil, fmt.Errorf("control_plane_signature: %w", err)
+			}
+		}
+		task.Kind = &rcaprobev1.TaskRequest_Write{
+			Write: &rcaprobev1.RemediationStep{
+				PlaybookId:            req.PlaybookID,
+				StepIndex:             req.StepIndex,
+				Op:                    req.Op,
+				Params:                paramsStruct,
+				ExecutionId:           req.ExecutionID,
+				ControlPlaneSignature: sig,
+			},
+		}
+	case "health":
+		builtin := true
+		if req.Builtin != nil {
+			builtin = *req.Builtin
+		}
+		task.Kind = &rcaprobev1.TaskRequest_Health{
+			Health: &rcaprobev1.HealthCheck{
+				Builtin:     builtin,
+				CustomQuery: req.CustomQuery,
+				WaitSeconds: req.WaitSeconds,
 			},
 		}
 	default:

@@ -78,19 +78,29 @@ class ActivityScript:
         self.analyze_calls = 0
         self.approvals: list[dict] = []
         self.closed: list[str] = []
+        self.notifications: list[dict] = []
+        self.rejected = False
+        self.reject_reason: str | None = None
+        self.remediation_config: dict = {}
+        self.settle_slept: list[int] = []
 
     def bind(self):
         script = self
 
         @activity.defn(name="create_case")
         async def create_case(payload: dict) -> dict:
-            return {
+            out = {
                 "investigation_id": payload.get("investigation_id") or str(uuid.uuid4()),
                 "platform_key": payload["event"]["platform_key"],
                 "budget": dict(script.budget),
                 "confidence_threshold": 0.85,
                 "max_calls_per_round": 8,
+                "deployment": "k8s",
+                "remediation": dict(script.remediation_config or {}),
+                "rejected": bool(script.rejected),
+                "reject_reason": script.reject_reason,
             }
+            return out
 
         @activity.defn(name="get_spend")
         async def get_spend(payload: dict) -> float:
@@ -167,6 +177,11 @@ class ActivityScript:
                 return {"ok": False, "plan": payload.get("verification_plan")}
             return {"ok": script.verify_ok, "plan": payload.get("verification_plan")}
 
+        @activity.defn(name="send_notifications")
+        async def send_notifications(payload: dict) -> dict:
+            script.notifications.append(payload)
+            return {"ok": True, "results": []}
+
         @activity.defn(name="close_with_summary")
         async def close_with_summary(payload: dict) -> dict:
             script.closed.append("CLOSED_SUMMARY")
@@ -202,6 +217,7 @@ class ActivityScript:
             plan_remediation,
             execute_playbook,
             verify_fix,
+            send_notifications,
             close_with_summary,
             close_resolved,
             to_needs_human,
@@ -699,3 +715,69 @@ async def test_m4_awaited_approval_id_guard_ignores_mismatched_signal():
             )
             result = await handle.result()
     assert result["status"] == "CLOSED_SUMMARY"
+
+
+@pytest.mark.asyncio
+async def test_platform_not_ready_rejects_and_notifies():
+    """W2 / FP-M5-10: REJECTED path fires case_rejected after reject_case."""
+    script = ActivityScript()
+    script.rejected = True
+    script.reject_reason = "platform_not_ready"
+    result, status = await _run(script)
+    assert result["status"] == "REJECTED"
+    assert result.get("reason") == "platform_not_ready"
+    assert status["status"] == "REJECTED"
+    assert "REJECTED" in script.closed
+    events = [n.get("event") for n in script.notifications]
+    assert "case_rejected" in events
+
+
+@pytest.mark.asyncio
+async def test_restart_playbook_default_settle_resolves():
+    """C2 / FP-M5-8: restart playbook without settle_seconds still reaches RESOLVED.
+
+    Default settle is 120s; time-skipping advances the durable timer. Regression
+    guard for the dead-code ternary that always yielded 0.
+    """
+    script = ActivityScript()
+    script.remediation = {
+        "proposed_actions": [
+            {
+                "kind": "playbook",
+                "playbook_id": "presto.restart_coordinator",
+                "risk_level": "R2",
+                "description": "restart coordinator",
+                "verification_plan": ["presto_cluster_info"],
+                # intentionally omit settle_seconds → playbook default 120
+            }
+        ],
+        "rca_compact": "gc hang",
+    }
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[InvestigationWorkflow],
+            activities=script.bind(),
+        ):
+            handle = await env.client.start_workflow(
+                InvestigationWorkflow.run,
+                {"event": _event(), "investigation_id": str(uuid.uuid4())},
+                id=f"inv-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            for _ in range(50):
+                await env.sleep(timedelta(seconds=1))
+                if script.approvals:
+                    await handle.signal(
+                        InvestigationWorkflow.approval_decided,
+                        {
+                            "approval_id": script.approvals[-1]["id"],
+                            "decision": "approved",
+                        },
+                    )
+                    break
+            result = await handle.result()
+    assert result["status"] == "RESOLVED"
+    events = [n.get("event") for n in script.notifications]
+    assert "case_resolved" in events

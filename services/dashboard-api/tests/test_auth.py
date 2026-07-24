@@ -9,7 +9,7 @@ import pytest
 
 from dashboard_api.auth import decode_token, issue_token, role_at_least
 from dashboard_api.errors import APIError
-from helpers import JWT_SECRET, login, seed_user
+from dashboard_helpers import JWT_SECRET, login, seed_user
 
 
 def test_issue_and_decode_token():

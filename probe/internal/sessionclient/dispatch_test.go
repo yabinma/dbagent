@@ -232,6 +232,17 @@ func (f *fakeExecEnv) ReadConfig(ctx context.Context, component, file, target st
 }
 func (f *fakeExecEnv) CoordinatorBaseURL(ctx context.Context) (string, error) { return "", nil }
 
+func (f *fakeExecEnv) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
+	return nil
+}
+func (f *fakeExecEnv) RolloutRestart(ctx context.Context, namespace, kind, name string) error { return nil }
+func (f *fakeExecEnv) DeletePod(ctx context.Context, namespace, name string) error { return nil }
+func (f *fakeExecEnv) UpdateServiceEnv(ctx context.Context, service string, env map[string]string) error {
+	return nil
+}
+func (f *fakeExecEnv) RestartService(ctx context.Context, service string) error { return nil }
+
+
 func TestHandleTask_RawCommand_Success(t *testing.T) {
 	env := &fakeExecEnv{result: platform.ExecResult{Stdout: "output", ExitCode: 0}}
 	task := &rcaprobev1.TaskRequest{

@@ -45,7 +45,7 @@ def _session_factory(session=None, inv=None):
 
 
 @pytest.fixture
-def acts():
+def acts(tmp_path):
     llm = ScriptedLLM(
         {
             "planner": {
@@ -82,10 +82,18 @@ def acts():
     probe = FakeProbeGatewayClient(
         {
             "presto_cluster_info": {"exit_code": 0, "data": {"activeWorkers": 3}},
-            "presto_nodes": {"exit_code": 0, "data": {"nodes": []}},
+            "presto_nodes": {"exit_code": 0, "data": {"nodes": [{"nodeId": "n1"}]}},
+            "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
+            "presto_query_detail": {"exit_code": 0, "data": {"queryId": "q"}},
+            "health": {"ok": True, "exit_code": 0},
+            "write": {"ok": True, "exit_code": 0},
         }
     )
     from rca_common.llmclient.objectstore import FakeObjectStore
+    from rca_common.signing.signer import bootstrap_signing_key
+
+    key_path = str(tmp_path / "ed25519.key")
+    signer = bootstrap_signing_key(key_path)
 
     return InvestigationActivities(
         session_factory=_session_factory(),
@@ -93,6 +101,7 @@ def acts():
         probe_client=probe,
         object_store=FakeObjectStore(),
         config=None,
+        signer=signer,
     ), llm, probe
 
 

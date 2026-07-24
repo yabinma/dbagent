@@ -24,6 +24,8 @@ def _config(**overrides):
         },
         "model_gateway": {"url": "http://model-gateway.local:4000", "master_key": "mk"},
         "tracing": {"backend": "builtin"},
+        # Test harness only: allow ephemeral when no mounted key is available (W1).
+        "signing": {"allow_ephemeral": True},
     }
     raw.update(overrides)
     return parse_config(raw)
@@ -93,3 +95,45 @@ def test_main_invokes_run_worker_with_loaded_config(monkeypatch, tmp_path):
     worker_main.main()
 
     assert captured["config"].storage.postgres_dsn == "sqlite:///:memory:"
+
+
+def test_build_investigation_activities_fails_closed_without_ephemeral(monkeypatch):
+    """W1: unwritable key_path without allow_ephemeral must raise (fail closed)."""
+    from worker.worker_main import build_investigation_activities
+    from unittest.mock import MagicMock
+
+    config = _config(signing={"key_path": "/etc/rca-agent/signing/ed25519.key", "allow_ephemeral": False})
+
+    def boom(_path):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr("rca_common.signing.signer.bootstrap_signing_key", boom)
+    with pytest.raises(OSError, match="read-only"):
+        build_investigation_activities(
+            config,
+            llm_client=MagicMock(),
+            probe_client=MagicMock(),
+            session_factory=MagicMock(),
+            object_store=MagicMock(),
+        )
+
+
+def test_build_investigation_activities_allows_ephemeral_when_flagged(monkeypatch):
+    """W1: allow_ephemeral=true may use an in-process key for dev/test."""
+    from worker.worker_main import build_investigation_activities
+    from unittest.mock import MagicMock
+
+    config = _config(signing={"key_path": "/etc/rca-agent/signing/ed25519.key", "allow_ephemeral": True})
+
+    def boom(_path):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr("rca_common.signing.signer.bootstrap_signing_key", boom)
+    acts = build_investigation_activities(
+        config,
+        llm_client=MagicMock(),
+        probe_client=MagicMock(),
+        session_factory=MagicMock(),
+        object_store=MagicMock(),
+    )
+    assert acts._signer is not None
