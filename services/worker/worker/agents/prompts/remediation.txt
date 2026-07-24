@@ -1,0 +1,19 @@
+Root cause conclusion: {{rca_report}}
+Available playbook catalog (with parameter schemas and risk levels):
+{{playbooks}}
+Write-op primitives: {{write_ops}}
+Platform health_query: {{health_query}}
+
+For every recommended action:
+- Match a playbook, or mark it manual_recommendation /
+  code_fix_recommendation.
+- Assign risk_level using these definitions: {{risk_defs}}
+- Provide rollback_note and a verification_plan (tool-call sequence plus a
+  wait window where settling time is needed, e.g. after restarts).
+- Never invent auto-executable actions outside the catalog.
+
+Also produce description_compact for each action (what / risk / expected
+effect, 1-2 sentences each) and confirm or refine the overall rca_compact
+for the approver audience.
+
+Output schema: {proposed_actions: [...], rca_compact: str}

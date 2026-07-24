@@ -88,6 +88,33 @@ class TemporalConfig:
 
 
 @dataclass
+class IngestSource:
+    name: str
+    secret: str
+
+
+@dataclass
+class IngestConfig:
+    sources: list[IngestSource] = field(default_factory=list)
+    correlation_window_seconds: int = 1800
+
+
+@dataclass
+class RawCommandsConfig:
+    policy: str = "approve"  # approve | validate_only
+    timeout_seconds: int = 60
+    max_output_bytes: int = 1048576
+
+
+@dataclass
+class ProbeGatewayConfig:
+    """Worker → probe-gateway internal ExecuteTool client (Section 3.2)."""
+
+    url: str = "http://probe-gateway:8080"
+    timeout_seconds: int = 120
+
+
+@dataclass
 class AppConfig:
     models: dict[str, ModelRoute] = field(default_factory=dict)
     budget_defaults: BudgetDefaults = field(default_factory=BudgetDefaults)
@@ -100,6 +127,9 @@ class AppConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     model_gateway: ModelGatewayConfig = field(default_factory=ModelGatewayConfig)
     temporal: TemporalConfig = field(default_factory=TemporalConfig)
+    ingest: IngestConfig = field(default_factory=IngestConfig)
+    raw_commands: RawCommandsConfig = field(default_factory=RawCommandsConfig)
+    probe_gateway: ProbeGatewayConfig = field(default_factory=ProbeGatewayConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def validate_egress_policy(self) -> None:
@@ -174,6 +204,28 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         namespace=tm.get("namespace", "default"),
     )
 
+    ig = raw.get("ingest") or {}
+    ingest = IngestConfig(
+        sources=[
+            IngestSource(name=s["name"], secret=s.get("secret", ""))
+            for s in (ig.get("sources") or [])
+        ],
+        correlation_window_seconds=ig.get("correlation_window_seconds", 1800),
+    )
+
+    rc = raw.get("raw_commands") or {}
+    raw_commands = RawCommandsConfig(
+        policy=rc.get("policy", "approve"),
+        timeout_seconds=rc.get("timeout_seconds", 60),
+        max_output_bytes=rc.get("max_output_bytes", 1048576),
+    )
+
+    pgw = raw.get("probe_gateway") or {}
+    probe_gateway = ProbeGatewayConfig(
+        url=pgw.get("url", "http://probe-gateway:8080"),
+        timeout_seconds=pgw.get("timeout_seconds", 120),
+    )
+
     cfg = AppConfig(
         models=models,
         budget_defaults=budget_defaults,
@@ -186,6 +238,9 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         storage=storage,
         model_gateway=model_gateway,
         temporal=temporal,
+        ingest=ingest,
+        raw_commands=raw_commands,
+        probe_gateway=probe_gateway,
         raw=raw,
     )
     cfg.validate_egress_policy()

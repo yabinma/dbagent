@@ -1,12 +1,8 @@
 """Worker process entrypoint (design.md Section 11 `services/worker`).
 
-Wires the real backends declared in the Appendix E config (LiteLLM HTTP
-model gateway, S3-compatible object store, Postgres trace store) into a
-single `LLMClient`, then runs a Temporal `Worker` hosting the M1
-workflows/activities. `InvestigationWorkflow` and the four production
-agent Activities (Section 5.2/5.3) are M3 scope; this process only hosts
-`PingWorkflow` + the demo activities that prove the plumbing end to end
-(Section 12 M1 acceptance).
+Wires backends (LiteLLM, S3, Postgres, probe-gateway ExecuteTool client)
+into Activities and runs a Temporal Worker hosting PingWorkflow (M1) plus
+InvestigationWorkflow and the full M3 activity set (Section 5.2).
 """
 from __future__ import annotations
 
@@ -24,7 +20,10 @@ from rca_common.db.session import make_engine, make_session_factory
 from rca_common.llmclient import LiteLLMHTTPBackend, LLMClient, PGTraceStore, S3ObjectStore
 
 from worker.activities.echo import echo
+from worker.activities.investigation import InvestigationActivities
 from worker.activities.llm_demo import LLMDemoActivities
+from worker.probeclient import HTTPProbeGatewayClient
+from worker.workflows.investigation import InvestigationWorkflow
 from worker.workflows.ping import PingWorkflow
 
 logger = logging.getLogger(__name__)
@@ -33,9 +32,7 @@ TASK_QUEUE = "rca-worker"
 
 
 def build_llm_client(config: AppConfig, *, http_client: httpx.AsyncClient | None = None) -> LLMClient:
-    """Assembles the production `LLMClient` from config (Section 7/D5): a
-    LiteLLM HTTP backend, an S3-compatible object store, and the builtin
-    Postgres trace store, dual-writing per `tracing.backend`."""
+    """Assembles the production `LLMClient` from config (Section 7/D5)."""
     backend = LiteLLMHTTPBackend(
         config.model_gateway.url,
         config.model_gateway.master_key,
@@ -62,9 +59,70 @@ def build_llm_client(config: AppConfig, *, http_client: httpx.AsyncClient | None
     )
 
 
+def build_investigation_activities(
+    config: AppConfig,
+    *,
+    llm_client: LLMClient | None = None,
+    probe_client=None,
+    session_factory=None,
+    object_store=None,
+) -> InvestigationActivities:
+    """Wire InvestigationActivities for production or tests."""
+    if llm_client is None:
+        llm_client = build_llm_client(config)
+    if session_factory is None:
+        engine = make_engine(config.storage.postgres_dsn)
+        session_factory = make_session_factory(engine)
+    if object_store is None:
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=config.storage.s3_endpoint or None,
+            aws_access_key_id=config.storage.s3_access_key or None,
+            aws_secret_access_key=config.storage.s3_secret_key or None,
+        )
+        object_store = S3ObjectStore(s3_client, config.storage.s3_bucket)
+    if probe_client is None:
+        probe_client = HTTPProbeGatewayClient(
+            config.probe_gateway.url,
+            timeout_seconds=config.probe_gateway.timeout_seconds,
+        )
+    return InvestigationActivities(
+        session_factory=session_factory,
+        llm_client=llm_client,
+        probe_client=probe_client,
+        object_store=object_store,
+        config=config,
+    )
+
+
+def investigation_activity_list(acts: InvestigationActivities) -> list:
+    """Flatten bound activity callables for Worker registration."""
+    return [
+        acts.create_case,
+        acts.get_spend,
+        acts.plan_initial,
+        acts.plan_next,
+        acts.collect,
+        acts.analyze,
+        acts.record_iteration,
+        acts.static_validate_raw_command,
+        acts.run_raw_command,
+        acts.create_approval_activity,
+        acts.record_approval_decision,
+        acts.plan_remediation,
+        acts.execute_playbook,
+        acts.verify_fix,
+        acts.close_with_summary,
+        acts.close_resolved,
+        acts.to_needs_human,
+        acts.reject_case,
+    ]
+
+
 async def run_worker(config: AppConfig, *, client: Client | None = None) -> None:
     llm_client = build_llm_client(config)
     llm_demo = LLMDemoActivities(llm_client)
+    inv_acts = build_investigation_activities(config, llm_client=llm_client)
 
     temporal_client = client or await Client.connect(
         config.temporal.address, namespace=config.temporal.namespace
@@ -73,8 +131,8 @@ async def run_worker(config: AppConfig, *, client: Client | None = None) -> None
     worker = Worker(
         temporal_client,
         task_queue=TASK_QUEUE,
-        workflows=[PingWorkflow],
-        activities=[echo, llm_demo.generate],
+        workflows=[PingWorkflow, InvestigationWorkflow],
+        activities=[echo, llm_demo.generate, *investigation_activity_list(inv_acts)],
     )
     logger.info("worker starting: task_queue=%s temporal=%s", TASK_QUEUE, config.temporal.address)
     await worker.run()

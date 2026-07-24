@@ -68,7 +68,7 @@ jobs:
         run: bash scripts/gen-proto.sh
       - name: Byte-compile sanity check (Python)
         run: |
-          python -m compileall -q libs/py/rca_common/rca_common services/worker/worker services/worker/scripts tests
+          python -m compileall -q libs/py/rca_common/rca_common services/worker/worker services/worker/scripts services/gateway/gateway tests
       - name: go vet (Go)
         run: go vet ./...
       # TODO(M3+): adopt a real linter (ruff for Python, golangci-lint for
@@ -118,6 +118,27 @@ jobs:
             --cov=worker --cov=scripts --cov-report=term-missing --cov-fail-under=80
         working-directory: services/worker
 
+  unit-gateway:
+    name: unit tests - ingest-gateway (>80% coverage)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install rca_common + gateway (test extras)
+        run: |
+          python -m venv services/gateway/.venv
+          services/gateway/.venv/bin/pip install --upgrade pip
+          services/gateway/.venv/bin/pip install -e libs/py/rca_common
+          services/gateway/.venv/bin/pip install -e "services/gateway[test]"
+      - name: pytest --cov (100% pass rate, >80% coverage)
+        working-directory: services/gateway
+        run: |
+          .venv/bin/python -m pytest tests/ \
+            --cov=gateway --cov-report=term-missing --cov-fail-under=80
+
   unit-go:
     name: unit tests - probe, probe-gateway (>80% coverage per package)
     runs-on: ubuntu-latest
@@ -153,9 +174,9 @@ jobs:
         run: bash scripts/go-coverage-check.sh 80
 
   functional:
-    name: functional tests (M1 F14 slice, M2 F8/F9, manifest checks)
+    name: functional tests (M1 F14, M2 F8/F9, M3 investigation loop, manifest checks)
     runs-on: ubuntu-latest
-    needs: [unit-rca-common, unit-worker, unit-go]
+    needs: [unit-rca-common, unit-worker, unit-gateway, unit-go]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -176,12 +197,13 @@ jobs:
           needed by the Go cross-service functional tests below, which build
           real probe/probe-gateway binaries)
         run: bash scripts/gen-proto.sh
-      - name: Install rca_common + worker (test extras)
+      - name: Install rca_common + worker + gateway (test extras)
         run: |
           python -m venv services/worker/.venv
           services/worker/.venv/bin/pip install --upgrade pip
           services/worker/.venv/bin/pip install -e libs/py/rca_common
           services/worker/.venv/bin/pip install -e "services/worker[test]"
+          services/worker/.venv/bin/pip install -e "services/gateway[test]"
       - name: Run Python functional tests
         # Docker is preinstalled on GitHub-hosted ubuntu-latest runners;
         # testcontainers (ephemeral Postgres/MinIO) and Temporal's real
@@ -189,13 +211,13 @@ jobs:
         # use it directly -- see tests/functional/conftest.py.
         run: |
           services/worker/.venv/bin/python -m pytest \
-            services/worker/tests tests/functional tests/mocks/llm -v --ignore=tests/functional/m2_probe_link
+            services/worker/tests services/gateway/tests tests/functional tests/mocks/llm -v --ignore=tests/functional/m2_probe_link
       - name: Run Go cross-service functional tests (F8; real probe +
           probe-gateway binaries over real mTLS + ephemeral Postgres)
         run: go test ./tests/functional/... -v -timeout 180s
 
   benchmark:
-    name: benchmark (B3/B4/B5/B9 covered; manifest check for the rest)
+    name: benchmark (B3/B4/B5/B6/B9/B13/B14 + M3 Python benches; manifest check)
     runs-on: ubuntu-latest
     needs: functional
     steps:
@@ -223,7 +245,8 @@ jobs:
           services/worker/.venv/bin/pip install --upgrade pip
           services/worker/.venv/bin/pip install -e libs/py/rca_common
           services/worker/.venv/bin/pip install -e "services/worker[test]"
-      - name: Validate tests/benchmark/thresholds.yaml (B3/B4/B5/B9 covered; rest deferred to their owning milestone)
+          services/worker/.venv/bin/pip install -e "services/gateway[test]"
+      - name: Validate tests/benchmark/thresholds.yaml (manifest honesty)
         run: |
           services/worker/.venv/bin/python -m pytest \
             tests/functional/test_manifests.py -v
@@ -233,18 +256,20 @@ jobs:
         run: go test ./services/probe-gateway/internal/gwserver/... -run TestB4 -v -timeout 60s
       - name: B5 -- redaction filter over a 1 MiB config payload
         run: go test ./probe/internal/redact/... -run TestB5 -v -timeout 60s
+      - name: B6 -- static raw-command validator < 5 ms
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            libs/py/rca_common/tests/test_rawcmd.py::test_b6_static_validator_under_5ms -v
       - name: B9 -- presto_query_json_section JSONPath slice over a 10 MB query JSON
         run: go test ./probe/internal/adapter/presto/... -run TestB9 -v -timeout 60s
+      - name: B13 -- workflow round-loop overhead < 1 s/round
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            services/worker/tests/test_investigation_workflow.py::test_b13_round_loop_overhead_under_1s -v
+      - name: B14 -- RCA context assembly < 200 ms
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            services/worker/tests/test_context_assembly.py::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v
       # v1.5 manifest honesty rule (design.md Section 14.4): a
       # thresholds.yaml entry cannot stay `deferred` once its hot-path code
-      # ships; each new `covered` entry above gets its own explicit `go
-      # test -run` step (not folded into the general `go test ./...` unit
-      # job) so a benchmark regression fails this dedicated gate with an
-      # unambiguous name, and B5/B9 are deliberately run without -race
-      # (see their test files' own `//go:build !race` doc comments) since
-      # they're CPU-bound workloads the race detector would otherwise
-      # time out against a threshold that isn't about race-instrumented
-      # performance.
-      # TODO(M3+): as each remaining benchmark's owning milestone lands,
-      # add its pytest-benchmark/go-test-bench job here per design.md
-      # Section 14.4.
+      # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14 to covered.

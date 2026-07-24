@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/yabinma/dbagent/internal/bootstrapca"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/bootstrapsrv"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/config"
+	"github.com/yabinma/dbagent/services/probe-gateway/internal/dispatch"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/gwserver"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/registry"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/signingkeys"
@@ -64,8 +66,27 @@ func main() {
 	go gw.ReapStaleProbes(ctx, cfg.HeartbeatCheckInterval)
 	go pollSigningKey(ctx, keys, gw, cfg.SigningKeyPollInterval)
 
+	if cfg.InternalListenAddr != "" {
+		go runInternalDispatchListener(ctx, cfg.InternalListenAddr, gw)
+	}
 	go runBootstrapListener(ctx, cfg.BootstrapListenAddr, ca, reg, cfg.ServerCertSANs)
 	runSessionListener(ctx, cfg.SessionListenAddr, ca, gw, reg, cfg.ServerCertSANs)
+}
+
+// runInternalDispatchListener serves POST /internal/v1/execute so the
+// Python temporal-worker can call ExecuteTool (design.md Section 3.2, M3).
+func runInternalDispatchListener(ctx context.Context, addr string, gw *gwserver.Server) {
+	srv := dispatch.New(gw)
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	log.Printf("probe-gateway: internal ExecuteTool HTTP listener on %s", addr)
+	if err := srv.ListenAndServe(addr); err != nil && err != http.ErrServerClosed {
+		log.Printf("probe-gateway: internal dispatch listener stopped: %v", err)
+	}
 }
 
 // logCAFingerprint logs the bootstrap CA's sha256 fingerprint at startup in

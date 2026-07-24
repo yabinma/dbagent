@@ -201,7 +201,7 @@ class User(Base):
 class AuditLog(Base):
     __tablename__ = "audit_log"
 
-    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), primary_key=True)
     investigation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     actor: Mapped[str] = mapped_column(Text, nullable=False)

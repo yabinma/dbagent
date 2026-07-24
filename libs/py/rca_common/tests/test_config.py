@@ -38,6 +38,9 @@ def test_defaults_applied():
     assert cfg.signing.backend == "mounted"
     assert cfg.temporal.address == "localhost:7233"
     assert cfg.temporal.namespace == "default"
+    assert cfg.ingest.correlation_window_seconds == 1800
+    assert cfg.raw_commands.policy == "approve"
+    assert cfg.probe_gateway.url == "http://probe-gateway:8080"
 
 
 def test_full_config_roundtrip():
@@ -59,6 +62,12 @@ def test_full_config_roundtrip():
         },
         "model_gateway": {"url": "http://model-gateway:4000", "master_key": "mk"},
         "temporal": {"address": "temporal-frontend:7233", "namespace": "rca-agent"},
+        "ingest": {
+            "sources": [{"name": "grafana-prod", "secret": "s"}],
+            "correlation_window_seconds": 900,
+        },
+        "raw_commands": {"policy": "validate_only", "timeout_seconds": 30},
+        "probe_gateway": {"url": "http://localhost:8080", "timeout_seconds": 30},
     }
     cfg = parse_config(raw)
     assert cfg.models["planner"].model == "ollama/qwen2.5:14b"
@@ -71,6 +80,10 @@ def test_full_config_roundtrip():
     assert cfg.model_gateway.master_key == "mk"
     assert cfg.temporal.address == "temporal-frontend:7233"
     assert cfg.temporal.namespace == "rca-agent"
+    assert cfg.ingest.sources[0].name == "grafana-prod"
+    assert cfg.ingest.correlation_window_seconds == 900
+    assert cfg.raw_commands.policy == "validate_only"
+    assert cfg.probe_gateway.url == "http://localhost:8080"
 
 
 def test_local_only_egress_policy_passes_with_local_models():

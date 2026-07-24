@@ -11,7 +11,9 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -390,6 +392,64 @@ func waitForListener(t *testing.T, addr string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("listener at %s never became ready", addr)
+}
+
+// TestRunInternalDispatchListener_HealthzAndShutdown covers
+// runInternalDispatchListener (review.md C1): start on an ephemeral port with
+// a real gwserver.Server as dispatcher, GET /healthz, then cancel ctx to
+// trigger graceful Shutdown. Same pattern as the other run*Listener helpers.
+func TestRunInternalDispatchListener_HealthzAndShutdown(t *testing.T) {
+	reg := registry.NewFake()
+	gw := gwserver.New(reg, []byte("signing-key"), "replica-1")
+
+	addr := freeLoopbackAddr(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runInternalDispatchListener(ctx, addr, gw)
+		close(done)
+	}()
+
+	// Wait until HTTP /healthz responds (not just TCP accept).
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				lastErr = nil
+				break
+			}
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr != nil {
+		cancel()
+		t.Fatalf("internal dispatch /healthz never ready: %v", lastErr)
+	}
+
+	resp, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		cancel()
+		t.Fatalf("healthz: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("healthz status=%d body=%s", resp.StatusCode, body)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runInternalDispatchListener did not return after context cancel")
+	}
 }
 
 func generateTestCSR(t *testing.T, cn string) []byte {

@@ -48,12 +48,19 @@ type Config struct {
 	// override for compose/bare-metal deployments using a different
 	// hostname, or to add an IP SAN for IP-address-only environments.
 	ServerCertSANs []string `yaml:"server_cert_sans"`
+
+	// InternalListenAddr is the plaintext HTTP listener for the M3
+	// ExecuteTool API (design.md Section 3.2) used by temporal-worker
+	// Activities. Empty disables the listener (tests that only need
+	// Session/Bootstrap leave it empty).
+	InternalListenAddr string `yaml:"internal_listen_addr"`
 }
 
 func defaults() Config {
 	return Config{
 		SessionListenAddr:      ":8443",
 		BootstrapListenAddr:    ":8444",
+		InternalListenAddr:     ":8080",
 		BootstrapCACertPath:    "/etc/rca-agent/probe-gateway/bootstrap-ca.crt",
 		BootstrapCAKeyPath:     "/etc/rca-agent/probe-gateway/bootstrap-ca.key",
 		SigningPublicKeyPath:   "/etc/rca-agent/signing/ed25519.key.pub",
