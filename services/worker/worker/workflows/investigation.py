@@ -29,6 +29,10 @@ class InvestigationWorkflow:
         self._aborted = False
         self._budget_override: dict[str, Any] | None = None
         self._approval_decision: dict[str, Any] | None = None
+        # M4 (Section 10.2.3): only apply a signal that matches the gate we are
+        # currently waiting on — stops a re-delivered first decision from
+        # corrupting a subsequent approval wait.
+        self._awaiting_approval_id: str | None = None
         self._status = "RECEIVED"
         self._last_report: dict[str, Any] | None = None
         self._terminal_reason: str | None = None
@@ -55,8 +59,17 @@ class InvestigationWorkflow:
 
     @workflow.signal
     def approval_decided(self, decision: dict[str, Any]) -> None:
-        """``{approval_id, decision, comment?}`` from dashboard (M4) or tests."""
-        self._approval_decision = dict(decision or {})
+        """``{approval_id, decision, comment?}`` from dashboard (M4) or tests.
+
+        M4 awaited-approval-id guard: ignore signals whose approval_id does not
+        match the gate currently being awaited (duplicate/late delivery).
+        """
+        payload = dict(decision or {})
+        signal_id = str(payload.get("approval_id") or "")
+        if self._awaiting_approval_id is not None and signal_id:
+            if signal_id != str(self._awaiting_approval_id):
+                return
+        self._approval_decision = payload
 
     @workflow.query
     def get_status(self) -> dict[str, Any]:
@@ -99,6 +112,8 @@ class InvestigationWorkflow:
             "reports": [],
             "investigation_id": investigation_id,
             "platform_key": case["platform_key"],
+            # M4 need_more / denied comments for the next RCA round (Section 10.2.3)
+            "approver_feedback": [],
         }
 
         plan = await workflow.execute_activity(
@@ -171,6 +186,7 @@ class InvestigationWorkflow:
                     "budget": budget,
                     "spent_usd": float(spent),
                     "investigation_id": investigation_id,
+                    "approver_feedback": list(ctx.get("approver_feedback") or []),
                 },
                 start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=_DEFAULT_RETRY,
@@ -213,6 +229,14 @@ class InvestigationWorkflow:
                     investigation_id,
                     timeout=timedelta(hours=24),
                 )
+                # need_more / commented deny feed the next RCA round (Section 10.2.3)
+                if (
+                    decision.get("decision") in ("need_more", "denied")
+                    and (decision.get("comment") or "").strip()
+                ):
+                    ctx.setdefault("approver_feedback", []).append(
+                        str(decision["comment"]).strip()
+                    )
                 if decision.get("decision") == "approved":
                     extra = await workflow.execute_activity(
                         "run_raw_command",
@@ -374,20 +398,31 @@ class InvestigationWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=_DEFAULT_RETRY,
         )
+        approval_id = str(approval["approval_id"])
+        self._awaiting_approval_id = approval_id
         self._status = "AWAITING_APPROVAL"
         try:
+            # Gate on matching approval_id so a late/duplicate signal for a
+            # *prior* approval that landed during create_approval (when
+            # _awaiting_approval_id was still None) cannot satisfy this wait.
             await workflow.wait_condition(
-                lambda: self._approval_decision is not None,
+                lambda: self._approval_decision is not None
+                and str(self._approval_decision.get("approval_id") or "")
+                == approval_id,
                 timeout=timeout,
             )
             decision = dict(self._approval_decision or {})
+            # Human path (dashboard already wrote decision + user-actor audits).
+            is_timeout = False
         except asyncio.TimeoutError:
             decision = {
                 "approval_id": approval["approval_id"],
                 "decision": "denied",
                 "comment": "timeout",
             }
+            is_timeout = True
         decision.setdefault("approval_id", approval["approval_id"])
+        self._awaiting_approval_id = None
         await workflow.execute_activity(
             "record_approval_decision",
             {
@@ -396,6 +431,9 @@ class InvestigationWorkflow:
                 "decision": decision.get("decision"),
                 "comment": decision.get("comment"),
                 "kind": kind,
+                # M4: only the timeout path is the "decider"; human path skips
+                # re-writing decision/audits so user:<id> actor is preserved.
+                "is_timeout": is_timeout,
             },
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=_DEFAULT_RETRY,

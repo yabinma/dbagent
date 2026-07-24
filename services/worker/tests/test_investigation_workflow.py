@@ -640,3 +640,62 @@ async def test_b13_round_loop_overhead_under_1s():
     per_round = elapsed / max(rounds, 1)
     assert result["status"] == "CLOSED_SUMMARY"
     assert per_round < 1.0, f"B13 FAILED: {per_round:.3f}s per round (budget 1s)"
+
+
+@pytest.mark.asyncio
+async def test_m4_awaited_approval_id_guard_ignores_mismatched_signal():
+    """M4 Section 10.2.3: mismatched approval_id must not unblock the wait.
+
+    A late/duplicate signal for a *previous* approval must not corrupt the
+    current gate. Only a matching approval_id applies.
+    """
+    script = ActivityScript()
+    script.reports = [
+        {
+            "status": "concluded",
+            "confidence": 0.95,
+            "raw_command_requests": [
+                {"command": "cat /etc/presto/config.properties", "justification": "need"}
+            ],
+            "rca_compact": "oom",
+        }
+    ]
+    script.remediation = {
+        "proposed_actions": [{"kind": "ignore", "risk_level": "R0", "description": "done"}],
+        "rca_compact": "oom",
+    }
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[InvestigationWorkflow],
+            activities=script.bind(),
+        ):
+            handle = await env.client.start_workflow(
+                InvestigationWorkflow.run,
+                {"event": _event(), "investigation_id": str(uuid.uuid4())},
+                id=f"inv-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            # Wait until approval is created.
+            for _ in range(50):
+                await env.sleep(timedelta(seconds=1))
+                if script.approvals:
+                    break
+            assert script.approvals, "expected a raw_command approval"
+            real_id = script.approvals[-1]["id"]
+            # Mismatched id — must be ignored by the guard.
+            await handle.signal(
+                InvestigationWorkflow.approval_decided,
+                {"approval_id": str(uuid.uuid4()), "decision": "approved"},
+            )
+            await env.sleep(timedelta(seconds=2))
+            status = await handle.query(InvestigationWorkflow.get_status)
+            assert status["status"] == "AWAITING_APPROVAL"
+            # Matching id — unblocks.
+            await handle.signal(
+                InvestigationWorkflow.approval_decided,
+                {"approval_id": real_id, "decision": "approved"},
+            )
+            result = await handle.result()
+    assert result["status"] == "CLOSED_SUMMARY"

@@ -7,6 +7,7 @@ Evidence corpus (summaries; use the read_evidence tool to read any item in
 full by id): {{evidence_summaries}}
 This round's new evidence (full): {{latest_evidence_full}}
 Your analyses from previous rounds: {{previous_reports_compact}}
+{{approver_feedback}}
 
 Requirements:
 1. Reason over the evidence to build a causal chain. Every conclusion must

@@ -196,6 +196,8 @@ class User(Base):
     role: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # M4 (migration 0002): forces first-login password change (Section 10.2)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class AuditLog(Base):
@@ -233,4 +235,10 @@ AUDIT_ACTIONS = (
     "credentials_detected",
     "credentials_verified",
     "credentials_test_failed",
+    # M4 (Section 10.2 / 4.3): signal endpoint + admin mutations
+    "case_paused",
+    "case_resumed",
+    "case_aborted",
+    "budget_adjusted",
+    "admin_config_changed",
 )

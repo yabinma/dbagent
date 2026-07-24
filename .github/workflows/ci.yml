@@ -1,15 +1,13 @@
 # CI pipeline (design.md Section 14.5): lint/typecheck -> unit -> functional
 # -> benchmark -> e2e, each gate blocking the next.
 #
-# M2 scope note: `probe`/`probe-gateway` (Go) land in this update, joining
-# `libs/py/rca_common`/`services/worker` (Python, M1). `dashboard-api`/
-# `dashboard-web` and the e2e fault-scenario suite (Section 13, "kind +
-# containerized Presto 0.298") land in M3-M6; their jobs are added
-# incrementally as those milestones deliver code, not stubbed out here, so
-# this workflow always reflects what actually exists and is
-# 100%-green-enforceable today. The benchmark job covers B3 (the one
-# benchmark whose owning milestone, M2, has actually shipped code) plus the
-# manifest sanity check for every other (still-deferred) B1-B14 entry.
+# M4 scope note: `dashboard-api` / `dashboard-web` land in this update, joining
+# `libs/py/rca_common`/`services/worker`/`services/gateway` (Python) and
+# `probe`/`probe-gateway` (Go). Jobs are added incrementally as milestones
+# deliver code, not stubbed out, so this workflow always reflects what
+# actually exists and is 100%-green-enforceable today. The benchmark job
+# covers every B* entry whose hot-path code has shipped (incl. B12 for M4
+# dashboard hot endpoints) plus the manifest sanity check for deferred ones.
 #
 # Generated-code policy (design.md Section 11): `gen/go`, `gen/python`,
 # `libs/py/rca_common/rca_common/schemas/generated`, and
@@ -21,20 +19,11 @@
 # job); jobs that don't touch generated code deliberately skip this step.
 # Today that means: `lint` (go vet) and every Go-testing job (`unit-go`,
 # `functional`, `benchmark`) regenerate `gen/go` (and, as a side effect of
-# `scripts/gen-proto.sh` doing both in one pass, `gen/python` too, even
-# though no Python code imports `gen/python` yet). `unit-rca-common` and
-# `unit-worker` regenerate nothing: no test in either suite imports
-# `rca_common.schemas.generated`, and `gen/python` isn't imported by any
-# Python code at all (probe<->probe-gateway is Go-to-Go gRPC; the worker
-# doesn't yet talk rcaprobe.v1 directly). The pydantic/TS schema-codegen
-# scripts likewise have no job wired in yet, since no code anywhere
-# imports `rca_common.schemas.generated` or `web/src/types/generated` --
-# `dashboard-web` doesn't exist yet and nothing else consumes them.
-# TODO(M3+): once code starts importing either, add the matching regen
-# step (`schemas/generate-pydantic.sh` to the Python job that consumes it;
-# `schemas/generate-ts.js`, which needs `npm ci` in `schemas/`, to
-# `dashboard-web`'s own future job) rather than adding it speculatively
-# now.
+# `scripts/gen-proto.sh` doing both in one pass, `gen/python` too).
+# `unit-rca-common`, `unit-worker`, `unit-gateway`, and `unit-dashboard-api`
+# regenerate nothing: no test in those suites imports generated schemas.
+# `unit-web` does not import `web/src/types/generated` at runtime under
+# coverage (those files are excluded from the vitest coverage denominator).
 
 name: ci
 
@@ -68,13 +57,17 @@ jobs:
         run: bash scripts/gen-proto.sh
       - name: Byte-compile sanity check (Python)
         run: |
-          python -m compileall -q libs/py/rca_common/rca_common services/worker/worker services/worker/scripts services/gateway/gateway tests
+          python -m compileall -q \
+            libs/py/rca_common/rca_common \
+            services/worker/worker services/worker/scripts \
+            services/gateway/gateway \
+            services/dashboard-api/dashboard_api \
+            tests
       - name: go vet (Go)
         run: go vet ./...
-      # TODO(M3+): adopt a real linter (ruff for Python, golangci-lint for
-      # Go) plus the TS toolchain (dashboard-web) once it exists, so lint
-      # config is decided once for the whole monorepo rather than
-      # piecemeal per language as each milestone lands.
+      # TODO(M5+): adopt a real linter (ruff for Python, golangci-lint for
+      # Go) plus the TS typecheck gate for dashboard-web, so lint config is
+      # decided once for the whole monorepo rather than piecemeal.
 
   unit-rca-common:
     name: unit tests - rca_common (>80% coverage per module)
@@ -139,6 +132,45 @@ jobs:
           .venv/bin/python -m pytest tests/ \
             --cov=gateway --cov-report=term-missing --cov-fail-under=80
 
+  unit-dashboard-api:
+    name: unit tests - dashboard-api (>80% coverage)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install rca_common + dashboard-api (test extras)
+        run: |
+          python -m venv services/dashboard-api/.venv
+          services/dashboard-api/.venv/bin/pip install --upgrade pip
+          services/dashboard-api/.venv/bin/pip install -e libs/py/rca_common
+          services/dashboard-api/.venv/bin/pip install -e "services/dashboard-api[test]"
+      - name: pytest --cov (100% pass rate, >80% coverage)
+        working-directory: services/dashboard-api
+        run: |
+          .venv/bin/python -m pytest tests/ \
+            --cov=dashboard_api --cov-report=term-missing --cov-fail-under=80
+
+  unit-web:
+    name: unit tests - dashboard-web (vitest, >80% coverage per directory)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: vitest --coverage (100% pass rate, >80% per-directory thresholds)
+        working-directory: web
+        run: npm test
+
   unit-go:
     name: unit tests - probe, probe-gateway (>80% coverage per package)
     runs-on: ubuntu-latest
@@ -174,9 +206,17 @@ jobs:
         run: bash scripts/go-coverage-check.sh 80
 
   functional:
-    name: functional tests (M1 F14, M2 F8/F9, M3 investigation loop, manifest checks)
+    name: functional tests (M1–M4 + manifest checks)
     runs-on: ubuntu-latest
-    needs: [unit-rca-common, unit-worker, unit-gateway, unit-go]
+    needs:
+      [
+        unit-rca-common,
+        unit-worker,
+        unit-gateway,
+        unit-dashboard-api,
+        unit-web,
+        unit-go,
+      ]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -197,13 +237,14 @@ jobs:
           needed by the Go cross-service functional tests below, which build
           real probe/probe-gateway binaries)
         run: bash scripts/gen-proto.sh
-      - name: Install rca_common + worker + gateway (test extras)
+      - name: Install rca_common + worker + gateway + dashboard-api (test extras)
         run: |
           python -m venv services/worker/.venv
           services/worker/.venv/bin/pip install --upgrade pip
           services/worker/.venv/bin/pip install -e libs/py/rca_common
           services/worker/.venv/bin/pip install -e "services/worker[test]"
           services/worker/.venv/bin/pip install -e "services/gateway[test]"
+          services/worker/.venv/bin/pip install -e "services/dashboard-api[test]"
       - name: Run Python functional tests
         # Docker is preinstalled on GitHub-hosted ubuntu-latest runners;
         # testcontainers (ephemeral Postgres/MinIO) and Temporal's real
@@ -211,13 +252,16 @@ jobs:
         # use it directly -- see tests/functional/conftest.py.
         run: |
           services/worker/.venv/bin/python -m pytest \
-            services/worker/tests services/gateway/tests tests/functional tests/mocks/llm -v --ignore=tests/functional/m2_probe_link
+            services/worker/tests services/gateway/tests \
+            services/dashboard-api/tests \
+            tests/functional tests/mocks/llm -v \
+            --ignore=tests/functional/m2_probe_link
       - name: Run Go cross-service functional tests (F8; real probe +
           probe-gateway binaries over real mTLS + ephemeral Postgres)
         run: go test ./tests/functional/... -v -timeout 180s
 
   benchmark:
-    name: benchmark (B3/B4/B5/B6/B9/B13/B14 + M3 Python benches; manifest check)
+    name: benchmark (B3–B6/B9/B12–B14 + M3/M4 Python benches; manifest check)
     runs-on: ubuntu-latest
     needs: functional
     steps:
@@ -246,6 +290,7 @@ jobs:
           services/worker/.venv/bin/pip install -e libs/py/rca_common
           services/worker/.venv/bin/pip install -e "services/worker[test]"
           services/worker/.venv/bin/pip install -e "services/gateway[test]"
+          services/worker/.venv/bin/pip install -e "services/dashboard-api[test]"
       - name: Validate tests/benchmark/thresholds.yaml (manifest honesty)
         run: |
           services/worker/.venv/bin/python -m pytest \
@@ -262,6 +307,10 @@ jobs:
             libs/py/rca_common/tests/test_rawcmd.py::test_b6_static_validator_under_5ms -v
       - name: B9 -- presto_query_json_section JSONPath slice over a 10 MB query JSON
         run: go test ./probe/internal/adapter/presto/... -run TestB9 -v -timeout 60s
+      - name: B12 -- dashboard hot endpoints p99 < 300 ms (50 concurrent users)
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            services/dashboard-api/tests/test_b12_hot_endpoints.py -v
       - name: B13 -- workflow round-loop overhead < 1 s/round
         run: |
           services/worker/.venv/bin/python -m pytest \
@@ -272,4 +321,4 @@ jobs:
             services/worker/tests/test_context_assembly.py::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v
       # v1.5 manifest honesty rule (design.md Section 14.4): a
       # thresholds.yaml entry cannot stay `deferred` once its hot-path code
-      # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14 to covered.
+      # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14; M4 flipped B12.

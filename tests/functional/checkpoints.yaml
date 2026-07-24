@@ -40,17 +40,22 @@ checkpoints:
   - libs/py/rca_common/tests/test_rawcmd.py
 - id: F6
   description: Human-in-the-loop signals (design.md 5.1, D.2, D.4)
-  owning_milestone: M3
-  status: partial
+  owning_milestone: M4
+  status: covered
   tests:
   - services/worker/tests/test_investigation_workflow.py::test_abort_signal
   - services/worker/tests/test_investigation_workflow.py::test_pause_resume_signal
   - services/worker/tests/test_investigation_workflow.py::test_adjust_budget_signal
   - services/worker/tests/test_investigation_workflow.py::test_happy_path_playbook_resolved
   - services/worker/tests/test_investigation_workflow.py::test_deny_remediation_closes_with_summary_if_no_approved_playbooks
-  notes: 'M3 covers workflow signal handlers: pause/resume/abort/adjust_budget (unit-tested against
-    InvestigationWorkflow). M4-dashboard-owned sub-cases remain open: 409-on-double-decision, 409-on-terminal,
-    need_more comment feedback (Appendix D.2 HTTP surface).'
+  - services/worker/tests/test_investigation_workflow.py::test_m4_awaited_approval_id_guard_ignores_mismatched_signal
+  - tests/functional/test_m4_dashboard.py::test_m4_approval_decision_end_to_end
+  - tests/functional/test_m4_dashboard.py::test_m4_approval_double_decision_409
+  - tests/functional/test_m4_dashboard.py::test_m4_approval_decision_on_terminal_409
+  - tests/functional/test_m4_dashboard.py::test_m4_signal_on_terminal_case_409
+  - tests/functional/test_m4_dashboard.py::test_m4_need_more_comment_in_next_rca_round
+  notes: 'M3 covered workflow signal handlers. M4 closed the HTTP-surface sub-cases: 409-on-double-decision,
+    409-on-terminal, need_more feedback into the next RCA round, and the awaited-approval-id guard.'
 - id: F7
   description: Structured output discipline (design.md 6)
   owning_milestone: M3
@@ -137,8 +142,16 @@ checkpoints:
 - id: F12
   description: Dashboard API (Appendix D)
   owning_milestone: M4
-  status: deferred
-  tests: []
+  status: covered
+  tests:
+  - tests/functional/test_m4_dashboard.py
+  - services/dashboard-api/tests/
+  - web/src/components/RcaPanel.test.tsx
+  - web/src/components/ApprovalCard.test.tsx
+  - web/src/components/AdminSurfaces.test.tsx
+  notes: 'M4: full Appendix D surface via dashboard-api (auth/RBAC/password gate, cases, evidence/traces,
+    approvals+signals, admin) plus dashboard-web Vitest for compact/Details, approval actions, and pending-credentials
+    guidance. End-to-end acceptance is test_m4_approval_decision_end_to_end (Section 12).'
 - id: F13
   description: Notifications (design.md 10.1)
   owning_milestone: M5

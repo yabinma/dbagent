@@ -406,6 +406,7 @@ class InvestigationActivities:
             spent_usd=spent,
             platform_type=payload.get("platform_type", "presto"),
             engine_version=payload.get("engine_version", "0.298"),
+            approver_feedback=payload.get("approver_feedback") or [],
         )
         template = load_prompt("rca.txt")
         prompt = render(template, assembled["variables"])
@@ -557,9 +558,18 @@ class InvestigationActivities:
 
     @activity.defn(name="record_approval_decision")
     async def record_approval_decision(self, payload: dict[str, Any]) -> None:
+        """Persist decision + audits.
+
+        M4 (Section 10.2.3): when the human already decided via dashboard-api,
+        ``decide_approval`` reports already-decided — skip decision write *and*
+        the system-actor audits so the human ``user:<id>`` actor is preserved.
+        The timeout path (``is_timeout=True`` or no prior decision) remains the
+        sole system-side decider.
+        """
         with self._session_factory() as session:
             from rca_common.investigation_repo import decide_approval
 
+            already_decided = False
             try:
                 decide_approval(
                     session,
@@ -567,10 +577,24 @@ class InvestigationActivities:
                     decision=payload.get("decision") or "denied",
                     comment=payload.get("comment"),
                 )
-            except (KeyError, ValueError):
-                # Timeout path may race an explicit decision; still audit.
+            except KeyError:
+                # Unknown approval — still attempt audit for observability.
                 pass
-            action = "raw_cmd_approved" if payload.get("decision") == "approved" and payload.get("kind") == "raw_command" else None
+            except ValueError:
+                # Already decided (human path via dashboard-api).
+                already_decided = True
+
+            if already_decided and not payload.get("is_timeout"):
+                # Human was the decider: decision + user-actor audits already
+                # written by dashboard-api. Do not double-audit as system.
+                session.commit()
+                return
+
+            action = (
+                "raw_cmd_approved"
+                if payload.get("decision") == "approved" and payload.get("kind") == "raw_command"
+                else None
+            )
             if payload.get("decision") == "denied" and payload.get("kind") == "raw_command":
                 action = "raw_cmd_denied"
             write_audit(

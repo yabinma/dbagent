@@ -138,9 +138,10 @@ benchmarks:
   description: 'PG partitioned-table queries: case list w/ cursor, history filters, tsvector search --
     12 monthly partitions, 100k investigations, 5M llm_calls/audit_log rows'
   threshold: list/filter p99 < 200 ms; search p99 < 1 s
-  owning_milestone: M4
+  owning_milestone: M6
   status: deferred
   tests: []
+  notes: 'Needs M6 load-data fixtures (Section 10.2.5 / 14.4 manifest honesty).'
 - id: B11
   description: audit_log + llm_calls insert throughput (every action writes audit)
   threshold: '>= 1000 inserts/s combined without partition-routing degradation'
@@ -155,8 +156,11 @@ benchmarks:
     50 concurrent users
   threshold: p99 < 300 ms
   owning_milestone: M4
-  status: deferred
-  tests: []
+  status: covered
+  tests:
+  - services/dashboard-api/tests/test_b12_hot_endpoints.py::test_b12_dashboard_hot_endpoints_p99_under_300ms
+  notes: 'In-process ASGI micro-benchmark against ephemeral Postgres with 50 concurrent users x 3 hot
+    endpoints; asserts p99 < 300 ms.'
 - id: B13
   description: Workflow round-loop overhead with all Activities mocked to 0-cost (Temporal orchestration
     tax)

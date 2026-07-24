@@ -1,7 +1,11 @@
 """B14: RCA context assembly (Section 5.3)."""
 import time
 
-from worker.context_assembly import assemble_rca_context, compact_report
+from worker.context_assembly import (
+    assemble_rca_context,
+    compact_report,
+    format_approver_feedback,
+)
 
 
 def _evidence(n_rounds=15, per_round=8):
@@ -88,3 +92,33 @@ def test_previous_reports_compact_includes_all_prior_reports():
         spent_usd=0.1,
     )
     assert "only-prior" in single["variables"]["previous_reports_compact"]
+
+
+def test_approver_feedback_injected_into_rca_context():
+    """M4 FP-M4-12: need_more / denied comments appear in the next RCA round."""
+    result = assemble_rca_context(
+        event={"error_summary": "oom"},
+        evidence=_evidence(1, 1),
+        reports=[],
+        round_num=2,
+        max_rounds=15,
+        spent_usd=0.1,
+        approver_feedback=["please collect GC logs", "check coordinator heap"],
+    )
+    fb = result["variables"]["approver_feedback"]
+    assert "Approver feedback from prior rounds:" in fb
+    assert "please collect GC logs" in fb
+    assert "check coordinator heap" in fb
+
+    empty = assemble_rca_context(
+        event={"error_summary": "oom"},
+        evidence=_evidence(1, 1),
+        reports=[],
+        round_num=1,
+        max_rounds=15,
+        spent_usd=0.0,
+        approver_feedback=[],
+    )
+    assert empty["variables"]["approver_feedback"] == ""
+    assert format_approver_feedback(None) == ""
+    assert format_approver_feedback(["  "]) == ""

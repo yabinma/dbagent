@@ -130,9 +130,19 @@ def test_approval_and_user_tables_present():
     assert Approval.__tablename__ == "approvals"
     assert User.__tablename__ == "users"
     assert User.__table__.columns["username"].unique is True
+    assert "must_change_password" in {c.name for c in User.__table__.columns}
 
 
 def test_audit_actions_enum_is_nonempty_and_unique():
     assert len(AUDIT_ACTIONS) == len(set(AUDIT_ACTIONS))
     assert "event_received" in AUDIT_ACTIONS
     assert "case_closed" in AUDIT_ACTIONS
+    # M4 additions (Section 4.3 / 10.2)
+    for action in (
+        "case_paused",
+        "case_resumed",
+        "case_aborted",
+        "budget_adjusted",
+        "admin_config_changed",
+    ):
+        assert action in AUDIT_ACTIONS

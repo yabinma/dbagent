@@ -115,6 +115,17 @@ class ProbeGatewayConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """Dashboard-api settings (Appendix E ``dashboard:`` block / Section 10.2)."""
+
+    jwt_secret: str = ""
+    token_ttl_seconds: int = 43200  # 12 h
+    password_min_length: int = 12
+    cors_origins: list[str] = field(default_factory=list)
+    bootstrap_ca_cert_path: str = ""
+
+
+@dataclass
 class AppConfig:
     models: dict[str, ModelRoute] = field(default_factory=dict)
     budget_defaults: BudgetDefaults = field(default_factory=BudgetDefaults)
@@ -130,6 +141,7 @@ class AppConfig:
     ingest: IngestConfig = field(default_factory=IngestConfig)
     raw_commands: RawCommandsConfig = field(default_factory=RawCommandsConfig)
     probe_gateway: ProbeGatewayConfig = field(default_factory=ProbeGatewayConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def validate_egress_policy(self) -> None:
@@ -226,6 +238,15 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         timeout_seconds=pgw.get("timeout_seconds", 120),
     )
 
+    db_cfg = raw.get("dashboard") or {}
+    dashboard = DashboardConfig(
+        jwt_secret=db_cfg.get("jwt_secret", ""),
+        token_ttl_seconds=int(db_cfg.get("token_ttl_seconds", 43200)),
+        password_min_length=int(db_cfg.get("password_min_length", 12)),
+        cors_origins=list(db_cfg.get("cors_origins") or []),
+        bootstrap_ca_cert_path=db_cfg.get("bootstrap_ca_cert_path", "") or "",
+    )
+
     cfg = AppConfig(
         models=models,
         budget_defaults=budget_defaults,
@@ -241,6 +262,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         ingest=ingest,
         raw_commands=raw_commands,
         probe_gateway=probe_gateway,
+        dashboard=dashboard,
         raw=raw,
     )
     cfg.validate_egress_policy()

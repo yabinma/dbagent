@@ -223,6 +223,42 @@ def _probe_script(scenario: str) -> dict:
     }
 
 
+def _pending_approval_id(session_factory) -> str | None:
+    """Latest undecided approval id (mirrors dashboard list_approvals pending).
+
+    Required by the M4 awaited-approval-id gate on InvestigationWorkflow:
+    signals without a matching approval_id are ignored, so functional auto-
+    approve must pass the real row id exactly as production does.
+    """
+    with session_factory() as session:
+        row = session.execute(
+            text(
+                "SELECT approval_id FROM approvals "
+                "WHERE decision IS NULL "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+        ).fetchone()
+    return str(row[0]) if row else None
+
+
+async def _signal_approval(
+    handle,
+    session_factory,
+    *,
+    decision: str,
+    comment: str,
+) -> bool:
+    """Signal approval_decided with the pending approval's id. Returns True if sent."""
+    approval_id = _pending_approval_id(session_factory)
+    if not approval_id:
+        return False
+    await handle.signal(
+        InvestigationWorkflow.approval_decided,
+        {"approval_id": approval_id, "decision": decision, "comment": comment},
+    )
+    return True
+
+
 async def _run_investigation(session_factory, scenario: str, auto_approve: bool = True):
     llm = ScriptedLLM(_scenario_scripts(scenario))
     probe = FakeProbeGatewayClient(_probe_script(scenario))
@@ -259,15 +295,17 @@ async def _run_investigation(session_factory, scenario: str, auto_approve: bool 
                 task_queue=TASK_QUEUE,
             )
             if auto_approve:
-                # Approve any pending approvals as they appear.
+                # Approve any pending approvals as they appear (with matching id).
                 for _ in range(100):
                     status = await handle.query(InvestigationWorkflow.get_status)
                     if status["status"] in ("RESOLVED", "CLOSED_SUMMARY", "NEEDS_HUMAN", "REJECTED"):
                         break
                     if status["status"] == "AWAITING_APPROVAL":
-                        await handle.signal(
-                            InvestigationWorkflow.approval_decided,
-                            {"decision": "approved", "comment": "functional auto"},
+                        await _signal_approval(
+                            handle,
+                            session_factory,
+                            decision="approved",
+                            comment="functional auto",
                         )
                     await env.sleep(timedelta(milliseconds=50))
             result = await handle.result()
@@ -625,9 +663,11 @@ async def test_f16_audit_actions_emitted(m3_session_factory, postgres_dsn):
                 if status["status"] in ("RESOLVED", "CLOSED_SUMMARY", "NEEDS_HUMAN"):
                     break
                 if status["status"] == "AWAITING_APPROVAL":
-                    await handle.signal(
-                        InvestigationWorkflow.approval_decided,
-                        {"decision": "approved", "comment": "f16 raw ok"},
+                    await _signal_approval(
+                        handle,
+                        m3_session_factory,
+                        decision="approved",
+                        comment="f16 raw ok",
                     )
                 await env.sleep(timedelta(milliseconds=50))
             await handle.result()
@@ -683,9 +723,11 @@ async def test_f16_audit_actions_emitted(m3_session_factory, postgres_dsn):
                 if status["status"] in ("RESOLVED", "CLOSED_SUMMARY", "NEEDS_HUMAN"):
                     break
                 if status["status"] == "AWAITING_APPROVAL":
-                    await handle.signal(
-                        InvestigationWorkflow.approval_decided,
-                        {"decision": "denied", "comment": "f16 raw deny"},
+                    await _signal_approval(
+                        handle,
+                        m3_session_factory,
+                        decision="denied",
+                        comment="f16 raw deny",
                     )
                 await env.sleep(timedelta(milliseconds=50))
             await handle.result()

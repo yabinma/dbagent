@@ -41,6 +41,9 @@ def test_defaults_applied():
     assert cfg.ingest.correlation_window_seconds == 1800
     assert cfg.raw_commands.policy == "approve"
     assert cfg.probe_gateway.url == "http://probe-gateway:8080"
+    assert cfg.dashboard.token_ttl_seconds == 43200
+    assert cfg.dashboard.password_min_length == 12
+    assert cfg.dashboard.jwt_secret == ""
 
 
 def test_full_config_roundtrip():
@@ -68,6 +71,13 @@ def test_full_config_roundtrip():
         },
         "raw_commands": {"policy": "validate_only", "timeout_seconds": 30},
         "probe_gateway": {"url": "http://localhost:8080", "timeout_seconds": 30},
+        "dashboard": {
+            "jwt_secret": "s3cret",
+            "token_ttl_seconds": 7200,
+            "password_min_length": 10,
+            "cors_origins": ["http://localhost:5173"],
+            "bootstrap_ca_cert_path": "/etc/rca/ca.crt",
+        },
     }
     cfg = parse_config(raw)
     assert cfg.models["planner"].model == "ollama/qwen2.5:14b"
@@ -78,6 +88,11 @@ def test_full_config_roundtrip():
     assert cfg.signing.key_path == "/tmp/k"
     assert cfg.storage.s3_bucket == "b"
     assert cfg.model_gateway.master_key == "mk"
+    assert cfg.dashboard.jwt_secret == "s3cret"
+    assert cfg.dashboard.token_ttl_seconds == 7200
+    assert cfg.dashboard.password_min_length == 10
+    assert cfg.dashboard.cors_origins == ["http://localhost:5173"]
+    assert cfg.dashboard.bootstrap_ca_cert_path == "/etc/rca/ca.crt"
     assert cfg.temporal.address == "temporal-frontend:7233"
     assert cfg.temporal.namespace == "rca-agent"
     assert cfg.ingest.sources[0].name == "grafana-prod"

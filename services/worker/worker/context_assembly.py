@@ -22,6 +22,21 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def format_approver_feedback(feedback: list[str] | None) -> str:
+    """Render approver feedback for the RCA prompt (Section 10.2.3 need_more).
+
+    Returns an empty string when there is nothing to inject so the template
+    block can be omitted cleanly.
+    """
+    items = [str(x).strip() for x in (feedback or []) if str(x).strip()]
+    if not items:
+        return ""
+    lines = ["Approver feedback from prior rounds:"]
+    for item in items:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
 def assemble_rca_context(
     *,
     event: dict[str, Any],
@@ -33,6 +48,7 @@ def assemble_rca_context(
     platform_type: str = "presto",
     engine_version: str = "0.298",
     model_context_budget_chars: int = 200_000,
+    approver_feedback: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the template variables for the RCA prompt.
 
@@ -67,6 +83,7 @@ def assemble_rca_context(
     # *before* the current round's report is appended (workflows/investigation.py).
     # Do not slice with [:-1] — that incorrectly drops the most recent prior report.
     previous = [compact_report(r) for r in reports] if reports else []
+    feedback_block = format_approver_feedback(approver_feedback)
     variables = {
         "platform_type": platform_type,
         "engine_version": engine_version,
@@ -77,6 +94,7 @@ def assemble_rca_context(
         "evidence_summaries": json.dumps(summaries, default=str),
         "latest_evidence_full": json.dumps(latest_full, default=str),
         "previous_reports_compact": json.dumps(previous, default=str),
+        "approver_feedback": feedback_block,
     }
     assembled_size = sum(len(v) for v in variables.values())
     # Never truncate the latest round's full payloads (Section 5.3 / B14).

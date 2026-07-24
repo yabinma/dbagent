@@ -449,3 +449,91 @@ async def test_summarize_falls_back_on_llm_error(acts):
         }
     )
     assert evidence[0]["summary"]  # fallback head bytes
+
+
+@pytest.mark.asyncio
+async def test_m4_record_approval_decision_skips_audit_on_human_path(acts):
+    """M4: when decide_approval raises already-decided and is_timeout is false,
+    system-actor audits must not be written (human actor already recorded).
+    """
+    activities, _, _ = acts
+    inv = str(uuid.uuid4())
+    session = MagicMock()
+    # decide_approval path is invoked via import inside the activity; patch it.
+    import rca_common.investigation_repo as repo
+
+    calls = {"decide": 0, "audits": 0}
+    original_write = None
+
+    def fake_decide(*args, **kwargs):
+        calls["decide"] += 1
+        raise ValueError("approval already decided")
+
+    from rca_common import audit as audit_mod
+
+    real_write = audit_mod.write_audit
+
+    def counting_write(*args, **kwargs):
+        calls["audits"] += 1
+        return real_write(*args, **kwargs) if False else MagicMock()
+
+    activities._session_factory = lambda: _SessionCtx(session)
+    import worker.activities.investigation as inv_mod
+
+    # Patch decide_approval used inside the activity
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(
+        "rca_common.investigation_repo.decide_approval",
+        fake_decide,
+    )
+    # Also patch write_audit where the activity module imported it
+    monkey.setattr(inv_mod, "write_audit", counting_write)
+    try:
+        await activities.record_approval_decision(
+            {
+                "investigation_id": inv,
+                "approval_id": str(uuid.uuid4()),
+                "decision": "approved",
+                "kind": "raw_command",
+                "is_timeout": False,
+            }
+        )
+        assert calls["decide"] == 1
+        assert calls["audits"] == 0
+        # Timeout path still audits even if already decided.
+        calls["audits"] = 0
+        await activities.record_approval_decision(
+            {
+                "investigation_id": inv,
+                "approval_id": str(uuid.uuid4()),
+                "decision": "denied",
+                "kind": "raw_command",
+                "comment": "timeout",
+                "is_timeout": True,
+            }
+        )
+        assert calls["audits"] >= 1
+    finally:
+        monkey.undo()
+
+
+@pytest.mark.asyncio
+async def test_m4_analyze_forwards_approver_feedback(acts):
+    activities, llm, _ = acts
+    report = await activities.analyze(
+        {
+            "event": {"error_summary": "oom", "platform_key": "presto-us1"},
+            "evidence": [],
+            "reports": [],
+            "round": 2,
+            "budget": {"max_rounds": 15},
+            "spent_usd": 0.1,
+            "investigation_id": str(uuid.uuid4()),
+            "approver_feedback": ["collect GC logs please"],
+        }
+    )
+    assert report["status"] == "concluded"
+    # Prompt must have included the feedback block.
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert "Approver feedback from prior rounds:" in prompt
+    assert "collect GC logs please" in prompt
