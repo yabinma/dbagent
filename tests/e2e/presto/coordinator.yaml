@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: presto-coordinator
+  labels: { app: presto, role: coordinator }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: presto, role: coordinator }
+  template:
+    metadata:
+      labels: { app: presto, role: coordinator }
+    spec:
+      containers:
+        - name: presto
+          image: prestodb/presto:0.298
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /opt/presto-server/etc/config.properties
+              subPath: config.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/jvm.config
+              subPath: jvm.config
+            - name: config
+              mountPath: /opt/presto-server/etc/node.properties
+              subPath: node.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/log.properties
+              subPath: log.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/catalog/tpch.properties
+              subPath: catalog_tpch.properties
+            # E3 (Section 13.5) constrains concurrency by switching
+            # config.properties to the file resource-group manager, which reads
+            # this file. Mounted unconditionally; inert until selected.
+            - name: config
+              mountPath: /opt/presto-server/etc/resource-groups.json
+              subPath: resource_groups.json
+          readinessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: presto-coordinator-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: presto-coordinator
+spec:
+  selector: { app: presto, role: coordinator }
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30880
+  type: NodePort

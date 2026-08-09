@@ -1,0 +1,9 @@
+platform_key: presto-local
+gateway_address: host.docker.internal:8443
+bootstrap_address: host.docker.internal:8444
+bootstrap_token: ${BOOTSTRAP_TOKEN}
+credentials_mount: /etc/rca-probe/platform-credentials
+write_enabled: false
+state_dir: /var/lib/rca-probe
+coordinator_service: presto-coordinator
+docker_api_base_url: http://docker

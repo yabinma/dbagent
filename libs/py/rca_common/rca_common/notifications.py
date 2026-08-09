@@ -7,6 +7,11 @@ Formatters:
   * ``format_slack`` — Slack Block Kit
   * ``format_generic`` — Section 10.1 generic JSON
 
+Sanitizer:
+  * ``sanitize_payload`` — password/userinfo redaction on free-form fields
+    before formatting (defense for subject digests that may carry config
+    snippets; probe-side redaction remains the primary control, design D3).
+
 Sender:
   * ``send_to_webhooks`` — per-webhook ``events`` / ``min_severity`` filter,
     up to 3 attempts with exponential backoff, never raises.
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,12 +47,48 @@ _SEVERITY_RANK = {
     "unknown": 0,
 }
 
+# Placeholder matches probe/internal/redact.Placeholder so e2e can assert the
+# same token on evidence and notification surfaces.
+REDACTION_PLACEHOLDER = "***REDACTED***"
+
+# password=/secret= style pairs and scheme://user:secret@host userinfo.
+_PASSWORD_PAIR_RE = re.compile(
+    r"(?i)((?:password|passwd|secret|api[_-]?key|token)\s*[=:]\s*)([^\s&;\"']+)"
+)
+_USERINFO_RE = re.compile(r"(://[^/\s:@]+):([^@/\s]+)@")
+
 
 def severity_at_least(actual: str | None, minimum: str | None) -> bool:
     """Return True if ``actual`` meets or exceeds ``minimum``."""
     a = _SEVERITY_RANK.get((actual or "unknown").lower(), 0)
     m = _SEVERITY_RANK.get((minimum or "low").lower(), 1)
     return a >= m
+
+
+def sanitize_string(value: str) -> str:
+    """Redact secret-like substrings from a free-form notification string."""
+    out = _PASSWORD_PAIR_RE.sub(rf"\1{REDACTION_PLACEHOLDER}", value)
+    out = _USERINFO_RE.sub(rf"\1:{REDACTION_PLACEHOLDER}@", out)
+    return out
+
+
+def sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy ``payload`` with secret-like strings redacted.
+
+    Applied on the notification send path so marker-bearing subject digests
+    cannot leave the control plane in the clear (code review round 7, C3).
+    """
+
+    def walk(obj: Any) -> Any:
+        if isinstance(obj, str):
+            return sanitize_string(obj)
+        if isinstance(obj, dict):
+            return {k: walk(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [walk(v) for v in obj]
+        return obj
+
+    return walk(dict(payload))
 
 
 def format_generic(event: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +99,9 @@ def format_generic(event: str, payload: dict[str, Any]) -> dict[str, Any]:
         "platform_key": payload.get("platform_key"),
         "severity": payload.get("severity") or "unknown",
         "summary": payload.get("summary") or payload.get("rca_compact") or "",
+        # digest carries subject/description snippets (approval_requested);
+        # sanitized before format so secrets never serialize (round 7, C3).
+        "digest": payload.get("digest") or "",
         "dashboard_url": payload.get("dashboard_url") or "",
         "occurred_at": payload.get("occurred_at")
         or datetime.now(timezone.utc).isoformat(),
@@ -180,7 +225,8 @@ async def send_to_webhooks(
                 results.append({"name": name, "ok": False, "error": "empty url"})
                 continue
 
-            body = format_payload(fmt, event, payload)
+            safe = sanitize_payload(payload if isinstance(payload, dict) else {})
+            body = format_payload(fmt, event, safe)
             last_err: str | None = None
             last_status: int | None = None
             ok = False

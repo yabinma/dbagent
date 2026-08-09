@@ -1,22 +1,21 @@
-# Local dev / functional-test control-plane stack (design.md Section 11,
-# M1 deliverables: "local Temporal stack; LiteLLM deployment"). Brings up
-# Temporal (+ its own Postgres store), the application Postgres, MinIO
-# (S3-compatible object store), and a LiteLLM Proxy (model gateway,
-# Section 7). Not consumed directly by the automated M1 functional test
-# (`tests/functional/test_m1_foundation.py`), which uses ephemeral
-# containers/time-skipping test servers of its own per Section 14.3 so it
-# stays hermetic and CI-friendly; this compose file is for interactive
-# local development and manual verification of the same M1 acceptance
-# criterion end to end.
+# Local dev / functional-test control-plane stack (design.md Section 11).
+# Bare `docker compose up -d` keeps M1 infrastructure-only behavior;
+# `--profile apps` brings the whole product up on one node (FP-M6-11).
 #
 # Usage:
 #   docker compose -f deploy/compose/control-plane.yml up -d
-#
-# Then RCA_WORKER_CONFIG can point `services/worker` at a config file whose
-# `storage.postgres_dsn` / `storage.s3.*` / `model_gateway.url` /
-# `temporal.address` match the ports below.
+#   docker compose -f deploy/compose/control-plane.yml --profile apps up -d
 
 name: rca-agent-control-plane
+
+x-app-env: &app-env
+  PG_DSN: ${PG_DSN:-postgres://rca_agent:rca_agent@postgres:5432/rca_agent}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+  LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-dev}
+  DASHBOARD_JWT_SECRET: ${DASHBOARD_JWT_SECRET:-dev-jwt-secret-change-me}
+  ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+  ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-admin-change-me}
 
 services:
   postgres:
@@ -72,10 +71,10 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: "http://localhost:3000"
     ports:
-      - "8080:8080"
+      - "8088:8080"
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -92,7 +91,7 @@ services:
       retries: 10
 
   minio-init:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy
@@ -105,7 +104,7 @@ services:
     restart: "no"
 
   model-gateway:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:main-v1.55.8
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
     volumes:
       - ./litellm-config.yaml:/etc/litellm/config.yaml:ro
@@ -117,7 +116,137 @@ services:
     ports:
       - "4000:4000"
 
+  # --- Application services (profile: apps) ---
+  migrate:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      <<: *app-env
+      RCA_PG_DSN: ${PG_DSN:-postgres://rca_agent:rca_agent@postgres:5432/rca_agent}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  signing-key:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
+    command: ["python", "/app/scripts/bootstrap_signing_key.py", "--key-path", "/etc/rca-agent/signing/ed25519.key"]
+    volumes:
+      - signing-key:/etc/rca-agent/signing
+    restart: "no"
+
+  bootstrap-admin:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/dashboard-api:${APP_VERSION:-0.1.0}
+    command: ["rca-dashboard-bootstrap-admin"]
+    environment:
+      <<: *app-env
+      RCA_DASHBOARD_CONFIG: /etc/rca-agent/config.yaml
+    volumes:
+      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  seed-playbooks:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
+    command: ["python", "/app/scripts/seed_playbooks.py", "--config", "/etc/rca-agent/config.yaml"]
+    environment:
+      <<: *app-env
+    volumes:
+      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  ingest-gateway:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/ingest-gateway:${APP_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      RCA_GATEWAY_CONFIG: /etc/rca-agent/config.yaml
+    volumes:
+      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+
+  temporal-worker:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      RCA_WORKER_CONFIG: /etc/rca-agent/config.yaml
+    volumes:
+      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+      - signing-key:/etc/rca-agent/signing:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      signing-key:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+
+  probe-gateway:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/probe-gateway:${APP_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      PROBE_GATEWAY_CONFIG: /etc/rca-agent/probe-gateway/config.yaml
+    volumes:
+      - ./config/probe-gateway.yaml:/etc/rca-agent/probe-gateway/config.yaml:ro
+      - signing-key:/etc/rca-agent/signing:ro
+      - bootstrap-ca:/etc/rca-agent/probe-gateway-ca
+    ports:
+      - "8443:8443"
+      - "8444:8444"
+      - "8082:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      signing-key:
+        condition: service_completed_successfully
+
+  dashboard-api:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/dashboard-api:${APP_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      RCA_DASHBOARD_CONFIG: /etc/rca-agent/config.yaml
+    volumes:
+      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+    ports:
+      - "8081:8081"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      bootstrap-admin:
+        condition: service_completed_successfully
+
+  dashboard-web:
+    profiles: ["apps"]
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/dashboard-web:${APP_VERSION:-0.1.0}
+    environment:
+      RCA_API_BASE_URL: /api/v1
+      RCA_API_UPSTREAM: http://dashboard-api:8081/
+    ports:
+      - "3000:8080"
+    depends_on:
+      - dashboard-api
+
 volumes:
   pg-data:
   temporal-pg-data:
   minio-data:
+  signing-key:
+  bootstrap-ca:

@@ -7,12 +7,21 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/pem"
 	"net"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcwait "github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -131,6 +140,14 @@ func (fp *fakeProbe) expectMessage(timeout time.Duration) *rcaprobev1.GatewayMes
 func testServer(t *testing.T) (rcaprobev1.ProbeGatewayClient, *Server, registry.Registry) {
 	t.Helper()
 	reg := registry.NewFake()
+	client, srv := testServerWithRegistry(t, reg)
+	return client, srv, reg
+}
+
+// testServerWithRegistry is testServer with a caller-supplied Registry
+// (used by F16 to pass a real *registry.PG so AuditDB can share reg.DB).
+func testServerWithRegistry(t *testing.T, reg registry.Registry) (rcaprobev1.ProbeGatewayClient, *Server) {
+	t.Helper()
 	srv := New(reg, []byte("fake-signing-public-key-32-bytes"), "replica-1")
 	srv.HeartbeatTimeout = 200 * time.Millisecond
 
@@ -149,12 +166,22 @@ func testServer(t *testing.T) (rcaprobev1.ProbeGatewayClient, *Server, registry.
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	return rcaprobev1.NewProbeGatewayClient(conn), srv, reg
+	return rcaprobev1.NewProbeGatewayClient(conn), srv
 }
 
 func seedPlatform(t *testing.T, reg registry.Registry, platformKey string) {
 	t.Helper()
+	// Idempotent: the composed F16 Python path may already have inserted this
+	// key (f16-plat) before invoking the Go test (review C2). CreatePlatform
+	// is a plain INSERT on PG and would PK-fail on the second seed.
+	if _, err := reg.GetPlatform(context.Background(), platformKey); err == nil {
+		return
+	}
 	if err := reg.CreatePlatform(context.Background(), registry.Platform{PlatformKey: platformKey}, "tok"); err != nil {
+		// Lost a race or concurrent insert: treat "already present" as success.
+		if _, gerr := reg.GetPlatform(context.Background(), platformKey); gerr == nil {
+			return
+		}
 		t.Fatalf("seed platform: %v", err)
 	}
 }
@@ -758,4 +785,162 @@ func waitForSession(t *testing.T, srv *Server, platformKey string) {
 		}
 		return false
 	})
+}
+
+func TestEmitCredentialAudits_NilDBNoOp(t *testing.T) {
+	s := New(registry.NewFake(), nil, "gw-0")
+	// Must not panic with nil AuditDB.
+	s.emitCredentialAudits(context.Background(), "pid", "pk", nil, &rcaprobev1.AuthStatus{
+		Scheme: "PASSWORD", Access: "full",
+	})
+	s.emitCredentialAudits(context.Background(), "pid", "pk", nil, nil)
+}
+
+func TestEmitCredentialAudits_TransitionFromPrevCaps(t *testing.T) {
+	s := New(registry.NewFake(), nil, "gw-0")
+	// With nil DB still exercises transition parsing paths.
+	prev := map[string]any{
+		"auth": map[string]any{
+			"scheme":  "PASSWORD",
+			"access":  "unauthenticated",
+			"missing": []any{"credentials"},
+		},
+	}
+	s.emitCredentialAudits(context.Background(), "pid", "pk", prev, &rcaprobev1.AuthStatus{
+		Scheme: "PASSWORD", Access: "full",
+	})
+	// missing as []string branch
+	prev2 := map[string]any{
+		"auth": map[string]any{
+			"scheme":  "PASSWORD",
+			"access":  "full",
+			"missing": []string{},
+		},
+	}
+	s.emitCredentialAudits(context.Background(), "pid", "pk", prev2, &rcaprobev1.AuthStatus{
+		Scheme: "PASSWORD", Access: "full",
+	})
+}
+
+func TestHandleMidSessionRegister(t *testing.T) {
+	reg := registry.NewFake()
+	seedPlatform(t, reg, "presto-us1")
+	// Seed an existing probe so prevCaps path is hit.
+	_ = reg.UpsertProbe(context.Background(), registry.Probe{
+		ProbeID:     "probe-1",
+		PlatformKey: "presto-us1",
+		Capabilities: map[string]any{
+			"auth": map[string]any{"scheme": "PASSWORD", "access": "unauthenticated", "missing": []any{"credentials"}},
+		},
+		Status: registry.ProbeOnline,
+	})
+	s := New(reg, nil, "gw-0")
+	s.handleMidSessionRegister(context.Background(), "probe-1", "presto-us1", &rcaprobev1.Register{
+		PlatformKey:  "presto-us1",
+		ProbeVersion: "1.0",
+		Capabilities: &rcaprobev1.Capabilities{
+			PlatformType: "presto",
+			Auth:         &rcaprobev1.AuthStatus{Scheme: "PASSWORD", Access: "full"},
+		},
+	})
+	p, err := reg.GetPlatform(context.Background(), "presto-us1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != registry.PlatformOnline {
+		t.Fatalf("status=%s", p.Status)
+	}
+	// nil register is no-op
+	s.handleMidSessionRegister(context.Background(), "probe-1", "presto-us1", nil)
+}
+
+func TestSession_MidSessionReRegisterUpdatesStatus(t *testing.T) {
+	client, _, reg := testServer(t)
+	seedPlatform(t, reg, "presto-us1")
+	fp := newFakeProbe(t, client)
+	fp.registerWithAuth("presto-us1", &rcaprobev1.AuthStatus{
+		Scheme: "PASSWORD", Access: "unauthenticated", Missing: []string{"credentials"},
+	})
+	fp.expectAck(2 * time.Second)
+	waitForCondition(t, 2*time.Second, func() bool {
+		p, err := reg.GetPlatform(context.Background(), "presto-us1")
+		return err == nil && p.Status == registry.PlatformPendingCredentials
+	})
+	// Mid-session re-register with full access (ManifestRefresh path).
+	fp.registerWithAuth("presto-us1", &rcaprobev1.AuthStatus{Scheme: "PASSWORD", Access: "full"})
+	waitForCondition(t, 2*time.Second, func() bool {
+		p, err := reg.GetPlatform(context.Background(), "presto-us1")
+		return err == nil && p.Status == registry.PlatformOnline
+	})
+}
+
+func TestEmitCredentialAudits_WritesRows(t *testing.T) {
+	if testing.Short() {
+		t.Skip("docker")
+	}
+	// Reuse registry's migrated postgres helper pattern inline.
+	ctx := context.Background()
+	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
+		postgres.WithDatabase("rca_agent"),
+		postgres.WithUsername("rca_agent"),
+		postgres.WithPassword("rca_agent"),
+		testcontainers.WithWaitStrategy(
+			tcwait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
+		),
+	)
+	if err != nil {
+		t.Fatalf("pg: %v", err)
+	}
+	t.Cleanup(func() { _ = pgContainer.Terminate(ctx) })
+	dsn, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// migrate
+	_, file, _, _ := runtime.Caller(0)
+	repo := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "..", ".."))
+	rca := filepath.Join(repo, "libs", "py", "rca_common")
+	py := filepath.Join(rca, ".venv", "bin", "python")
+	alembicDSN := strings.Replace(dsn, "postgres://", "postgresql+psycopg2://", 1)
+	cmd := exec.Command(py, "-m", "alembic", "upgrade", "head")
+	cmd.Dir = rca
+	cmd.Env = append(os.Environ(), "RCA_PG_DSN="+alembicDSN)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("migrate: %v\n%s", err, out)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	s := New(registry.NewFake(), nil, "gw-0")
+	s.AuditDB = db
+	s.emitCredentialAudits(ctx, "probe-1", "pk1", nil, &rcaprobev1.AuthStatus{
+		Scheme: "PASSWORD", Access: "full",
+	})
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM audit_log WHERE action IN ('credentials_detected','credentials_verified')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("expected credentials_* rows, got %d", n)
+	}
+}
+
+func TestReapStaleProbes_RunsOnce(t *testing.T) {
+	s := New(registry.NewFake(), nil, "gw-0")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.ReapStaleProbes(ctx, 20*time.Millisecond)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reaper did not stop")
+	}
 }

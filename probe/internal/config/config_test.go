@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoad_AppliesDefaults(t *testing.T) {
@@ -93,5 +94,74 @@ func TestLoad_InvalidYAML(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Fatalf("expected error for invalid yaml")
+	}
+}
+
+func TestLoad_EnvInterpolation(t *testing.T) {
+	t.Setenv("BOOTSTRAP_TOKEN", "tok-from-env")
+	dir := t.TempDir()
+	path := dir + "/cfg.yaml"
+	if err := os.WriteFile(path, []byte("platform_key: p1\nbootstrap_token: ${BOOTSTRAP_TOKEN}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BootstrapToken != "tok-from-env" {
+		t.Fatalf("got %q", cfg.BootstrapToken)
+	}
+	if cfg.CredentialsMount == "" {
+		t.Fatal("defaults lost")
+	}
+}
+
+func TestLoad_BootstrapTokenFileWhenEmpty(t *testing.T) {
+	// Swarm path: config expands ${BOOTSTRAP_TOKEN} to empty; file supplies it.
+	t.Setenv("BOOTSTRAP_TOKEN", "")
+	dir := t.TempDir()
+	tokFile := dir + "/bootstrap_token"
+	if err := os.WriteFile(tokFile, []byte("  secret-from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BOOTSTRAP_TOKEN_FILE", tokFile)
+	path := dir + "/cfg.yaml"
+	if err := os.WriteFile(path, []byte("platform_key: p1\nbootstrap_token: ${BOOTSTRAP_TOKEN}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BootstrapToken != "secret-from-file" {
+		t.Fatalf("got %q", cfg.BootstrapToken)
+	}
+}
+
+// FP-KR-20
+func TestLoad_SigningKeyGraceWindowDefaultAndOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "probe.yaml")
+	if err := os.WriteFile(path, []byte("platform_key: presto-us1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SigningKeyGraceWindow != 10*time.Minute {
+		t.Fatalf("default signing_key_grace_window = %s, want 10m", cfg.SigningKeyGraceWindow)
+	}
+
+	path2 := filepath.Join(dir, "probe2.yaml")
+	if err := os.WriteFile(path2, []byte("platform_key: p1\nsigning_key_grace_window: 30s\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, err := Load(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.SigningKeyGraceWindow != 30*time.Second {
+		t.Fatalf("override = %s, want 30s", cfg2.SigningKeyGraceWindow)
 	}
 }

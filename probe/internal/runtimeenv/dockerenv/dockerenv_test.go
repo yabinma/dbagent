@@ -357,3 +357,11 @@ func TestUpdateServiceEnvAndRestart(t *testing.T) {
 		t.Fatalf("expected k8s-only error")
 	}
 }
+
+func TestReadConfigMapKey_K8sOnly(t *testing.T) {
+	env := New(nil, Config{})
+	_, err := env.ReadConfigMapKey(context.Background(), "ns", "cm", "config.properties")
+	if err == nil || !strings.Contains(err.Error(), "k8s-only") {
+		t.Fatalf("expected k8s-only error, got %v", err)
+	}
+}

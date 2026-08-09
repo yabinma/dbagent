@@ -107,3 +107,87 @@ func TestLoad_NoRotationWhenKeyUnchanged(t *testing.T) {
 		t.Fatalf("expected no rotation when key content is unchanged")
 	}
 }
+
+// FP-KR-18: malformed load while a rotation deadline is already live must leave
+// Current, Previous and rotated exactly as they were.
+func TestLoad_RejectsWrongLengthKeyAndKeepsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ed25519.key.pub")
+	keyA := []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	keyB := []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	keyC := []byte("cccccccccccccccccccccccccccccccc")
+
+	r := NewReader(path, time.Hour)
+	writeKey(t, path, keyA)
+	if err := r.Load(); err != nil {
+		t.Fatalf("load A: %v", err)
+	}
+	writeKey(t, path, keyB)
+	if err := r.Load(); err != nil {
+		t.Fatalf("load B: %v", err)
+	}
+	r.mu.RLock()
+	rotatedBefore := r.rotated
+	r.mu.RUnlock()
+	if rotatedBefore.IsZero() {
+		t.Fatal("expected a live rotation deadline after A→B")
+	}
+
+	// Four distinct malformed fixtures. empty-file is a truly empty file;
+	// zero-decoded is non-empty whitespace-only content that trims to the
+	// empty string (valid base64 of zero bytes) — distinct from empty-file.
+	malformed := []struct {
+		name    string
+		writeFn func(path string) error
+	}{
+		{"31-byte", func(path string) error {
+			return os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString([]byte("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))), 0o644)
+		}},
+		{"33-byte", func(path string) error {
+			return os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString([]byte("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))), 0o644)
+		}},
+		{"empty-file", func(path string) error {
+			return os.WriteFile(path, []byte(""), 0o644)
+		}},
+		{"zero-decoded", func(path string) error {
+			// Non-empty, whitespace-only: TrimSpace → "" → base64 decode → 0 bytes.
+			return os.WriteFile(path, []byte("   \n\t  \n"), 0o644)
+		}},
+	}
+	for _, m := range malformed {
+		if err := m.writeFn(path); err != nil {
+			t.Fatal(err)
+		}
+		err := r.Load()
+		if err == nil {
+			t.Fatalf("%s: expected Load error", m.name)
+		}
+		if string(r.Current()) != string(keyB) {
+			t.Fatalf("%s: Current changed to %v", m.name, r.Current())
+		}
+		if string(r.Previous()) != string(keyA) {
+			t.Fatalf("%s: Previous changed to %v", m.name, r.Previous())
+		}
+		r.mu.RLock()
+		rotatedAfter := r.rotated
+		r.mu.RUnlock()
+		if !rotatedAfter.Equal(rotatedBefore) {
+			t.Fatalf("%s: rotated changed from %v to %v", m.name, rotatedBefore, rotatedAfter)
+		}
+	}
+
+	// Valid C still works afterwards.
+	writeKey(t, path, keyC)
+	if err := r.Load(); err != nil {
+		t.Fatalf("load C: %v", err)
+	}
+	if string(r.Current()) != string(keyC) || string(r.Previous()) != string(keyB) {
+		t.Fatalf("after C: current=%v previous=%v", r.Current(), r.Previous())
+	}
+	r.mu.RLock()
+	rotatedAfterC := r.rotated
+	r.mu.RUnlock()
+	if !rotatedAfterC.After(rotatedBefore) {
+		t.Fatalf("rotated must move on valid C")
+	}
+}

@@ -94,6 +94,12 @@ type RuntimeEnv interface {
 
 	// --- Write methods (M5, design.md Section 9.5.3) -------------------------
 
+	// ReadConfigMapKey reads one data key from a named ConfigMap (k8s only;
+	// swarm returns a "k8s-only" error). Empty namespace defaults to the
+	// env's configured namespace; empty key defaults to "config.properties"
+	// (design.md FP-M6-29 / S3).
+	ReadConfigMapKey(ctx context.Context, namespace, name, key string) (string, error)
+
 	// PatchConfigMap strategic-merges dataPatches into a ConfigMap's data
 	// keys (k8s only; swarm returns an error).
 	PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error

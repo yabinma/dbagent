@@ -18,13 +18,17 @@ export default defineConfig({
         "src/test/**",
         "src/**/*.test.{ts,tsx}",
       ],
-      // Per-directory gate: every covered directory must clear 80%.
+      // Per-file gate: every covered file must clear the bar. Design §14.1 is
+      // *line* coverage, strictly above 80%. Vitest only accepts integer
+      // thresholds, so 81 is the enforceable floor that rejects exactly-80%
+      // files the previous aggregate gate accepted (code review round 6, W2).
+      // Branches are reported but not gated — partial short-circuit arms in
+      // presentational components are not the §14.1 bar.
       thresholds: {
-        lines: 80,
-        functions: 80,
-        branches: 80,
-        statements: 80,
-        perFile: false,
+        lines: 81,
+        functions: 81,
+        statements: 81,
+        perFile: true,
         autoUpdate: false,
       },
     },

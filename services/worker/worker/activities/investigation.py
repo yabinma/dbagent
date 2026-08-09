@@ -1051,9 +1051,22 @@ class InvestigationActivities:
                 )
                 ok = bool(result.get("ok"))
             else:
-                # Backward-compatible M3 path when no probe/playbook bound.
-                ok = True
-                result = {"ok": True, "checks": [], "plan": plan}
+                # FP-M6-27 / S1: fail closed when required wiring is missing so
+                # a regression cannot produce a silent RESOLVED.
+                missing: list[str] = []
+                if not platform_key:
+                    missing.append("platform_key")
+                if self._probe is None:
+                    missing.append("probe")
+                if not playbook_id:
+                    missing.append("playbook_id")
+                err_msg = "missing wiring: " + ", ".join(missing) if missing else "missing wiring"
+                ok = False
+                result = {
+                    "ok": False,
+                    "checks": [{"name": "wiring", "ok": False, "error": err_msg}],
+                    "plan": plan,
+                }
 
         with self._session_factory() as session:
             write_audit(

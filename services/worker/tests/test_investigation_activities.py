@@ -258,12 +258,40 @@ async def test_execute_playbook_and_verify(acts):
         }
     )
     assert r["ok"] is True
-    v = await activities.verify_fix({"investigation_id": inv, "verification_plan": ["presto_list_queries"]})
+    # FP-M6-27: complete wiring required (platform_key + probe + playbook_id).
+    v = await activities.verify_fix(
+        {
+            "investigation_id": inv,
+            "platform_key": "presto-test",
+            "playbook_id": "presto.kill_query",
+            "verification_plan": ["presto_list_queries"],
+        }
+    )
     assert v["ok"] is True
     v2 = await activities.verify_fix(
-        {"investigation_id": inv, "verification_plan": [], "force_fail": True}
+        {
+            "investigation_id": inv,
+            "platform_key": "presto-test",
+            "playbook_id": "presto.kill_query",
+            "verification_plan": [],
+            "force_fail": True,
+        }
     )
     assert v2["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_verify_fix_fails_closed_on_missing_wiring(acts):
+    """FP-M6-27 / S1: missing platform_key / probe / playbook_id → ok=False wiring check."""
+    activities, _, _ = acts
+    inv = str(uuid.uuid4())
+    # No platform_key, no playbook_id.
+    v = await activities.verify_fix(
+        {"investigation_id": inv, "verification_plan": ["presto_list_queries"]}
+    )
+    assert v["ok"] is False
+    assert any(c.get("name") == "wiring" and c.get("ok") is False for c in v.get("checks") or [])
+    assert "playbook_id" in (v["checks"][0].get("error") or "")
 
 
 @pytest.mark.asyncio

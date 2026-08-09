@@ -300,6 +300,11 @@ func grepLines(lines []string, needle string) []string {
 
 // --- Write methods (M5, design.md Section 9.5.3) -------------------------------------
 
+// ReadConfigMapKey is k8s-only (FP-M6-29 / S3).
+func (e *Env) ReadConfigMapKey(ctx context.Context, namespace, name, key string) (string, error) {
+	return "", fmt.Errorf("dockerenv: ReadConfigMapKey is k8s-only")
+}
+
 func (e *Env) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
 	return fmt.Errorf("dockerenv: PatchConfigMap is k8s-only")
 }

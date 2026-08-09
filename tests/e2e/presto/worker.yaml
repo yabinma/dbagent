@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: presto-worker
+  labels: { app: presto, role: worker }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: presto, role: worker }
+  template:
+    metadata:
+      labels: { app: presto, role: worker }
+    spec:
+      containers:
+        - name: presto
+          image: prestodb/presto:0.298
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /opt/presto-server/etc/config.properties
+              subPath: config.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/jvm.config
+              subPath: jvm.config
+            - name: config
+              mountPath: /opt/presto-server/etc/node.properties
+              subPath: node.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/log.properties
+              subPath: log.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/catalog/tpch.properties
+              subPath: catalog_tpch.properties
+      volumes:
+        - name: config
+          configMap:
+            name: presto-worker-config

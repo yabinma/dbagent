@@ -23,6 +23,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -58,7 +60,12 @@ func generateFunctestCSR(t *testing.T, cn string) (csrPEM, keyPEM []byte) {
 // enrollDirect performs a real token-based Bootstrap.Enroll against the
 // gateway subprocess's real bootstrap listener, returning the raw
 // PEM-encoded client cert/key/CA.
-func enrollDirect(t *testing.T, bootstrapAddr, platformKey, token string) (certPEM, keyPEM, caPEM []byte) {
+//
+// The bootstrap listener presents a cert signed by the CA written to
+// stateDir/ca.crt at gateway start.  We load that CA into RootCAs and verify
+// normally — InsecureSkipVerify is forbidden on this real-network path
+// (code review round 6, W1).
+func enrollDirect(t *testing.T, bootstrapAddr, platformKey, token, caCertPath string) (certPEM, keyPEM, caPEM []byte) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -70,7 +77,20 @@ func enrollDirect(t *testing.T, bootstrapAddr, platformKey, token string) (certP
 	}
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
 
-	conn, err := grpc.NewClient(bootstrapAddr, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true}))) //nolint:gosec
+	caBytes, err := os.ReadFile(caCertPath)
+	if err != nil {
+		t.Fatalf("read gateway CA %s: %v", caCertPath, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caBytes) {
+		t.Fatalf("failed to parse gateway CA PEM from %s", caCertPath)
+	}
+
+	conn, err := grpc.NewClient(bootstrapAddr, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+		RootCAs:    pool,
+		ServerName: "127.0.0.1",
+		MinVersion: tls.VersionTLS12,
+	})))
 	if err != nil {
 		t.Fatalf("dial bootstrap listener: %v", err)
 	}
@@ -128,7 +148,10 @@ func TestBootstrapFix_CrossPlatformCertSubstitution_Rejected(t *testing.T) {
 
 	// A real certificate, genuinely issued (by the real gateway
 	// subprocess, over the real Bootstrap protocol) for platform A.
-	certPEM, keyPEM, caPEM := enrollDirect(t, gw.bootstrapAddr, platformA, "tok-fix-a")
+	certPEM, keyPEM, caPEM := enrollDirect(
+		t, gw.bootstrapAddr, platformA, "tok-fix-a",
+		filepath.Join(gw.stateDir, "ca.crt"),
+	)
 
 	// Attempt to register as platform B using that certificate. Section
 	// 8.4a: "probe-gateway MUST reject a Session registration whose
@@ -188,7 +211,10 @@ func TestBootstrapFix_RenewalOverMTLSListener_Succeeds(t *testing.T) {
 	const platformKey = "presto-fix-renew"
 	seedPlatform(t, dsn, platformKey, "tok-fix-renew")
 
-	certPEM, keyPEM, caPEM := enrollDirect(t, gw.bootstrapAddr, platformKey, "tok-fix-renew")
+	certPEM, keyPEM, caPEM := enrollDirect(
+		t, gw.bootstrapAddr, platformKey, "tok-fix-renew",
+		filepath.Join(gw.stateDir, "ca.crt"),
+	)
 
 	// design.md Section 8.4a: "the Bootstrap service is registered on both
 	// listeners" -- renewal calls Enroll on the mTLS Session listener,
@@ -247,7 +273,10 @@ func TestBootstrapFix_RenewalWithMismatchedCN_Rejected(t *testing.T) {
 	seedPlatform(t, dsn, platformA, "tok-renew-a")
 	seedPlatform(t, dsn, platformB, "tok-renew-b")
 
-	certPEM, keyPEM, caPEM := enrollDirect(t, gw.bootstrapAddr, platformA, "tok-renew-a")
+	certPEM, keyPEM, caPEM := enrollDirect(
+		t, gw.bootstrapAddr, platformA, "tok-renew-a",
+		filepath.Join(gw.stateDir, "ca.crt"),
+	)
 
 	conn := dialSessionListenerWithCert(t, gw.sessionAddr, certPEM, keyPEM, caPEM)
 	mismatchCSR, _ := generateFunctestCSR(t, platformB)

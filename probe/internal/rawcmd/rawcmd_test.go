@@ -140,6 +140,9 @@ func (f *fakeExecEnv) ReadConfig(ctx context.Context, component, file, target st
 }
 func (f *fakeExecEnv) CoordinatorBaseURL(ctx context.Context) (string, error) { return "", nil }
 
+func (f *fakeExecEnv) ReadConfigMapKey(ctx context.Context, namespace, name, key string) (string, error) {
+	return "", nil
+}
 func (f *fakeExecEnv) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
 	return nil
 }

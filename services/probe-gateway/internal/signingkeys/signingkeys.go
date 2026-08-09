@@ -9,6 +9,7 @@
 package signingkeys
 
 import (
+	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -18,12 +19,13 @@ import (
 )
 
 // Reader tracks the current + previous (grace-window) public key,
-// refreshed by polling the `.pub` file (design.md D14: "Rotation runbook:
-// regenerate Secret -> rolling-restart workers -> probe-gateway
-// broadcasts ManifestRefresh; probes hold old + new public keys for a
-// 10-minute grace window." -- probe-gateway itself needs the same old+new
-// bookkeeping to keep serving the correct key(s) in RegisterAck during
-// that window).
+// refreshed by polling the `.pub` sidecar. This reader picks the rotated
+// key up from the file; pollSigningKey publishes it with SetSigningPublicKey
+// and pushes it to every connected session with PropagateSigningKey
+// (design.md §9.6, Appendix A.2), and probes hold old + new for the grace
+// window — while this type keeps the same old+new bookkeeping so
+// probe-gateway itself serves the right key in RegisterAck during that
+// window.
 type Reader struct {
 	Path        string
 	GraceWindow time.Duration
@@ -40,7 +42,9 @@ func NewReader(path string, graceWindow time.Duration) *Reader {
 
 // Load reads the current public key from disk. If the on-disk key has
 // changed since the last successful Load, the previously-held key
-// becomes Previous (grace window starts now).
+// becomes Previous (grace window starts now). A decoded value whose
+// length is not ed25519.PublicKeySize is refused without touching
+// current/previous/rotated (design.md §9.6.5).
 func (r *Reader) Load() error {
 	raw, err := os.ReadFile(r.Path)
 	if err != nil {
@@ -49,6 +53,11 @@ func (r *Reader) Load() error {
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
 	if err != nil {
 		return fmt.Errorf("signingkeys: decode %s: %w", r.Path, err)
+	}
+	// Validate before taking r.mu so a bad sidecar never blanks a working key.
+	if len(decoded) != ed25519.PublicKeySize {
+		return fmt.Errorf("signingkeys: %s: expected a %d-byte ed25519 public key, got %d",
+			r.Path, ed25519.PublicKeySize, len(decoded))
 	}
 
 	r.mu.Lock()

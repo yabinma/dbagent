@@ -1,0 +1,13 @@
+# E3 queue saturation → CLOSED_SUMMARY, no playbook (Section 13.5).
+- when: {agent_role: planner}
+  respond: planner.json
+  repeat: all
+- when: {agent_role: collector}
+  respond: collector.json
+  repeat: all
+- when: {agent_role: rca}
+  respond: rca.json
+  repeat: all
+- when: {agent_role: remediation}
+  respond: remediation.json
+  repeat: all

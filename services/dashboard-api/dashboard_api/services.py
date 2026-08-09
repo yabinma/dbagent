@@ -61,6 +61,23 @@ def sum_llm_cost(session: Session, investigation_id: uuid.UUID) -> float:
     return float(total or 0)
 
 
+def sum_llm_costs_batch(
+    session: Session, investigation_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, float]:
+    """One GROUP BY for a page of investigation ids (avoids N+1 on list)."""
+    if not investigation_ids:
+        return {}
+    rows = session.execute(
+        select(
+            LLMCall.investigation_id,
+            func.coalesce(func.sum(LLMCall.cost_usd), 0),
+        )
+        .where(LLMCall.investigation_id.in_(investigation_ids))
+        .group_by(LLMCall.investigation_id)
+    ).all()
+    return {row[0]: float(row[1] or 0) for row in rows if row[0] is not None}
+
+
 def latest_investigation(session: Session, investigation_id: uuid.UUID) -> Investigation | None:
     return session.scalars(
         select(Investigation)
@@ -70,15 +87,24 @@ def latest_investigation(session: Session, investigation_id: uuid.UUID) -> Inves
     ).first()
 
 
-def investigation_summary(session: Session, inv: Investigation) -> dict[str, Any]:
+def investigation_summary(
+    session: Session,
+    inv: Investigation,
+    *,
+    cost_usd: float | None = None,
+    severity: str | None = None,
+) -> dict[str, Any]:
     spent = dict(inv.spent or {})
     spent["rounds"] = int(spent.get("rounds") or 0)
-    spent["cost_usd"] = sum_llm_cost(session, inv.investigation_id)
-    severity = "unknown"
-    if inv.trigger_event:
-        ev = session.get(AlertEventRow, inv.trigger_event)
-        if ev is not None:
-            severity = ev.severity or (ev.normalized or {}).get("severity") or "unknown"
+    spent["cost_usd"] = (
+        float(cost_usd) if cost_usd is not None else sum_llm_cost(session, inv.investigation_id)
+    )
+    if severity is None:
+        severity = "unknown"
+        if inv.trigger_event:
+            ev = session.get(AlertEventRow, inv.trigger_event)
+            if ev is not None:
+                severity = ev.severity or (ev.normalized or {}).get("severity") or "unknown"
     rca_compact = None
     if inv.rca_report:
         rca_compact = inv.rca_report.get("rca_compact")
@@ -105,8 +131,10 @@ def list_investigations(
     limit: int = 50,
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit or 50), 50))
-    # Distinct latest row per investigation_id via DISTINCT ON (PG).
-    # Fallback: order by created_at desc and de-dupe in Python for test SQLite.
+    # Push filters into SQL (including JSONB category) so the page read stays
+    # O(limit) rather than scanning then filtering in Python. De-dupe by
+    # investigation_id in Python for SQLite-friendly unit tests; PG benefits
+    # from the tighter WHERE + ordered limit.
     stmt = select(Investigation).order_by(
         Investigation.created_at.desc(), Investigation.investigation_id.desc()
     )
@@ -114,6 +142,11 @@ def list_investigations(
         stmt = stmt.where(Investigation.status.in_(list(status)))
     if platform_key:
         stmt = stmt.where(Investigation.platform_key == platform_key)
+    if category:
+        # rca_report->root_cause->>category (Appendix D case list filter).
+        stmt = stmt.where(
+            Investigation.rca_report["root_cause"]["category"].as_string() == category
+        )
     if cursor:
         c_at, c_id = _decode_cursor(cursor)
         stmt = stmt.where(
@@ -124,17 +157,16 @@ def list_investigations(
             )
         )
 
-    rows = list(session.scalars(stmt.limit(limit * 4)).all())
-    # De-dupe by investigation_id keeping newest.
+    # Fetch a surplus so de-dupe can still fill `limit` when rare
+    # investigation_id collisions exist across partitions (PK is
+    # (investigation_id, created_at) on a range-partitioned table).
+    fetch_n = max(limit + 1, limit * 4)
+    rows = list(session.scalars(stmt.limit(fetch_n)).all())
     seen: set[uuid.UUID] = set()
     unique: list[Investigation] = []
     for r in rows:
         if r.investigation_id in seen:
             continue
-        if category:
-            cat = ((r.rca_report or {}).get("root_cause") or {}).get("category")
-            if cat != category:
-                continue
         seen.add(r.investigation_id)
         unique.append(r)
         if len(unique) >= limit + 1:
@@ -145,8 +177,34 @@ def list_investigations(
     if len(unique) > limit:
         last = page[-1]
         next_cursor = _encode_cursor(last.created_at, str(last.investigation_id))
+
+    # Batch cost + severity lookups — one query each instead of N+1.
+    costs = sum_llm_costs_batch(session, [inv.investigation_id for inv in page])
+    event_ids = [inv.trigger_event for inv in page if inv.trigger_event]
+    severities: dict[uuid.UUID, str] = {}
+    if event_ids:
+        for ev in session.scalars(
+            select(AlertEventRow).where(AlertEventRow.event_id.in_(event_ids))
+        ):
+            severities[ev.event_id] = (
+                ev.severity or (ev.normalized or {}).get("severity") or "unknown"
+            )
+
+    items = []
+    for inv in page:
+        sev = "unknown"
+        if inv.trigger_event and inv.trigger_event in severities:
+            sev = severities[inv.trigger_event]
+        items.append(
+            investigation_summary(
+                session,
+                inv,
+                cost_usd=costs.get(inv.investigation_id, 0.0),
+                severity=sev,
+            )
+        )
     return {
-        "items": [investigation_summary(session, inv) for inv in page],
+        "items": items,
         "next_cursor": next_cursor,
     }
 

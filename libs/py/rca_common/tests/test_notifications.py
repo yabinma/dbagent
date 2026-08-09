@@ -1,15 +1,18 @@
 """Unit tests for rca_common.notifications (FP-M5-10)."""
 from __future__ import annotations
 
-import asyncio
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
 import pytest
 
 from rca_common.notifications import (
+    REDACTION_PLACEHOLDER,
     format_generic,
     format_slack,
+    sanitize_payload,
+    sanitize_string,
     send_to_webhooks,
     severity_at_least,
 )
@@ -23,13 +26,53 @@ def test_format_generic_shape():
             "platform_key": "p1",
             "severity": "high",
             "summary": "fixed",
+            "digest": "playbook-x",
             "dashboard_url": "http://d/cases/i1",
         },
     )
     assert body["event"] == "case_resolved"
     assert body["platform_key"] == "p1"
     assert body["summary"] == "fixed"
+    assert body["digest"] == "playbook-x"
     assert "occurred_at" in body
+
+
+def test_sanitize_string_redacts_password_pairs_and_userinfo():
+    """C3: marker-bearing subject digests must not leave the control plane."""
+    raw = (
+        "connection-url=jdbc:hive2://x?password=REDACT_SENTINEL_secret "
+        "and scheme://user:hunter2@host/db"
+    )
+    out = sanitize_string(raw)
+    assert "REDACT_SENTINEL_secret" not in out
+    assert "hunter2" not in out
+    assert REDACTION_PLACEHOLDER in out
+    assert "password=" in out
+
+    url = "jdbc:hive2://user:supersecret@host/db"
+    red = sanitize_string(url)
+    assert "supersecret" not in red
+    assert REDACTION_PLACEHOLDER in red
+
+
+def test_sanitize_payload_and_format_generic_carry_digest():
+    payload = {
+        "summary": "approval: password=s3cret",
+        "digest": "password=SECRET_MARKER",
+        "nested": {"token": "token=abc123"},
+        "list": ["api_key=zz"],
+    }
+    out = sanitize_payload(payload)
+    blob = json.dumps(out)
+    assert "s3cret" not in blob
+    assert "SECRET_MARKER" not in blob
+    assert "abc123" not in blob
+    assert "zz" not in blob
+    assert blob.count(REDACTION_PLACEHOLDER) >= 3
+    body = format_generic("approval_requested", out)
+    assert body["digest"] == out["digest"]
+    assert REDACTION_PLACEHOLDER in body["summary"]
+    assert "SECRET_MARKER" not in json.dumps(body)
 
 
 def test_format_slack_block_kit():
@@ -122,5 +165,47 @@ async def test_send_to_webhooks_filters_and_retries():
         assert results[1].get("skipped") is True
         assert results[2].get("skipped") is True
         assert len(_Handler.hits) == 3  # only slack, 3 attempts
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_send_to_webhooks_sanitizes_marker_bearing_digest():
+    """Round 7 C3: free-form digest with password= must be redacted in flight."""
+    _Handler.hits = []
+    _Handler.fail_times = 0
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        marker = "REDACT_SENTINEL_e2e_password_value"
+        results = await send_to_webhooks(
+            [
+                {
+                    "name": "generic",
+                    "url": f"http://127.0.0.1:{port}/hook",
+                    "format": "generic",
+                    "events": ["approval_requested"],
+                    "min_severity": "low",
+                }
+            ],
+            "approval_requested",
+            {
+                "investigation_id": "inv-e2",
+                "platform_key": "p1",
+                "severity": "high",
+                "summary": f"remediation approval requested: password={marker}",
+                "digest": f"password={marker}",
+            },
+            base_backoff_seconds=0.01,
+            max_attempts=1,
+        )
+        assert results[0]["ok"] is True
+        assert len(_Handler.hits) == 1
+        body = _Handler.hits[0].decode("utf-8")
+        assert marker not in body
+        assert REDACTION_PLACEHOLDER in body
+        assert "inv-e2" in body
     finally:
         server.shutdown()

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rca-agent.fullname" . }}-config
+  labels:
+    {{- include "rca-agent.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- /* Merge temporal address for external mode */ -}}
+    {{- $cfg := deepCopy .Values.config -}}
+    {{- if eq .Values.temporal.mode "external" -}}
+    {{- $_ := set $cfg.temporal "address" .Values.temporal.address -}}
+    {{- else if eq .Values.temporal.mode "dev" -}}
+    {{- $_ := set $cfg.temporal "address" (printf "%s-temporal:7233" (include "rca-agent.fullname" .)) -}}
+    {{- end -}}
+    {{- toYaml $cfg | nindent 4 }}

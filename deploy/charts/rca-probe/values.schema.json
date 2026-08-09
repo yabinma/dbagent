@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "writeEnabled": { "type": "boolean" },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 1 },
+    "platformKey": { "type": "string" }
+  }
+}

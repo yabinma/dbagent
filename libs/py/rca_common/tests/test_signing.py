@@ -144,6 +144,88 @@ def test_bootstrap_signing_key_refreshes_sidecar_on_existing_key_path(tmp_path):
     assert signer.public_key_bytes() == signer_2.public_key_bytes()
 
 
+def test_sidecar_write_is_skipped_only_when_the_existing_bytes_match(tmp_path, monkeypatch):
+    """W2: a byte-identical sidecar on a read-only mount is the one case where
+    not writing is correct — and it is proved by a read, before any write."""
+    from pathlib import Path as _Path
+
+    key_path = tmp_path / "ed25519.key"
+    pub_path = tmp_path / "ed25519.key.pub"
+    signer = bootstrap_signing_key(str(key_path))
+    assert base64.b64decode(pub_path.read_bytes()) == signer.public_key_bytes()
+
+    calls: list[str] = []
+    real_write_bytes = _Path.write_bytes
+
+    def _tracking_write_bytes(self, data):
+        calls.append(str(self))
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(_Path, "write_bytes", _tracking_write_bytes)
+    again = bootstrap_signing_key(str(key_path))
+
+    assert again.public_key_bytes() == signer.public_key_bytes()
+    assert calls == [], f"a matching sidecar must not be rewritten; wrote {calls}"
+
+
+def test_sidecar_write_error_propagates_when_existing_bytes_differ(tmp_path, monkeypatch):
+    """W2: a *stale* sidecar plus an unwritable parent must fail loudly — the
+    old code returned successfully, leaving worker and probe-gateway trusting
+    different keys."""
+    from pathlib import Path as _Path
+
+    key_path = tmp_path / "ed25519.key"
+    pub_path = tmp_path / "ed25519.key.pub"
+    bootstrap_signing_key(str(key_path))
+    pub_path.write_bytes(b"c3RhbGUtcHVibGljLWtleQ==")  # someone else's key
+
+    real_write_bytes = _Path.write_bytes
+
+    def _read_only_mount(self, data):
+        if self.name.endswith(".tmp"):
+            raise OSError(30, "Read-only file system")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(_Path, "write_bytes", _read_only_mount)
+
+    with pytest.raises(OSError):
+        bootstrap_signing_key(str(key_path))
+
+    assert pub_path.read_bytes() == b"c3RhbGUtcHVibGljLWtleQ=="
+    assert not (tmp_path / "ed25519.key.pub.tmp").exists()
+
+
+def test_sidecar_write_error_propagates_when_existing_bytes_are_unreadable(
+    tmp_path, monkeypatch
+):
+    """W2: a comparison that could not run is not proof of equality either."""
+    from pathlib import Path as _Path
+
+    key_path = tmp_path / "ed25519.key"
+    pub_path = tmp_path / "ed25519.key.pub"
+    bootstrap_signing_key(str(key_path))
+
+    real_read_bytes = _Path.read_bytes
+    real_write_bytes = _Path.write_bytes
+
+    def _unreadable(self):
+        if self.name.endswith(".pub"):
+            raise OSError(13, "Permission denied")
+        return real_read_bytes(self)
+
+    def _read_only_mount(self, data):
+        if self.name.endswith(".tmp"):
+            raise OSError(30, "Read-only file system")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(_Path, "read_bytes", _unreadable)
+    monkeypatch.setattr(_Path, "write_bytes", _read_only_mount)
+
+    with pytest.raises(OSError):
+        bootstrap_signing_key(str(key_path))
+    assert pub_path.exists()
+
+
 def test_mounted_signer_load_from_path(tmp_path):
     key_path = tmp_path / "ed25519.key"
     bootstrap_signing_key(str(key_path))

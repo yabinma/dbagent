@@ -14,6 +14,7 @@ import (
 
 	rcaprobev1 "github.com/yabinma/dbagent/gen/go/rcaprobe/v1"
 	"github.com/yabinma/dbagent/probe/internal/platform"
+	"github.com/yabinma/dbagent/probe/internal/writeops"
 )
 
 // fakeGatewayServer is a minimal hand-rolled ProbeGatewayServer standing
@@ -97,7 +98,7 @@ func TestClient_RegistersAndReceivesAck(t *testing.T) {
 	stream := dialFakeGateway(t, srv)
 
 	adapter := &fakeAdapter{}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,7 +130,7 @@ func TestClient_RegistrationRejectedReturnsError(t *testing.T) {
 	srv := newFakeGatewayServer()
 	stream := dialFakeGateway(t, srv)
 	adapter := &fakeAdapter{}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- client.Run(context.Background()) }()
@@ -153,7 +154,7 @@ func TestClient_SendsHeartbeats(t *testing.T) {
 	srv := newFakeGatewayServer()
 	stream := dialFakeGateway(t, srv)
 	adapter := &fakeAdapter{}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 	client.HeartbeatInterval = 50 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -175,7 +176,7 @@ func TestClient_DispatchesTaskAndSendsChunkedResult(t *testing.T) {
 	srv := newFakeGatewayServer()
 	stream := dialFakeGateway(t, srv)
 	adapter := &fakeAdapter{executeResult: platform.ToolResult{Tool: "presto_cluster_info", Data: map[string]any{"version": "0.298"}}}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 	client.HeartbeatInterval = time.Hour // avoid heartbeat noise in this test
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,7 +222,7 @@ func TestClient_CancelTaskCancelsContext(t *testing.T) {
 
 	blockCh := make(chan struct{})
 	adapter := &blockingAdapter{unblock: blockCh, sawCancel: make(chan struct{})}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 	client.HeartbeatInterval = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -303,7 +304,7 @@ func TestClient_RefreshManifest_LogsDetectError(t *testing.T) {
 	srv := newFakeGatewayServer()
 	stream := dialFakeGateway(t, srv)
 	adapter := &erroringDetectAdapter{}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 	client.HeartbeatInterval = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -351,7 +352,7 @@ func TestClient_ManifestRefreshReRunsDetect(t *testing.T) {
 	srv := newFakeGatewayServer()
 	stream := dialFakeGateway(t, srv)
 	adapter := &countingDetectAdapter{}
-	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false)
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
 	client.HeartbeatInterval = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -365,6 +366,60 @@ func TestClient_ManifestRefreshReRunsDetect(t *testing.T) {
 	srv.toSend <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Refresh{Refresh: &rcaprobev1.ManifestRefresh{}}}
 
 	waitForCondition(t, 2*time.Second, func() bool { return adapter.detectCalls() >= 2 })
+}
+
+// TestClient_ManifestRefreshSendsSecondRegister proves the production
+// ManifestRefresh path re-Detects and enqueues a second Register with the
+// refreshed AuthStatus (code review round 8, C3) — not merely that Detect ran.
+func TestClient_ManifestRefreshSendsSecondRegister(t *testing.T) {
+	srv := newFakeGatewayServer()
+	stream := dialFakeGateway(t, srv)
+	adapter := &authChangingDetectAdapter{}
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
+	client.HeartbeatInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go client.Run(ctx)
+
+	first := expectFromGateway(t, srv, 2*time.Second)
+	if first.GetRegister() == nil {
+		t.Fatalf("expected initial Register, got %+v", first)
+	}
+	if got := first.GetRegister().GetCapabilities().GetAuth().GetAccess(); got != "full" {
+		t.Fatalf("initial auth access=%q want full", got)
+	}
+	srv.toSend <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Ack{
+		Ack: &rcaprobev1.RegisterAck{ProbeId: "probe-1", Accepted: true},
+	}}
+	srv.toSend <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Refresh{
+		Refresh: &rcaprobev1.ManifestRefresh{},
+	}}
+
+	// Drain heartbeats if any; wait for the mid-session Register carrying
+	// the refreshed (unauthenticated) AuthStatus.
+	deadline := time.Now().Add(2 * time.Second)
+	var second *rcaprobev1.Register
+	for time.Now().Before(deadline) {
+		msg := expectFromGateway(t, srv, time.Until(deadline))
+		if reg := msg.GetRegister(); reg != nil {
+			second = reg
+			break
+		}
+	}
+	if second == nil {
+		t.Fatal("expected mid-session Register after ManifestRefresh")
+	}
+	auth := second.GetCapabilities().GetAuth()
+	if auth == nil || auth.GetAccess() != "unauthenticated" {
+		t.Fatalf("refreshed Register auth=%+v want access=unauthenticated", auth)
+	}
+	if second.GetPlatformKey() != "presto-us1" {
+		t.Fatalf("platform_key=%q", second.GetPlatformKey())
+	}
+	if adapter.detectCalls() < 2 {
+		t.Fatalf("Detect calls=%d want >= 2", adapter.detectCalls())
+	}
 }
 
 type countingDetectAdapter struct {
@@ -381,6 +436,41 @@ func (a *countingDetectAdapter) Detect(ctx context.Context, env platform.Runtime
 }
 
 func (a *countingDetectAdapter) detectCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+// authChangingDetectAdapter returns full access on the first Detect and
+// unauthenticated on subsequent Detects (simulates credential loss between
+// initial registration and ManifestRefresh re-Detect).
+type authChangingDetectAdapter struct {
+	fakeAdapter
+	calls int
+	mu    sync.Mutex
+}
+
+func (a *authChangingDetectAdapter) Detect(ctx context.Context, env platform.RuntimeEnv) (platform.Manifest, error) {
+	a.mu.Lock()
+	a.calls++
+	n := a.calls
+	a.mu.Unlock()
+	auth := platform.AuthStatus{Scheme: "PASSWORD", Access: "full"}
+	if n >= 2 {
+		auth = platform.AuthStatus{
+			Scheme:  "PASSWORD",
+			Access:  "unauthenticated",
+			Missing: []string{"connectivity"},
+		}
+	}
+	return platform.Manifest{
+		PlatformType: "presto",
+		Deployment:   "k8s",
+		Auth:         auth,
+	}, nil
+}
+
+func (a *authChangingDetectAdapter) detectCalls() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.calls

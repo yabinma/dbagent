@@ -73,3 +73,22 @@ func TestLoad_InvalidYAML(t *testing.T) {
 		t.Fatalf("expected error for invalid yaml")
 	}
 }
+
+func TestLoad_EnvInterpolation(t *testing.T) {
+	t.Setenv("PG_DSN", "postgres://u:p@h/db")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.yaml")
+	if err := os.WriteFile(path, []byte("postgres_dsn: ${PG_DSN}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PostgresDSN != "postgres://u:p@h/db" {
+		t.Fatalf("got %q", cfg.PostgresDSN)
+	}
+	if cfg.InternalListenAddr != ":8080" {
+		t.Fatalf("default internal lost: %q", cfg.InternalListenAddr)
+	}
+}

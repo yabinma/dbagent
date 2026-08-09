@@ -164,6 +164,12 @@ func startFakePresto(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"nodeVersion":{"version":"0.298"},"coordinator":true}`))
 	})
+	mux.HandleFunc("/v1/cluster", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"runningQueries":0,"queuedQueries":0,"blockedQueries":0,"activeWorkers":1,"totalMemoryBytes":1000,"reservedMemoryBytes":100}`))
+	})
+	mux.HandleFunc("/v1/node", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
 	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
 			"columns": []map[string]string{{"name": "node_id"}},
@@ -230,6 +236,8 @@ type gatewayStartOpts struct {
 	SigningPubKeyPath string
 	// EnableInternalHTTP binds POST /internal/v1/execute (design.md §3.2 / M5 write wire).
 	EnableInternalHTTP bool
+	// SigningKeyPollInterval overrides signing_key_poll_interval (empty → "1h").
+	SigningKeyPollInterval string
 }
 
 func startGatewaySubprocess(t *testing.T, gatewayBin, dsn string) *gatewayProcess {
@@ -264,6 +272,10 @@ func startGatewaySubprocessOpts(t *testing.T, gatewayBin, dsn string, opts gatew
 		// Empty disables the listener (config defaults would otherwise bind :8080).
 		internalLine = "internal_listen_addr: \"\"\n"
 	}
+	pollInterval := opts.SigningKeyPollInterval
+	if pollInterval == "" {
+		pollInterval = "1h"
+	}
 
 	cfg := fmt.Sprintf(`
 session_listen_addr: %q
@@ -275,13 +287,14 @@ signing_public_key_path: %q
 gateway_replica: functest-replica
 heartbeat_timeout: 3s
 heartbeat_check_interval: 1s
-signing_key_poll_interval: 1h
+signing_key_poll_interval: %s
 server_cert_sans: ["127.0.0.1"]
 %s
 `,
 		sessionAddr, bootstrapAddr, dsn,
 		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
 		pubKeyPath,
+		pollInterval,
 		internalLine,
 	)
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -361,9 +374,20 @@ type probeConfig struct {
 	// write_enabled deployment flag). Default false matches production-safe
 	// registration tests; M5 write-path tests set true.
 	WriteEnabled bool
+	// SigningKeyGraceWindow, when non-empty, is written as
+	// signing_key_grace_window (empty → omit; probe default 10m applies).
+	SigningKeyGraceWindow string
 }
 
 func startProbeSubprocess(t *testing.T, probeBin string, pc probeConfig) *exec.Cmd {
+	t.Helper()
+	cmd, _ := startProbeSubprocessWithLog(t, probeBin, pc)
+	return cmd
+}
+
+// startProbeSubprocessWithLog is startProbeSubprocess that also returns the
+// probe log path (design.md §9.6.7 FP-KR-23 synchronization point).
+func startProbeSubprocessWithLog(t *testing.T, probeBin string, pc probeConfig) (*exec.Cmd, string) {
 	t.Helper()
 	dir := t.TempDir()
 	if pc.CredentialsMount == "" {
@@ -379,6 +403,11 @@ func startProbeSubprocess(t *testing.T, probeBin string, pc probeConfig) *exec.C
 		t.Fatalf("split presto host port: %v", err)
 	}
 
+	graceLine := ""
+	if pc.SigningKeyGraceWindow != "" {
+		graceLine = fmt.Sprintf("signing_key_grace_window: %s\n", pc.SigningKeyGraceWindow)
+	}
+
 	cfg := fmt.Sprintf(`
 platform_key: %q
 gateway_address: %q
@@ -391,19 +420,21 @@ docker_api_base_url: %q
 credentials_mount: %q
 state_dir: %q
 write_enabled: %t
+%s
 `,
 		pc.PlatformKey, pc.GatewayAddr, pc.BootstrapAddr, pc.BootstrapToken,
 		prestoPort, pc.DockerAPIURL, pc.CredentialsMount, filepath.Join(dir, "state"),
-		pc.WriteEnabled,
+		pc.WriteEnabled, graceLine,
 	)
 	cfgPath := filepath.Join(dir, "probe.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatalf("write probe config: %v", err)
 	}
 
+	logPath := filepath.Join(dir, "probe.log")
 	cmd := exec.Command(probeBin)
 	cmd.Env = append(os.Environ(), "PROBE_CONFIG="+cfgPath)
-	logFile, err := os.Create(filepath.Join(dir, "probe.log"))
+	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create log file: %v", err)
 	}
@@ -418,12 +449,12 @@ write_enabled: %t
 			_, _ = cmd.Process.Wait()
 		}
 		if t.Failed() {
-			if content, err := os.ReadFile(filepath.Join(dir, "probe.log")); err == nil {
+			if content, err := os.ReadFile(logPath); err == nil {
 				t.Logf("probe log:\n%s", content)
 			}
 		}
 	})
-	return cmd
+	return cmd, logPath
 }
 
 // --- Postgres seeding/assertions ---------------------------------------------------

@@ -1,0 +1,51 @@
+# Docker Swarm stack for the data-plane probe (design.md FP-M6-12).
+# Deploy: docker stack deploy -c deploy/compose/probe-swarm-stack.yml rca-probe
+# Secrets: bootstrap_token, username, password (platform credentials).
+# Config:  config.yaml via Docker config.
+
+version: "3.8"
+
+services:
+  probe:
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/probe:${APP_VERSION:-0.1.0}
+    environment:
+      PROBE_CONFIG: /etc/rca-probe/config.yaml
+      # Config uses bootstrap_token: ${BOOTSTRAP_TOKEN}. Swarm cannot inject
+      # secret contents into env directly; the probe reads BOOTSTRAP_TOKEN_FILE
+      # when the expanded token is empty (Docker secret-file convention).
+      BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap_token
+    configs:
+      - source: probe_config
+        target: /etc/rca-probe/config.yaml
+    secrets:
+      - source: bootstrap_token
+        target: bootstrap_token
+      - source: platform_username
+        target: /etc/rca-probe/platform-credentials/username
+      - source: platform_password
+        target: /etc/rca-probe/platform-credentials/password
+    volumes:
+      - probe-state:/var/lib/rca-probe
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+configs:
+  probe_config:
+    file: ./config/probe.yaml
+
+secrets:
+  bootstrap_token:
+    external: true
+  platform_username:
+    external: true
+  platform_password:
+    external: true
+
+volumes:
+  probe-state:

@@ -1,0 +1,97 @@
+# Combined e2e fixture set for the in-cluster mock LLM (FP-M6-17).
+# Rules are ordered; prompt_contains disambiguates scenarios that share agent_role.
+# E1 worker OOM — MUST NOT set settle_seconds on adjust_memory_config (rev 2.4).
+- when: {agent_role: planner, prompt_contains: "OOM"}
+  respond: e1/planner.json
+  repeat: all
+- when: {agent_role: collector, prompt_contains: "OOM"}
+  respond: e1/collector.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "OOM"}
+  respond: e1/rca.json
+  repeat: all
+- when: {agent_role: remediation, prompt_contains: "OOM"}
+  respond: e1/remediation.json
+  repeat: all
+- when: {agent_role: planner, prompt_contains: "memory"}
+  respond: e1/planner.json
+  repeat: all
+- when: {agent_role: collector, prompt_contains: "memory"}
+  respond: e1/collector.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "memory"}
+  respond: e1/rca.json
+  repeat: all
+- when: {agent_role: remediation, prompt_contains: "memory"}
+  respond: e1/remediation.json
+  repeat: all
+# E2 broken catalog / configuration
+- when: {agent_role: planner, prompt_contains: "catalog"}
+  respond: e2/planner.json
+  repeat: all
+- when: {agent_role: collector, prompt_contains: "catalog"}
+  respond: e2/collector.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "catalog"}
+  respond: e2/rca.json
+  repeat: all
+- when: {agent_role: remediation, prompt_contains: "catalog"}
+  respond: e2/remediation.json
+  repeat: all
+- when: {agent_role: planner, prompt_contains: "broken.properties"}
+  respond: e2/planner.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "broken.properties"}
+  respond: e2/rca.json
+  repeat: all
+# E3 queue saturation → CLOSED_SUMMARY, no playbook
+- when: {agent_role: planner, prompt_contains: "queue"}
+  respond: e3/planner.json
+  repeat: all
+- when: {agent_role: collector, prompt_contains: "queue"}
+  respond: e3/collector.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "queue"}
+  respond: e3/rca.json
+  repeat: all
+- when: {agent_role: remediation, prompt_contains: "queue"}
+  respond: e3/remediation.json
+  repeat: all
+- when: {agent_role: planner, prompt_contains: "QUEUED"}
+  respond: e3/planner.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "QUEUED"}
+  respond: e3/rca.json
+  repeat: all
+# E4 runaway query → kill_query
+- when: {agent_role: planner, prompt_contains: "runaway"}
+  respond: e4/planner.json
+  repeat: all
+- when: {agent_role: collector, prompt_contains: "runaway"}
+  respond: e4/collector.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "runaway"}
+  respond: e4/rca.json
+  repeat: all
+- when: {agent_role: remediation, prompt_contains: "runaway"}
+  respond: e4/remediation.json
+  repeat: all
+- when: {agent_role: planner, prompt_contains: "kill"}
+  respond: e4/planner.json
+  repeat: all
+- when: {agent_role: rca, prompt_contains: "kill"}
+  respond: e4/rca.json
+  repeat: all
+# Fallbacks by agent_role (E1-shaped) so unknown prompts still progress.
+- when: {agent_role: planner}
+  respond: e1/planner.json
+  repeat: all
+- when: {agent_role: collector}
+  respond: e1/collector.json
+  repeat: all
+- when: {agent_role: rca}
+  respond: e1/rca.json
+  repeat: all
+- when: {agent_role: remediation}
+  respond: e1/remediation.json
+  repeat: all

@@ -475,14 +475,24 @@ class InvestigationWorkflow:
         self._awaiting_approval_id = approval_id
         self._status = "AWAITING_APPROVAL"
         # Non-blocking notification (Section 9.5.3); failures are swallowed.
+        # Include subject description in digest so free-form marker-bearing
+        # text reaches the notification sanitizer/formatter (round 7, C3) —
+        # a fixed "<kind> approval requested" summary alone made E2's
+        # notification redaction assertion vacuous.
+        subject_digest = (
+            subject.get("description")
+            or subject.get("playbook_id")
+            or subject.get("command")
+            or kind
+        )
         await self._notify(
             "approval_requested",
             {
                 "investigation_id": investigation_id,
                 "platform_key": self._platform_key,
                 "severity": self._severity,
-                "summary": f"{kind} approval requested",
-                "digest": subject.get("playbook_id") or subject.get("command") or kind,
+                "summary": f"{kind} approval requested: {subject_digest}",
+                "digest": str(subject_digest),
                 "approval_kind": kind,
             },
         )

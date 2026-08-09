@@ -20,6 +20,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Design §14.1 requires *strictly above* 80%. Accept a threshold argument for
+# the floor that must be exceeded (default 80 → fail at 80.0%, pass at 80.01%).
 THRESHOLD="${1:-80}"
 PROFILE="$(mktemp)"
 trap 'rm -f "$PROFILE"' EXIT
@@ -28,7 +30,7 @@ echo "==> go test ./... -coverprofile=$PROFILE"
 go test ./... -coverprofile="$PROFILE" -covermode=atomic -timeout 300s
 
 echo
-echo "==> per-package coverage (excluding gen/go/... and cmd/*/main.go's main() function)"
+echo "==> per-package coverage (excluding gen/go/... and cmd/*/main.go's main() function; must be strictly > ${THRESHOLD}%)"
 
 python3 - "$PROFILE" "$THRESHOLD" "$ROOT" << 'PYEOF'
 import re
@@ -107,8 +109,9 @@ failed = []
 for pkg in sorted(pkg_stats):
     total, covered = pkg_stats[pkg]
     pct = (covered / total * 100) if total else 100.0
-    status = "OK" if pct >= threshold else "FAIL"
-    if pct < threshold:
+    # Strict inequality: design requires *above* 80%, not equal.
+    status = "OK" if pct > threshold else "FAIL"
+    if pct <= threshold:
         failed.append(pkg)
     print(f"{status:4s} {pct:6.1f}%  {covered:4d}/{total:<4d}  {pkg}")
 
@@ -118,14 +121,14 @@ print(f"TOTAL (excluding generated code + main()): {overall[1]}/{overall[0]} = {
 
 if failed:
     print()
-    print(f"FAILED: {len(failed)} package(s) below {threshold}%:")
+    print(f"FAILED: {len(failed)} package(s) at or below {threshold}%:")
     for p in failed:
         print(f"  - {p}")
     sys.exit(1)
 
-if overall_pct < threshold:
-    print(f"FAILED: repo-wide coverage {overall_pct:.1f}% is below {threshold}%")
+if overall_pct <= threshold:
+    print(f"FAILED: repo-wide coverage {overall_pct:.1f}% is not strictly above {threshold}%")
     sys.exit(1)
 
-print(f"PASS: every package and the repo total are >= {threshold}%")
+print(f"PASS: every package and the repo total are strictly above {threshold}%")
 PYEOF

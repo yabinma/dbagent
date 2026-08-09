@@ -426,3 +426,41 @@ func TestK8sSwarmOnlyWriteMethodsError(t *testing.T) {
 		t.Fatalf("expected swarm-only error")
 	}
 }
+
+func TestReadConfigMapKey(t *testing.T) {
+	cs := fakeclientset.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm1", Namespace: "ns"},
+		Data:       map[string]string{"config.properties": "a=1\n", "other": "x"},
+	})
+	env := New(cs, nil, Config{Namespace: "ns"}, nil)
+
+	// Default key = config.properties
+	v, err := env.ReadConfigMapKey(context.Background(), "ns", "cm1", "")
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if v != "a=1\n" {
+		t.Fatalf("got %q", v)
+	}
+
+	// Explicit key
+	v, err = env.ReadConfigMapKey(context.Background(), "", "cm1", "other")
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if v != "x" {
+		t.Fatalf("got %q", v)
+	}
+
+	// Missing key
+	_, err = env.ReadConfigMapKey(context.Background(), "ns", "cm1", "nope")
+	if err == nil {
+		t.Fatal("expected missing key error")
+	}
+
+	// Missing ConfigMap
+	_, err = env.ReadConfigMapKey(context.Background(), "ns", "missing", "config.properties")
+	if err == nil {
+		t.Fatal("expected missing cm error")
+	}
+}

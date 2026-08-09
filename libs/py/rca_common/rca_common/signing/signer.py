@@ -134,10 +134,31 @@ def bootstrap_signing_key(key_path: str) -> MountedEd25519Signer:
 
 
 def _write_public_key_sidecar(pub_path: Path, public_key_bytes: bytes) -> None:
+    desired = base64.b64encode(public_key_bytes)
+    # Read-only Secret mounts (K8s) already carry the .pub written by the
+    # signing-key hook Job — do not attempt a write that would raise EROFS.
+    # The *only* sanctioned reason to skip the write is a read that has
+    # **proved** the sidecar already holds exactly these bytes: mere existence
+    # is not proof.  A mismatched (or unreadable) sidecar that swallowed the
+    # write error would leave probe-gateway verifying RegisterAck against a
+    # different public key than the worker signs with, silently (code review
+    # round 5, W2).
+    if pub_path.exists():
+        try:
+            if pub_path.read_bytes() == desired:
+                return
+        except OSError:
+            # Could not prove equality — fall through and write; any failure
+            # from here on must surface to the caller.
+            pass
     tmp_path = pub_path.with_suffix(pub_path.suffix + ".tmp")
-    tmp_path.write_bytes(base64.b64encode(public_key_bytes))
-    os.chmod(tmp_path, 0o644)
-    os.replace(tmp_path, pub_path)
+    try:
+        tmp_path.write_bytes(desired)
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, pub_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def verify(public_key_bytes: bytes, message: bytes, signature: bytes) -> bool:

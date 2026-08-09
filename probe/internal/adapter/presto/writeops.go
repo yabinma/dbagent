@@ -91,29 +91,24 @@ func (a *Adapter) applyMemoryConfigWhitelist(ctx context.Context, step platform.
 	}
 
 	// Read-merge-write: only the whitelisted Presto memory properties into the
-	// target config file / service env (design.md Section 9.5.3).
+	// target config file / service env (design.md Section 9.5.3 / FP-M6-29 S3).
 	if step.Op == "k8s_patch_configmap" {
-		// Each patch value is full file content in Appendix B.5 literal form,
-		// but for adjust_memory_config the control plane may send property
-		// key/value pairs where key is the Presto property name. We treat
-		// patches as property overlays onto the existing ConfigMap data key
-		// (defaults to config.properties) when values look like bare property
-		// values rather than multi-line files — still merge safely either way.
+		// Read the *same* ConfigMap that will be patched (namespace/name from
+		// step.Params), not a conventional component name. Fail closed on
+		// read error so we never merge onto an empty base and discard
+		// non-whitelisted Presto properties.
 		name, _ := step.Params["name"].(string)
 		namespace, _ := step.Params["namespace"].(string)
-		// Read current config.properties (or first patch key as file name).
 		fileKey := "config.properties"
-		current, readErr := a.env.ReadConfig(ctx, "worker", "config", "")
+		current, readErr := a.env.ReadConfigMapKey(ctx, namespace, name, fileKey)
 		if readErr != nil {
-			// Fall back to empty base if unreadable — still only write whitelist keys.
-			current = ""
+			return nil, fmt.Errorf("read configmap %s/%s key %s: %w", namespace, name, fileKey, readErr)
 		}
 		mergedContent := mergeProperties(current, patches)
 		out := copyMap(step.Params)
 		out["patches"] = []any{
 			map[string]any{"key": fileKey, "value": mergedContent},
 		}
-		// Keep original name/namespace.
 		if name != "" {
 			out["name"] = name
 		}

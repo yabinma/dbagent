@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/yabinma/dbagent/internal/envexpand"
 )
 
 type Config struct {
@@ -74,13 +76,28 @@ func defaults() Config {
 }
 
 // Load reads a YAML config file, applying defaults for any unset fields.
+// ${ENV_VAR} placeholders are expanded after YAML parsing (FP-M6-10).
 func Load(path string) (Config, error) {
 	cfg := defaults()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, err
 	}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	if len(raw) == 0 {
+		return cfg, nil
+	}
+	// Expand then re-marshal so Unmarshal into defaults-preserving cfg
+	// keeps zero/unset fields at their defaults (same as pre-M6 Load).
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		return Config{}, err
+	}
+	envexpand.ExpandNode(&root)
+	expanded, err := yaml.Marshal(&root)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := yaml.Unmarshal(expanded, &cfg); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

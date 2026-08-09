@@ -4,8 +4,12 @@ package config
 
 import (
 	"os"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/yabinma/dbagent/internal/envexpand"
 )
 
 // Probe mirrors design.md Appendix E's `probe:` deployment-parameter block.
@@ -36,13 +40,20 @@ type Probe struct {
 	// "http://docker"). Configurable mainly so functional tests can point
 	// it at an httptest-mocked Docker API instead of a real daemon.
 	DockerAPIBaseURL string `yaml:"docker_api_base_url"`
+	// SigningKeyGraceWindow is D14's rotation grace: how long the
+	// pre-rotation control-plane signing public key keeps verifying
+	// write-ops after a mid-session key update (design.md §9.6 /
+	// Appendix A.2). Default 10m. Held per probe process so it survives
+	// reconnects (A.2 rule 8).
+	SigningKeyGraceWindow time.Duration `yaml:"signing_key_grace_window"`
 }
 
 func defaults() Probe {
 	return Probe{
-		CredentialsMount: "/etc/rca-probe/platform-credentials",
-		StateDir:         "/var/lib/rca-probe",
-		DockerAPIBaseURL: "http://docker",
+		CredentialsMount:      "/etc/rca-probe/platform-credentials",
+		StateDir:              "/var/lib/rca-probe",
+		DockerAPIBaseURL:      "http://docker",
+		SigningKeyGraceWindow: 10 * time.Minute,
 	}
 }
 
@@ -52,8 +63,37 @@ func Load(path string) (Probe, error) {
 	if err != nil {
 		return Probe{}, err
 	}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	if len(raw) == 0 {
+		return cfg, nil
+	}
+	// Post-parse ${ENV_VAR} expansion (design.md FP-M6-10): expand after
+	// YAML parsing so secret values with YAML-significant characters are safe.
+	// Re-marshal + Unmarshal into cfg preserves defaults for unset fields
+	// (yaml.Node.Decode would zero missing fields).
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
 		return Probe{}, err
+	}
+	envexpand.ExpandNode(&root)
+	expanded, err := yaml.Marshal(&root)
+	if err != nil {
+		return Probe{}, err
+	}
+	if err := yaml.Unmarshal(expanded, &cfg); err != nil {
+		return Probe{}, err
+	}
+	// Docker Swarm / Compose secret-file convention: when bootstrap_token is
+	// empty after ${VAR} expansion, load it from BOOTSTRAP_TOKEN_FILE (the
+	// mounted secret path). Keeps secrets out of process env while letting
+	// probe-swarm-stack.yml enroll (FP-M6-12).
+	if cfg.BootstrapToken == "" {
+		if filePath := os.Getenv("BOOTSTRAP_TOKEN_FILE"); filePath != "" {
+			rawTok, err := os.ReadFile(filePath)
+			if err != nil {
+				return Probe{}, err
+			}
+			cfg.BootstrapToken = strings.TrimSpace(string(rawTok))
+		}
 	}
 	return cfg, nil
 }

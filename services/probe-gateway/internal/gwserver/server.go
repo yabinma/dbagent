@@ -9,6 +9,7 @@ package gwserver
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"google.golang.org/grpc/peer"
 
 	rcaprobev1 "github.com/yabinma/dbagent/gen/go/rcaprobe/v1"
+	"github.com/yabinma/dbagent/services/probe-gateway/internal/audit"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/registry"
 )
 
@@ -53,6 +55,7 @@ type sessionHandle struct {
 	lastHeartbeat time.Time
 	pending       map[string]chan taskOutcome
 	chunks        map[string]map[uint32][]byte
+	lastKeySent   []byte // key last handed in RegisterAck / key-update (§9.6.5)
 }
 
 func newSessionHandle(probeID, platformKey string) *sessionHandle {
@@ -205,9 +208,25 @@ type Server struct {
 	GatewayReplica   string
 	HeartbeatTimeout time.Duration
 
+	// AuditDB is the optional Postgres handle used for credentials_* audit
+	// rows (FP-M6-25). Nil means "auditing not wired" — a silent no-op used
+	// by every Fake-registry unit test. Set from main via registry.PG.DB.
+	AuditDB *sql.DB
+
 	mu                 sync.Mutex
 	sessionsByPlatform map[string]*sessionHandle
 	signingPublicKey   []byte // control-plane's current ed25519 public key (D14, embedded in RegisterAck)
+
+	// admitHook, when non-nil, is called by admitSession while it still holds
+	// s.mu, after the key this session will be admitted with has been captured
+	// and before that key has been recorded or its RegisterAck enqueued. It is
+	// nil in production and exists for exactly one reason: the atomicity of this
+	// function is a property of an *interleaving*, and an interleaving the
+	// implementation is required to make impossible cannot be produced by a real
+	// race — a test that merely spawned a rotation goroutine and hoped for the
+	// right ordering would pass against a non-atomic implementation whenever the
+	// scheduler was kind, which is most of the time (design.md §9.6.7, FP-KR-26).
+	admitHook func()
 }
 
 func New(reg registry.Registry, signingPublicKey []byte, gatewayReplica string) *Server {
@@ -220,12 +239,11 @@ func New(reg registry.Registry, signingPublicKey []byte, gatewayReplica string) 
 	}
 }
 
-// SetSigningPublicKey updates the key embedded in future RegisterAcks
-// (design.md D14 rotation: "probe-gateway broadcasts ManifestRefresh" is
-// the probe-side trigger to re-Detect; this setter is what lets a
-// background refresher -- services/probe-gateway/internal/signingkeys --
-// keep probe-gateway itself current without a restart). Safe for
-// concurrent use with Session().
+// SetSigningPublicKey publishes the key future admission RegisterAcks carry.
+// A rotation reaches already-connected sessions when pollSigningKey calls
+// this setter and then PropagateSigningKey (§9.6.5), which pushes the new
+// key to each connected session as a mid-session RegisterAck (Appendix A.2).
+// Safe for concurrent use with Session().
 func (s *Server) SetSigningPublicKey(key []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -305,18 +323,21 @@ func (s *Server) Session(stream rcaprobev1.ProbeGateway_SessionServer) error {
 	// existing probe's UUID on reconnect rather than minting a new one
 	// every time (design.md D11: "one probe per Presto cluster").
 	probeID := ""
+	var prevCaps map[string]any
 	if existing, found, ferr := s.Registry.FindProbeByPlatform(stream.Context(), platform.PlatformKey); ferr == nil && found {
 		probeID = existing.ProbeID
+		prevCaps = existing.Capabilities
 	} else {
 		probeID = uuid.NewString()
 	}
 	handle := newSessionHandle(probeID, platform.PlatformKey)
 
+	newCaps := capabilitiesToMap(reg.GetCapabilities())
 	if err := s.Registry.UpsertProbe(stream.Context(), registry.Probe{
 		ProbeID:        probeID,
 		PlatformKey:    platform.PlatformKey,
 		Version:        reg.GetProbeVersion(),
-		Capabilities:   capabilitiesToMap(reg.GetCapabilities()),
+		Capabilities:   newCaps,
 		Status:         registry.ProbeOnline,
 		GatewayReplica: s.GatewayReplica,
 		LastHeartbeat:  time.Now().UTC(),
@@ -335,29 +356,8 @@ func (s *Server) Session(stream rcaprobev1.ProbeGateway_SessionServer) error {
 	if err := s.Registry.UpdatePlatformStatus(stream.Context(), platform.PlatformKey, newStatus); err != nil {
 		log.Printf("gwserver: update platform status for %s: %v", platform.PlatformKey, err)
 	}
-
-	s.mu.Lock()
-	s.sessionsByPlatform[platform.PlatformKey] = handle
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		if s.sessionsByPlatform[platform.PlatformKey] == handle {
-			delete(s.sessionsByPlatform, platform.PlatformKey)
-		}
-		s.mu.Unlock()
-		handle.close()
-
-		// The TCP/mTLS connection is now definitely gone (whether from a
-		// clean shutdown or a crash/network partition) -- mark the probe
-		// offline immediately rather than waiting for the heartbeat-timeout
-		// reaper (CheckStaleProbes), which only catches the rarer case of a
-		// session that's still technically connected but has gone silent.
-		// Use context.Background() since stream.Context() is already
-		// cancelled/done at this point.
-		if err := s.Registry.UpdateProbeStatus(context.Background(), probeID, registry.ProbeOffline); err != nil {
-			log.Printf("gwserver: mark probe %s offline on disconnect: %v", probeID, err)
-		}
-	}()
+	// FP-M6-25: emit credentials_* audit rows on AuthStatus transitions.
+	s.emitCredentialAudits(stream.Context(), probeID, platform.PlatformKey, prevCaps, reg.GetCapabilities().GetAuth())
 
 	writerErr := make(chan error, 1)
 	go func() {
@@ -379,9 +379,29 @@ func (s *Server) Session(stream rcaprobev1.ProbeGateway_SessionServer) error {
 		}
 	}()
 
-	handle.outbound <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Ack{
-		Ack: &rcaprobev1.RegisterAck{ProbeId: probeID, Accepted: true, SigningPublicKey: s.getSigningPublicKey()},
-	}}
+	// admitSession publishes the handle and enqueues the first RegisterAck
+	// under one s.mu hold so a concurrent rotation cannot regress the key
+	// sequence (design.md §9.6.5 / Appendix A.2 rule 9).
+	s.admitSession(platform.PlatformKey, handle, probeID)
+	defer func() {
+		s.mu.Lock()
+		if s.sessionsByPlatform[platform.PlatformKey] == handle {
+			delete(s.sessionsByPlatform, platform.PlatformKey)
+		}
+		s.mu.Unlock()
+		handle.close()
+
+		// The TCP/mTLS connection is now definitely gone (whether from a
+		// clean shutdown or a crash/network partition) -- mark the probe
+		// offline immediately rather than waiting for the heartbeat-timeout
+		// reaper (CheckStaleProbes), which only catches the rarer case of a
+		// session that's still technically connected but has gone silent.
+		// Use context.Background() since stream.Context() is already
+		// cancelled/done at this point.
+		if err := s.Registry.UpdateProbeStatus(context.Background(), probeID, registry.ProbeOffline); err != nil {
+			log.Printf("gwserver: mark probe %s offline on disconnect: %v", probeID, err)
+		}
+	}()
 
 	for {
 		msg, err := stream.Recv()
@@ -404,7 +424,88 @@ func (s *Server) Session(stream rcaprobev1.ProbeGateway_SessionServer) error {
 			handle.receiveResult(m.Result)
 		case *rcaprobev1.ProbeMessage_Register:
 			// Re-registration mid-session (e.g. after a ManifestRefresh
-			// re-Detect): update capabilities, no new RegisterAck needed.
+			// re-Detect): update capabilities + platform status + credential
+			// audits; no new RegisterAck needed.
+			s.handleMidSessionRegister(stream.Context(), probeID, platform.PlatformKey, m.Register)
+		}
+	}
+}
+
+// handleMidSessionRegister updates capabilities/status and fires credential
+// audits when a probe re-Detects after ManifestRefresh (FP-M6-25). No new
+// RegisterAck is sent: key delivery is the gateway-push path
+// (PropagateSigningKey / Appendix A.2), never a reply to re-registration
+// (design.md §9.6.2 leaves this deliberate; A.2 rule 7).
+func (s *Server) handleMidSessionRegister(ctx context.Context, probeID, platformKey string, reg *rcaprobev1.Register) {
+	if reg == nil {
+		return
+	}
+	var prevCaps map[string]any
+	if existing, found, err := s.Registry.FindProbeByPlatform(ctx, platformKey); err == nil && found {
+		prevCaps = existing.Capabilities
+	}
+	newCaps := capabilitiesToMap(reg.GetCapabilities())
+	if err := s.Registry.UpsertProbe(ctx, registry.Probe{
+		ProbeID:        probeID,
+		PlatformKey:    platformKey,
+		Version:        reg.GetProbeVersion(),
+		Capabilities:   newCaps,
+		Status:         registry.ProbeOnline,
+		GatewayReplica: s.GatewayReplica,
+		LastHeartbeat:  time.Now().UTC(),
+	}); err != nil {
+		log.Printf("gwserver: mid-session upsert probe %s: %v", probeID, err)
+	}
+	newStatus := platformStatusFromAuth(reg.GetCapabilities().GetAuth())
+	if err := s.Registry.UpdatePlatformStatus(ctx, platformKey, newStatus); err != nil {
+		log.Printf("gwserver: mid-session update platform status for %s: %v", platformKey, err)
+	}
+	s.emitCredentialAudits(ctx, probeID, platformKey, prevCaps, reg.GetCapabilities().GetAuth())
+}
+
+// emitCredentialAudits writes transition-driven credentials_* audit rows.
+// Non-fatal on error (same posture as UpdatePlatformStatus).
+func (s *Server) emitCredentialAudits(ctx context.Context, probeID, platformKey string, prevCaps map[string]any, auth *rcaprobev1.AuthStatus) {
+	if s.AuditDB == nil || auth == nil {
+		return
+	}
+	curr := audit.AuthSnapshot{
+		Scheme:  auth.GetScheme(),
+		Access:  auth.GetAccess(),
+		Missing: auth.GetMissing(),
+	}
+	var prev *audit.AuthSnapshot
+	if prevCaps != nil {
+		if a, ok := prevCaps["auth"].(map[string]any); ok {
+			ps := audit.AuthSnapshot{}
+			if v, ok := a["scheme"].(string); ok {
+				ps.Scheme = v
+			}
+			if v, ok := a["access"].(string); ok {
+				ps.Access = v
+			}
+			if raw, ok := a["missing"].([]any); ok {
+				for _, m := range raw {
+					if s, ok := m.(string); ok {
+						ps.Missing = append(ps.Missing, s)
+					}
+				}
+			} else if raw, ok := a["missing"].([]string); ok {
+				ps.Missing = raw
+			}
+			prev = &ps
+		}
+	}
+	detail := map[string]any{
+		"platform_key": platformKey,
+		"auth_scheme":  curr.Scheme,
+		"access":       curr.Access,
+		"missing":      curr.Missing,
+	}
+	actor := "probe:" + probeID
+	for _, action := range audit.Transitions(prev, curr) {
+		if err := audit.Write(ctx, s.AuditDB, action, actor, platformKey, detail); err != nil {
+			log.Printf("gwserver: audit %s for %s: %v", action, platformKey, err)
 		}
 	}
 }

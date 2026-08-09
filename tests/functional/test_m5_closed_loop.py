@@ -505,7 +505,7 @@ async def test_m5_closed_loop_e2e(postgres_dsn, tmp_path, webhook_receiver):
     result, probe, factory, inv, signer = await _run_closed_loop(
         postgres_dsn, tmp_path, webhook_receiver, settle_seconds=0
     )
-    assert result.get("status") == "RESOLVED" or result.get("rca_report")
+    assert result.get("status") == "RESOLVED"
 
     with factory() as session:
         from sqlalchemy import select
@@ -612,7 +612,7 @@ async def test_m5_verify_fix_union_and_canary(postgres_dsn, tmp_path, webhook_re
     result, probe, factory, inv, _ = await _run_closed_loop(
         postgres_dsn, tmp_path, webhook_receiver
     )
-    assert result.get("status") == "RESOLVED" or "RESOLVED" in str(result)
+    assert result.get("status") == "RESOLVED"
     health_calls = [c for c in probe.calls if c.get("kind") == "health"]
     assert health_calls, "expected canary health check"
     with factory() as session:
@@ -665,7 +665,7 @@ async def test_m5_settle_window_timer(postgres_dsn, tmp_path, webhook_receiver):
     result, _, _, _, _ = await _run_closed_loop(
         postgres_dsn, tmp_path, webhook_receiver, settle_seconds=2
     )
-    assert result.get("status") == "RESOLVED" or "RESOLVED" in str(result)
+    assert result.get("status") == "RESOLVED"
 
 
 @pytest.mark.asyncio
@@ -934,3 +934,28 @@ def test_b7_sign_verify_roundtrip_under_10ms(tmp_path):
         nacl.signing.VerifyKey(signer.public_key_bytes()).verify(h, sig)
     elapsed_ms = (time.perf_counter() - start) / 50 * 1000
     assert elapsed_ms < 10.0, f"B7 round trip {elapsed_ms:.3f}ms >= 10ms"
+
+
+@pytest.mark.asyncio
+async def test_m5_verify_fix_fails_closed_on_missing_wiring(postgres_dsn, tmp_path):
+    """FP-M6-27 / S1: verify_fix fails closed when wiring is incomplete."""
+    from worker.activities.investigation import InvestigationActivities
+    from rca_common.db.session import make_engine, make_session_factory
+
+    engine = make_engine(postgres_dsn)
+    factory = make_session_factory(engine)
+    acts = InvestigationActivities(
+        session_factory=factory,
+        llm_client=None,
+        probe_client=None,
+        object_store=None,
+        config=None,
+        signer=None,
+    )
+    inv = str(__import__("uuid").uuid4())
+    result = await acts.verify_fix(
+        {"investigation_id": inv, "verification_plan": ["presto_list_queries"]}
+    )
+    assert result["ok"] is False
+    checks = result.get("checks") or []
+    assert any(c.get("name") == "wiring" and c.get("ok") is False for c in checks)

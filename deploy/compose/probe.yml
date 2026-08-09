@@ -1,0 +1,19 @@
+# Single-node Docker probe (design.md FP-M6-12).
+# write_enabled defaults to false; set true and remount write-capable docker socket carefully.
+name: rca-probe
+
+services:
+  probe:
+    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/probe:${APP_VERSION:-0.1.0}
+    environment:
+      PROBE_CONFIG: /etc/rca-probe/config.yaml
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
+    volumes:
+      - ./config/probe.yaml:/etc/rca-probe/config.yaml:ro
+      - probe-state:/var/lib/rca-probe
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${PLATFORM_CREDENTIALS_DIR:-./platform-credentials}:/etc/rca-probe/platform-credentials:ro
+    restart: unless-stopped
+
+volumes:
+  probe-state:

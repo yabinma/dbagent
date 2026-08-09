@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -8,20 +9,26 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 
 	rcaprobev1 "github.com/yabinma/dbagent/gen/go/rcaprobe/v1"
 	"github.com/yabinma/dbagent/internal/bootstrapca"
@@ -38,12 +45,31 @@ import (
 // calls (runSessionListener, runBootstrapListener, pollSigningKey) is
 // independently tested below with real TCP+TLS listeners.
 
+// TestMainWiresAuditDBFromRegistry proves production FP-M6-25 wiring:
+// newSessionServer attaches the registry's *sql.DB as AuditDB. Deleting
+// `gw.AuditDB = reg.DB` from newSessionServer fails this test (review C3).
+func TestMainWiresAuditDBFromRegistry(t *testing.T) {
+	// Open with a DSN that constructs a *sql.DB without requiring a live
+	// server for pointer-equality of the wiring itself.
+	reg, err := registry.Open("postgres://rca:rca@127.0.0.1:1/rca?sslmode=disable")
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.DB.Close() })
+
+	gw := newSessionServer(reg, []byte("signing-key"), "replica-1")
+	if gw.AuditDB == nil {
+		t.Fatal("newSessionServer left AuditDB nil; main must wire reg.DB")
+	}
+	if gw.AuditDB != reg.DB {
+		t.Fatal("AuditDB must be the same *sql.DB as registry.PG.DB")
+	}
+}
+
 func TestPollSigningKey_PropagatesRotatedKeyToServer(t *testing.T) {
 	dir := t.TempDir()
 	pubPath := filepath.Join(dir, "ed25519.key.pub")
-	if err := os.WriteFile(pubPath, []byte("YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYQ=="), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	writeSigningPub(t, pubPath, bytes.Repeat([]byte("a"), 32))
 
 	keys := signingkeys.NewReader(pubPath, time.Hour)
 	gw := gwserver.New(registry.NewFake(), nil, "replica-1")
@@ -61,7 +87,7 @@ func TestPollSigningKey_PropagatesRotatedKeyToServer(t *testing.T) {
 func TestPollSigningKey_StopsOnContextCancellation(t *testing.T) {
 	dir := t.TempDir()
 	pubPath := filepath.Join(dir, "ed25519.key.pub")
-	os.WriteFile(pubPath, []byte("YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYQ=="), 0o644)
+	writeSigningPub(t, pubPath, bytes.Repeat([]byte("a"), 32))
 
 	keys := signingkeys.NewReader(pubPath, time.Hour)
 	gw := gwserver.New(registry.NewFake(), nil, "replica-1")
@@ -101,6 +127,382 @@ func TestPollSigningKey_ToleratesLoadErrors(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected pollSigningKey to return promptly after cancellation")
 	}
+}
+
+// writeSigningPub writes a base64-encoded ed25519 public key sidecar, matching
+// the format signingkeys.Reader expects (same as the Python bootstrap path).
+func writeSigningPub(t *testing.T, path string, raw []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(raw)), 0o644); err != nil {
+		t.Fatalf("write signing pub: %v", err)
+	}
+}
+
+// startBufconnSessionServer stands up a plaintext bufconn ProbeGateway.Session
+// server (same pattern as gwserver's own unit tests) so main_test can register
+// a live session and observe outbound GatewayMessages without mTLS.
+func startBufconnSessionServer(t *testing.T, gw *gwserver.Server) rcaprobev1.ProbeGatewayClient {
+	t.Helper()
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	rcaprobev1.RegisterProbeGatewayServer(grpcServer, gw)
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(grpcServer.Stop)
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("dial bufconn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return rcaprobev1.NewProbeGatewayClient(conn)
+}
+
+// connectFakeSession registers one platform session and returns a channel of
+// subsequent outbound GatewayMessages, the admission RegisterAck, and a cancel.
+func connectFakeSession(t *testing.T, gw *gwserver.Server, platformKey string) (received <-chan *rcaprobev1.GatewayMessage, firstAck *rcaprobev1.RegisterAck, cancel func()) {
+	t.Helper()
+	reg := gw.Registry
+	if err := reg.CreatePlatform(context.Background(), registry.Platform{PlatformKey: platformKey}, "tok-"+platformKey); err != nil && err != registry.ErrPlatformExists {
+		t.Fatalf("seed platform: %v", err)
+	}
+	client := startBufconnSessionServer(t, gw)
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.Session(ctx)
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
+	ch := make(chan *rcaprobev1.GatewayMessage, 32)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				close(ch)
+				return
+			}
+			ch <- msg
+		}
+	}()
+	if err := stream.Send(&rcaprobev1.ProbeMessage{Msg: &rcaprobev1.ProbeMessage_Register{
+		Register: &rcaprobev1.Register{PlatformKey: platformKey, ProbeVersion: "0.1.0"},
+	}}); err != nil {
+		t.Fatalf("send register: %v", err)
+	}
+	var ack *rcaprobev1.RegisterAck
+	select {
+	case msg := <-ch:
+		ack = msg.GetAck()
+		if ack == nil || !ack.GetAccepted() {
+			t.Fatalf("expected accepted RegisterAck, got %+v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RegisterAck")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		for _, k := range gw.ConnectedPlatforms() {
+			if k == platformKey {
+				return ch, ack, cancel
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session never registered on server")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// FP-KR-17
+func TestPollSigningKey_PropagatesRotatedKeyToConnectedProbe(t *testing.T) {
+	dir := t.TempDir()
+	pubPath := filepath.Join(dir, "ed25519.key.pub")
+	keyA := bytes.Repeat([]byte("a"), 32)
+	keyB := bytes.Repeat([]byte("b"), 32)
+	writeSigningPub(t, pubPath, keyA)
+
+	reg := registry.NewFake()
+	if err := reg.CreatePlatform(context.Background(), registry.Platform{PlatformKey: "presto-us1"}, "tok-1"); err != nil {
+		t.Fatalf("seed platform: %v", err)
+	}
+	// Admit with A so the session records A as lastKeySent.
+	gw := gwserver.New(reg, keyA, "replica-1")
+	received, _, cancelSession := connectFakeSession(t, gw, "presto-us1")
+	defer cancelSession()
+
+	// Long tick so a broken impl that converges only after many ticks fails:
+	// the assertion window is one tick plus a bounded scheduling margin, not
+	// a multi-second multi-tick budget.
+	const tick = 250 * time.Millisecond
+	const schedMargin = 150 * time.Millisecond
+	keys := signingkeys.NewReader(pubPath, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pollSigningKey(ctx, keys, gw, tick)
+
+	// Wait for initial load of A (converged — no frame expected).
+	// Allow a few ticks for the first Load (poll only fires on ticker).
+	deadline := time.Now().Add(3 * tick)
+	for keys.Current() == nil || !bytes.Equal(keys.Current(), keyA) {
+		if time.Now().After(deadline) {
+			t.Fatal("expected pollSigningKey to load A")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Silence across several ticks while unchanged.
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-received:
+			t.Fatalf("unexpected frame while sidecar unchanged: %+v", msg)
+		case <-time.After(tick + schedMargin):
+		}
+	}
+
+	// Rotate to B — must deliver a RegisterAck with B within ONE tick + margin,
+	// never ManifestRefresh. A multi-tick convergence budget would green a
+	// broken implementation that only eventually propagates.
+	writeSigningPub(t, pubPath, keyB)
+	deadline = time.Now().Add(tick + schedMargin)
+	var gotAck bool
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-received:
+			if msg.GetRefresh() != nil {
+				t.Fatal("must not send ManifestRefresh on key rotation")
+			}
+			ack := msg.GetAck()
+			if ack == nil {
+				t.Fatalf("unexpected frame: %+v", msg)
+			}
+			if !ack.GetAccepted() || !bytes.Equal(ack.GetSigningPublicKey(), keyB) {
+				t.Fatalf("expected A.2 RegisterAck with B, got %+v", ack)
+			}
+			gotAck = true
+		case <-time.After(20 * time.Millisecond):
+		}
+		if gotAck {
+			break
+		}
+	}
+	if !gotAck {
+		t.Fatal("expected mid-session RegisterAck with rotated key within one poll tick")
+	}
+
+	// Unchanged B: no further frames across a couple of ticks.
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-received:
+			t.Fatalf("unexpected frame after convergence: %+v", msg)
+		case <-time.After(tick + schedMargin):
+		}
+	}
+}
+
+// FP-KR-19
+func TestPollSigningKey_WrongLengthSidecarNeverBecomesServedOrAdmissionKey(t *testing.T) {
+	dir := t.TempDir()
+	pubPath := filepath.Join(dir, "ed25519.key.pub")
+	keyA := bytes.Repeat([]byte("a"), 32)
+	keyB := bytes.Repeat([]byte("b"), 32)
+	writeSigningPub(t, pubPath, keyA)
+
+	reg := registry.NewFake()
+	if err := reg.CreatePlatform(context.Background(), registry.Platform{PlatformKey: "presto-us1"}, "tok-1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := reg.CreatePlatform(context.Background(), registry.Platform{PlatformKey: "presto-us2"}, "tok-2"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	gw := gwserver.New(reg, keyA, "replica-1")
+	received, _, cancelSession := connectFakeSession(t, gw, "presto-us1")
+	defer cancelSession()
+
+	keys := signingkeys.NewReader(pubPath, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pollSigningKey(ctx, keys, gw, 20*time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !bytes.Equal(keys.Current(), keyA) {
+		if time.Now().After(deadline) {
+			t.Fatal("never loaded A")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Wrong-length sidecar.
+	writeSigningPub(t, pubPath, bytes.Repeat([]byte("x"), 31))
+	time.Sleep(100 * time.Millisecond)
+	if !bytes.Equal(keys.Current(), keyA) {
+		t.Fatalf("wrong-length sidecar became Current: %v", keys.Current())
+	}
+
+	// Session admitted now must still receive A.
+	_, ack2, cancel2 := connectFakeSession(t, gw, "presto-us2")
+	defer cancel2()
+	if !bytes.Equal(ack2.GetSigningPublicKey(), keyA) {
+		t.Fatalf("admission after bad sidecar got key %v, want A", ack2.GetSigningPublicKey())
+	}
+	select {
+	case msg := <-received:
+		t.Fatalf("no key-update expected during bad sidecar, got %+v", msg)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	// Valid B recovers.
+	writeSigningPub(t, pubPath, keyB)
+	deadline = time.Now().Add(2 * time.Second)
+	var sawB bool
+	for time.Now().Before(deadline) {
+		if bytes.Equal(keys.Current(), keyB) {
+			sawB = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawB {
+		t.Fatal("valid B never became Current after bad sidecar")
+	}
+	// Connected session(s) should receive B via propagation.
+	deadline = time.Now().Add(2 * time.Second)
+	var gotB bool
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-received:
+			if ack := msg.GetAck(); ack != nil && bytes.Equal(ack.GetSigningPublicKey(), keyB) {
+				gotB = true
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+		if gotB {
+			break
+		}
+	}
+	if !gotB {
+		t.Fatal("expected propagation of B to connected session after recovery")
+	}
+}
+
+// mutexBuffer is a race-safe log capture for pollSigningKey tests.
+type mutexBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (m *mutexBuffer) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.b.Write(p)
+}
+
+func (m *mutexBuffer) String() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.b.String()
+}
+
+// FP-KR-27
+func TestPollSigningKey_ReadinessLineOnlyOnACleanPass(t *testing.T) {
+	// Part 1: pure function table.
+	cases := []struct {
+		name           string
+		p              gwserver.SigningKeyPropagation
+		prevIncomplete bool
+		wantPrefix     string
+		wantIncomplete bool
+		wantEmpty      bool
+		wantZeroDrop   bool
+		wantNotReady   bool
+	}{
+		{"converged silent", gwserver.SigningKeyPropagation{Sent: 0, UpToDate: 0, Dropped: 0}, false, "", false, true, false, false},
+		{"sent ready", gwserver.SigningKeyPropagation{Sent: 1, UpToDate: 0, Dropped: 0}, false, "probe-gateway: signing key propagated to all connected sessions (", false, false, true, false},
+		{"dropped not ready", gwserver.SigningKeyPropagation{Sent: 1, UpToDate: 2, Dropped: 1}, false, "probe-gateway: signing key propagation incomplete: ", true, false, false, true},
+		{"dropped with prev", gwserver.SigningKeyPropagation{Sent: 0, UpToDate: 3, Dropped: 2}, true, "probe-gateway: signing key propagation incomplete: ", true, false, false, true},
+		{"carry-over ready", gwserver.SigningKeyPropagation{Sent: 0, UpToDate: 3, Dropped: 0}, true, "probe-gateway: signing key propagated to all connected sessions (", false, false, true, false},
+		{"clean silent", gwserver.SigningKeyPropagation{Sent: 0, UpToDate: 3, Dropped: 0}, false, "", false, true, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			line, incomplete := propagationLogLine(tc.p, tc.prevIncomplete)
+			if incomplete != tc.wantIncomplete {
+				t.Fatalf("incomplete=%v want %v", incomplete, tc.wantIncomplete)
+			}
+			if tc.wantEmpty {
+				if line != "" {
+					t.Fatalf("want empty line, got %q", line)
+				}
+				return
+			}
+			if !strings.HasPrefix(line, tc.wantPrefix) {
+				t.Fatalf("line %q missing prefix %q", line, tc.wantPrefix)
+			}
+			if tc.wantZeroDrop && !strings.Contains(line, "0 dropped") {
+				t.Fatalf("ready line must contain 0 dropped: %q", line)
+			}
+			if tc.wantNotReady && !strings.Contains(line, "NOT ready") {
+				t.Fatalf("not-ready line must contain NOT ready: %q", line)
+			}
+		})
+	}
+
+	// Part 2: real pollSigningKey wiring emits the ready line after rotation.
+	dir := t.TempDir()
+	pubPath := filepath.Join(dir, "ed25519.key.pub")
+	keyA := bytes.Repeat([]byte("a"), 32)
+	keyB := bytes.Repeat([]byte("b"), 32)
+	writeSigningPub(t, pubPath, keyA)
+
+	reg := registry.NewFake()
+	_ = reg.CreatePlatform(context.Background(), registry.Platform{PlatformKey: "presto-us1"}, "tok-1")
+	gw := gwserver.New(reg, keyA, "replica-1")
+	_, _, cancelSession := connectFakeSession(t, gw, "presto-us1")
+	defer cancelSession()
+
+	var buf mutexBuffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	keys := signingkeys.NewReader(pubPath, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pollSigningKey(ctx, keys, gw, 20*time.Millisecond)
+
+	// Load A first.
+	deadline := time.Now().Add(2 * time.Second)
+	for !bytes.Equal(keys.Current(), keyA) {
+		if time.Now().After(deadline) {
+			t.Fatal("never loaded A")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	writeSigningPub(t, pubPath, keyB)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		out := buf.String()
+		// Incomplete must never appear in this clean-pass harness: fail
+		// immediately rather than keep waiting for a later ready line.
+		if strings.Contains(out, "signing key propagation incomplete") {
+			t.Fatalf("signing key propagation incomplete must not appear in clean-pass real poll; log=%q", out)
+		}
+		if strings.Contains(out, "signing key propagated to all connected sessions") {
+			// Same line must have 0 dropped.
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, "signing key propagated to all connected sessions") {
+					if !strings.Contains(line, "0 dropped") {
+						t.Fatalf("ready line missing 0 dropped: %q", line)
+					}
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("ready line never appeared; log=%q", buf.String())
 }
 
 // bootstrapCAPinFingerprintFormat is the exact format design.md Section

@@ -25,6 +25,7 @@ import (
 	"github.com/yabinma/dbagent/probe/internal/runtimeenv/dockerenv"
 	"github.com/yabinma/dbagent/probe/internal/runtimeenv/k8senv"
 	"github.com/yabinma/dbagent/probe/internal/sessionclient"
+	"github.com/yabinma/dbagent/probe/internal/writeops"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
@@ -70,6 +71,9 @@ func main() {
 	})
 	go watcher.Start(ctx)
 
+	// Exactly one process-lifetime KeyStore, created once before the reconnect
+	// loop (design.md §9.6.4a / Appendix A.2 rule 8).
+	keys := newKeyStore(cfg)
 	for {
 		// design.md Section 8.4a: "The probe MUST renew whenever less than
 		// 50% of certificate validity remains (checked at startup and on
@@ -78,7 +82,7 @@ func main() {
 		// here covers both.
 		enrollment = maybeRenew(ctx, cfg, enrollment)
 
-		if err := runSession(ctx, cfg, enrollment, adapter, env); err != nil {
+		if err := runSession(ctx, cfg, enrollment, adapter, env, keys); err != nil {
 			log.Printf("probe: session ended: %v", err)
 		}
 		select {
@@ -88,6 +92,22 @@ func main() {
 			log.Printf("probe: reconnecting to %s", cfg.GatewayAddress)
 		}
 	}
+}
+
+// newKeyStore builds the single process-lifetime signing-key store from
+// config. Called exactly once, from main, before the reconnect loop.
+func newKeyStore(cfg config.Probe) *writeops.KeyStore {
+	return writeops.NewKeyStore(cfg.SigningKeyGraceWindow)
+}
+
+// newSessionClient wires one session's client over the process-lifetime key
+// store. It hands the store straight to sessionclient.New and MUST NOT
+// construct one: keys survive reconnects because this pointer is the same on
+// every call.
+func newSessionClient(stream rcaprobev1.ProbeGateway_SessionClient, cfg config.Probe,
+	adapter platform.PlatformAdapter, env platform.RuntimeEnv,
+	keys *writeops.KeyStore) *sessionclient.Client {
+	return sessionclient.New(stream, adapter, env, cfg.PlatformKey, "0.1.0", cfg.WriteEnabled, keys)
 }
 
 func ensureEnrolled(ctx context.Context, cfg config.Probe) (*bootstrapclient.Result, error) {
@@ -164,7 +184,11 @@ type staticError struct{ msg string }
 
 func (e *staticError) Error() string { return e.msg }
 
-func runSession(ctx context.Context, cfg config.Probe, enrollment *bootstrapclient.Result, adapter platform.PlatformAdapter, env platform.RuntimeEnv) error {
+// runSession gains the keys parameter and passes it straight through; the
+// grpc.NewClient / Session() body above it is unchanged.
+func runSession(ctx context.Context, cfg config.Probe, enrollment *bootstrapclient.Result,
+	adapter platform.PlatformAdapter, env platform.RuntimeEnv,
+	keys *writeops.KeyStore) error {
 	tlsConfig, err := enrollment.TLSConfig()
 	if err != nil {
 		return err
@@ -180,8 +204,7 @@ func runSession(ctx context.Context, cfg config.Probe, enrollment *bootstrapclie
 		return err
 	}
 
-	client := sessionclient.New(stream, adapter, env, cfg.PlatformKey, "0.1.0", cfg.WriteEnabled)
-	return client.Run(ctx)
+	return newSessionClient(stream, cfg, adapter, env, keys).Run(ctx)
 }
 
 // inClusterConfig is a seam over rest.InClusterConfig so tests can inject

@@ -57,7 +57,7 @@ func main() {
 		log.Printf("probe-gateway: initial signing key load failed (will retry): %v", err)
 	}
 
-	gw := gwserver.New(reg, keys.Current(), cfg.GatewayReplica)
+	gw := newSessionServer(reg, keys.Current(), cfg.GatewayReplica)
 	gw.HeartbeatTimeout = cfg.HeartbeatTimeout
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -71,6 +71,16 @@ func main() {
 	}
 	go runBootstrapListener(ctx, cfg.BootstrapListenAddr, ca, reg, cfg.ServerCertSANs)
 	runSessionListener(ctx, cfg.SessionListenAddr, ca, gw, reg, cfg.ServerCertSANs)
+}
+
+// newSessionServer constructs the Session server with production wiring
+// (FP-M6-25): credentials_* audit rows share the registry's *sql.DB pool.
+// Extracted so the AuditDB assignment cannot be deleted without breaking
+// TestMainWiresAuditDBFromRegistry.
+func newSessionServer(reg *registry.PG, signingPublicKey []byte, gatewayReplica string) *gwserver.Server {
+	gw := gwserver.New(reg, signingPublicKey, gatewayReplica)
+	gw.AuditDB = reg.DB
+	return gw
 }
 
 // runInternalDispatchListener serves POST /internal/v1/execute so the
@@ -166,11 +176,14 @@ func runBootstrapListener(ctx context.Context, addr string, ca *bootstrapca.CA, 
 }
 
 // pollSigningKey periodically re-reads the signing public key sidecar
-// (design.md D14 rotation) and pushes it into gw, so key rotation takes
-// effect without a probe-gateway restart.
+// (design.md §9.6 / D14), serves it via SetSigningPublicKey, then
+// converges every connected session onto it with PropagateSigningKey
+// (mid-session RegisterAck, Appendix A.2). Does not broadcast
+// ManifestRefresh — a key rotation does not change a manifest.
 func pollSigningKey(ctx context.Context, keys *signingkeys.Reader, gw *gwserver.Server, interval time.Duration) {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
+	var incomplete bool
 	for {
 		select {
 		case <-ctx.Done():
@@ -180,7 +193,35 @@ func pollSigningKey(ctx context.Context, keys *signingkeys.Reader, gw *gwserver.
 				log.Printf("probe-gateway: reload signing key: %v", err)
 				continue
 			}
+			// Serve the new key first so concurrent admissions get it, then
+			// converge already-connected sessions onto it.
 			gw.SetSigningPublicKey(keys.Current())
+			p := gw.PropagateSigningKey()
+			var line string
+			line, incomplete = propagationLogLine(p, incomplete)
+			if line != "" {
+				log.Print(line)
+			}
 		}
+	}
+}
+
+// propagationLogLine renders one propagation pass for the operator and carries
+// the "a previous pass was incomplete" flag forward. The returned bool is
+// always authoritative; an empty line means "log nothing this tick".
+// prevIncomplete is true when an earlier pass since the last clean one
+// reported Dropped > 0.
+func propagationLogLine(p gwserver.SigningKeyPropagation, prevIncomplete bool) (line string, incomplete bool) {
+	switch {
+	case p.Dropped > 0:
+		return fmt.Sprintf(
+			"probe-gateway: signing key propagation incomplete: %d updated, %d already current, %d session(s) not reachable this pass; NOT ready, retrying next tick",
+			p.Sent, p.UpToDate, p.Dropped), true
+	case p.Sent > 0 || prevIncomplete:
+		return fmt.Sprintf(
+			"probe-gateway: signing key propagated to all connected sessions (%d updated, %d already current, 0 dropped)",
+			p.Sent, p.UpToDate), false
+	default:
+		return "", false
 	}
 }

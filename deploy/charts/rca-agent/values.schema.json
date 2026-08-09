@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "temporal": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["dev", "chart", "external"]
+        }
+      }
+    },
+    "probeGateway": {
+      "type": "object",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "existingSecret": { "type": "string" }
+      }
+    },
+    "postgresql": {
+      "type": "object",
+      "properties": {
+        "bundled": { "type": "boolean" }
+      }
+    },
+    "minio": {
+      "type": "object",
+      "properties": {
+        "bundled": { "type": "boolean" }
+      }
+    },
+    "modelGateway": {
+      "type": "object",
+      "properties": {
+        "bundled": { "type": "boolean" }
+      }
+    }
+  }
+}

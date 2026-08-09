@@ -162,7 +162,6 @@ class TestPGTraceStore:
         store = PGTraceStore(session_factory)
         assert store.get_spend(uuid.uuid4()) == 0.0
 
-
 # --------------------------------------------------------------------- tracing sink
 
 class TestFakeTracingSink:

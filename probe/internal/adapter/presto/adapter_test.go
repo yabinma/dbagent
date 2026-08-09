@@ -41,7 +41,12 @@ type fakeEnv struct {
 		ns, name string
 		patches  map[string]string
 	}
-	patchCMErr     error
+	patchCMErr error
+	lastReadCM struct {
+		ns, name, key string
+	}
+	readCMText string
+	readCMErr  error
 	lastRestart    struct{ ns, kind, name string }
 	restartErr     error
 	lastDeletePod  struct{ ns, name string }
@@ -82,6 +87,16 @@ func (f *fakeEnv) CoordinatorBaseURL(ctx context.Context) (string, error) {
 }
 
 // Write methods (M5) — recorded for ExecuteWrite unit tests.
+func (f *fakeEnv) ReadConfigMapKey(ctx context.Context, namespace, name, key string) (string, error) {
+	f.lastReadCM = struct{ ns, name, key string }{namespace, name, key}
+	if f.readCMErr != nil {
+		return "", f.readCMErr
+	}
+	if f.readCMText != "" {
+		return f.readCMText, nil
+	}
+	return f.configText, f.configErr
+}
 func (f *fakeEnv) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
 	f.lastPatchCM = struct {
 		ns, name string

@@ -11,7 +11,11 @@ from rca_common.db.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers` defaults to True, which would silence every
+    # logger the *calling* process had already created — migrations run
+    # in-process (install hooks, and the functional/e2e tiers), so alembic's
+    # own logging config must not reach outside alembic.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

@@ -90,6 +90,93 @@ def _seed_inv(
     return inv_id, wf
 
 
+def test_sum_llm_costs_batch_empty_missing_and_mixed(session_factory):
+    """sum_llm_costs_batch: empty list, ids with no rows, mixed costs (W2)."""
+    from dashboard_api.services import sum_llm_costs_batch
+
+    _seed_platform(session_factory)
+    inv_with, _ = _seed_inv(session_factory, cost=0.4)
+    inv_zero, _ = _seed_inv(session_factory, cost=0)
+    inv_extra = uuid.uuid4()  # never inserted
+
+    with session_factory() as session:
+        assert sum_llm_costs_batch(session, []) == {}
+        # id with no llm_calls rows is absent from the map (caller uses .get(..., 0.0))
+        costs = sum_llm_costs_batch(session, [inv_with, inv_zero, inv_extra])
+        assert costs[inv_with] == pytest.approx(0.4)
+        assert inv_zero not in costs or costs[inv_zero] == pytest.approx(0.0)
+        assert inv_extra not in costs
+
+
+@pytest.mark.asyncio
+async def test_case_list_category_filter_and_cursor(client, session_factory):
+    """category= is a SQL predicate; filtered page + next_cursor stay consistent."""
+    seed_user(session_factory, username="v", password="viewer-pass-12", role="viewer")
+    _seed_platform(session_factory)
+    # two resource, one capacity
+    _seed_inv(
+        session_factory,
+        status="RESOLVED",
+        rca={
+            "status": "concluded",
+            "root_cause": {"category": "resource", "summary": "oom"},
+            "rca_compact": "oom",
+        },
+    )
+    _seed_inv(
+        session_factory,
+        status="RESOLVED",
+        rca={
+            "status": "concluded",
+            "root_cause": {"category": "resource", "summary": "oom2"},
+            "rca_compact": "oom2",
+        },
+    )
+    _seed_inv(
+        session_factory,
+        status="RESOLVED",
+        rca={
+            "status": "concluded",
+            "root_cause": {"category": "capacity", "summary": "queue"},
+            "rca_compact": "queue",
+        },
+    )
+    # row with rca_report but no root_cause — must not match category filter
+    _seed_inv(
+        session_factory,
+        status="RESOLVED",
+        rca={"status": "concluded", "rca_compact": "bare"},
+    )
+    tok = await login(client, "v", "viewer-pass-12")
+    r = await client.get(
+        "/api/v1/investigations",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"category": "resource", "limit": 1},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 1
+    # next_cursor present when more resource rows remain
+    assert body.get("next_cursor"), body
+    r2 = await client.get(
+        "/api/v1/investigations",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"category": "resource", "limit": 1, "cursor": body["next_cursor"]},
+    )
+    assert r2.status_code == 200
+    body2 = r2.json()
+    assert len(body2["items"]) == 1
+    assert body2["items"][0]["investigation_id"] != body["items"][0]["investigation_id"]
+    # capacity-only page
+    r3 = await client.get(
+        "/api/v1/investigations",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"category": "capacity", "limit": 10},
+    )
+    assert r3.status_code == 200
+    assert len(r3.json()["items"]) == 1
+
+
 @pytest.mark.asyncio
 async def test_case_list_filters_and_cursor(client, session_factory):
     seed_user(session_factory, username="v", password="viewer-pass-12", role="viewer")

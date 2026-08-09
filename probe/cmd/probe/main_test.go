@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -246,7 +247,8 @@ func TestRunSession_ConnectsRegistersAndRuns(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
-	go func() { runErr <- runSession(ctx, cfg, enrollment, adapter, nil) }()
+	keys := newKeyStore(cfg)
+	go func() { runErr <- runSession(ctx, cfg, enrollment, adapter, nil, keys) }()
 
 	select {
 	case msg := <-srv.received:
@@ -267,7 +269,8 @@ func TestRunSession_ConnectsRegistersAndRuns(t *testing.T) {
 
 func TestRunSession_InvalidTLSConfigErrors(t *testing.T) {
 	enrollment := &bootstrapclient.Result{ClientCertPEM: []byte("bad"), ClientKeyPEM: []byte("bad"), CACertPEM: []byte("bad")}
-	err := runSession(context.Background(), config.Probe{GatewayAddress: "127.0.0.1:0"}, enrollment, &noopAdapter{}, nil)
+	cfg := config.Probe{GatewayAddress: "127.0.0.1:0"}
+	err := runSession(context.Background(), cfg, enrollment, &noopAdapter{}, nil, newKeyStore(cfg))
 	if err == nil {
 		t.Fatalf("expected an error for an invalid TLS config")
 	}
@@ -421,25 +424,100 @@ func startBootstrapServerForMain(t *testing.T) (addr string, tokens *mainTokenSt
 type fakeSessionServer struct {
 	rcaprobev1.UnimplementedProbeGatewayServer
 	received chan *rcaprobev1.ProbeMessage
+	// ackKeys: per successive Session invocation, the SigningPublicKey of
+	// the first RegisterAck (nil/exhausted → nil key, today's behavior).
+	ackKeys [][]byte
+	// push delivers mid-session frames after the first ack (optional; nil
+	// keeps the original one-shot Session behaviour for existing callers).
+	push chan *rcaprobev1.GatewayMessage
+
+	mu         sync.Mutex
+	sessionIdx int
 }
 
 func newFakeSessionServer() *fakeSessionServer {
 	return &fakeSessionServer{received: make(chan *rcaprobev1.ProbeMessage, 16)}
 }
 
+// newFakeSessionServerWithKeys is additive: session N is acked with keys[N].
+func newFakeSessionServerWithKeys(keys ...[]byte) *fakeSessionServer {
+	return &fakeSessionServer{
+		received: make(chan *rcaprobev1.ProbeMessage, 64),
+		ackKeys:  keys,
+		push:     make(chan *rcaprobev1.GatewayMessage, 8),
+	}
+}
+
 func (s *fakeSessionServer) Session(stream rcaprobev1.ProbeGateway_SessionServer) error {
-	msg, err := stream.Recv()
+	// Original one-shot path for existing TestRunSession_* callers.
+	if s.push == nil {
+		msg, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		s.received <- msg
+		if err := stream.Send(&rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Ack{
+			Ack: &rcaprobev1.RegisterAck{ProbeId: "probe-1", Accepted: true},
+		}}); err != nil {
+			return err
+		}
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	}
+
+	s.mu.Lock()
+	idx := s.sessionIdx
+	s.sessionIdx++
+	s.mu.Unlock()
+
+	// Wait for Register on this stream (do not share the first Recv with the
+	// async drain goroutine — that race can drop the frame under load).
+	regMsg, err := stream.Recv()
 	if err != nil {
 		return err
 	}
-	s.received <- msg
+	select {
+	case s.received <- regMsg:
+	default:
+	}
+
+	var key []byte
+	if idx < len(s.ackKeys) {
+		key = s.ackKeys[idx]
+	}
 	if err := stream.Send(&rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Ack{
-		Ack: &rcaprobev1.RegisterAck{ProbeId: "probe-1", Accepted: true},
+		Ack: &rcaprobev1.RegisterAck{ProbeId: "probe-1", Accepted: true, SigningPublicKey: key},
 	}}); err != nil {
 		return err
 	}
-	<-stream.Context().Done()
-	return stream.Context().Err()
+
+	// Keep receiving after the first frame (heartbeats, etc.).
+	recvDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				return
+			}
+			select {
+			case s.received <- msg:
+			default:
+			}
+		}
+	}()
+
+	for {
+		select {
+		case msg := <-s.push:
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			<-recvDone
+			return stream.Context().Err()
+		}
+	}
 }
 
 func startMTLSSessionServer(t *testing.T, srv *fakeSessionServer, ca *bootstrapca.CA) string {
@@ -633,5 +711,156 @@ func TestMaybeRenew_RenewalRejectedOnCNMismatch(t *testing.T) {
 	result := maybeRenew(ctx, config.Probe{PlatformKey: "presto-b", GatewayAddress: addr, StateDir: t.TempDir()}, current)
 	if string(result.ClientCertPEM) != string(certPEM) {
 		t.Fatalf("expected the existing certificate to be returned when the renewal server rejects a CN mismatch")
+	}
+}
+
+// dialMainSession holds the four lines runSession uses to reach its stream
+// (design.md §9.6.7 FP-KR-22); runSession itself is not refactored for the test.
+func dialMainSession(t *testing.T, ctx context.Context, cfg config.Probe, enrollment *bootstrapclient.Result) rcaprobev1.ProbeGateway_SessionClient {
+	t.Helper()
+	tlsConfig, err := enrollment.TLSConfig()
+	if err != nil {
+		t.Fatalf("tls: %v", err)
+	}
+	conn, err := grpc.NewClient(cfg.GatewayAddress, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	stream, err := rcaprobev1.NewProbeGatewayClient(conn).Session(ctx)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	return stream
+}
+
+// FP-KR-21
+func TestNewKeyStore_UsesConfiguredGraceWindow(t *testing.T) {
+	// Default from defaults() is 10m when zero value is not set via Load —
+	// newKeyStore uses cfg.SigningKeyGraceWindow directly.
+	cfgDefault := config.Probe{SigningKeyGraceWindow: 10 * time.Minute}
+	store := newKeyStore(cfgDefault)
+	if store.GraceWindow() != 10*time.Minute {
+		t.Fatalf("default grace = %s, want 10m", store.GraceWindow())
+	}
+	cfgOverride := config.Probe{SigningKeyGraceWindow: 30 * time.Second}
+	store2 := newKeyStore(cfgOverride)
+	if store2.GraceWindow() != 30*time.Second {
+		t.Fatalf("override grace = %s, want 30s", store2.GraceWindow())
+	}
+}
+
+// FP-KR-22
+func TestSessionClientReconnect_KeepsPreviousKeyAndOriginalGraceDeadline(t *testing.T) {
+	keyA := bytes.Repeat([]byte("a"), 32)
+	keyB := bytes.Repeat([]byte("b"), 32)
+
+	ca := testMainCA(t)
+	certPEM, keyPEM := issueMainClientCert(t, ca, "presto-us1")
+	enrollment := &bootstrapclient.Result{ClientCertPEM: certPEM, ClientKeyPEM: keyPEM, CACertPEM: ca.CACertPEM()}
+	srv := newFakeSessionServerWithKeys(keyA, keyB)
+	addr := startMTLSSessionServer(t, srv, ca)
+
+	cfg := config.Probe{
+		PlatformKey:           "presto-us1",
+		GatewayAddress:        addr,
+		SigningKeyGraceWindow: 4 * time.Second,
+	}
+	store := newKeyStore(cfg)
+
+	// Session 1.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	stream1 := dialMainSession(t, ctx1, cfg, enrollment)
+	c1 := newSessionClient(stream1, cfg, &noopAdapter{}, nil, store)
+	run1Done := make(chan error, 1)
+	go func() { run1Done <- c1.Run(ctx1) }()
+
+	if c1.KeyStore() != store {
+		t.Fatal("c1 must hold the process store pointer")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !bytes.Equal(store.Ring().Current, keyA) {
+		if time.Now().After(deadline) {
+			t.Fatal("session 1 never installed A")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Mid-session rotation A→B via push.
+	srv.push <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Ack{
+		Ack: &rcaprobev1.RegisterAck{ProbeId: "probe-1", Accepted: true, SigningPublicKey: keyB},
+	}}
+	deadline = time.Now().Add(2 * time.Second)
+	for !bytes.Equal(store.Ring().Current, keyB) {
+		if time.Now().After(deadline) {
+			t.Fatal("mid-session install of B never happened")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	rotatedAt := time.Now() // T_i
+	ring := store.Ring()
+	if !bytes.Equal(ring.Current, keyB) || !bytes.Equal(ring.Previous, keyA) {
+		t.Fatalf("after rotation ring={%v,%v}", ring.Current, ring.Previous)
+	}
+
+	// 3a: deliberate reconnect delay.
+	time.Sleep(time.Until(rotatedAt.Add(1500 * time.Millisecond)))
+
+	// 4: reconnect.
+	cancel1()
+	select {
+	case <-run1Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("c1.Run did not return after cancel")
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	stream2 := dialMainSession(t, ctx2, cfg, enrollment)
+	c2 := newSessionClient(stream2, cfg, &noopAdapter{}, nil, store)
+	c2.HeartbeatInterval = 20 * time.Millisecond
+	go func() { _ = c2.Run(ctx2) }()
+
+	// Sync on first heartbeat from session 2 (skip Register).
+	deadline = time.Now().Add(2 * time.Second)
+	var sawHB bool
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-srv.received:
+			if msg.GetHeartbeat() != nil {
+				sawHB = true
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+		if sawHB {
+			break
+		}
+	}
+	if !sawHB {
+		t.Fatal("never saw session-2 heartbeat (first-ack path not completed)")
+	}
+	reconnectedAt := time.Now() // T_r
+
+	// 5: in-grace assertions.
+	if !reconnectedAt.Before(rotatedAt.Add(2800 * time.Millisecond)) {
+		t.Fatalf("premise guard: T_r - T_i = %s exceeds 2.8s", reconnectedAt.Sub(rotatedAt))
+	}
+	if c2.KeyStore() != store || c2 == c1 {
+		t.Fatal("c2 must be a new client over the same store")
+	}
+	ring = c2.KeyStore().Ring()
+	if !bytes.Equal(ring.Previous, keyA) || !bytes.Equal(ring.Current, keyB) {
+		t.Fatalf("after reconnect ring={Current:%v Previous:%v}", ring.Current, ring.Previous)
+	}
+
+	// 6: original-deadline assertion at T_i + 4.3s.
+	time.Sleep(time.Until(rotatedAt.Add(4300 * time.Millisecond)))
+	ring = c2.KeyStore().Ring()
+	observedAt := time.Now()
+	if !observedAt.Before(rotatedAt.Add(5200 * time.Millisecond)) {
+		t.Fatalf("premise guard: T_obs - T_i = %s not in [4.3s, 5.2s)", observedAt.Sub(rotatedAt))
+	}
+	if ring.Previous != nil || !bytes.Equal(ring.Current, keyB) {
+		t.Fatalf("at T_obs Previous must be nil and Current=B; got {%v,%v}", ring.Current, ring.Previous)
 	}
 }

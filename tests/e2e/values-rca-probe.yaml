@@ -1,0 +1,12 @@
+platformKey: presto-e2e
+gatewayAddress: rca-agent-probe-gateway:8443
+bootstrapAddress: rca-agent-probe-gateway:8444
+# Overridden at install time by run.sh via --set bootstrapToken=<issued token>.
+bootstrapToken: ""
+writeEnabled: true
+coordinatorLocator: app=presto,role=coordinator
+namespace: rca
+image:
+  registry: ghcr.io/yabinma/rca-agent
+  name: probe
+  tag: "0.1.0"

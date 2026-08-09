@@ -369,6 +369,26 @@ func grepLines(lines []string, needle string) []string {
 
 // --- Write methods (M5, design.md Section 9.5.3) -------------------------------------
 
+// ReadConfigMapKey implements platform.RuntimeEnv (FP-M6-29): read a specific
+// ConfigMap data key. Empty namespace → Cfg.Namespace; empty key → config.properties.
+func (e *Env) ReadConfigMapKey(ctx context.Context, namespace, name, key string) (string, error) {
+	if namespace == "" {
+		namespace = e.Cfg.Namespace
+	}
+	if key == "" {
+		key = "config.properties"
+	}
+	cm, err := e.Clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("k8senv: get configmap %s/%s: %w", namespace, name, err)
+	}
+	content, ok := cm.Data[key]
+	if !ok {
+		return "", fmt.Errorf("k8senv: key %q not found in configmap %s/%s", key, namespace, name)
+	}
+	return content, nil
+}
+
 func (e *Env) PatchConfigMap(ctx context.Context, namespace, name string, dataPatches map[string]string) error {
 	if namespace == "" {
 		namespace = e.Cfg.Namespace

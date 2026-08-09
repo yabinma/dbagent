@@ -17,9 +17,17 @@
 # `schemas/generate-ts.js`. Every job below that actually compiles/imports
 # generated code regenerates it itself (toolchain installed in that same
 # job); jobs that don't touch generated code deliberately skip this step.
-# Today that means: `lint` (go vet) and every Go-testing job (`unit-go`,
-# `functional`, `benchmark`) regenerate `gen/go` (and, as a side effect of
-# `scripts/gen-proto.sh` doing both in one pass, `gen/python` too).
+# Today that means: `lint` (go vet) and every Go-testing job that builds
+# product code (`unit-go`, `functional`, `benchmark`) regenerate `gen/go`
+# (and, as a side effect of `scripts/gen-proto.sh` doing both in one pass,
+# `gen/python` too).
+# `manifest-guard` is the deliberate exception: it is a parser-only guard
+# (`go/ast`, `go/parser`, `gopkg.in/yaml.v3`) that reads sources as text and
+# imports no generated package, so it compiles and runs with no generated
+# code present. Omitting codegen there is INTENTIONAL -- do not "fix" it by
+# adding buf/protoc steps; they would add a network dependency and ~1 min of
+# setup to the one job that must be able to run on its own (design.md
+# Section 11.1.3, errata pass 20 clause (AS)(2), errata pass 21 clause (BA)).
 # `unit-rca-common`, `unit-worker`, `unit-gateway`, and `unit-dashboard-api`
 # regenerate nothing: no test in those suites imports generated schemas.
 # `unit-web` does not import `web/src/types/generated` at runtime under
@@ -30,8 +38,13 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']                 # release runs of the e2e job
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]   # `labeled` makes the e2e label work
+  schedule:
+    - cron: '0 3 * * *'          # nightly e2e
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -69,6 +82,50 @@ jobs:
       # Go) plus the TS typecheck gate for dashboard-web, so lint config is
       # decided once for the whole monorepo rather than piecemeal.
 
+  # Independent gate (design.md §11.1.3 errata pass 20, clause (AS)):
+  # this job deliberately has NO `needs:` and NO `if:`. Every other job in
+  # this workflow is downstream of `lint`, so a skip of `lint` cascades and
+  # a skipped check run reads as passing to branch protection -- which would
+  # leave the workflow's own guard among the things that did not run.
+  # Do not add a dependency, a condition or a matrix to this job.
+  #
+  # `name:` MUST stay byte-equal to the job id (design.md errata pass 21,
+  # clause (AX)): GitHub emits this job's status-check context under `name:`,
+  # and `manifest-guard` is the context this repository's branch protection
+  # requires. Renaming the job silently renames that context, and a required
+  # check that no longer reports leaves every PR pending. Do not "improve"
+  # this name.
+  manifest-guard:
+    name: manifest-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - name: Install test deps
+        run: |
+          python -m venv services/worker/.venv
+          services/worker/.venv/bin/pip install --upgrade pip
+          services/worker/.venv/bin/pip install -e libs/py/rca_common
+          services/worker/.venv/bin/pip install -e "services/worker[test]"
+          services/worker/.venv/bin/pip install -e "services/gateway[test]"
+          services/worker/.venv/bin/pip install -e "services/dashboard-api[test]"
+      # FP-M6-31 A10(v): runtime env hygiene immediately before the guard's own
+      # pytest process (ordinary import mode; a PYTHONPATH would own the guard).
+      - name: FP-M6-31 A10(v) environment hygiene before the guard pytest
+        run: |
+          bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
+      - name: Manifest honesty + CI pin (Python half)
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            tests/functional/test_manifests.py -v
+      - name: Manifest honesty (Go half)
+        run: go test ./tests/functional/manifest_honesty/... -v -timeout 300s
+
   unit-rca-common:
     name: unit tests - rca_common (>80% coverage per module)
     runs-on: ubuntu-latest
@@ -88,7 +145,8 @@ jobs:
         working-directory: libs/py/rca_common
         run: |
           .venv/bin/python -m pytest tests/ \
-            --cov=rca_common --cov-report=term-missing --cov-fail-under=80
+            --cov=rca_common --cov-report=term-missing --cov-fail-under=81
+          bash ../../../scripts/py-coverage-check.sh 80 rca_common
 
   unit-worker:
     name: unit tests - worker (>80% coverage per module)
@@ -106,10 +164,11 @@ jobs:
           services/worker/.venv/bin/pip install -e libs/py/rca_common
           services/worker/.venv/bin/pip install -e "services/worker[test]"
       - name: pytest --cov (100% pass rate, >80% coverage, every module)
-        run: |
-          services/worker/.venv/bin/python -m pytest services/worker/tests/ \
-            --cov=worker --cov=scripts --cov-report=term-missing --cov-fail-under=80
         working-directory: services/worker
+        run: |
+          .venv/bin/python -m pytest tests/ \
+            --cov=worker --cov=scripts --cov-report=term-missing --cov-fail-under=81
+          bash ../../scripts/py-coverage-check.sh 80 worker scripts
 
   unit-gateway:
     name: unit tests - ingest-gateway (>80% coverage)
@@ -130,7 +189,8 @@ jobs:
         working-directory: services/gateway
         run: |
           .venv/bin/python -m pytest tests/ \
-            --cov=gateway --cov-report=term-missing --cov-fail-under=80
+            --cov=gateway --cov-report=term-missing --cov-fail-under=81
+          bash ../../scripts/py-coverage-check.sh 80 gateway
 
   unit-dashboard-api:
     name: unit tests - dashboard-api (>80% coverage)
@@ -151,10 +211,11 @@ jobs:
         working-directory: services/dashboard-api
         run: |
           .venv/bin/python -m pytest tests/ \
-            --cov=dashboard_api --cov-report=term-missing --cov-fail-under=80
+            --cov=dashboard_api --cov-report=term-missing --cov-fail-under=81
+          bash ../../scripts/py-coverage-check.sh 80 dashboard_api
 
   unit-web:
-    name: unit tests - dashboard-web (vitest, >80% coverage per directory)
+    name: unit tests - dashboard-web (vitest, >80% coverage per file)
     runs-on: ubuntu-latest
     needs: lint
     steps:
@@ -167,7 +228,7 @@ jobs:
       - name: npm ci
         working-directory: web
         run: npm ci
-      - name: vitest --coverage (100% pass rate, >80% per-directory thresholds)
+      - name: vitest --coverage (100% pass rate, >80% per-file thresholds)
         working-directory: web
         run: npm test
 
@@ -245,20 +306,35 @@ jobs:
           services/worker/.venv/bin/pip install -e "services/worker[test]"
           services/worker/.venv/bin/pip install -e "services/gateway[test]"
           services/worker/.venv/bin/pip install -e "services/dashboard-api[test]"
+      - name: Install helm (pinned from deploy/versions.env)
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source deploy/versions.env
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tgz
+          tar -xzf /tmp/helm.tgz -C /tmp
+          sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version
+      # FP-M6-31 A10(v): runtime env hygiene immediately before the guard's own
+      # pytest process (ordinary import mode; a PYTHONPATH would own the guard).
+      - name: FP-M6-31 A10(v) environment hygiene before functional pytest
+        run: |
+          bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
       - name: Run Python functional tests
         # Docker is preinstalled on GitHub-hosted ubuntu-latest runners;
         # testcontainers (ephemeral Postgres/MinIO) and Temporal's real
         # local dev server (temporalio.testing.WorkflowEnvironment) both
         # use it directly -- see tests/functional/conftest.py.
+        # tests/delivery is the packaging/docs/CI assertion tier (FP-M6-*).
         run: |
           services/worker/.venv/bin/python -m pytest \
             services/worker/tests services/gateway/tests \
             services/dashboard-api/tests \
-            tests/functional tests/mocks/llm -v \
+            tests/functional tests/delivery tests/mocks/llm -v \
             --ignore=tests/functional/m2_probe_link
-      - name: Run Go cross-service functional tests (F8; real probe +
+      - name: Run Go cross-service functional tests (F8/F9; real probe +
           probe-gateway binaries over real mTLS + ephemeral Postgres)
-        run: go test ./tests/functional/... -v -timeout 180s
+        run: go test ./tests/functional/... -v -timeout 300s
 
   benchmark:
     name: benchmark (B3–B6/B9/B12–B14 + M3/M4 Python benches; manifest check)
@@ -319,6 +395,110 @@ jobs:
         run: |
           services/worker/.venv/bin/python -m pytest \
             services/worker/tests/test_context_assembly.py::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v
+
+      # One step so the session-scoped scale_pg seed is shared by B2/B10/B11
+      # (§11.1.3 — seeding thrice would triple the cost). Test ids name each bar.
+      # No --timeout flag: pytest-timeout is not a declared dependency.
+      # -s: keep B11 fixed-prefix diagnostics on a green run (errata pass 9).
+      # FP-M6-31 A10(v): runtime env hygiene immediately before the measured step.
+      - name: FP-M6-31 A10(v) environment hygiene before B2/B10/B11
+        run: |
+          bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
+      - name: B2/B10/B11 -- PG scale benchmarks (shared seeded fixture)
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            tests/benchmark/test_pg_scale.py -v -s
       # v1.5 manifest honesty rule (design.md Section 14.4): a
       # thresholds.yaml entry cannot stay `deferred` once its hot-path code
       # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14; M4 flipped B12.
+
+  images:
+    name: build product images (six)
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.47.2"
+      - name: Install protoc-gen-go / protoc-gen-go-grpc
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Source pins and build all six images
+        run: |
+          set -euo pipefail
+          source deploy/versions.env
+          export SHORT_SHA="${GITHUB_SHA::12}"
+          bash deploy/docker/build.sh
+      - name: Push to GHCR (main and tags only)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          source deploy/versions.env
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          SHORT_SHA="${GITHUB_SHA::12}"
+          for c in ingest-gateway temporal-worker probe-gateway dashboard-api dashboard-web probe; do
+            docker push "${REGISTRY}/${c}:${APP_VERSION}"
+            docker push "${REGISTRY}/${c}:sha-${SHORT_SHA}"
+          done
+
+  e2e:
+    name: e2e (kind + Presto 0.298 + Section 13 scenarios)
+    runs-on: ubuntu-latest
+    needs: benchmark
+    timeout-minutes: 30
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e'))
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.47.2"
+      - name: Install protoc plugins, helm, kind
+        run: |
+          set -euo pipefail
+          source deploy/versions.env
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+          curl -fsSL "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" -o /tmp/kind
+          chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin/kind
+      - name: Run e2e (1500s product budget inside 30m job)
+        run: bash tests/e2e/run.sh
+      - name: Upload phase timing and pod logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs
+          path: |
+            /tmp/rca-e2e/**
+            tests/e2e/*.log
+          if-no-files-found: ignore

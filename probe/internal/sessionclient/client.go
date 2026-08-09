@@ -35,14 +35,22 @@ type Client struct {
 	HeartbeatInterval time.Duration
 
 	mu      sync.Mutex
-	keys    writeops.KeyRing
+	keys    *writeops.KeyStore // process-lifetime; set once by New (§9.6.4a)
 	probeID string
 
 	outbound chan *rcaprobev1.ProbeMessage
 	cancels  map[string]context.CancelFunc
 }
 
-func New(stream rcaprobev1.ProbeGateway_SessionClient, adapter platform.PlatformAdapter, env platform.RuntimeEnv, platformKey, probeVersion string, writeEnabled bool) *Client {
+// New builds a session client over the caller's process-lifetime signing-key
+// store. keys MUST NOT be nil: the store's lifetime is the probe process,
+// not the session (§9.6.4a), so New neither creates, replaces nor copies a
+// store — it only holds the pointer it is given. Passing the store as a
+// parameter is the point: it turns "forgot to inject the process store"
+// into a compile error instead of a silently per-session store.
+func New(stream rcaprobev1.ProbeGateway_SessionClient, adapter platform.PlatformAdapter,
+	env platform.RuntimeEnv, platformKey, probeVersion string, writeEnabled bool,
+	keys *writeops.KeyStore) *Client {
 	return &Client{
 		Stream:            stream,
 		Adapter:           adapter,
@@ -51,10 +59,15 @@ func New(stream rcaprobev1.ProbeGateway_SessionClient, adapter platform.Platform
 		ProbeVersion:      probeVersion,
 		WriteEnabled:      writeEnabled,
 		HeartbeatInterval: DefaultHeartbeatInterval,
+		keys:              keys,
 		outbound:          make(chan *rcaprobev1.ProbeMessage, 64),
 		cancels:           map[string]context.CancelFunc{},
 	}
 }
+
+// KeyStore returns the store this client was built over: the exact pointer
+// New was given, for the client's whole life.
+func (c *Client) KeyStore() *writeops.KeyStore { return c.keys }
 
 // Run performs Detect + Register, then drives heartbeat + task dispatch
 // until ctx is cancelled or the stream errors.
@@ -88,8 +101,9 @@ func (c *Client) Run(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.probeID = ack.GetProbeId()
-	c.keys = writeops.KeyRing{Current: ack.GetSigningPublicKey()}
 	c.mu.Unlock()
+	// First-ack install only — never create/replace/reset the store (§9.6.4).
+	c.keys.Install(ack.GetSigningPublicKey())
 	if setter, ok := c.Adapter.(ProbeIDSetter); ok {
 		setter.SetProbeID(ack.GetProbeId())
 	}
@@ -179,10 +193,31 @@ func (c *Client) readerLoop(ctx context.Context) error {
 		case *rcaprobev1.GatewayMessage_Refresh:
 			go c.refreshManifest(ctx)
 		case *rcaprobev1.GatewayMessage_Ack:
-			// A second RegisterAck mid-session is unexpected under the
-			// current protocol; ignore rather than error, for forward
-			// compatibility.
+			// Mid-session RegisterAck is a signing-key update (Appendix A.2).
+			c.handleKeyUpdate(m.Ack)
 		}
+	}
+}
+
+// handleKeyUpdate installs a mid-session signing public key (design.md
+// §9.6.4 / Appendix A.2). Ignores rejected acks and acks for another probe.
+func (c *Client) handleKeyUpdate(ack *rcaprobev1.RegisterAck) {
+	if ack == nil {
+		return
+	}
+	if !ack.GetAccepted() {
+		log.Printf("sessionclient: ignoring mid-session RegisterAck with accepted=false")
+		return
+	}
+	c.mu.Lock()
+	self := c.probeID
+	c.mu.Unlock()
+	if id := ack.GetProbeId(); id != "" && self != "" && id != self {
+		log.Printf("sessionclient: ignoring mid-session RegisterAck for other probe %q (self=%q)", id, self)
+		return
+	}
+	if c.keys.Install(ack.GetSigningPublicKey()) {
+		log.Printf("sessionclient: installed rotated signing public key (previous key honored for %s)", c.keys.GraceWindow())
 	}
 }
 
@@ -193,11 +228,11 @@ func (c *Client) handleTaskRequest(ctx context.Context, task *rcaprobev1.TaskReq
 		c.mu.Unlock()
 	}()
 
-	c.mu.Lock()
-	keys := c.keys
-	c.mu.Unlock()
+	// Snapshot at verification time so the grace window is evaluated now
+	// (§9.6.4), not at install time.
+	ring := c.keys.Ring()
 
-	outcome := HandleTask(ctx, c.Adapter, c.Env, keys, c.WriteEnabled, task)
+	outcome := HandleTask(ctx, c.Adapter, c.Env, ring, c.WriteEnabled, task)
 	chunks := ChunkPayload(outcome.Payload, DefaultChunkSize)
 
 	for i, chunk := range chunks {
@@ -223,9 +258,24 @@ func (c *Client) handleTaskRequest(ctx context.Context, task *rcaprobev1.TaskReq
 	}
 }
 
+// refreshManifest re-runs Detect and enqueues a mid-session Register with the
+// refreshed capabilities so the gateway can update auth status and emit
+// credentials_* audits (FP-M6-25 / design.md ManifestRefresh path).
 func (c *Client) refreshManifest(ctx context.Context) {
-	if _, err := c.Adapter.Detect(ctx, c.Env); err != nil {
+	manifest, err := c.Adapter.Detect(ctx, c.Env)
+	if err != nil {
 		log.Printf("sessionclient: manifest refresh: detect failed: %v", err)
+		return
+	}
+	select {
+	case c.outbound <- &rcaprobev1.ProbeMessage{Msg: &rcaprobev1.ProbeMessage_Register{
+		Register: &rcaprobev1.Register{
+			PlatformKey:  c.PlatformKey,
+			ProbeVersion: c.ProbeVersion,
+			Capabilities: manifestToCapabilities(manifest),
+		},
+	}}:
+	case <-ctx.Done():
 	}
 }
 

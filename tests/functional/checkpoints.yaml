@@ -78,23 +78,15 @@ checkpoints:
     KERBEROS "unsupported" -> degraded)
   - services/probe-gateway/internal/bootstrapsrv/server_test.go (bootstrap token validation matrix)
   - probe/cmd/probe/main_test.go::TestEnsureEnrolled_* (enroll/persist/reuse/failure paths)
-  notes: 'Covered via real compiled `probe` + `probe-gateway` binaries run as OS subprocesses talking
-    over real mTLS (bootstrap CA issued/loaded for real, client certs signed for real), against a real
-    ephemeral Postgres migrated with the exact M1 alembic migration, with only the platform-side externals
-    mocked (fake Presto REST + fake Docker Engine API, both httptest) -- this is what "cross-service tier"
-    ( design.md Section 11) means for M2, since Go''s internal-package visibility rules don''t let one
-    test file import both probe/internal/... and services/probe-gateway/internal/... (see impl-progress.md).
-    Steps 1-2 (dashboard creates platform + bootstrap token) are dashboard-api''s job (M4, not built yet);
-    this tier''s tests seed that precondition directly via SQL, matching how M1 treated dashboard-dependent
-    preconditions. TLS CA resolution order and the Swarm `docker secret create`/`service update` credential-rotation
-    path are unit-tested (probe/internal/credentials, probe/internal/adapter/presto/auth_test.go) but
-    not re-proven at the subprocess level (redundant with the unit coverage already there).
-
-    '
+  notes: Covered via real compiled probe + probe-gateway binaries over real mTLS against ephemeral Postgres.
+    Steps 1-2 (dashboard creates platform + bootstrap token) shipped in M4 (b4c29d3); this tier still
+    seeds that precondition via SQL by choice so the subprocess harness stays self-contained. TLS CA resolution
+    and Swarm credential-rotation paths remain unit-tested in probe/internal/credentials and adapter auth
+    tests.
 - id: F9
   description: Toolpack dispatch (design.md 8.5, Appendix A/B)
   owning_milestone: M2
-  status: partial
+  status: covered
   tests:
   - probe/internal/sessionclient/dispatch_test.go (every TaskRequest kind incl. ToolCall/RawCommand/RemediationStep/HealthCheck;
     per-tool coverage via probe/internal/adapter/presto's ~50 tests)
@@ -113,22 +105,12 @@ checkpoints:
     secrets in presto_config)
   - probe/internal/sessionclient/dispatch_test.go::TestHandleTask_ToolCall_TruncatesAtMaxOutputBytes (truncated=true
     at output cap)
-  notes: "Covered: every element design.md Section 14.3 names for F9 -- per-tool envelope correctness\
-    \ (all ~20 Toolpack tools, via the presto adapter test suite), chunked reassembly (order/integrity/\
-    \ missing-chunk), redaction, truncation, task timeout, CancelTask -- each proven with REAL production\
-    \ code on both sides (real sessionclient.HandleTask/ChunkPayload on the probe side, real gwserver.Dispatch/chunk-reassembly\
-    \ on the gateway side), following design.md Section 14.3's own \"a fake probe (in-process ... with\
-    \ a scripted PlatformAdapter returning fixture data)\" pattern -- just split across two co-located\
-    \ test suites (one per service) rather than one file, since Go's internal-package rules don't allow\
-    \ a single test to import both sides' internals (see F8's notes and impl-progress.md). Not yet covered:\
-    \ a single test with the REAL probe binary AND real probe-gateway binary AND a third-party caller\
-    \ triggering dispatch end to end in three separate processes. `gwserver.Server.Dispatch` has no external\
-    \ (gRPC/HTTP) trigger surface yet -- design.md Section 3.2's \"exposes internal ExecuteTool(platform_key,\
-    \ task) API for Activities\" is explicitly deferred to M3, since no Activity exists yet to call it\
-    \ (documented decision, gwserver.go's own doc comment). Also not yet covered: S3 storage + `evidence`\
-    \ row persistence for dispatched results -- that's the M3 Activity's job once it exists, not probe-gateway's.\n\
-    \ M3 added services/probe-gateway/internal/dispatch HTTP ExecuteTool API + worker probeclient; evidence\
-    \ rows written by collector Activity."
+  - tests/functional/m2_probe_link/tool_dispatch_test.go
+  notes: 'M6 closed the three-separate-processes gap via tool_dispatch_test.go (real probe + real probe-gateway
+    + HTTP caller over real mTLS): envelope correctness, chunked reassembly of >256 KiB payloads, truncation
+    at max_output_bytes, catalog-secret redaction, task timeout and CancelTask. Evidence/S3 persistence
+    for dispatched results is covered by the M3 collector activity tests (services/worker/tests/test_investigation_activities.py).
+    In-process per-tool and chunk-reassembly coverage from M2 remains linked above.'
 - id: F10
   description: Remediation + signing (design.md 9)
   owning_milestone: M5
@@ -139,10 +121,12 @@ checkpoints:
   - services/worker/tests/test_playbooks_and_verification.py
   - probe/internal/writeops/
   - probe/internal/adapter/presto/
-  notes: 'M5: real write-op primitives, D14 per-step signing, execute_playbook/verify_fix closed loop.
-    Cross-process write path (FP-M5-1/2/12): m2_probe_link subprocess harness posts Python-signed
-    kind=write through real probe-gateway HTTP → real probe → httptest Presto (presto_kill_query).'
-
+  - tests/functional/test_m5_closed_loop.py::test_m5_verify_fix_fails_closed_on_missing_wiring
+  - probe/internal/adapter/presto/writeops_test.go::TestM6_AdjustMemoryConfig_ReadsTargetConfigMap_AndFailsClosed
+  - tests/functional/m2_probe_link/key_rotation_test.go::TestKR_MidSessionRotation_NewKeyAcceptedOldKeyGracedThenRejected
+  notes: "M5: real write-op primitives, D14 per-step signing, execute_playbook/verify_fix closed loop.\
+    \ Cross-process write path (FP-M5-1/2/12): m2_probe_link subprocess harness posts Python-signed kind=write\
+    \ through real probe-gateway HTTP \u2192 real probe \u2192 httptest Presto (presto_kill_query)."
 - id: F11
   description: Playbook catalog (design.md 9.2)
   owning_milestone: M5
@@ -152,7 +136,6 @@ checkpoints:
   - tests/functional/test_m5_closed_loop.py::test_m5_seed_playbooks_idempotent
   - services/worker/tests/test_seed_playbooks.py
   notes: 'M5: 5 MVP playbooks seeded idempotently; step registry per deployment.'
-
 - id: F12
   description: Dashboard API (Appendix D)
   owning_milestone: M4
@@ -175,23 +158,17 @@ checkpoints:
   - tests/functional/test_m5_closed_loop.py::test_m5_closed_loop_e2e
   - libs/py/rca_common/tests/test_notifications.py
   notes: 'M5: shared notifications.py, send_notifications Activity, notification_sent audits.'
-
 - id: F14
   description: Tracing (design.md D5, 7)
   owning_milestone: M1
-  status: partial
+  status: covered
   tests:
   - tests/functional/test_m1_foundation.py::test_one_model_call_produces_llm_calls_row_and_s3_objects
-  notes: 'Covered now: "builtin" backend -- one real model call (against the mocked LLM provider) produces
-    a real `llm_calls` row (ephemeral Postgres, migrated schema) and real prompt/response objects (ephemeral
-    MinIO). This is M1''s Section 12 acceptance criterion. Not yet covered functionally: the "both"/Langfuse-mock-receiver
-    case and cross-investigation spend aggregation. The dual-write matrix itself (builtin/langfuse/both)
-    is unit-tested (libs/py/rca_common/tests/test_llmclient.py :: test_generate_dual_write_matrix); wiring
-    a real Langfuse mock receiver into the functional tier is deferred alongside the rest of the notification/observability-adjacent
-    functional surface (no milestone explicitly owns it yet; revisit at M3 when InvestigationWorkflow
-    starts making real multi-round model calls).
-
-    '
+  - tests/functional/test_m6_tracing.py
+  notes: 'M6 closed both gaps the prior note named: the both/Langfuse-mock-receiver case and cross-investigation
+    spend aggregation via tests/functional/test_m6_tracing.py (real LLMClient with tracing.backend=both
+    against real PG + MinIO + mock LLM + RecordingLangfuseClient). Unit-level dual-write matrix remains
+    in libs/py/rca_common/tests/test_llmclient.py.'
 - id: F15
   description: Config & policy (Appendix E)
   owning_milestone: M1
@@ -199,13 +176,42 @@ checkpoints:
   tests:
   - libs/py/rca_common/tests/test_config.py
   - tests/functional/test_m3_investigation_loop.py::test_f4_platform_budget_override
+  - tests/functional/test_m6_go_config_env_interpolation.py
   notes: Per-platform budget override merge exercised in F4 functional test; local_only egress still unit-tested
     in test_config.py.
 - id: F16
   description: Audit completeness (design.md 4.3)
   owning_milestone: M3
-  status: partial
+  status: covered
   tests:
   - tests/functional/test_m3_investigation_loop.py::test_f16_audit_actions_emitted
   - tests/functional/test_m5_closed_loop.py::test_m5_closed_loop_e2e
-  notes: 'M3 walks M3-emittable audits; M5 e2e asserts notification_sent. Still partial: credentials_* (M2).'
+  - tests/functional/test_m6_audit_completeness.py
+  - services/probe-gateway/internal/gwserver/f16_refresh_integration_test.go
+  notes: "M6 made probe-gateway emit credentials_detected, credentials_verified and credentials_test_failed\
+    \ at registration/ManifestRefresh AuthStatus transitions (actor probe:<probe_id>). tests/functional/test_m6_audit_completeness.py\
+    \ walks every value of the closed AUDIT_ACTIONS enum at its trigger point, which is what F16's \xA7\
+    14.3 wording has always required. f16_refresh_integration_test.go composes the real session client\
+    \ with the gateway audit path (ManifestRefresh through production refreshManifest)."
+- id: F17
+  description: Delivery artifacts (11, 11.1)
+  owning_milestone: M6
+  status: covered
+  tests:
+  - tests/delivery/
+  - tests/functional/test_m6_walkthrough_selftest.py
+  - tests/functional/test_manifests.py
+  - tests/functional/manifest_honesty/thresholds_test.go
+  notes: 'Six product images, charts, compose, docs, CI on: block, walkthrough --self-test, and manifest
+    honesty enforced in test_manifests.py.'
+- id: F18
+  description: e2e install and fault scenarios (12, 13, 11.1)
+  owning_milestone: M6
+  status: covered
+  tests:
+  - tests/e2e/test_e2e_smoke.py
+  - tests/e2e/test_e2e_scenarios.py
+  notes: "Automated: E0 install smoke, E1 worker OOM, E2 broken catalog (redaction), E3 queue saturation,\
+    \ E4 runaway kill_query, plus B1 burst. \xA713.2 coordinator full-GC hang and \xA713.4 single-worker\
+    \ network isolation remain manual/real-cluster (kindnet does not enforce NetworkPolicy; real heap\
+    \ pressure is not simulated)."
