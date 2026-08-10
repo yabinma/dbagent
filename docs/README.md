@@ -37,4 +37,4 @@ Operator documentation for the RCA Agent system.
 
 - Python 3.12, Go 1.26.4, Node 20, Docker, Helm (pinned in `deploy/versions.env`), kind (for e2e)
 - Delivery tests (`tests/delivery/`) require `helm` and `docker compose` on PATH; a missing binary is a hard failure, never a skip
-- Adding a label to a PR re-runs the full CI workflow (needed so the `e2e` label can start the e2e job)
+- The e2e job (kind + Presto 0.298) runs on every PR targeting `main`, on `main` pushes, on tags, and nightly on schedule

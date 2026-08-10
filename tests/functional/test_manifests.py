@@ -349,8 +349,7 @@ _BRACED_PARAM_RE = re.compile(
 CONDITIONAL_JOBS = {
     "e2e": (
         "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || "
-        "startsWith(github.ref, 'refs/tags/') || (github.event_name == 'pull_request' && "
-        "contains(github.event.pull_request.labels.*.name, 'e2e'))"
+        "startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request'"
     ),
 }
 CONDITIONAL_STEPS = {
