@@ -26,13 +26,19 @@ class TemporalWorkflowStarter:
         self._task_queue = task_queue
 
     async def start_investigation(self, event: dict[str, Any], investigation_id: uuid.UUID) -> str:
-        # Lazy import so the gateway package does not hard-depend on worker at import time
-        # for unit tests that inject a fake starter.
-        from worker.workflows.investigation import InvestigationWorkflow
-
+        # Untyped (string) workflow start: deploy/docker/ingest-gateway.Dockerfile
+        # installs only rca_common + services/gateway (design.md §11
+        # one-service/one-image), so importing worker.workflows.investigation
+        # here -- as a previous version of this method did -- raised
+        # ModuleNotFoundError on every real investigation in any deployment
+        # built from that image (masked in tests only because the functional
+        # CI job happens to install gateway and worker into one shared venv).
+        # "InvestigationWorkflow" is the real registered type: @workflow.defn
+        # on that class carries no name= override, so Temporal defaults the
+        # workflow type to the class name.
         workflow_id = f"investigation-{investigation_id}"
         handle = await self._client.start_workflow(
-            InvestigationWorkflow.run,
+            "InvestigationWorkflow",
             {
                 "event": event,
                 "investigation_id": str(investigation_id),

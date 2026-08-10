@@ -88,37 +88,42 @@ temporal:
 
 
 @pytest.mark.asyncio
-async def test_temporal_starter_lazy_import(monkeypatch):
+async def test_temporal_starter_does_not_import_worker(monkeypatch):
+    """deploy/docker/ingest-gateway.Dockerfile installs only rca_common +
+    services/gateway (design.md §11 one-service/one-image) -- no `worker`
+    package is ever present in the real deployed image. A previous version of
+    start_investigation imported worker.workflows.investigation.InvestigationWorkflow
+    directly, which raised ModuleNotFoundError on every real investigation in
+    any real deployment; it was masked here only by a fake `worker` module this
+    test injected into sys.modules, which made the bug invisible. This test
+    instead asserts `worker` is genuinely absent and that start_workflow is
+    called with the plain string "InvestigationWorkflow" (Temporal's untyped
+    workflow-start form, which needs no import of worker's code at all)."""
+    import sys
+
+    assert "worker" not in sys.modules, (
+        "an earlier test left a fake `worker` module in sys.modules; this "
+        "test needs it genuinely absent to prove no import is attempted"
+    )
+
     class FakeHandle:
         id = "wf-1"
 
+    calls: list[tuple[tuple, dict]] = []
+
     class FakeClient:
         async def start_workflow(self, *a, **k):
+            calls.append((a, k))
             return FakeHandle()
 
     starter = TemporalWorkflowStarter(FakeClient())
-    # Will try to import InvestigationWorkflow — ensure worker package is on path
-    # or that the import is attempted. If worker is not installed in gateway
-    # venv this may fail; guard by injecting a fake module.
-    import sys
-    import types
-
-    inv_mod = types.ModuleType("worker.workflows.investigation")
-
-    class InvestigationWorkflow:
-        @staticmethod
-        async def run(x):
-            return None
-
-    inv_mod.InvestigationWorkflow = InvestigationWorkflow
-    workflows_mod = types.ModuleType("worker.workflows")
-    worker_mod = types.ModuleType("worker")
-    sys.modules["worker"] = worker_mod
-    sys.modules["worker.workflows"] = workflows_mod
-    sys.modules["worker.workflows.investigation"] = inv_mod
     import uuid
 
     wid = await starter.start_investigation(
         {"platform_key": "p", "error_summary": "x"}, uuid.uuid4()
     )
     assert wid == "wf-1"
+    assert "worker" not in sys.modules, "start_investigation imported the worker package"
+    assert calls[0][0][0] == "InvestigationWorkflow", (
+        f"expected the untyped workflow type name, got {calls[0][0]!r}"
+    )
