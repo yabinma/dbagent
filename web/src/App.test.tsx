@@ -153,7 +153,7 @@ describe("App routing + role-gated navigation", () => {
     await waitFor(() =>
       expect(screen.getByText("Approval queue")).toBeInTheDocument()
     );
-    expect(screen.getByTestId("approval-card")).toBeInTheDocument();
+    expect(await screen.findByTestId("approval-card")).toBeInTheDocument();
     expect(screen.getByText("Approvals")).toBeInTheDocument();
   });
 
