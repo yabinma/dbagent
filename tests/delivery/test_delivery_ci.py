@@ -31,10 +31,9 @@ def test_ci_on_block_wires_all_four_e2e_triggers():
     tags = on["push"].get("tags") or []
     assert tags, "push.tags must be non-empty for release e2e"
     assert any("v*" in str(t) or t == "v*" for t in tags)
-    # pull_request.types includes labeled
+    # pull_request.types — e2e runs on every PR targeting main (no label gate)
     pr = on["pull_request"]
     types = pr.get("types") or []
-    assert "labeled" in types
     for t in ("opened", "synchronize", "reopened"):
         assert t in types
     # schedule
@@ -54,14 +53,13 @@ def test_e2e_job_gate_order_and_timeout():
     if isinstance(needs, str):
         needs = [needs]
     assert "benchmark" in needs
-    # if: narrows triggers — require the PR-label path explicitly (not a bare "github" match).
+    # if: narrows triggers — e2e runs on every PR targeting main, plus
+    # schedule/workflow_dispatch/tags; no PR-label gate anymore.
     iff = e2e.get("if") or ""
     assert "schedule" in iff
     assert "workflow_dispatch" in iff
     assert "tags" in iff or "refs/tags" in iff
     assert "pull_request" in iff
-    assert "e2e" in iff
-    assert "labels" in iff
 
 
 # Code review round 5, C8: the worker job ran
