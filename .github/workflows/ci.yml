@@ -275,7 +275,7 @@ jobs:
         run: bash scripts/go-coverage-check.sh 80
 
   functional:
-    name: functional tests (M1–M4 + manifest checks)
+    name: functional tests (M1–M6 + manifest checks)
     runs-on: ubuntu-latest
     needs:
       [
