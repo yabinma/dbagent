@@ -27,7 +27,12 @@ PROFILE="$(mktemp)"
 trap 'rm -f "$PROFILE"' EXIT
 
 echo "==> go test ./... -coverprofile=$PROFILE"
-go test ./... -coverprofile="$PROFILE" -covermode=atomic -timeout 300s
+# -p 1: this re-runs the whole suite a second time (for coverage, after the
+# CI step above already ran it once under -race); without serializing package
+# execution it recreates the same real-Postgres-testcontainer contention
+# between registry and tests/functional/m2_probe_link that -p 1 was added to
+# the -race step to fix -- see that step's comment in .github/workflows/ci.yml.
+go test ./... -coverprofile="$PROFILE" -covermode=atomic -timeout 300s -p 1
 
 echo
 echo "==> per-package coverage (excluding gen/go/... and cmd/*/main.go's main() function; must be strictly > ${THRESHOLD}%)"
