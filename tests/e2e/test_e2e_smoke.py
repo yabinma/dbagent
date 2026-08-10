@@ -33,8 +33,14 @@ def test_e0_presto_0298_cluster_ready_and_probe_online(presto_url, dashboard_url
     body = r.json()
     ver = (body.get("nodeVersion") or {}).get("version") or body.get("version") or ""
     # FP-M6-16 pins Presto 0.298 exactly — a 0.29 prefix accepted 0.297/0.299
-    # (code review round 7, W2).
-    assert str(ver).strip() == "0.298", f"expected Presto 0.298 exactly, got {ver!r}"
+    # (code review round 7, W2). The real prestodb/presto:0.298 image reports
+    # a build-hash suffix ("0.298-e121953"), confirmed against the actual
+    # image, not "0.298" bare -- accept that specific shape (a literal "-"
+    # right after "0.298") without reopening the loose-prefix hole W2 closed:
+    # "0.2971"/"0.2980" etc. still fail since the character after "0.298"
+    # isn't "-".
+    v = str(ver).strip()
+    assert v == "0.298" or v.startswith("0.298-"), f"expected Presto 0.298 exactly, got {ver!r}"
 
     # Auth required for platforms — login and assert at least one online platform.
     lr = httpx.post(

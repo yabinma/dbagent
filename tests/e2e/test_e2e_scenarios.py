@@ -652,8 +652,8 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
     # establish no memory fault while the canned alert still drove RCA.
     result = _presto_query(
         presto_url,
-        "SELECT l_orderkey, count(*) AS n FROM tpch.sf1.lineitem "
-        "GROUP BY l_orderkey ORDER BY n DESC LIMIT 10",
+        "SELECT orderkey, count(*) AS n FROM tpch.sf1.lineitem "
+        "GROUP BY orderkey ORDER BY n DESC LIMIT 10",
     )
     state = str(result.get("state") or "").upper()
     assert state == "FAILED", (
@@ -809,9 +809,18 @@ def test_e2_broken_catalog_redacted(dashboard_url, ingest_url, presto_url):
     # probe's `presto_config` tool resolves `catalog:broken` to (k8senv
     # configFileToKey) — so what the pod mounts and what the collector reads
     # are the same bytes, and the redaction filter is genuinely on the path.
+    # connector.name=hive doesn't match any factory this image ships (real
+    # name is hive-hadoop2, confirmed against the actual prestodb/presto:0.298
+    # image) and crashes the WHOLE coordinator rather than just this catalog,
+    # which defeats the scenario -- the platform has to stay observable.
+    # hive-hadoop2 itself doesn't take connection-url (it wants
+    # hive.metastore.uri, no embedded credential). postgresql is a real,
+    # accepted JDBC connector whose connection-url legitimately carries an
+    # embedded password, which is exactly the shape this scenario needs to
+    # prove gets redacted, and the coordinator stays healthy with it.
     broken = (
-        f"connector.name=hive\n"
-        f"connection-url=jdbc:hive2://x?password={sentinel}\n"
+        f"connector.name=postgresql\n"
+        f"connection-url=jdbc:postgresql://x?password={sentinel}\n"
     )
     _put_configmap_key(COORDINATOR_CONFIGMAP, BROKEN_CATALOG_KEY, broken)
 
@@ -1006,36 +1015,22 @@ def test_e2_broken_catalog_redacted(dashboard_url, ingest_url, presto_url):
 RESOURCE_GROUP_MANAGER_PROP = "resource-groups.configuration-manager"
 RESOURCE_GROUP_FILE_PROP = "resource-groups.config-file"
 RESOURCE_GROUP_FILE = "/opt/presto-server/etc/resource-groups.json"
+# These two properties are NOT config.properties keys: Presto's core Bootstrap
+# injector validates config.properties against only its own modules and fails
+# startup ("Configuration property ... was not used") if they are appended
+# there instead of their own etc/resource-groups.properties file -- confirmed
+# against the real prestodb/presto:0.298 image (docs:
+# https://prestodb.io/docs/current/admin/resource-groups.html). Empty by
+# default (see configmaps.yaml); E3 writes both lines into this whole key via
+# _put_configmap_key and empties it again on cleanup -- never into
+# config.properties.
+RESOURCE_GROUPS_PROPERTIES_KEY = "resource-groups.properties"
+RESOURCE_GROUPS_PROPERTIES_PATH = "/opt/presto-server/etc/resource-groups.properties"
 E3_LONG_QUERY = (
     "SELECT count(*) FROM tpch.sf1.lineitem l "
-    "JOIN tpch.sf1.orders o ON l.l_orderkey = o.o_orderkey"
+    "JOIN tpch.sf1.orders o ON l.orderkey = o.orderkey"
 )
 E3_CONCURRENT_QUERIES = 6
-
-
-def _set_coordinator_properties(props: dict[str, str | None]) -> None:
-    """Add or remove coordinator properties inside `data.config.properties`,
-    preserving everything else in that value, then restart and wait."""
-    data = _configmap_data(COORDINATOR_CONFIGMAP)
-    text = data["config.properties"]
-    for prop, value in props.items():
-        if value is None:
-            text = "\n".join(
-                line for line in text.splitlines()
-                if not line.strip().startswith(f"{prop}=")
-            ) + "\n"
-        else:
-            text = _with_property(text, prop, value)
-    _kubectl_ok(
-        "patch",
-        "configmap",
-        COORDINATOR_CONFIGMAP,
-        "--type",
-        "merge",
-        "-p",
-        json.dumps({"data": {"config.properties": text}}),
-    )
-    _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
 
 
 def _wait_for_states(
@@ -1062,20 +1057,22 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
     token = _login(dashboard_url)
 
     # Fault injection: switch the coordinator to the file resource-group
-    # manager, whose shipped root group runs one query at a time.
-    _set_coordinator_properties(
-        {
-            RESOURCE_GROUP_MANAGER_PROP: "file",
-            RESOURCE_GROUP_FILE_PROP: RESOURCE_GROUP_FILE,
-        }
+    # manager, whose shipped root group runs one query at a time. These two
+    # properties live in their own resource-groups.properties key/file, never
+    # in config.properties -- see RESOURCE_GROUPS_PROPERTIES_KEY.
+    _put_configmap_key(
+        COORDINATOR_CONFIGMAP,
+        RESOURCE_GROUPS_PROPERTIES_KEY,
+        f"{RESOURCE_GROUP_MANAGER_PROP}=file\n{RESOURCE_GROUP_FILE_PROP}={RESOURCE_GROUP_FILE}\n",
     )
+    _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
     # Everything after the constraint is installed runs under `finally`: a
     # failure in mount verification or query submission used to leave hard
     # concurrency pinned at 1 for every later scenario (code review round 5,
     # W1).
     try:
         mounted = _mounted_property(
-            COORDINATOR_WORKLOAD, PRESTO_CONFIG_PATH, RESOURCE_GROUP_MANAGER_PROP
+            COORDINATOR_WORKLOAD, RESOURCE_GROUPS_PROPERTIES_PATH, RESOURCE_GROUP_MANAGER_PROP
         )
         assert mounted == "file", (
             f"resource-group constraint never reached the coordinator: {mounted!r}"
@@ -1110,10 +1107,11 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
         assert inv_id
         _e3_assert_case(dashboard_url, token, inv_id, queued=queued)
     finally:
-        # Recovery: remove the constraint and require the backlog to drain.
-        _set_coordinator_properties(
-            {RESOURCE_GROUP_MANAGER_PROP: None, RESOURCE_GROUP_FILE_PROP: None}
-        )
+        # Recovery: empty resource-groups.properties back out (never
+        # config.properties -- see RESOURCE_GROUPS_PROPERTIES_KEY) and require
+        # the backlog to drain.
+        _put_configmap_key(COORDINATOR_CONFIGMAP, RESOURCE_GROUPS_PROPERTIES_KEY, "")
+        _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
 
     drained_deadline = time.time() + 120
     remaining = {}

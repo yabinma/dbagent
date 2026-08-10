@@ -48,9 +48,10 @@ data:
     com.facebook.presto=INFO
   catalog_tpch.properties: |
     connector.name=tpch
-  # E3 (Section 13.5): one running query at a time, the rest QUEUED. Inert
-  # until config.properties selects the file resource-group manager, which is
-  # exactly the fault E3 injects and then removes.
+  # E3 (Section 13.5): one running query at a time, the rest QUEUED. Inert on
+  # its own -- it only takes effect once resource-groups.properties (below)
+  # selects the file resource-group manager, which is exactly the fault E3
+  # injects and then removes. This is the JSON payload that manager reads.
   resource_groups.json: |
     {
       "rootGroups": [
@@ -68,6 +69,16 @@ data:
         }
       ]
     }
+  # Empty by default -- inert. Presto's resource-groups.configuration-manager
+  # and resource-groups.config-file properties MUST live in their own
+  # etc/resource-groups.properties file (a Presto plugin-config convention,
+  # like catalog properties): the core Bootstrap injector validates
+  # config.properties against only its own modules and fails startup with
+  # "Configuration property ... was not used" if they are appended there
+  # instead (confirmed against the real prestodb/presto:0.298 image). E3
+  # writes both properties into this key via _put_configmap_key and restores
+  # it to empty afterward; it must never touch config.properties for this.
+  resource-groups.properties: ""
 ---
 apiVersion: v1
 kind: ConfigMap
