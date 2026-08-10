@@ -24,6 +24,13 @@ die() { echo "build.sh: ERROR: $*" >&2; exit 1; }
 echo "==> codegen"
 bash scripts/gen-proto.sh
 bash schemas/generate-pydantic.sh
+# schemas/node_modules is a dev-sandbox convenience, not a guarantee: a fresh
+# checkout (including CI) has never run `npm ci` here, so generate-ts.js's
+# json-schema-to-typescript import would otherwise fail MODULE_NOT_FOUND.
+if [[ ! -d schemas/node_modules/json-schema-to-typescript ]]; then
+  echo "==> npm ci --prefix schemas (json-schema-to-typescript not installed)"
+  npm --prefix schemas ci
+fi
 node schemas/generate-ts.js
 
 # Fail fast if generated trees are still missing (they are gitignored).

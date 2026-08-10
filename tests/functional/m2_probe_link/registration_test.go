@@ -130,9 +130,40 @@ func setupSharedInfra(t *testing.T) (dsn, probeBin, gatewayBin string) {
 	return sharedDSN, sharedProbeBin, sharedGatewayBin
 }
 
+// rcaCommonPythonBin finds a Python that has rca_common (and its alembic
+// dependency) installed. Which venv exists depends on which CI job is
+// running this package: `unit-go` creates libs/py/rca_common/.venv
+// specifically for this migration; `functional` instead installs
+// rca_common editable into a shared services/worker/.venv alongside
+// worker/gateway/dashboard-api. Neither job is wrong -- this just needs to
+// find whichever one the caller set up, rather than assuming the first.
+// Shared with write_dispatch_test.go's signing helpers, which need the same
+// rca_common-importable interpreter for an unrelated reason (D14 signing).
+func rcaCommonPythonBin(root string) (string, error) {
+	candidates := []string{
+		filepath.Join(root, "libs", "py", "rca_common", ".venv", "bin", "python"),
+		filepath.Join(root, "services", "worker", ".venv", "bin", "python"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
+		}
+	}
+	if p, err := exec.LookPath("python3"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf(
+		"no python with rca_common installed found (tried %v, and python3 on PATH)",
+		candidates,
+	)
+}
+
 func runAlembicMigrationErr(root, dsn string) error {
 	rcaCommonDir := filepath.Join(root, "libs", "py", "rca_common")
-	pythonBin := filepath.Join(rcaCommonDir, ".venv", "bin", "python")
+	pythonBin, err := rcaCommonPythonBin(root)
+	if err != nil {
+		return err
+	}
 	alembicDSN := "postgresql+psycopg2://" + dsn[len("postgres://"):]
 
 	cmd := exec.Command(pythonBin, "-m", "alembic", "upgrade", "head")

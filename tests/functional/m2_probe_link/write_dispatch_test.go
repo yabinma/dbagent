@@ -83,7 +83,10 @@ func (fp *fakePrestoKill) deletedIDs() []string {
 // public sidecar is path+".pub".
 func bootstrapPythonSigningKey(t *testing.T, root, keyPath string) {
 	t.Helper()
-	pythonBin := filepath.Join(root, "libs", "py", "rca_common", ".venv", "bin", "python")
+	pythonBin, err := rcaCommonPythonBin(root)
+	if err != nil {
+		t.Fatalf("bootstrap_signing_key via Python: %v", err)
+	}
 	script := `
 import sys
 from rca_common.signing.signer import bootstrap_signing_key
@@ -104,7 +107,10 @@ print("ok")
 // control_plane_signature.
 func pythonSignStep(t *testing.T, root, keyPath, executionID, playbookID string, stepIndex int, op string, params map[string]any) string {
 	t.Helper()
-	pythonBin := filepath.Join(root, "libs", "py", "rca_common", ".venv", "bin", "python")
+	pythonBin, err := rcaCommonPythonBin(root)
+	if err != nil {
+		t.Fatalf("python sign step: %v", err)
+	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		t.Fatalf("marshal params: %v", err)
