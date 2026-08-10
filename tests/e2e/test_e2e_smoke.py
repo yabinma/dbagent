@@ -79,10 +79,10 @@ def test_e0_helm_upgrade_is_idempotent():
             [
                 "kubectl",
                 "-n",
-                "rca",
+                "dbagent",
                 "get",
                 "secret",
-                "rca-agent-signing-key",
+                "dbagent-signing-key",
                 "-o",
                 "jsonpath={.data.ed25519\\.key}",
             ],
@@ -97,14 +97,14 @@ def test_e0_helm_upgrade_is_idempotent():
             [
                 "kubectl",
                 "-n",
-                "rca",
+                "dbagent",
                 "exec",
-                "deploy/rca-agent-dashboard-api",
+                "deploy/dbagent-dashboard-api",
                 "--",
                 "python",
                 "-c",
                 "import os; from sqlalchemy import create_engine,text; "
-                "e=create_engine(os.environ['RCA_PG_DSN']); "
+                "e=create_engine(os.environ['PG_DSN']); "
                 "print(e.connect().execute(text('select version_num from alembic_version')).scalar())",
             ],
             capture_output=True,
@@ -122,14 +122,14 @@ def test_e0_helm_upgrade_is_idempotent():
             [
                 "kubectl",
                 "-n",
-                "rca",
+                "dbagent",
                 "exec",
-                "deploy/rca-agent-dashboard-api",
+                "deploy/dbagent-dashboard-api",
                 "--",
                 "python",
                 "-c",
                 "import os,json; from sqlalchemy import create_engine,text; "
-                "e=create_engine(os.environ['RCA_PG_DSN']); "
+                "e=create_engine(os.environ['PG_DSN']); "
                 "rows=e.connect().execute(text("
                 "'select playbook_id, auto_eligible, maturity from playbooks order by playbook_id'"
                 ")).fetchall(); "
@@ -156,12 +156,12 @@ def test_e0_helm_upgrade_is_idempotent():
         [
             "helm",
             "upgrade",
-            "rca-agent",
-            "deploy/charts/rca-agent",
+            "dbagent",
+            "deploy/charts/dbagent",
             "-n",
-            "rca",
+            "dbagent",
             "-f",
-            "tests/e2e/values-rca-agent.yaml",
+            "tests/e2e/values-dbagent.yaml",
             "--wait",
             "--timeout",
             "5m",

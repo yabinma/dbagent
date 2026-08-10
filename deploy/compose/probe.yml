@@ -1,18 +1,37 @@
 # Single-node Docker probe (design.md FP-M6-12).
 # write_enabled defaults to false; set true and remount write-capable docker socket carefully.
-name: rca-probe
+#
+# The probe reaches the Docker Engine API by dialing the socket mounted below
+# (design.md §11.2.3 B, FP-SW-2/FP-SW-4). There is deliberately NO socket-proxy
+# service here: a TCP proxy in front of /var/run/docker.sock grants
+# root-equivalent control of the node to everything that can reach that port.
+# The `:ro` flag on the mount is NOT a write control -- `write_enabled` and the
+# signed write channel are (Section 8.1).
+#
+# The shipped image runs as non-root UID/GID 65532. A typical host Docker
+# socket is root:docker mode 0660, so the container must join the host docker
+# group by numeric GID. Set DOCKER_SOCKET_GID before `docker compose up`:
+#   export DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock)"
+# See docs/deployment/swarm.md ("Socket group membership").
+name: dbagent-probe
 
 services:
   probe:
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/probe:${APP_VERSION:-0.1.0}
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/probe:${APP_VERSION:-0.1.0}
     environment:
-      PROBE_CONFIG: /etc/rca-probe/config.yaml
+      PROBE_CONFIG: /etc/dbagent-probe/config.yaml
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
+      BOOTSTRAP_CA_PIN: ${BOOTSTRAP_CA_PIN:-}
+    # Supplemental group so non-root 65532 can connect to a root:docker 0660
+    # socket. Required — without it the probe gets EACCES and exits before
+    # enrollment (GET /_ping preflight).
+    group_add:
+      - "${DOCKER_SOCKET_GID:?set DOCKER_SOCKET_GID to the host docker group GID (stat -c '%g' /var/run/docker.sock)}"
     volumes:
-      - ./config/probe.yaml:/etc/rca-probe/config.yaml:ro
-      - probe-state:/var/lib/rca-probe
+      - ./config/probe.yaml:/etc/dbagent-probe/config.yaml:ro
+      - probe-state:/var/lib/dbagent-probe
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${PLATFORM_CREDENTIALS_DIR:-./platform-credentials}:/etc/rca-probe/platform-credentials:ro
+      - ${PLATFORM_CREDENTIALS_DIR:-./platform-credentials}:/etc/dbagent-probe/platform-credentials:ro
     restart: unless-stopped
 
 volumes:

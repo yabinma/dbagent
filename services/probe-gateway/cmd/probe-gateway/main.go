@@ -34,7 +34,7 @@ import (
 func main() {
 	configPath := os.Getenv("PROBE_GATEWAY_CONFIG")
 	if configPath == "" {
-		configPath = "/etc/rca-agent/probe-gateway/config.yaml"
+		configPath = "/etc/dbagent/probe-gateway/config.yaml"
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {

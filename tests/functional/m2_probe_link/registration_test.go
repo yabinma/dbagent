@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -69,9 +70,9 @@ func TestMain(m *testing.M) {
 	ctx := context.Background()
 
 	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("rca_agent"),
-		postgres.WithUsername("rca_agent"),
-		postgres.WithPassword("rca_agent"),
+		postgres.WithDatabase("dbagent"),
+		postgres.WithUsername("dbagent"),
+		postgres.WithPassword("dbagent"),
 		testcontainers.WithWaitStrategy(
 			tcwait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
 		),
@@ -136,7 +137,7 @@ func runAlembicMigrationErr(root, dsn string) error {
 
 	cmd := exec.Command(pythonBin, "-m", "alembic", "upgrade", "head")
 	cmd.Dir = rcaCommonDir
-	cmd.Env = append(os.Environ(), "RCA_PG_DSN="+alembicDSN)
+	cmd.Env = append(os.Environ(), "DBAGENT_PG_DSN="+alembicDSN)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
@@ -377,6 +378,13 @@ type probeConfig struct {
 	// SigningKeyGraceWindow, when non-empty, is written as
 	// signing_key_grace_window (empty → omit; probe default 10m applies).
 	SigningKeyGraceWindow string
+	// ConfigPaths, when non-empty, is written as the probe's config_paths
+	// map (design.md §11.2.3 A, FP-SW-1).
+	ConfigPaths map[string]string
+	// WorkDir, when non-empty, becomes the probe process's working
+	// directory (FP-SW-3's relative-socket case needs the socket to sit in
+	// the process's cwd).
+	WorkDir string
 }
 
 func startProbeSubprocess(t *testing.T, probeBin string, pc probeConfig) *exec.Cmd {
@@ -407,6 +415,17 @@ func startProbeSubprocessWithLog(t *testing.T, probeBin string, pc probeConfig) 
 	if pc.SigningKeyGraceWindow != "" {
 		graceLine = fmt.Sprintf("signing_key_grace_window: %s\n", pc.SigningKeyGraceWindow)
 	}
+	if len(pc.ConfigPaths) > 0 {
+		keys := make([]string, 0, len(pc.ConfigPaths))
+		for k := range pc.ConfigPaths {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		graceLine += "config_paths:\n"
+		for _, k := range keys {
+			graceLine += fmt.Sprintf("  %q: %q\n", k, pc.ConfigPaths[k])
+		}
+	}
 
 	cfg := fmt.Sprintf(`
 platform_key: %q
@@ -434,6 +453,7 @@ write_enabled: %t
 	logPath := filepath.Join(dir, "probe.log")
 	cmd := exec.Command(probeBin)
 	cmd.Env = append(os.Environ(), "PROBE_CONFIG="+cfgPath)
+	cmd.Dir = pc.WorkDir
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create log file: %v", err)

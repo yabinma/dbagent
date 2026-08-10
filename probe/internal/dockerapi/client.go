@@ -14,9 +14,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 )
 
 type Client struct {
@@ -32,6 +37,100 @@ func New(baseURL string, httpClient *http.Client) *Client {
 		httpClient = http.DefaultClient
 	}
 	return &Client{BaseURL: baseURL, HTTP: httpClient}
+}
+
+// unixScheme is the only form that dials a socket; the other two keep the
+// plain transport (design.md §11.2.3 B).
+const (
+	unixScheme  = "unix://"
+	httpScheme  = "http://"
+	httpsScheme = "https://"
+
+	// dummyAuthority is the authority Docker's own SDK uses when the
+	// transport dials a unix socket. It is only correct because a dialer
+	// backs it -- the shipped probe used to carry the authority without the
+	// dialer, which is the defect FP-SW-2 fixes.
+	dummyAuthority = "http://docker"
+)
+
+// NewForBaseURL builds a Client from a deployment-supplied base URL
+// (design.md §11.2.3 B, FP-SW-2/FP-SW-3).
+//
+//	unix:///var/run/docker.sock -> unix-socket transport (default)
+//	http://host:port | https://host:port -> plain transport (tests; an
+//	operator-run socket proxy)
+//
+// Any other scheme, or a unix path that is missing or not a socket, is an
+// error -- the caller treats it as fatal.
+//
+// For unix:// URLs, NewForBaseURL also issues a real GET /_ping against the
+// Engine API. Stat alone cannot detect a non-root probe lacking the host
+// docker group (typical root:docker 0660 socket); without this preflight the
+// single-use bootstrap token would already be spent by the time the first
+// real Docker call failed. http(s):// stays lazy so tests and operator
+// proxies can construct a client without a live endpoint.
+func NewForBaseURL(baseURL string) (*Client, error) {
+	switch {
+	case strings.HasPrefix(baseURL, unixScheme):
+		socketPath := strings.TrimPrefix(baseURL, unixScheme)
+		// Preflight order matters: an *existing* relative socket must be
+		// rejected for being relative, not accepted for existing.
+		if !filepath.IsAbs(socketPath) {
+			return nil, fmt.Errorf("dockerapi: docker socket path %q must be absolute (use unix:///var/run/docker.sock)", socketPath)
+		}
+		info, err := os.Stat(socketPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("dockerapi: docker socket %s not found (mount /var/run/docker.sock into the probe container)", socketPath)
+			}
+			return nil, fmt.Errorf("dockerapi: docker socket %s: %w", socketPath, err)
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("dockerapi: %s is not a unix socket", socketPath)
+		}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		}
+		// No client-level Timeout: every request already carries a context
+		// (http.NewRequestWithContext throughout this file), and a timeout
+		// here would truncate long Exec streams.
+		client := New(dummyAuthority, &http.Client{Transport: transport})
+		if err := client.ping(socketPath); err != nil {
+			return nil, err
+		}
+		return client, nil
+	case strings.HasPrefix(baseURL, httpScheme), strings.HasPrefix(baseURL, httpsScheme):
+		return New(baseURL, nil), nil
+	default:
+		return nil, fmt.Errorf("dockerapi: unsupported docker_api_base_url scheme %q (want unix://, http:// or https://)", baseURL)
+	}
+}
+
+// pingDeadline bounds the construction-time connectivity check so a hung
+// socket cannot stall probe startup indefinitely.
+const pingDeadline = 5 * time.Second
+
+// ping issues GET /_ping so permission and connectivity failures surface
+// during client construction (before enrollment spends the bootstrap token).
+func (c *Client) ping(socketPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), pingDeadline)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/_ping", nil)
+	if err != nil {
+		return fmt.Errorf("dockerapi: docker socket %s: build ping: %w", socketPath, err)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("dockerapi: cannot reach docker via %s: %w (mount the socket and add the host docker group GID via DOCKER_SOCKET_GID — group_add on Compose, user: \"uid:gid\" on Swarm; see docs/deployment/swarm.md)", socketPath, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("dockerapi: docker socket %s: GET /_ping status %d", socketPath, resp.StatusCode)
+	}
+	return nil
 }
 
 // --- Swarm tasks -------------------------------------------------------------------

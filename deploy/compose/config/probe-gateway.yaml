@@ -2,9 +2,9 @@ postgres_dsn: ${PG_DSN}
 session_listen_addr: ":8443"
 bootstrap_listen_addr: ":8444"
 internal_listen_addr: ":8080"
-signing_public_key_path: /etc/rca-agent/signing/ed25519.key.pub
-bootstrap_ca_cert_path: /etc/rca-agent/probe-gateway-ca/bootstrap-ca.crt
-bootstrap_ca_key_path: /etc/rca-agent/probe-gateway-ca/bootstrap-ca.key
+signing_public_key_path: /etc/dbagent/signing/ed25519.key.pub
+bootstrap_ca_cert_path: /etc/dbagent/probe-gateway-ca/bootstrap-ca.crt
+bootstrap_ca_key_path: /etc/dbagent/probe-gateway-ca/bootstrap-ca.key
 server_cert_sans:
   - probe-gateway
   - localhost

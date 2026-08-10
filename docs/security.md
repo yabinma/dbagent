@@ -29,7 +29,7 @@ Secrets never live in ConfigMaps or committed YAML as literals.
 | Probe bootstrap token | K8s Secret or Docker secret file | YAML `bootstrap_token` **or** `BOOTSTRAP_TOKEN_FILE` |
 | Platform Presto credentials | per-platform Secret / Docker secret | mounted at `credentials_mount` |
 | Bootstrap CA key | PVC or `existingSecret` | probe-gateway only |
-| ed25519 signing private key | `rca-agent-signing-key` Secret | worker + probe-gateway |
+| ed25519 signing private key | `dbagent-signing-key` Secret | worker + probe-gateway |
 
 ### Operators
 
@@ -40,6 +40,35 @@ Secrets never live in ConfigMaps or committed YAML as literals.
    rather than an environment variable (see `docs/configuration.md`).
 4. After rotation, confirm probes re-enroll and that `GET /platforms` stays
    `online` before tearing down the old credential.
+
+## Docker socket access on Swarm (design.md §11.2.3 B)
+
+The probe reaches the Docker Engine API by **dialing the mounted unix socket**
+(`docker_api_base_url: unix:///var/run/docker.sock`, the default). The shipped
+compose and stack files declare no socket-proxy service.
+
+- **The `:ro` mount flag is not a security control.** A read-only bind mount of
+  `/var/run/docker.sock` does not make the Engine API read-only. What limits the
+  probe to reads is `write_enabled: false` and the signed write channel.
+- **Non-root + socket group.** The probe image runs as UID/GID 65532. Operators
+  must set `DOCKER_SOCKET_GID` (the host docker group's numeric GID) so the
+  process can open a typical `root:docker` `0660` socket — Compose uses
+  `group_add`, Swarm uses `user: "65532:${DOCKER_SOCKET_GID}"` (stack schema
+  rejects `group_add`); see `docs/deployment/swarm.md`. Startup performs
+  `GET /_ping` before enrollment so an `EACCES` failure does not spend the
+  single-use bootstrap token.
+- A site that forbids socket mounts may run its own proxy and point
+  `docker_api_base_url` at `http://<proxy>:<port>`. Understand the cost: a TCP
+  proxy in front of the socket grants root-equivalent control of the manager
+  node to everything that can reach that port, and the probe sits on the Presto
+  overlay network. Use an endpoint-filtering proxy on a dedicated network.
+
+## Identities the product presents
+
+| Identity | Value | Why an operator cares |
+|---|---|---|
+| Presto client user | `X-Presto-User: dbagent-probe` | appears in the customer's query history and `system.runtime.queries.user`; grant and filter on it, and write per-user resource groups against it |
+| Bootstrap CA subject | `CN=dbagent probe-gateway bootstrap CA` | the display string in `openssl x509 -subject`. `bootstrap_ca_pin` pins the SHA-256 of the **DER**, which is per-CA regardless of subject, so no pin an operator holds is invalidated by the name |
 
 ## Redaction (Section 8.2)
 

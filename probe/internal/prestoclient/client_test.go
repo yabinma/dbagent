@@ -102,8 +102,12 @@ func TestQuery_SinglePageSuccess(t *testing.T) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/statement" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
-		if r.Header.Get("X-Presto-User") == "" {
-			t.Fatalf("expected X-Presto-User header")
+		// design.md §11.2.3 C.1 row 29 / FP-SW-10's destination half: the
+		// product names itself to the platform it investigates, and this
+		// string shows up in the customer's own query history. Pinned
+		// exactly -- a non-empty check would pass a typo or a deletion.
+		if got := r.Header.Get("X-Presto-User"); got != "dbagent-probe" {
+			t.Fatalf("X-Presto-User = %q, want %q", got, "dbagent-probe")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -166,7 +170,9 @@ func TestQuery_FollowsNextURIPagination(t *testing.T) {
 
 func TestQuery_ReturnsStatementError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"error":{"message":"syntax error","errorCode":"SYNTAX_ERROR"}}`))
+		// Presto's real /v1/statement error shape: errorCode is a NUMBER,
+		// with symbolic errorName/errorType alongside it.
+		_, _ = w.Write([]byte(`{"error":{"message":"syntax error","errorCode":1,"errorName":"SYNTAX_ERROR","errorType":"USER_ERROR"}}`))
 	}))
 	defer srv.Close()
 
@@ -175,7 +181,7 @@ func TestQuery_ReturnsStatementError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected transport error: %v", err)
 	}
-	if res.Error == nil || res.Error.ErrorCode != "SYNTAX_ERROR" {
+	if res.Error == nil || res.Error.ErrorName != "SYNTAX_ERROR" || res.Error.ErrorCode != 1 {
 		t.Fatalf("expected statement error, got %+v", res)
 	}
 }

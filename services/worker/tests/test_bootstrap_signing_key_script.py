@@ -55,7 +55,7 @@ def test_is_idempotent_on_second_invocation(tmp_path, caplog):
 
 def test_reads_key_path_from_env_var(tmp_path, monkeypatch):
     key_path = tmp_path / "from-env" / "ed25519.key"
-    monkeypatch.setenv("RCA_SIGNING_KEY_PATH", str(key_path))
+    monkeypatch.setenv("DBAGENT_SIGNING_KEY_PATH", str(key_path))
 
     exit_code = bootstrap_signing_key_script.main([])
 

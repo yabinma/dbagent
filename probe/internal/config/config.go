@@ -3,7 +3,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,11 +38,25 @@ type Probe struct {
 	Namespace          string `yaml:"namespace"`           // K8s namespace; ignored for swarm
 	CoordinatorService string `yaml:"coordinator_service"` // Swarm coordinator locator form (Appendix E)
 	WorkerService      string `yaml:"worker_service"`
-	// DockerAPIBaseURL overrides the Docker Engine API base URL for Swarm
-	// deployments (default assumes a docker socket proxy reachable at
-	// "http://docker"). Configurable mainly so functional tests can point
-	// it at an httptest-mocked Docker API instead of a real daemon.
+	// DockerAPIBaseURL selects how the probe reaches the Docker Engine API on
+	// Swarm/Docker deployments (design.md §11.2.3 B, FP-SW-2/3). Accepted
+	// forms: "unix://<absolute path>" (the default,
+	// unix:///var/run/docker.sock -- the probe dials the mounted socket
+	// directly and the shipped stack contains no socket proxy),
+	// "http://host:port" and "https://host:port" (the test transport, and the
+	// still-supported operator option of an external socket proxy). Any other
+	// scheme, or a unix path that is missing or is not a socket, is a fatal
+	// startup error raised before enrollment.
 	DockerAPIBaseURL string `yaml:"docker_api_base_url"`
+	// ConfigPaths overrides where the probe reads platform config files inside
+	// the coordinator/worker container (design.md §11.2.3 A, FP-SW-1): a map
+	// from the Appendix B.1 `presto_config` `file` value
+	// ("config" | "jvm" | "node" | "catalog:<name>") to an ABSOLUTE
+	// in-container path. Absent keys keep the conventional /etc/presto/...
+	// default per key, never wholesale; a relative or empty value is a named
+	// load-time error. Swarm/Docker only -- ignored on Kubernetes, where
+	// RuntimeEnv.ReadConfig resolves a ConfigMap key rather than a path.
+	ConfigPaths map[string]string `yaml:"config_paths"`
 	// SigningKeyGraceWindow is D14's rotation grace: how long the
 	// pre-rotation control-plane signing public key keeps verifying
 	// write-ops after a mid-session key update (design.md §9.6 /
@@ -50,11 +67,32 @@ type Probe struct {
 
 func defaults() Probe {
 	return Probe{
-		CredentialsMount:      "/etc/rca-probe/platform-credentials",
-		StateDir:              "/var/lib/rca-probe",
-		DockerAPIBaseURL:      "http://docker",
+		CredentialsMount:      "/etc/dbagent-probe/platform-credentials",
+		StateDir:              "/var/lib/dbagent-probe",
+		DockerAPIBaseURL:      "unix:///var/run/docker.sock",
 		SigningKeyGraceWindow: 10 * time.Minute,
 	}
+}
+
+// validateConfigPaths enforces design.md §11.2.3 A's absolute-path rule on
+// every config_paths value. Keys are visited in sorted order so a config with
+// several bad values always reports the same one first.
+func validateConfigPaths(paths map[string]string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(paths))
+	for k := range paths {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := paths[key]
+		if value == "" || !filepath.IsAbs(value) {
+			return fmt.Errorf("probe config: config_paths[%q] must be an absolute path, got %q", key, value)
+		}
+	}
+	return nil
 }
 
 func Load(path string) (Probe, error) {
@@ -80,6 +118,13 @@ func Load(path string) (Probe, error) {
 		return Probe{}, err
 	}
 	if err := yaml.Unmarshal(expanded, &cfg); err != nil {
+		return Probe{}, err
+	}
+	// design.md §11.2.3 A (FP-SW-1): config_paths values must be absolute
+	// in-container paths, and this is enforced at load time -- after ${VAR}
+	// expansion, so an unset variable expanding to "" is caught here rather
+	// than producing a bare `cat` against the container's working directory.
+	if err := validateConfigPaths(cfg.ConfigPaths); err != nil {
 		return Probe{}, err
 	}
 	// Docker Swarm / Compose secret-file convention: when bootstrap_token is

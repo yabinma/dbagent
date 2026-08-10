@@ -3,8 +3,12 @@ package dockerapi
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -292,5 +296,207 @@ func TestServiceInspectAndUpdate(t *testing.T) {
 	}
 	if !updated {
 		t.Fatalf("update not called")
+	}
+}
+
+// --- UT-SW-3 (design.md §11.2.5, FP-SW-2/FP-SW-3): NewForBaseURL. ---
+
+// serveOnUnixSocket starts an httptest.Server whose listener is a unix socket
+// at socketPath, so the client under test performs a real socket dial.
+func serveOnUnixSocket(t *testing.T, socketPath string, handler http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", socketPath, err)
+	}
+	srv := &httptest.Server{Listener: ln, Config: &http.Server{Handler: handler}}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestNewForBaseURL_UnixSocketPerformsRealRequest(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "docker.sock")
+	var sawPing bool
+	serveOnUnixSocket(t, socketPath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_ping":
+			sawPing = true
+			_, _ = w.Write([]byte("OK"))
+		case "/tasks":
+			_, _ = w.Write([]byte(`[{"ID":"t1","ServiceID":"svc1","Slot":1,"NodeID":"n1","DesiredState":"running","Status":{"State":"running","ContainerStatus":{"ContainerID":"c1"}}}]`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+
+	client, err := NewForBaseURL("unix://" + socketPath)
+	if err != nil {
+		t.Fatalf("NewForBaseURL: %v", err)
+	}
+	if !sawPing {
+		t.Fatal("NewForBaseURL did not issue GET /_ping (Stat-only preflight is insufficient for permission failures)")
+	}
+	if client.BaseURL != "http://docker" {
+		t.Fatalf("BaseURL = %q, want the dummy authority http://docker", client.BaseURL)
+	}
+	if client.HTTP.Timeout != 0 {
+		t.Fatalf("client Timeout = %s, want none (contexts bound every request)", client.HTTP.Timeout)
+	}
+	tasks, err := client.ListTasks(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTasks over the unix socket: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "t1" || tasks[0].Status.ContainerStatus.ContainerID != "c1" {
+		t.Fatalf("unexpected tasks: %#v", tasks)
+	}
+}
+
+// C1: Stat alone cannot detect a non-root process lacking the docker group.
+// A socket that exists (Stat succeeds) but is not connectable must fail at
+// NewForBaseURL — before enrollment can spend the bootstrap token.
+func TestNewForBaseURL_UnixSocketPermissionDeniedSurfacesPreEnrollment(t *testing.T) {
+	// Root bypasses unix socket permission bits, so chmod 000 does not deny.
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses socket permission bits; chmod 000 is not a denial")
+	}
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "docker.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// Mode 000: Stat still succeeds; connect must fail with EACCES for any
+	// non-root caller, including the socket owner. That is the production
+	// failure mode when UID 65532 meets a root:docker 0660 socket without the
+	// host docker GID (Compose group_add / Swarm user:).
+	if err := os.Chmod(socketPath, 0); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(socketPath, 0o700) })
+
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatalf("precondition: Stat must succeed (the bug was stopping here): %v", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatal("precondition: path must remain a socket")
+	}
+
+	_, err = NewForBaseURL("unix://" + socketPath)
+	if err == nil {
+		t.Fatal("expected a connectivity/permission error; Stat-only preflight would wrongly succeed")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "cannot reach docker") {
+		t.Fatalf("error = %q, want a connectivity failure (not a missing-socket Stat error)", msg)
+	}
+	// The failure must be a permission denial past Stat — not merely the
+	// guidance string that every "cannot reach docker" error already carries.
+	if !strings.Contains(msg, "permission denied") {
+		t.Fatalf("error = %q, want permission denied (past Stat)", msg)
+	}
+}
+
+func TestNewForBaseURL_HTTPKeepsTodaysClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	for _, base := range []string{srv.URL, "https://docker-proxy.internal:2376"} {
+		client, err := NewForBaseURL(base)
+		if err != nil {
+			t.Fatalf("NewForBaseURL(%q): %v", base, err)
+		}
+		if client.BaseURL != base {
+			t.Fatalf("BaseURL = %q, want %q", client.BaseURL, base)
+		}
+		if client.HTTP != http.DefaultClient {
+			t.Fatalf("expected the plain default client for %q", base)
+		}
+	}
+	client, _ := NewForBaseURL(srv.URL)
+	if _, err := client.ListTasks(context.Background(), nil); err != nil {
+		t.Fatalf("ListTasks over http: %v", err)
+	}
+}
+
+func TestNewForBaseURL_NamedErrors(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "not-a-socket")
+	if err := os.WriteFile(regular, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "absent.sock")
+
+	cases := []struct {
+		name    string
+		baseURL string
+		want    string
+	}{
+		{
+			name:    "unsupported scheme",
+			baseURL: "tcp://docker:2375",
+			want:    `dockerapi: unsupported docker_api_base_url scheme "tcp://docker:2375" (want unix://, http:// or https://)`,
+		},
+		{
+			name:    "no scheme at all",
+			baseURL: "/var/run/docker.sock",
+			want:    `dockerapi: unsupported docker_api_base_url scheme "/var/run/docker.sock" (want unix://, http:// or https://)`,
+		},
+		{
+			name:    "missing socket path",
+			baseURL: "unix://" + missing,
+			want:    "dockerapi: docker socket " + missing + " not found (mount /var/run/docker.sock into the probe container)",
+		},
+		{
+			name:    "path is a regular file",
+			baseURL: "unix://" + regular,
+			want:    "dockerapi: " + regular + " is not a unix socket",
+		},
+		{
+			name:    "empty unix path",
+			baseURL: "unix://",
+			want:    `dockerapi: docker socket path "" must be absolute (use unix:///var/run/docker.sock)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewForBaseURL(tc.baseURL)
+			if err == nil {
+				t.Fatalf("expected an error, got client %#v", client)
+			}
+			if err.Error() != tc.want {
+				t.Fatalf("error = %q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// DW2: an *existing* relative socket must be rejected for being relative, not
+// accepted for existing -- the case that separates "checked absoluteness" from
+// "happened to fail Stat".
+func TestNewForBaseURL_ExistingRelativeSocketIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	serveOnUnixSocket(t, filepath.Join(dir, "docker.sock"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	if _, err := os.Stat("docker.sock"); err != nil {
+		t.Fatalf("precondition: the relative socket must exist and Stat cleanly: %v", err)
+	}
+
+	_, err := NewForBaseURL("unix://docker.sock")
+	if err == nil {
+		t.Fatal("expected a relative-path error for an existing relative socket")
+	}
+	want := `dockerapi: docker socket path "docker.sock" must be absolute (use unix:///var/run/docker.sock)`
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
 	}
 }

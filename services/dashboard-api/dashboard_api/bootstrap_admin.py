@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from rca_common.config import load_config
 from rca_common.db.models import User
+from rca_common.envcompat import reject_legacy_env
 from rca_common.db.session import make_engine, make_session_factory
 from rca_common.userauth import hash_password
 from sqlalchemy import select
@@ -50,13 +51,14 @@ def bootstrap_admin(
 
 
 def main(argv: list[str] | None = None) -> int:
+    reject_legacy_env()
     logging.basicConfig(level=logging.INFO)
     username = os.environ.get("ADMIN_USERNAME", "").strip()
     password = os.environ.get("ADMIN_INITIAL_PASSWORD", "")
     if not username or not password:
         logger.error("ADMIN_USERNAME and ADMIN_INITIAL_PASSWORD are required")
         return 2
-    config_path = os.environ.get("RCA_DASHBOARD_CONFIG", "/etc/rca-agent/config.yaml")
+    config_path = os.environ.get("DBAGENT_DASHBOARD_CONFIG", "/etc/dbagent/config.yaml")
     if len(sys.argv) > 1:
         config_path = sys.argv[1]
     config = load_config(config_path)

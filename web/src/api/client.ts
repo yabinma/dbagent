@@ -6,13 +6,13 @@ export type ApiError = {
 
 declare global {
   interface Window {
-    __RCA_CONFIG__?: { apiBaseUrl?: string };
+    __DBAGENT_CONFIG__?: { apiBaseUrl?: string };
   }
 }
 
 function baseUrl(): string {
   return (
-    (typeof window !== "undefined" && window.__RCA_CONFIG__?.apiBaseUrl) ||
+    (typeof window !== "undefined" && window.__DBAGENT_CONFIG__?.apiBaseUrl) ||
     "/api/v1"
   );
 }

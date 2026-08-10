@@ -103,18 +103,18 @@ phase "kind_load" 130 bash -c '
   exit $fail
 '
 
-phase "helm_rca_agent" 180 bash -c '
+phase "helm_dbagent" 180 bash -c '
   set -euo pipefail
-  kubectl create namespace rca --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace dbagent --dry-run=client -o yaml | kubectl apply -f -
   # Mock LLM must be up before model-gateway starts (MOCK_LLM_URL=http://mock-llm:8090).
-  kubectl apply -n rca -f tests/e2e/mockllm/deployment.yaml
-  kubectl -n rca rollout status deploy/mock-llm --timeout=120s
+  kubectl apply -n dbagent -f tests/e2e/mockllm/deployment.yaml
+  kubectl -n dbagent rollout status deploy/mock-llm --timeout=120s
   # Notification capture for E2 redaction of outbound payloads (FP-M6-17).
-  kubectl apply -n rca -f tests/e2e/webhook-capture/deployment.yaml
-  kubectl -n rca rollout status deploy/webhook-capture --timeout=120s
-  helm upgrade --install rca-agent deploy/charts/rca-agent \
-    -n rca --create-namespace \
-    -f tests/e2e/values-rca-agent.yaml \
+  kubectl apply -n dbagent -f tests/e2e/webhook-capture/deployment.yaml
+  kubectl -n dbagent rollout status deploy/webhook-capture --timeout=120s
+  helm upgrade --install dbagent deploy/charts/dbagent \
+    -n dbagent --create-namespace \
+    -f tests/e2e/values-dbagent.yaml \
     --wait --timeout 5m
   # Clear must_change_password so subsequent API calls (platform seed, pytest) work.
   python3 - <<'"'"'PY'"'"'
@@ -165,9 +165,9 @@ PY
 
 phase "deploy_presto" 150 bash -c '
   set -euo pipefail
-  kubectl apply -n rca -f tests/e2e/presto/
-  kubectl -n rca rollout status deploy/presto-coordinator --timeout=120s
-  kubectl -n rca wait --for=condition=Ready pod -l app=presto --timeout=120s
+  kubectl apply -n dbagent -f tests/e2e/presto/
+  kubectl -n dbagent rollout status deploy/presto-coordinator --timeout=120s
+  kubectl -n dbagent wait --for=condition=Ready pod -l app=presto --timeout=120s
 '
 
 # Create platform + issue bootstrap token BEFORE installing the probe (C2.3/C2.5).
@@ -175,7 +175,7 @@ phase "deploy_presto" 150 bash -c '
 # totals 1480 s, 20 s under the 1500 s gate. `helm --wait --timeout` below is a
 # failure ceiling, not the expected cost: every image is already loaded into kind
 # by phase 3, so the probe install is a scheduling wait.
-phase "helm_rca_probe" 60 bash -c '
+phase "helm_dbagent_probe" 60 bash -c '
   set -euo pipefail
   BOOTSTRAP_TOKEN=$(python3 - <<'"'"'PY'"'"'
 import json, time, urllib.error, urllib.request
@@ -234,7 +234,7 @@ except urllib.error.HTTPError as e:
 PLATFORM_CONFIG = {
     "remediation": {"settle_seconds": 15},
     "remediation_targets": {
-        "namespace": "rca",
+        "namespace": "dbagent",
         "worker_configmap": "presto-worker-config",
         "coordinator_configmap": "presto-coordinator-config",
         "worker_workload_kind": "deployment",
@@ -281,11 +281,11 @@ PY
     echo "phase6: empty bootstrap token" >&2
     exit 1
   fi
-  helm upgrade --install rca-probe deploy/charts/rca-probe \
-    -n rca -f tests/e2e/values-rca-probe.yaml \
+  helm upgrade --install dbagent-probe deploy/charts/dbagent-probe \
+    -n dbagent -f tests/e2e/values-dbagent-probe.yaml \
     --set "bootstrapToken=${BOOTSTRAP_TOKEN}" \
     --wait --timeout 2m
-  echo "phase6: rca-probe installed with issued bootstrap token"
+  echo "phase6: dbagent-probe installed with issued bootstrap token"
 '
 
 env_hygiene_gate() {

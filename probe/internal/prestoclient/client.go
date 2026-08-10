@@ -93,8 +93,14 @@ type QueryResult struct {
 }
 
 type statementError struct {
-	Message   string `json:"message"`
-	ErrorCode string `json:"errorCode"`
+	Message string `json:"message"`
+	// Presto's /v1/statement error object carries errorCode as a JSON number
+	// (e.g. 8), plus symbolic errorName/errorType; decoding errorCode as a
+	// string fails on every real query error ("cannot unmarshal number into
+	// ... errorCode of type string").
+	ErrorCode int    `json:"errorCode"`
+	ErrorName string `json:"errorName"`
+	ErrorType string `json:"errorType"`
 }
 
 type statementResponse struct {
@@ -120,7 +126,7 @@ func (c *Client) Query(ctx context.Context, sql string) (*QueryResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Presto-User", "rca-probe")
+	req.Header.Set("X-Presto-User", "dbagent-probe")
 	req.Header.Set("Content-Type", "text/plain")
 	c.applyAuth(req)
 

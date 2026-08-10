@@ -57,9 +57,9 @@ def scale_pg():
     """
     pg = PostgresContainer(
         "postgres:16-alpine",
-        dbname="rca_agent",
-        username="rca_agent",
-        password="rca_agent",
+        dbname="dbagent",
+        username="dbagent",
+        password="dbagent",
     )
     with pg:
         dsn = pg.get_connection_url()

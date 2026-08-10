@@ -21,7 +21,7 @@ temporal:
   namespace: default
 """
     )
-    monkeypatch.setenv("RCA_GATEWAY_CONFIG", str(cfg))
+    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
     app, config, service = build_app(str(cfg))
     assert app is not None
     assert config.ingest.sources[0].name == "manual"
@@ -31,7 +31,7 @@ temporal:
 def test_main_starts_async(monkeypatch, tmp_path):
     cfg = tmp_path / "config.yaml"
     cfg.write_text("storage:\n  postgres_dsn: 'sqlite:///:memory:'\n")
-    monkeypatch.setenv("RCA_GATEWAY_CONFIG", str(cfg))
+    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
 
     called = {}
 
@@ -58,8 +58,8 @@ temporal:
   namespace: default
 """
     )
-    monkeypatch.setenv("RCA_GATEWAY_CONFIG", str(cfg))
-    monkeypatch.setenv("RCA_GATEWAY_PORT", "0")
+    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
+    monkeypatch.setenv("DBAGENT_GATEWAY_PORT", "0")
 
     class FakeClient:
         pass

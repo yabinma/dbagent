@@ -11,6 +11,7 @@ import uvicorn
 from temporalio.client import Client
 
 from rca_common.config import load_config
+from rca_common.envcompat import reject_legacy_env
 from rca_common.db.session import make_engine, make_session_factory
 
 from gateway.app import create_app
@@ -43,7 +44,7 @@ class TemporalWorkflowStarter:
 
 
 def build_app(config_path: str | None = None):
-    path = config_path or os.environ.get("RCA_GATEWAY_CONFIG", "/etc/rca-agent/config.yaml")
+    path = config_path or os.environ.get("DBAGENT_GATEWAY_CONFIG", "/etc/dbagent/config.yaml")
     config = load_config(path)
     engine = make_engine(config.storage.postgres_dsn)
     session_factory = make_session_factory(engine)
@@ -68,14 +69,15 @@ async def _async_main() -> None:
     app, config, service = build_app()
     client = await Client.connect(config.temporal.address, namespace=config.temporal.namespace)
     service._workflow_starter = TemporalWorkflowStarter(client)
-    host = os.environ.get("RCA_GATEWAY_HOST", "0.0.0.0")
-    port = int(os.environ.get("RCA_GATEWAY_PORT", "8080"))
+    host = os.environ.get("DBAGENT_GATEWAY_HOST", "0.0.0.0")
+    port = int(os.environ.get("DBAGENT_GATEWAY_PORT", "8080"))
     uvicorn_config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(uvicorn_config)
     await server.serve()
 
 
 def main() -> None:
+    reject_legacy_env()
     asyncio.run(_async_main())
 
 

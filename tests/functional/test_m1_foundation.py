@@ -80,7 +80,7 @@ async def test_one_model_call_produces_llm_calls_row_and_s3_objects(
     ) as mock_llm:
         async with httpx.AsyncClient() as http_client:
             backend = LiteLLMHTTPBackend(mock_llm.base_url, "unused-master-key", client=http_client)
-            object_store = S3ObjectStore(minio_client, "rca-agent")
+            object_store = S3ObjectStore(minio_client, "dbagent")
 
             engine = make_engine(postgres_dsn)
             session_factory = make_session_factory(engine)
@@ -125,8 +125,8 @@ async def test_one_model_call_produces_llm_calls_row_and_s3_objects(
     assert row["response_ref"] is not None
 
     # --- real S3 (MinIO) objects for prompt + response ---
-    prompt_obj = minio_client.get_object(Bucket="rca-agent", Key=row["prompt_ref"])
-    response_obj = minio_client.get_object(Bucket="rca-agent", Key=row["response_ref"])
+    prompt_obj = minio_client.get_object(Bucket="dbagent", Key=row["prompt_ref"])
+    response_obj = minio_client.get_object(Bucket="dbagent", Key=row["response_ref"])
 
     prompt_body = json.loads(prompt_obj["Body"].read())
     response_body = json.loads(response_obj["Body"].read())

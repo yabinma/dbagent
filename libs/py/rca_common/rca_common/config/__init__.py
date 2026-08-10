@@ -62,7 +62,7 @@ class TracingConfig:
 @dataclass
 class SigningConfig:
     backend: str = "mounted"  # mounted | vault | aws_kms
-    key_path: str = "/etc/rca-agent/signing/ed25519.key"
+    key_path: str = "/etc/dbagent/signing/ed25519.key"
     rotation_grace_seconds: int = 600
     # When True, an unwritable key_path may fall back to an in-process
     # ephemeral key (dev/test only). Production must leave this False so
@@ -75,7 +75,7 @@ class SigningConfig:
 class StorageConfig:
     postgres_dsn: str = ""
     s3_endpoint: str = ""
-    s3_bucket: str = "rca-agent"
+    s3_bucket: str = "dbagent"
     s3_access_key: str = ""
     s3_secret_key: str = ""
 
@@ -89,7 +89,7 @@ class ModelGatewayConfig:
 @dataclass
 class TemporalConfig:
     address: str = "localhost:7233"
-    namespace: str = "default"
+    namespace: str = "dbagent"
 
 
 @dataclass
@@ -213,7 +213,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     sg = raw.get("signing") or {}
     signing = SigningConfig(
         backend=sg.get("backend", "mounted"),
-        key_path=sg.get("key_path", "/etc/rca-agent/signing/ed25519.key"),
+        key_path=sg.get("key_path", "/etc/dbagent/signing/ed25519.key"),
         rotation_grace_seconds=sg.get("rotation_grace_seconds", 600),
         allow_ephemeral=bool(sg.get("allow_ephemeral", False)),
     )
@@ -223,7 +223,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     storage = StorageConfig(
         postgres_dsn=st.get("postgres_dsn", ""),
         s3_endpoint=s3.get("endpoint", ""),
-        s3_bucket=s3.get("bucket", "rca-agent"),
+        s3_bucket=s3.get("bucket", "dbagent"),
         s3_access_key=s3.get("access_key", ""),
         s3_secret_key=s3.get("secret_key", ""),
     )
@@ -237,7 +237,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     tm = raw.get("temporal") or {}
     temporal = TemporalConfig(
         address=tm.get("address", "localhost:7233"),
-        namespace=tm.get("namespace", "default"),
+        namespace=tm.get("namespace", "dbagent"),
     )
 
     ig = raw.get("ingest") or {}

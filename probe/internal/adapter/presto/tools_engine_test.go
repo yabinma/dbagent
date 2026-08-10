@@ -268,7 +268,7 @@ func TestExecute_PrestoSessionProperties(t *testing.T) {
 		w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
 	})
 	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
-		writeStatementResponse(w, []string{"name", "value", "default_value"}, [][]any{{"query_max_memory", "10GB", "5GB"}})
+		writeStatementResponse(w, []string{"Name", "Value", "Default"}, [][]any{{"query_max_memory", "10GB", "5GB"}})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -295,7 +295,7 @@ func TestExecute_PrestoSessionProperties_NameBasedRedaction(t *testing.T) {
 		w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
 	})
 	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
-		writeStatementResponse(w, []string{"name", "value", "default_value"}, [][]any{
+		writeStatementResponse(w, []string{"Name", "Value", "Default"}, [][]any{
 			{"http-server.https.keystore.password", "hunter2", "changeit"},
 			{"query.max-memory", "10GB", "5GB"},
 		})
@@ -333,7 +333,7 @@ func TestExecute_PrestoSessionProperties_ValueBasedRedaction(t *testing.T) {
 		w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
 	})
 	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
-		writeStatementResponse(w, []string{"name", "value", "default_value"}, [][]any{
+		writeStatementResponse(w, []string{"Name", "Value", "Default"}, [][]any{
 			{"catalog.mysql.connection-url", "jdbc:mysql://svc:hunter2@db:3306/analytics", ""},
 		})
 	})
@@ -365,7 +365,7 @@ func TestExecute_PrestoSessionProperties_NoRedactionNeeded(t *testing.T) {
 		w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
 	})
 	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
-		writeStatementResponse(w, []string{"name", "value", "default_value"}, [][]any{{"query_max_memory", "10GB", "5GB"}})
+		writeStatementResponse(w, []string{"Name", "Value", "Default"}, [][]any{{"query_max_memory", "10GB", "5GB"}})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -406,8 +406,11 @@ func TestExecute_PrestoJMX_ResolvesAlias(t *testing.T) {
 	if len(rows) != 1 || rows[0]["mbean"] != "java.lang:type=Memory" {
 		t.Fatalf("unexpected rows (alias not resolved?): %+v", rows)
 	}
-	if !strings.Contains(capturedSQL, "jmx.current") {
-		t.Fatalf("expected SQL to target jmx.current, got %q", capturedSQL)
+	// The mbean must be the quoted table identifier, not merely mentioned in a
+	// comment: `SELECT * FROM jmx.current."java.lang:type=Memory"`. A bare
+	// `FROM jmx.current` parses as schema.table and fails on a real cluster.
+	if !strings.Contains(capturedSQL, `jmx.current."java.lang:type=Memory"`) {
+		t.Fatalf("expected SQL to target the quoted mbean table, got %q", capturedSQL)
 	}
 }
 

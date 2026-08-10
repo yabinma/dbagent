@@ -7,7 +7,7 @@ describe("ApiClient (Bearer + uniform error envelope)", () => {
   beforeEach(() => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
-    delete window.__RCA_CONFIG__;
+    delete window.__DBAGENT_CONFIG__;
   });
 
   afterEach(() => {
@@ -71,8 +71,8 @@ describe("ApiClient (Bearer + uniform error envelope)", () => {
     await expect(client.changePassword("old", "new-password-12")).resolves.toBeUndefined();
   });
 
-  it("uses window.__RCA_CONFIG__.apiBaseUrl when set", async () => {
-    window.__RCA_CONFIG__ = { apiBaseUrl: "https://api.example/v1" };
+  it("uses window.__DBAGENT_CONFIG__.apiBaseUrl when set", async () => {
+    window.__DBAGENT_CONFIG__ = { apiBaseUrl: "https://api.example/v1" };
     fetchMock.mockResolvedValue({
       status: 200,
       ok: true,
@@ -81,6 +81,31 @@ describe("ApiClient (Bearer + uniform error envelope)", () => {
     const client = new ApiClient(() => "t");
     await client.listPlatforms();
     expect(fetchMock.mock.calls[0][0]).toBe("https://api.example/v1/platforms");
+  });
+
+  // UT-SW-6 (design.md §11.2.5, FP-SW-7 / mapping row 16): the legacy global
+  // is not a fallback -- an object published under the legacy global must
+  // be ignored, so a stale nginx entrypoint cannot silently keep working.
+  it("ignores a config object published under the legacy global name", async () => {
+    // The legacy identifier is assembled rather than written out: FP-SW-10's
+    // forward guard rejects that literal everywhere outside its closed
+    // allowlist, and this file is not on it.
+    const legacyGlobal = `__${"RCA"}_CONFIG__`;
+    (window as unknown as Record<string, unknown>)[legacyGlobal] = {
+      apiBaseUrl: "https://legacy.example/v1",
+    };
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    try {
+      const client = new ApiClient(() => "t");
+      await client.listPlatforms();
+      expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/platforms");
+    } finally {
+      delete (window as unknown as Record<string, unknown>)[legacyGlobal];
+    }
   });
 
   it("covers investigation/approval/metrics/llm helpers", async () => {

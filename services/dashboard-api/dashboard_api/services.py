@@ -501,12 +501,12 @@ def decide_approval_atomic(
 CREDENTIAL_GUIDANCE = {
     "k8s": (
         "Create a K8s Secret with keys username/password (and optional ca.crt), "
-        "mount it at /etc/rca-probe/platform-credentials on the probe Deployment, "
+        "mount it at /etc/dbagent-probe/platform-credentials on the probe Deployment, "
         "then wait for the probe to re-detect credentials (Section 8.4 step 6)."
     ),
     "swarm": (
         "Create a Docker secret and update the probe service to mount it at "
-        "/etc/rca-probe/platform-credentials (keys: username/password/ca.crt). "
+        "/etc/dbagent-probe/platform-credentials (keys: username/password/ca.crt). "
         "See Section 8.4 step 6."
     ),
 }

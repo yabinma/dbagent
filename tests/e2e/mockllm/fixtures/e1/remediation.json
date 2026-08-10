@@ -5,7 +5,7 @@
       "playbook_id": "presto.adjust_memory_config",
       "playbook_params": {
         "name": "presto-worker-config",
-        "namespace": "rca",
+        "namespace": "dbagent",
         "patches": [
           {"key": "query.max-memory-per-node", "value": "128MB"}
         ]

@@ -95,9 +95,9 @@ func TestWrite_InsertsRow(t *testing.T) {
 	}
 	ctx := context.Background()
 	pg, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("rca_agent"),
-		postgres.WithUsername("rca_agent"),
-		postgres.WithPassword("rca_agent"),
+		postgres.WithDatabase("dbagent"),
+		postgres.WithUsername("dbagent"),
+		postgres.WithPassword("dbagent"),
 		testcontainers.WithWaitStrategy(
 			tcwait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
 		),
@@ -120,7 +120,7 @@ func TestWrite_InsertsRow(t *testing.T) {
 	alembicDSN := strings.Replace(dsn, "postgres://", "postgresql+psycopg2://", 1)
 	cmd := exec.Command(py, "-m", "alembic", "upgrade", "head")
 	cmd.Dir = rca
-	cmd.Env = append(os.Environ(), "RCA_PG_DSN="+alembicDSN)
+	cmd.Env = append(os.Environ(), "DBAGENT_PG_DSN="+alembicDSN)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("migrate: %v\n%s", err, out)
 	}
@@ -186,9 +186,9 @@ func TestWrite_AgainstRealPostgres(t *testing.T) {
 	}
 	ctx := context.Background()
 	pg, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("rca_agent"),
-		postgres.WithUsername("rca_agent"),
-		postgres.WithPassword("rca_agent"),
+		postgres.WithDatabase("dbagent"),
+		postgres.WithUsername("dbagent"),
+		postgres.WithPassword("dbagent"),
 		testcontainers.WithWaitStrategy(
 			tcwait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
 		),
@@ -208,7 +208,7 @@ func TestWrite_AgainstRealPostgres(t *testing.T) {
 	alembicDSN := strings.Replace(dsn, "postgres://", "postgresql+psycopg2://", 1)
 	cmd := exec.Command(py, "-m", "alembic", "upgrade", "head")
 	cmd.Dir = rca
-	cmd.Env = append(os.Environ(), "RCA_PG_DSN="+alembicDSN)
+	cmd.Env = append(os.Environ(), "DBAGENT_PG_DSN="+alembicDSN)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("migrate: %v\n%s", err, out)
 	}

@@ -33,8 +33,8 @@ type Config struct {
 	CoordinatorHTTPS   bool
 	// ConfigPaths maps a `file` param (Appendix B.1 presto_config:
 	// "config | jvm | node | catalog:<name>") to an in-container path.
-	// Not specified by the design; defaults to the conventional
-	// `/etc/presto/...` layout documented in impl-progress.md.
+	// design.md §11.2.3 A (normative): defaults to the conventional
+	// `/etc/presto/...` layout when ConfigPaths is unset.
 	ConfigPaths map[string]string
 }
 
@@ -86,7 +86,30 @@ func (e *Env) now() time.Time {
 
 func (e *Env) Kind() platform.EnvKind { return platform.EnvKindSwarm }
 
+// SelectorAll is Appendix B.1's sentinel for "every target"
+// (`resource_usage — params: selector:str=all`). It is deliberately not a
+// Swarm service name: feeding it to the Docker `/tasks` `service` filter
+// makes the Engine answer `404 {"message":"service all not found"}`, so it
+// is resolved here to "no service filter" (every Swarm task, across
+// services) instead. k8senv.ResourceUsage handles the same sentinel by
+// clearing its label selector.
+const SelectorAll = "all"
+
 func (e *Env) ListTargets(ctx context.Context, selector string) ([]platform.TargetInfo, error) {
+	if selector == SelectorAll {
+		tasks, err := e.Docker.ListTasks(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("dockerenv: list tasks (all services): %w", err)
+		}
+		out := make([]platform.TargetInfo, 0, len(tasks))
+		for _, t := range tasks {
+			out = append(out, taskToTargetInfo(t))
+		}
+		return out, nil
+	}
+
+	// An empty selector keeps Appendix B.2's `<platform default>` for
+	// swarm_tasks: the configured coordinator and worker services.
 	services := []string{selector}
 	if selector == "" {
 		services = []string{e.Cfg.CoordinatorService, e.Cfg.WorkerService}
@@ -209,6 +232,13 @@ func describeEventAttrs(attrs map[string]string) string {
 }
 
 func (e *Env) ResourceUsage(ctx context.Context, selector string) ([]platform.ResourceUsageInfo, error) {
+	// Appendix B.1 / fix.md: both "" and "all" mean every target (no service
+	// filter). ListTargets alone keeps "" as the swarm_tasks default
+	// (configured coordinator + worker services); ResourceUsage must not
+	// inherit that narrower filter (review W2).
+	if selector == "" || selector == SelectorAll {
+		selector = SelectorAll
+	}
 	targets, err := e.ListTargets(ctx, selector)
 	if err != nil {
 		return nil, err

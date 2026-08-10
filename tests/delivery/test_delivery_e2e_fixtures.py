@@ -24,7 +24,7 @@ from rca_common.config import DashboardConfig
 
 E2E = REPO_ROOT / "tests" / "e2e"
 RUN_SH = E2E / "run.sh"
-E2E_VALUES = E2E / "values-rca-agent.yaml"
+E2E_VALUES = E2E / "values-dbagent.yaml"
 
 # design.md §11.1.3, "run.sh phases and their budget caps (total 1480 s, 20 s
 # reserve under the 1500 s gate)".  Order matters: adjacency is what the table
@@ -33,9 +33,9 @@ APPROVED_PHASE_BUDGETS = [
     ("preflight", 20),
     ("build_and_cluster", 500),
     ("kind_load", 130),
-    ("helm_rca_agent", 180),
+    ("helm_dbagent", 180),
     ("deploy_presto", 150),
-    ("helm_rca_probe", 60),
+    ("helm_dbagent_probe", 60),
     ("pytest_e2e", 420),
     ("teardown", 20),
 ]
@@ -69,7 +69,7 @@ def _e2e_passwords() -> dict[str, str]:
     seeded = ((values.get("secrets") or {}).get("data") or {}).get(
         "ADMIN_INITIAL_PASSWORD"
     )
-    assert seeded, "tests/e2e/values-rca-agent.yaml must seed ADMIN_INITIAL_PASSWORD"
+    assert seeded, "tests/e2e/values-dbagent.yaml must seed ADMIN_INITIAL_PASSWORD"
     found[str(E2E_VALUES.relative_to(REPO_ROOT))] = str(seeded)
 
     run_sh = RUN_SH.read_text(encoding="utf-8")
@@ -435,7 +435,7 @@ def test_e2_values_configure_an_outbound_webhook():
         )
         or []
     )
-    assert hooks, "tests/e2e/values-rca-agent.yaml must configure outbound_webhooks"
+    assert hooks, "tests/e2e/values-dbagent.yaml must configure outbound_webhooks"
     assert any("webhook-capture" in str(h.get("url") or "") for h in hooks), hooks
 
 
@@ -507,4 +507,67 @@ def test_run_sh_phase_budgets_leave_the_approved_reserve():
     run_sh = RUN_SH.read_text(encoding="utf-8")
     assert f"BUDGET={RUN_SH_GATE}" in run_sh, (
         f"run.sh must fail above the approved {RUN_SH_GATE}s gate"
+    )
+
+
+# --- C3: inline smoke snippets must read env vars the dashboard pod actually has. ---
+
+
+def test_e2e_smoke_inline_env_lookups_exist_in_rendered_dashboard_pod():
+    """Review C3: catch DBAGENT_PG_DSN vs PG_DSN drift without a cluster run.
+
+    Parses os.environ['...'] lookups in the helm-upgrade smoke commands of
+    test_e2e_smoke.py and asserts each name is present in the rendered
+    dashboard-api pod (explicit env or envFrom Secret keys).
+    """
+    from delivery_helpers import CHARTS, helm_template, parse_manifests
+
+    smoke = (E2E / "test_e2e_smoke.py").read_text(encoding="utf-8")
+    # Inline kubectl exec python snippets use os.environ['KEY'].
+    looked_up = sorted(set(re.findall(r"os\.environ\[['\"]([A-Z0-9_]+)['\"]\]", smoke)))
+    assert looked_up, "test_e2e_smoke.py has no os.environ['...'] lookups to validate"
+    # The defect: smoke used DBAGENT_PG_DSN while the pod only has PG_DSN.
+    assert "DBAGENT_PG_DSN" not in looked_up, (
+        "smoke must not read DBAGENT_PG_DSN; dashboard-api Secret key is PG_DSN"
+    )
+    assert "PG_DSN" in looked_up, "expected at least one PG_DSN lookup in smoke"
+
+    rendered = helm_template(
+        CHARTS / "dbagent",
+        values=[str(E2E_VALUES)],
+    )
+    docs = parse_manifests(rendered)
+
+    dash = next(
+        d
+        for d in docs
+        if d.get("kind") == "Deployment"
+        and "dashboard-api" in (d.get("metadata") or {}).get("name", "")
+    )
+    container = dash["spec"]["template"]["spec"]["containers"][0]
+    explicit_env = {
+        e["name"] for e in (container.get("env") or []) if e.get("name")
+    }
+    # envFrom secretRef: keys come from the app Secret stringData.
+    secret_names = {
+        ref["secretRef"]["name"]
+        for ref in (container.get("envFrom") or [])
+        if (ref.get("secretRef") or {}).get("name")
+    }
+    secret_keys: set[str] = set()
+    for d in docs:
+        if d.get("kind") != "Secret":
+            continue
+        name = (d.get("metadata") or {}).get("name") or ""
+        if name not in secret_names:
+            continue
+        secret_keys.update((d.get("stringData") or {}).keys())
+        secret_keys.update((d.get("data") or {}).keys())
+
+    available = explicit_env | secret_keys
+    missing = [k for k in looked_up if k not in available]
+    assert not missing, (
+        f"smoke looks up {looked_up} but dashboard-api pod only provides "
+        f"explicit={sorted(explicit_env)} secret_keys={sorted(secret_keys)}; "
+        f"missing={missing}"
     )

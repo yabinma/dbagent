@@ -1,0 +1,27 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dbagent-probe.fullname" . }}-read
+  labels:
+    {{- include "dbagent-probe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "nodes", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dbagent-probe.fullname" . }}-read
+  labels:
+    {{- include "dbagent-probe.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dbagent-probe.fullname" . }}-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dbagent-probe.fullname" . }}

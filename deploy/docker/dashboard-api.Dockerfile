@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 ARG PYTHON_IMAGE=python:3.12-slim
 FROM ${PYTHON_IMAGE}
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin rca \
- && mkdir -p /etc/rca-agent && chown rca:rca /etc/rca-agent
+ && mkdir -p /etc/dbagent && chown rca:rca /etc/dbagent
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -21,4 +21,4 @@ ENV PATH="/opt/venv/bin:$PATH" \
 USER 10001
 WORKDIR /home/rca
 EXPOSE 8081
-ENTRYPOINT ["rca-dashboard-api"]
+ENTRYPOINT ["dbagent-dashboard-api"]

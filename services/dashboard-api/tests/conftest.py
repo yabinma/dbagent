@@ -59,7 +59,7 @@ def pg_dsn():
     except Exception:
         pytest.skip("testcontainers not available")
     with PostgresContainer(
-        "postgres:16-alpine", dbname="rca_agent", username="rca_agent", password="rca_agent"
+        "postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent"
     ) as pg:
         dsn = pg.get_connection_url()
         _run_migrations(dsn)

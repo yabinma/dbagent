@@ -12,6 +12,8 @@ import logging
 import os
 import sys
 
+from rca_common.envcompat import reject_legacy_env
+
 logger = logging.getLogger("seed_playbooks")
 
 
@@ -55,18 +57,19 @@ def seed_playbooks(session, catalog: list[dict] | None = None) -> dict[str, int]
 
 
 def main(argv: list[str] | None = None) -> int:
+    reject_legacy_env()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--postgres-dsn",
-        default=os.environ.get("RCA_POSTGRES_DSN")
+        default=os.environ.get("DBAGENT_POSTGRES_DSN")
         or os.environ.get("POSTGRES_DSN")
         or "",
-        help="Postgres DSN (or set RCA_POSTGRES_DSN).",
+        help="Postgres DSN (or set DBAGENT_POSTGRES_DSN).",
     )
     parser.add_argument(
         "--config",
-        default=os.environ.get("RCA_WORKER_CONFIG", ""),
+        default=os.environ.get("DBAGENT_WORKER_CONFIG", ""),
         help="Optional AppConfig YAML to read storage.postgres_dsn from.",
     )
     args = parser.parse_args(argv)

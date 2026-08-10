@@ -10,6 +10,7 @@ import uvicorn
 from temporalio.client import Client
 
 from rca_common.config import load_config
+from rca_common.envcompat import reject_legacy_env
 from rca_common.db.session import make_engine, make_session_factory
 from rca_common.llmclient.objectstore import S3ObjectStore
 
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 def build_app(config_path: str | None = None):
     path = config_path or os.environ.get(
-        "RCA_DASHBOARD_CONFIG", "/etc/rca-agent/config.yaml"
+        "DBAGENT_DASHBOARD_CONFIG", "/etc/dbagent/config.yaml"
     )
     config = load_config(path)
     if not config.dashboard.jwt_secret:
@@ -67,14 +68,15 @@ async def _async_main() -> None:
         config.temporal.address, namespace=config.temporal.namespace
     )
     app.state.temporal_client = client
-    host = os.environ.get("RCA_DASHBOARD_HOST", "0.0.0.0")
-    port = int(os.environ.get("RCA_DASHBOARD_PORT", "8081"))
+    host = os.environ.get("DBAGENT_DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.environ.get("DBAGENT_DASHBOARD_PORT", "8081"))
     uvicorn_config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(uvicorn_config)
     await server.serve()
 
 
 def main() -> None:
+    reject_legacy_env()
     asyncio.run(_async_main())
 
 

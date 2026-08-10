@@ -102,7 +102,7 @@ def test_build_app_requires_secret(tmp_path, monkeypatch):
     cfg.write_text(
         "dashboard:\n  jwt_secret: ''\nstorage:\n  postgres_dsn: postgresql://x\n  s3:\n    endpoint: http://minio:9000\n    bucket: b\n    access_key: a\n    secret_key: s\n"
     )
-    monkeypatch.setenv("RCA_DASHBOARD_CONFIG", str(cfg))
+    monkeypatch.setenv("DBAGENT_DASHBOARD_CONFIG", str(cfg))
     with pytest.raises(SystemExit):
         main_mod.build_app(str(cfg))
 
@@ -140,9 +140,9 @@ async def test_async_main_wires_temporal_and_serves(tmp_path, monkeypatch):
         "    bucket: b\n    access_key: a\n    secret_key: s\n"
         "temporal:\n  address: localhost:7233\n  namespace: default\n"
     )
-    monkeypatch.setenv("RCA_DASHBOARD_CONFIG", str(cfg))
-    monkeypatch.setenv("RCA_DASHBOARD_PORT", "0")
-    monkeypatch.setenv("RCA_DASHBOARD_HOST", "127.0.0.1")
+    monkeypatch.setenv("DBAGENT_DASHBOARD_CONFIG", str(cfg))
+    monkeypatch.setenv("DBAGENT_DASHBOARD_PORT", "0")
+    monkeypatch.setenv("DBAGENT_DASHBOARD_HOST", "127.0.0.1")
 
     class FakeClient:
         pass

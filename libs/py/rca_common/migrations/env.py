@@ -7,6 +7,11 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from rca_common.db.models import Base
+from rca_common.envcompat import reject_legacy_env
+
+# design.md §11.2.3 C.3: fail closed on a legacy RCA_* name at module scope,
+# before alembic reads any configuration.
+reject_legacy_env()
 
 config = context.config
 
@@ -19,7 +24,7 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-db_url = os.environ.get("RCA_PG_DSN")
+db_url = os.environ.get("DBAGENT_PG_DSN")
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 

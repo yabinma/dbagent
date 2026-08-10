@@ -441,9 +441,9 @@ def scale_pg():
     \"\"\"
     pg = PostgresContainer(
         "postgres:16-alpine",
-        dbname="rca_agent",
-        username="rca_agent",
-        password="rca_agent",
+        dbname="dbagent",
+        username="dbagent",
+        password="dbagent",
     )
     with pg:
         dsn = pg.get_connection_url()
@@ -4278,8 +4278,8 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "A6",
         tier_case(
             TIER_CONFTEST,
-            "        password=\"rca_agent\",\n    )",
-            "        password=\"rca_agent\",\n        driver=None,\n    )",
+            "        password=\"dbagent\",\n    )",
+            "        password=\"dbagent\",\n        driver=None,\n    )",
             lambda root: check_A6(tier_sources(root)),
         ),
     )

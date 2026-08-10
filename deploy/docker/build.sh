@@ -11,7 +11,9 @@ cd "$ROOT"
 # shellcheck disable=SC1091
 source "${ROOT}/deploy/versions.env"
 
-REGISTRY="${REGISTRY:-ghcr.io/yabinma/rca-agent}"
+# REGISTRY comes from versions.env, sourced two lines above -- it is the
+# single authoritative source for the registry coordinate (design.md
+# §11.2.3 C.1 row 2a), so no literal is repeated here.
 APP_VERSION="${APP_VERSION:-0.1.0}"
 SHORT_SHA="${SHORT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo dev)}"
 PUSH="${PUSH:-0}"

@@ -63,12 +63,12 @@ def test_k8s_secret_200_reuses_existing(key_path, tmp_path):
             "ed25519.key.pub": base64.b64encode(pub).decode(),
         }
     }
-    respx.get("https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key").mock(
+    respx.get("https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key").mock(
         return_value=httpx.Response(200, json=secret_body)
     )
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=_readable_ca(),
@@ -82,15 +82,15 @@ def test_k8s_secret_200_reuses_existing(key_path, tmp_path):
 def test_k8s_secret_404_creates(key_path, tmp_path):
     token = tmp_path / "token"
     token.write_text("tok", encoding="utf-8")
-    respx.get("https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key").mock(
+    respx.get("https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key").mock(
         return_value=httpx.Response(404, json={"reason": "NotFound"})
     )
     respx.post("https://k8s/api/v1/namespaces/ns/secrets").mock(
-        return_value=httpx.Response(201, json={"metadata": {"name": "rca-agent-signing-key"}})
+        return_value=httpx.Response(201, json={"metadata": {"name": "dbagent-signing-key"}})
     )
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=_readable_ca(),
@@ -119,7 +119,7 @@ def test_k8s_secret_409_reread(key_path, tmp_path):
             "ed25519.key.pub": base64.b64encode(pub).decode(),
         }
     }
-    respx.get("https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key").mock(
+    respx.get("https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key").mock(
         side_effect=[
             httpx.Response(404, json={}),
             httpx.Response(200, json=secret_body),
@@ -130,7 +130,7 @@ def test_k8s_secret_409_reread(key_path, tmp_path):
     )
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=_readable_ca(),
@@ -146,12 +146,12 @@ def test_k8s_secret_missing_ca_fails_closed_without_calling_the_api(key_path, tm
     token = tmp_path / "token"
     token.write_text("tok", encoding="utf-8")
     route = respx.get(
-        "https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key"
+        "https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key"
     ).mock(return_value=httpx.Response(200, json={"data": {}}))
 
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=str(tmp_path / "missing-ca"),
@@ -170,12 +170,12 @@ def test_k8s_secret_empty_or_unreadable_ca_fails_closed(key_path, tmp_path):
     empty_ca = tmp_path / "ca.crt"
     empty_ca.write_bytes(b"")
     route = respx.get(
-        "https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key"
+        "https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key"
     ).mock(return_value=httpx.Response(200, json={"data": {}}))
 
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=str(empty_ca),
@@ -191,7 +191,7 @@ def test_k8s_secret_injected_client_is_the_sanctioned_test_transport(key_path, t
     applies to the client this module builds itself."""
     token = tmp_path / "token"
     token.write_text("tok", encoding="utf-8")
-    respx.get("https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key").mock(
+    respx.get("https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key").mock(
         return_value=httpx.Response(404, json={})
     )
     respx.post("https://k8s/api/v1/namespaces/ns/secrets").mock(
@@ -203,7 +203,7 @@ def test_k8s_secret_injected_client_is_the_sanctioned_test_transport(key_path, t
     with httpx.Client(verify=ctx) as client:
         rc = bootstrap_from_k8s_secret(
             key_path,
-            "rca-agent-signing-key",
+            "dbagent-signing-key",
             "ns",
             token_path=str(token),
             ca_path=str(tmp_path / "missing-ca"),
@@ -228,7 +228,7 @@ def test_ca_is_usable_matrix(tmp_path):
 def test_k8s_secret_missing_token_hard_fail(key_path, tmp_path):
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(tmp_path / "no-token"),
         api_base="https://k8s",
@@ -240,12 +240,12 @@ def test_k8s_secret_missing_token_hard_fail(key_path, tmp_path):
 def test_k8s_secret_non_2xx_hard_fail(key_path, tmp_path):
     token = tmp_path / "token"
     token.write_text("tok", encoding="utf-8")
-    respx.get("https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key").mock(
+    respx.get("https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key").mock(
         return_value=httpx.Response(500, text="boom")
     )
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=_readable_ca(),
@@ -311,7 +311,7 @@ def test_read_sa_namespace_explicit_and_file(tmp_path, monkeypatch):
 def test_create_secret_non_2xx_hard_fail(key_path, tmp_path):
     token = tmp_path / "token"
     token.write_text("tok", encoding="utf-8")
-    respx.get("https://k8s/api/v1/namespaces/ns/secrets/rca-agent-signing-key").mock(
+    respx.get("https://k8s/api/v1/namespaces/ns/secrets/dbagent-signing-key").mock(
         return_value=httpx.Response(404, json={})
     )
     respx.post("https://k8s/api/v1/namespaces/ns/secrets").mock(
@@ -319,7 +319,7 @@ def test_create_secret_non_2xx_hard_fail(key_path, tmp_path):
     )
     rc = bootstrap_from_k8s_secret(
         key_path,
-        "rca-agent-signing-key",
+        "dbagent-signing-key",
         "ns",
         token_path=str(token),
         ca_path=_readable_ca(),

@@ -1,6 +1,6 @@
 // Package credentials reads platform credentials from the probe's fixed
 // mounted path (design.md D15 / Section 8.1: "read from a fixed mounted
-// path `/etc/rca-probe/platform-credentials/` backed by a K8s Secret or
+// path `/etc/dbagent-probe/platform-credentials/` backed by a K8s Secret or
 // Docker secret. Fixed key names: `username`, `password`, `ca.crt`
 // (optional)."), and watches that path for changes so the probe can
 // auto-retest connectivity when credentials appear/change (Section 8.4

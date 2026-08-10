@@ -177,6 +177,7 @@ checkpoints:
   - libs/py/rca_common/tests/test_config.py
   - tests/functional/test_m3_investigation_loop.py::test_f4_platform_budget_override
   - tests/functional/test_m6_go_config_env_interpolation.py
+  - tests/functional/m2_probe_link/swarm_docker_access_test.go
   notes: Per-platform budget override merge exercised in F4 functional test; local_only egress still unit-tested
     in test_config.py.
 - id: F16
@@ -202,6 +203,8 @@ checkpoints:
   - tests/functional/test_m6_walkthrough_selftest.py
   - tests/functional/test_manifests.py
   - tests/functional/manifest_honesty/thresholds_test.go
+  - tests/delivery/test_delivery_naming.py
+  - tests/functional/test_dbagent_env_rename.py
   notes: 'Six product images, charts, compose, docs, CI on: block, walkthrough --self-test, and manifest
     honesty enforced in test_manifests.py.'
 - id: F18

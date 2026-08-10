@@ -28,8 +28,8 @@ test = [
 ]
 
 [project.scripts]
-rca-dashboard-api = "dashboard_api.main:main"
-rca-dashboard-bootstrap-admin = "dashboard_api.bootstrap_admin:main"
+dbagent-dashboard-api = "dashboard_api.main:main"
+dbagent-dashboard-bootstrap-admin = "dashboard_api.bootstrap_admin:main"
 
 [tool.setuptools.packages.find]
 include = ["dashboard_api*"]

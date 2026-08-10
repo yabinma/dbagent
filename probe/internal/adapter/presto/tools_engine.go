@@ -110,7 +110,7 @@ func toolPrestoListQueries(ctx context.Context, a *Adapter, args map[string]any)
 		return toolResult{}, err
 	}
 	if res.Error != nil {
-		return toolResult{}, fmt.Errorf("presto_list_queries: %s: %s", res.Error.ErrorCode, res.Error.Message)
+		return toolResult{}, fmt.Errorf("presto_list_queries: %s: %s", res.Error.ErrorName, res.Error.Message)
 	}
 
 	col := colIndex(res.Columns)
@@ -269,20 +269,23 @@ func configFilePath(file string) string {
 // property name whose value still happens to embed a URL-userinfo
 // password or a `password=`/`secret=` pair doesn't leak it.
 func toolPrestoSessionProperties(ctx context.Context, a *Adapter, args map[string]any) (toolResult, error) {
-	res, err := a.presto.Query(ctx, "SELECT * FROM system.runtime.session")
+	// Session properties come from `SHOW SESSION` (columns Name/Value/Default/
+	// Type/Description); there is no `system.runtime.session` table in Presto,
+	// so the previous SELECT failed with SYNTAX_ERROR on every real cluster.
+	res, err := a.presto.Query(ctx, "SHOW SESSION")
 	if err != nil {
 		return toolResult{}, err
 	}
 	if res.Error != nil {
-		return toolResult{}, fmt.Errorf("presto_session_properties: %s: %s", res.Error.ErrorCode, res.Error.Message)
+		return toolResult{}, fmt.Errorf("presto_session_properties: %s: %s", res.Error.ErrorName, res.Error.Message)
 	}
 	col := colIndex(res.Columns)
 	props := []map[string]any{}
 	wasRedacted := false
 	for _, row := range res.Rows {
-		name := colStr(row, col, "name")
-		value := colStr(row, col, "value")
-		def := colStr(row, col, "default_value")
+		name := colStr(row, col, "Name")
+		value := colStr(row, col, "Value")
+		def := colStr(row, col, "Default")
 
 		if redact.KeyPattern.MatchString(name) {
 			value = redact.Placeholder
@@ -323,13 +326,19 @@ func toolPrestoJMX(ctx context.Context, a *Adapter, args map[string]any) (toolRe
 	}
 	attrs := stringSliceDefault(args, "attributes", nil)
 
-	sql := fmt.Sprintf("SELECT * FROM jmx.current %s", jmxWhereClause(mbean))
+	// The jmx catalog exposes each mbean as its own table under schema
+	// `current`, named by the object name; select that table directly. The
+	// identifier is double-quoted (embedded quotes doubled) because object
+	// names contain ':' '=' '.'. A bare `FROM jmx.current` parses as
+	// schema.table and fails with "Catalog must be specified when session
+	// catalog is not set".
+	sql := fmt.Sprintf("SELECT * FROM jmx.current.%s", quoteSQLIdent(mbean))
 	res, err := a.presto.Query(ctx, sql)
 	if err != nil {
 		return toolResult{}, err
 	}
 	if res.Error != nil {
-		return toolResult{}, fmt.Errorf("presto_jmx: %s: %s", res.Error.ErrorCode, res.Error.Message)
+		return toolResult{}, fmt.Errorf("presto_jmx: %s: %s", res.Error.ErrorName, res.Error.Message)
 	}
 	col := colIndex(res.Columns)
 	out := []map[string]any{}
@@ -352,13 +361,11 @@ func toolPrestoJMX(ctx context.Context, a *Adapter, args map[string]any) (toolRe
 	return toolResult{Data: out}, nil
 }
 
-func jmxWhereClause(mbean string) string {
-	// jmx.current table name convention is the lower-cased mbean object
-	// name; `WHERE` filtering here is a simplification since the real
-	// `jmx` catalog exposes each mbean as its own table rather than a
-	// single filterable one -- documented M2 simplification (see
-	// impl-progress.md): the probe issues `SELECT * FROM jmx.current."<mbean>"`.
-	return fmt.Sprintf("WHERE 1=1 /* mbean=%s */", mbean)
+// quoteSQLIdent double-quotes a Presto SQL identifier, doubling any embedded
+// double-quote, so mbean object names (which contain ':' '=' '.') are usable
+// as a table identifier.
+func quoteSQLIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 func containsStr(list []string, s string) bool {

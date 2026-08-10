@@ -16,6 +16,7 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from rca_common.config import AppConfig, load_config
+from rca_common.envcompat import reject_legacy_env
 from rca_common.db.session import make_engine, make_session_factory
 from rca_common.llmclient import LiteLLMHTTPBackend, LLMClient, PGTraceStore, S3ObjectStore
 
@@ -166,8 +167,9 @@ async def run_worker(config: AppConfig, *, client: Client | None = None) -> None
 
 
 def main() -> None:
+    reject_legacy_env()
     logging.basicConfig(level=logging.INFO)
-    config_path = os.environ.get("RCA_WORKER_CONFIG", "/etc/rca-agent/config.yaml")
+    config_path = os.environ.get("DBAGENT_WORKER_CONFIG", "/etc/dbagent/config.yaml")
     config = load_config(config_path)
     asyncio.run(run_worker(config))
 

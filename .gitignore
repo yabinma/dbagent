@@ -229,8 +229,22 @@ node_modules/
 # Local-only code review report (not published to the remote repo)
 /review.md
 
-# Walkthrough acceptance artifact (operator/self-test output; not committed)
+# Walkthrough acceptance artifacts (operator/self-test output; not committed).
+# Dated report names and bootstrap-token files can carry raw secrets.
 /walkthrough-report.json
+/walkthrough-report-*.json
+walkthrough-report-*.json
+bootstrap-token.txt
+**/bootstrap-token.txt
+# Narrowed per review S1: only the token-handoff staging file, not every
+# .staging file repo-wide (which would silently hide unrelated ones).
+bootstrap-token.txt.staging
+**/bootstrap-token.txt.staging
+
+# Local-only operator scratch at repo root (review S8): fix briefs and
+# deploy-issue notes; not published. Root-anchored so nested names still track.
+/fix.md
+/DEPLOY-ISSUES-2026-08-09.md
 
 # Local e2e scratch (kubeconfig / docker config overrides)
 /.tmp-e2e/
@@ -243,3 +257,9 @@ node_modules/
 /gen/
 /libs/py/rca_common/rca_common/schemas/generated/
 /web/src/types/generated/
+
+# Recurring zero-byte artifact observed across multiple grok-coder/codex-reviewer
+# launcher runs during the M6 swarm-deploy review loop (2026-08-10); root cause
+# not in this repo's own scripts, harmless, but repeatedly flagged as review
+# noise -- ignored so it stops surfacing as an untracked-file finding.
+/2026-08-08

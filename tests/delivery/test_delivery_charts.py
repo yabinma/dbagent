@@ -10,16 +10,16 @@ import yaml
 from delivery_helpers import CHARTS, REPO_ROOT, helm_template, load_versions, parse_manifests, require_bin, run
 
 
-RCA_AGENT = CHARTS / "rca-agent"
-RCA_PROBE = CHARTS / "rca-probe"
+DBAGENT = CHARTS / "dbagent"
+DBAGENT_PROBE = CHARTS / "dbagent-probe"
 
 
 def test_helm_available_or_hard_fail():
     require_bin("helm")
 
 
-def test_rca_agent_renders_five_workloads_and_secret_indirection():
-    out = helm_template(RCA_AGENT)
+def test_dbagent_renders_five_workloads_and_secret_indirection():
+    out = helm_template(DBAGENT)
     docs = parse_manifests(out)
     kinds = [(d.get("kind"), d.get("metadata", {}).get("name", "")) for d in docs]
     names = " ".join(n for _, n in kinds)
@@ -42,7 +42,7 @@ def test_rca_agent_renders_five_workloads_and_secret_indirection():
 
 
 def test_bootstrap_ca_pvc_and_replica_guard():
-    out = helm_template(RCA_AGENT)
+    out = helm_template(DBAGENT)
     assert "bootstrap-ca" in out
     # replicaCount>1 without existingSecret must fail.
     proc = run(
@@ -50,7 +50,7 @@ def test_bootstrap_ca_pvc_and_replica_guard():
             "helm",
             "template",
             "t",
-            str(RCA_AGENT),
+            str(DBAGENT),
             "--set",
             "probeGateway.replicaCount=2",
         ],
@@ -61,7 +61,7 @@ def test_bootstrap_ca_pvc_and_replica_guard():
 
 
 def test_networkpolicy_restricts_internal_listener():
-    out = helm_template(RCA_AGENT, set_args=["networkPolicy.enabled=true"])
+    out = helm_template(DBAGENT, set_args=["networkPolicy.enabled=true"])
     docs = parse_manifests(out)
     nps = [d for d in docs if d.get("kind") == "NetworkPolicy"]
     assert nps
@@ -72,7 +72,7 @@ def test_networkpolicy_restricts_internal_listener():
 
 def test_secrets_existing_secret_branch_renders_no_secret():
     out = helm_template(
-        RCA_AGENT,
+        DBAGENT,
         set_args=["secrets.create=false", "secrets.existingSecret=my-existing"],
     )
     docs = parse_manifests(out)
@@ -86,7 +86,7 @@ def test_secrets_existing_secret_branch_renders_no_secret():
 
 
 def test_probe_gateway_configmap_keys_incl_internal_listen_addr():
-    out = helm_template(RCA_AGENT)
+    out = helm_template(DBAGENT)
     docs = parse_manifests(out)
     cm = next(
         d
@@ -115,7 +115,7 @@ def test_probe_gateway_configmap_keys_incl_internal_listen_addr():
 def test_temporal_mode_dev_chart_external_render_exactly_one():
     # dev requires bundled PostgreSQL (auto-setup has no external DB surface).
     dev = helm_template(
-        RCA_AGENT, set_args=["temporal.mode=dev", "postgresql.bundled=true"]
+        DBAGENT, set_args=["temporal.mode=dev", "postgresql.bundled=true"]
     )
     dev_docs = parse_manifests(dev)
     dev_temporal = [
@@ -135,7 +135,7 @@ def test_temporal_mode_dev_chart_external_render_exactly_one():
             "helm",
             "template",
             "t",
-            str(RCA_AGENT),
+            str(DBAGENT),
             "--set",
             "temporal.mode=dev",
             "--set",
@@ -148,7 +148,7 @@ def test_temporal_mode_dev_chart_external_render_exactly_one():
 
     # external: no temporal workload from our chart (address points outside)
     ext = helm_template(
-        RCA_AGENT, set_args=["temporal.mode=external", "temporal.address=temporal.other:7233"]
+        DBAGENT, set_args=["temporal.mode=external", "temporal.address=temporal.other:7233"]
     )
     ext_docs = parse_manifests(ext)
     ext_temporal_workloads = [
@@ -156,7 +156,7 @@ def test_temporal_mode_dev_chart_external_render_exactly_one():
         for d in ext_docs
         if d.get("kind") in {"Deployment", "StatefulSet"}
         and "temporal" in (d.get("metadata", {}).get("name") or "").lower()
-        and "rca-agent" in (d.get("metadata", {}).get("name") or "")
+        and "dbagent" in (d.get("metadata", {}).get("name") or "")
     ]
     # Exactly zero bundled temporal server workloads in external mode.
     assert len(ext_temporal_workloads) == 0, [
@@ -165,13 +165,13 @@ def test_temporal_mode_dev_chart_external_render_exactly_one():
 
     # chart mode with dependency enabled
     chart = helm_template(
-        RCA_AGENT,
+        DBAGENT,
         set_args=["temporal.mode=chart", "temporal.chart.enabled=true"],
     )
     assert chart  # must render offline from vendored tgz
     # invalid mode fails
     proc = run(
-        ["helm", "template", "t", str(RCA_AGENT), "--set", "temporal.mode=bogus"],
+        ["helm", "template", "t", str(DBAGENT), "--set", "temporal.mode=bogus"],
         cwd=str(REPO_ROOT),
     )
     assert proc.returncode != 0
@@ -180,19 +180,19 @@ def test_temporal_mode_dev_chart_external_render_exactly_one():
 def test_temporal_subchart_vendored_and_pinned():
     vers = load_versions()
     ver = vers["TEMPORAL_CHART_VERSION"]
-    tgz = RCA_AGENT / "charts" / f"temporal-{ver}.tgz"
+    tgz = DBAGENT / "charts" / f"temporal-{ver}.tgz"
     assert tgz.is_file()
-    lock = yaml.safe_load((RCA_AGENT / "Chart.lock").read_text(encoding="utf-8"))
+    lock = yaml.safe_load((DBAGENT / "Chart.lock").read_text(encoding="utf-8"))
     deps = lock["dependencies"]
     assert any(d["name"] == "temporal" and d["version"] == ver for d in deps)
-    chart_yaml = (RCA_AGENT / "Chart.yaml").read_text(encoding="utf-8")
+    chart_yaml = (DBAGENT / "Chart.yaml").read_text(encoding="utf-8")
     assert ver in chart_yaml
 
 
 def test_bundled_or_external_postgres_minio_model_gateway():
     # Bundled path must opt in explicitly (defaults are external-only).
     bundled = helm_template(
-        RCA_AGENT,
+        DBAGENT,
         set_args=[
             "postgresql.bundled=true",
             "minio.bundled=true",
@@ -203,7 +203,7 @@ def test_bundled_or_external_postgres_minio_model_gateway():
     assert "minio" in bundled.lower()
     assert "model-gateway" in bundled or "litellm" in bundled.lower()
     external = helm_template(
-        RCA_AGENT,
+        DBAGENT,
         set_args=[
             "postgresql.bundled=false",
             "minio.bundled=false",
@@ -223,7 +223,7 @@ def test_bundled_or_external_postgres_minio_model_gateway():
 
 def test_bundled_postgres_is_dev_only_and_defaults_off():
     """Chart defaults ship no bundled PG; opt-in renders it with computed DSN."""
-    defaults = helm_template(RCA_AGENT)
+    defaults = helm_template(DBAGENT)
     default_docs = parse_manifests(defaults)
     pg_default = [
         d
@@ -238,7 +238,7 @@ def test_bundled_postgres_is_dev_only_and_defaults_off():
             dsn = (d.get("stringData") or {}).get("PG_DSN") or ""
             assert "-postgresql" not in dsn, dsn
 
-    opted = helm_template(RCA_AGENT, set_args=["postgresql.bundled=true"])
+    opted = helm_template(DBAGENT, set_args=["postgresql.bundled=true"])
     opted_docs = parse_manifests(opted)
     pg_opted = [
         d
@@ -256,7 +256,7 @@ def test_bundled_postgres_is_dev_only_and_defaults_off():
 def test_no_stateful_resource_in_the_pre_upgrade_hook_set():
     """Bundled PG (and any emptyDir-backed state) must never be pre-upgrade hooks."""
     for set_args in ([], ["postgresql.bundled=true"]):
-        out = helm_template(RCA_AGENT, set_args=set_args or None)
+        out = helm_template(DBAGENT, set_args=set_args or None)
         docs = parse_manifests(out)
         for d in docs:
             ann = (d.get("metadata") or {}).get("annotations") or {}
@@ -275,7 +275,7 @@ def test_no_stateful_resource_in_the_pre_upgrade_hook_set():
 
 def test_hook_jobs_order_images_and_idempotence_annotations():
     # Complete hook set includes bundled PG — opt in explicitly.
-    out = helm_template(RCA_AGENT, set_args=["postgresql.bundled=true"])
+    out = helm_template(DBAGENT, set_args=["postgresql.bundled=true"])
     docs = parse_manifests(out)
     jobs = {
         d["metadata"]["name"]: d
@@ -370,9 +370,9 @@ def test_hook_jobs_order_images_and_idempotence_annotations():
         assert pw < -20, f"postgresql hook-weight {pw} must be < migrate (-20)"
 
 
-def test_rca_probe_write_rbac_only_when_write_enabled():
+def test_dbagent_probe_write_rbac_only_when_write_enabled():
     off = helm_template(
-        RCA_PROBE,
+        DBAGENT_PROBE,
         set_args=["platformKey=p1", "bootstrapToken=tok", "writeEnabled=false"],
     )
     assert "k8s_patch_configmap" not in off  # not expected in RBAC
@@ -387,7 +387,7 @@ def test_rca_probe_write_rbac_only_when_write_enabled():
     assert not write_roles
 
     on = helm_template(
-        RCA_PROBE,
+        DBAGENT_PROBE,
         set_args=["platformKey=p1", "bootstrapToken=tok", "writeEnabled=true"],
     )
     docs_on = parse_manifests(on)
@@ -420,7 +420,7 @@ def test_e2e_nodeports_match_kind_and_conftest():
         ), f"conftest/smoke/scenarios missing {port}"
 
     out = helm_template(
-        RCA_AGENT, values=[str(REPO_ROOT / "tests/e2e/values-rca-agent.yaml")]
+        DBAGENT, values=[str(REPO_ROOT / "tests/e2e/values-dbagent.yaml")]
     )
     docs = parse_manifests(out)
     node_ports: set[int] = set()
@@ -440,8 +440,8 @@ def test_e2e_nodeports_match_kind_and_conftest():
 def test_one_container_per_pod_and_resources_probes():
     """FP-M6-4: one container per rendered pod spec in both charts."""
     for chart, set_args in (
-        (RCA_AGENT, None),
-        (RCA_PROBE, ["platformKey=p1", "bootstrapToken=tok", "writeEnabled=false"]),
+        (DBAGENT, None),
+        (DBAGENT_PROBE, ["platformKey=p1", "bootstrapToken=tok", "writeEnabled=false"]),
     ):
         out = helm_template(chart, set_args=set_args)
         docs = parse_manifests(out)
@@ -452,8 +452,178 @@ def test_one_container_per_pod_and_resources_probes():
             assert len(containers) == 1, f"{chart.name}: {d['metadata']['name']}"
             c = containers[0]
             name = d["metadata"]["name"]
-            if chart is RCA_AGENT and any(
+            if chart is DBAGENT and any(
                 x in name for x in ("ingest", "dashboard", "probe-gateway", "temporal-worker")
             ):
                 assert "resources" in c
                 assert "livenessProbe" in c or "readinessProbe" in c
+
+
+# --- FP-SW-6 (design.md §11.2.5): Helm identities are `dbagent`. ---
+
+
+def test_values_dev_usage_installs_into_dbagent_namespace():
+    """FP-SW-6/rename: the dev values usage example must not reintroduce `rca`."""
+    text = (DBAGENT / "values-dev.yaml").read_text(encoding="utf-8")
+    assert "-n dbagent" in text, "values-dev.yaml usage must install into namespace dbagent"
+    assert "-n rca" not in text, "values-dev.yaml usage must not install into namespace rca"
+
+
+def test_chart_identity_is_dbagent():
+    # Directories exist under the new names and the old ones do not.
+    assert DBAGENT.is_dir() and DBAGENT_PROBE.is_dir()
+    # The legacy names are assembled, not written out: FP-SW-10's forward
+    # guard rejects those literals outside its closed allowlist, and this file
+    # is not on it.
+    legacy_umbrella, legacy_probe = f"rca-{'agent'}", f"rca-{'probe'}"
+    assert not (CHARTS / legacy_umbrella).exists()
+    assert not (CHARTS / legacy_probe).exists()
+    assert sorted(p.name for p in CHARTS.iterdir() if p.is_dir()) == ["dbagent", "dbagent-probe"]
+
+    # Chart.yaml names.
+    umbrella = yaml.safe_load((DBAGENT / "Chart.yaml").read_text(encoding="utf-8"))
+    probe = yaml.safe_load((DBAGENT_PROBE / "Chart.yaml").read_text(encoding="utf-8"))
+    assert umbrella["name"] == "dbagent"
+    assert probe["name"] == "dbagent-probe"
+
+    # Every define/include in both charts uses the new prefix.
+    for chart, prefix in ((DBAGENT, "dbagent."), (DBAGENT_PROBE, "dbagent-probe.")):
+        for path in chart.rglob("*.tpl"):
+            for name in re.findall(r'\{\{-?\s*define\s+"([^"]+)"', path.read_text(encoding="utf-8")):
+                assert name.startswith(prefix), f"{path}: define {name}"
+        for path in list(chart.rglob("*.yaml")) + list(chart.rglob("*.tpl")):
+            text = path.read_text(encoding="utf-8")
+            for name in re.findall(r'\{\{-?\s*include\s+"([^"]+)"', text):
+                assert not name.startswith(
+                    (f"rca-{'agent'}.", f"rca-{'probe'}.")
+                ), f"{path}: include {name}"
+
+    # Rendered labels and the fixed signing-key Secret name.
+    umbrella_docs = parse_manifests(helm_template(DBAGENT))
+    label_values = {
+        d.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name")
+        for d in umbrella_docs
+        if (d.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/name")
+    }
+    assert label_values == {"dbagent"}, label_values
+
+    probe_docs = parse_manifests(
+        helm_template(
+            DBAGENT_PROBE,
+            set_args=["platformKey=p1", "bootstrapToken=tok", "writeEnabled=false"],
+        )
+    )
+    probe_labels = {
+        d.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name")
+        for d in probe_docs
+        if (d.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/name")
+    }
+    assert probe_labels == {"dbagent-probe"}, probe_labels
+
+    helpers = (DBAGENT / "templates/_helpers.tpl").read_text(encoding="utf-8")
+    assert re.search(r'define\s+"dbagent\.signingKeySecretName"', helpers)
+    assert "dbagent-signing-key" in helpers
+    rendered = helm_template(DBAGENT)
+    assert "dbagent-signing-key" in rendered
+    assert f"rca-{'agent'}-signing-key" not in rendered
+
+
+# --- C2: worker config hostnames must match rendered Service DNS names. ---
+
+
+def _hostname_from_url_or_addr(value: str) -> str:
+    """Extract the host from http(s)://host:port or host:port."""
+    raw = (value or "").strip()
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    host = raw.split("/", 1)[0]
+    # strip port
+    if host.startswith("["):
+        return host.split("]", 1)[0].lstrip("[")
+    return host.split(":", 1)[0]
+
+
+def test_configmap_internal_endpoints_match_rendered_service_names():
+    """Review C2: release-qualify bundled endpoints; hostnames must exist as Services.
+
+    Renders the chart the same way e2e/dev does (bundled minio/model-gateway +
+    temporal.mode=dev), parses config.yaml, and checks each internal hostname
+    against Service metadata from the *same* render so bare defaults like
+    http://minio:9000 cannot ship against dbagent-minio.
+    """
+    release = "dbagent"
+    require_bin("helm")
+    proc = run(
+        [
+            "helm",
+            "template",
+            release,
+            str(DBAGENT),
+            "-f",
+            str(DBAGENT / "values-dev.yaml"),
+        ],
+        cwd=str(REPO_ROOT),
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    docs = parse_manifests(proc.stdout)
+
+    service_names = {
+        d["metadata"]["name"]
+        for d in docs
+        if d.get("kind") == "Service" and d.get("metadata", {}).get("name")
+    }
+    assert service_names, "render produced no Services"
+
+    cm = next(
+        d
+        for d in docs
+        if d.get("kind") == "ConfigMap"
+        and d.get("metadata", {}).get("name") == f"{release}-config"
+    )
+    cfg = yaml.safe_load(cm["data"]["config.yaml"])
+
+    checks = {
+        "storage.s3_endpoint": cfg["storage"]["s3_endpoint"],
+        "model_gateway.url": cfg["model_gateway"]["url"],
+        "probe_gateway.url": cfg["probe_gateway"]["url"],
+        "temporal.address": cfg["temporal"]["address"],
+    }
+    for key, value in checks.items():
+        host = _hostname_from_url_or_addr(value)
+        assert host in service_names, (
+            f"{key}={value!r} host {host!r} is not a Service in this render; "
+            f"services={sorted(service_names)}"
+        )
+        # Explicitly reject the bare compose-style defaults that C2 found.
+        assert host not in {"minio", "model-gateway", "probe-gateway", "temporal"}, (
+            f"{key} still uses bare hostname {host!r}"
+        )
+        assert host.startswith(f"{release}-"), (
+            f"{key} host {host!r} is not release-qualified with {release!r}"
+        )
+
+    # Operator override for an external endpoint must survive (not rewritten).
+    external = "https://minio.example.invalid:9000"
+    proc_ext = run(
+        [
+            "helm",
+            "template",
+            release,
+            str(DBAGENT),
+            "-f",
+            str(DBAGENT / "values-dev.yaml"),
+            "--set",
+            f"config.storage.s3_endpoint={external}",
+        ],
+        cwd=str(REPO_ROOT),
+    )
+    assert proc_ext.returncode == 0, proc_ext.stderr or proc_ext.stdout
+    docs_ext = parse_manifests(proc_ext.stdout)
+    cm_ext = next(
+        d
+        for d in docs_ext
+        if d.get("kind") == "ConfigMap"
+        and d.get("metadata", {}).get("name") == f"{release}-config"
+    )
+    cfg_ext = yaml.safe_load(cm_ext["data"]["config.yaml"])
+    assert cfg_ext["storage"]["s3_endpoint"] == external

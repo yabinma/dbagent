@@ -6,10 +6,10 @@
 #   docker compose -f deploy/compose/control-plane.yml up -d
 #   docker compose -f deploy/compose/control-plane.yml --profile apps up -d
 
-name: rca-agent-control-plane
+name: dbagent-control-plane
 
 x-app-env: &app-env
-  PG_DSN: ${PG_DSN:-postgres://rca_agent:rca_agent@postgres:5432/rca_agent}
+  PG_DSN: ${PG_DSN:-postgresql://dbagent:dbagent@postgres:5432/dbagent}
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
   S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
   LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-dev}
@@ -21,15 +21,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: rca_agent
-      POSTGRES_USER: rca_agent
-      POSTGRES_PASSWORD: rca_agent
+      POSTGRES_DB: dbagent
+      POSTGRES_USER: dbagent
+      POSTGRES_PASSWORD: dbagent
     ports:
       - "5432:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rca_agent -d rca_agent"]
+      test: ["CMD-SHELL", "pg_isready -U dbagent -d dbagent"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -59,7 +59,14 @@ services:
       POSTGRES_USER: temporal
       POSTGRES_PWD: temporal
       POSTGRES_SEEDS: temporal-postgresql
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      # auto-setup:1.24.2 ships config/dynamicconfig/docker.yaml; the previous
+      # development-sql.yaml path does not exist in the image and makes the
+      # server exit on boot ("stat ...development-sql.yaml: no such file").
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/docker.yaml
+      # The application's Temporal namespace default is `dbagent`
+      # (design.md §11.2.3 C.1 row 22); auto-setup registers `default`
+      # unless told otherwise, so register the one the services connect to.
+      DEFAULT_NAMESPACE: dbagent
     ports:
       - "7233:7233"
 
@@ -98,7 +105,7 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb -p local/rca-agent &&
+      mc mb -p local/dbagent &&
       exit 0
       "
     restart: "no"
@@ -119,11 +126,15 @@ services:
   # --- Application services (profile: apps) ---
   migrate:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
-    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/temporal-worker:${APP_VERSION:-0.1.0}
+    # entrypoint (not command): the image pins ENTRYPOINT to worker_main, and
+    # Compose `command:` only replaces CMD -- so a `command:` override would run
+    # `worker_main alembic ...` instead of alembic. K8s `command:` overrides the
+    # entrypoint, which is why the chart's Job works with `command:` there.
+    entrypoint: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
     environment:
       <<: *app-env
-      RCA_PG_DSN: ${PG_DSN:-postgres://rca_agent:rca_agent@postgres:5432/rca_agent}
+      DBAGENT_PG_DSN: ${PG_DSN:-postgresql://dbagent:dbagent@postgres:5432/dbagent}
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,21 +142,24 @@ services:
 
   signing-key:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
-    command: ["python", "/app/scripts/bootstrap_signing_key.py", "--key-path", "/etc/rca-agent/signing/ed25519.key"]
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/temporal-worker:${APP_VERSION:-0.1.0}
+    # entrypoint (not command): see the migrate service note above.
+    entrypoint: ["python", "/app/scripts/bootstrap_signing_key.py", "--key-path", "/etc/dbagent/signing/ed25519.key"]
     volumes:
-      - signing-key:/etc/rca-agent/signing
+      - signing-key:/etc/dbagent/signing
     restart: "no"
 
   bootstrap-admin:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/dashboard-api:${APP_VERSION:-0.1.0}
-    command: ["rca-dashboard-bootstrap-admin"]
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/dashboard-api:${APP_VERSION:-0.1.0}
+    # entrypoint (not command): the image pins ENTRYPOINT to dbagent-dashboard-api;
+    # see the migrate service note above.
+    entrypoint: ["dbagent-dashboard-bootstrap-admin"]
     environment:
       <<: *app-env
-      RCA_DASHBOARD_CONFIG: /etc/rca-agent/config.yaml
+      DBAGENT_DASHBOARD_CONFIG: /etc/dbagent/config.yaml
     volumes:
-      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+      - ./config/dbagent.yaml:/etc/dbagent/config.yaml:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -153,12 +167,13 @@ services:
 
   seed-playbooks:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
-    command: ["python", "/app/scripts/seed_playbooks.py", "--config", "/etc/rca-agent/config.yaml"]
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/temporal-worker:${APP_VERSION:-0.1.0}
+    # entrypoint (not command): see the migrate service note above.
+    entrypoint: ["python", "/app/scripts/seed_playbooks.py", "--config", "/etc/dbagent/config.yaml"]
     environment:
       <<: *app-env
     volumes:
-      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+      - ./config/dbagent.yaml:/etc/dbagent/config.yaml:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -166,12 +181,12 @@ services:
 
   ingest-gateway:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/ingest-gateway:${APP_VERSION:-0.1.0}
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/ingest-gateway:${APP_VERSION:-0.1.0}
     environment:
       <<: *app-env
-      RCA_GATEWAY_CONFIG: /etc/rca-agent/config.yaml
+      DBAGENT_GATEWAY_CONFIG: /etc/dbagent/config.yaml
     volumes:
-      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+      - ./config/dbagent.yaml:/etc/dbagent/config.yaml:ro
     ports:
       - "8080:8080"
     depends_on:
@@ -182,13 +197,13 @@ services:
 
   temporal-worker:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/temporal-worker:${APP_VERSION:-0.1.0}
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/temporal-worker:${APP_VERSION:-0.1.0}
     environment:
       <<: *app-env
-      RCA_WORKER_CONFIG: /etc/rca-agent/config.yaml
+      DBAGENT_WORKER_CONFIG: /etc/dbagent/config.yaml
     volumes:
-      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
-      - signing-key:/etc/rca-agent/signing:ro
+      - ./config/dbagent.yaml:/etc/dbagent/config.yaml:ro
+      - signing-key:/etc/dbagent/signing:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -199,14 +214,14 @@ services:
 
   probe-gateway:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/probe-gateway:${APP_VERSION:-0.1.0}
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/probe-gateway:${APP_VERSION:-0.1.0}
     environment:
       <<: *app-env
-      PROBE_GATEWAY_CONFIG: /etc/rca-agent/probe-gateway/config.yaml
+      PROBE_GATEWAY_CONFIG: /etc/dbagent/probe-gateway/config.yaml
     volumes:
-      - ./config/probe-gateway.yaml:/etc/rca-agent/probe-gateway/config.yaml:ro
-      - signing-key:/etc/rca-agent/signing:ro
-      - bootstrap-ca:/etc/rca-agent/probe-gateway-ca
+      - ./config/probe-gateway.yaml:/etc/dbagent/probe-gateway/config.yaml:ro
+      - signing-key:/etc/dbagent/signing:ro
+      - bootstrap-ca:/etc/dbagent/probe-gateway-ca
     ports:
       - "8443:8443"
       - "8444:8444"
@@ -219,12 +234,12 @@ services:
 
   dashboard-api:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/dashboard-api:${APP_VERSION:-0.1.0}
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/dashboard-api:${APP_VERSION:-0.1.0}
     environment:
       <<: *app-env
-      RCA_DASHBOARD_CONFIG: /etc/rca-agent/config.yaml
+      DBAGENT_DASHBOARD_CONFIG: /etc/dbagent/config.yaml
     volumes:
-      - ./config/rca-agent.yaml:/etc/rca-agent/config.yaml:ro
+      - ./config/dbagent.yaml:/etc/dbagent/config.yaml:ro
     ports:
       - "8081:8081"
     depends_on:
@@ -235,10 +250,10 @@ services:
 
   dashboard-web:
     profiles: ["apps"]
-    image: ${REGISTRY:-ghcr.io/yabinma/rca-agent}/dashboard-web:${APP_VERSION:-0.1.0}
+    image: ${REGISTRY:-ghcr.io/yabinma/dbagent}/dashboard-web:${APP_VERSION:-0.1.0}
     environment:
-      RCA_API_BASE_URL: /api/v1
-      RCA_API_UPSTREAM: http://dashboard-api:8081/
+      DBAGENT_API_BASE_URL: /api/v1
+      DBAGENT_API_UPSTREAM: http://dashboard-api:8081/
     ports:
       - "3000:8080"
     depends_on:

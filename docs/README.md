@@ -2,6 +2,11 @@
 
 Operator documentation for the RCA Agent system.
 
+## Architecture
+
+- [Architecture](architecture.md) — the six services, control plane vs. data
+  plane, and how they communicate
+
 ## Deployment
 
 - [Kubernetes](deployment/kubernetes.md)

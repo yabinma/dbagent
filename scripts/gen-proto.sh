@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 BUF_BIN="${BUF_BIN:-buf}"
-PY_VENV="${PY_VENV:-$HOME/.cache/rca-agent-protoc-venv}"
+PY_VENV="${PY_VENV:-$HOME/.cache/dbagent-protoc-venv}"
 
 echo "==> buf lint"
 "$BUF_BIN" lint proto

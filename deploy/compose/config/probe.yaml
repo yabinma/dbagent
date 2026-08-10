@@ -2,8 +2,16 @@ platform_key: presto-local
 gateway_address: host.docker.internal:8443
 bootstrap_address: host.docker.internal:8444
 bootstrap_token: ${BOOTSTRAP_TOKEN}
-credentials_mount: /etc/rca-probe/platform-credentials
+# Bootstrap CA pin (design.md Section 8.4a): the sha256 fingerprint shown on
+# the dashboard platform page. REQUIRED when the link to probe-gateway crosses
+# an untrusted network, as it does for the Swarm stack; empty preserves TOFU.
+bootstrap_ca_pin: ${BOOTSTRAP_CA_PIN}
+credentials_mount: /etc/dbagent-probe/platform-credentials
 write_enabled: false
-state_dir: /var/lib/rca-probe
+state_dir: /var/lib/dbagent-probe
 coordinator_service: presto-coordinator
-docker_api_base_url: http://docker
+# The probe dials the mounted Docker socket directly (design.md §11.2.3 B /
+# Section 8.1). The shipped stack contains NO socket proxy service; the
+# http(s):// form exists only for an operator who runs their own proxy.
+# This is also the loader default, so the key could be omitted entirely.
+docker_api_base_url: unix:///var/run/docker.sock

@@ -17,15 +17,15 @@ at an operator-managed database (`postgresql.bundled: false` + external DSN).
    ```bash
    pg_dump "$PG_DSN" --format=custom --file="rca-$(date -u +%Y%m%dT%H%M%SZ).dump"
    ```
-3. **Object storage**: snapshot the `rca-agent` bucket (or `mc mirror` /
+3. **Object storage**: snapshot the `dbagent` bucket (or `mc mirror` /
    `aws s3 sync` to a cold bucket). Record the bucket name and endpoint from
    `config.storage`.
 4. **Kubernetes Secrets** you will need on restore: app Secret (`PG_DSN`, JWT,
-   LiteLLM key, …), `rca-agent-signing-key`, probe bootstrap CA PVC/Secret, and
+   LiteLLM key, …), `dbagent-signing-key`, probe bootstrap CA PVC/Secret, and
    any platform-credential Secrets. Export with care (they are credentials):
    ```bash
-   kubectl -n rca get secret rca-agent-app -o yaml > app-secret.backup.yaml
-   kubectl -n rca get secret rca-agent-signing-key -o yaml > signing-key.backup.yaml
+   kubectl -n dbagent get secret dbagent-app -o yaml > app-secret.backup.yaml
+   kubectl -n dbagent get secret dbagent-signing-key -o yaml > signing-key.backup.yaml
    ```
 5. Store dumps and Secret YAMLs in an access-controlled location; encrypt at rest.
 
@@ -48,5 +48,5 @@ at an operator-managed database (`postgresql.bundled: false` + external DSN).
 - Alembic migrations run as a pre-install/pre-upgrade hook; a restore of a
   schema at revision N does not require re-running migrations unless you
   intentionally upgrade past N afterward.
-- Do **not** delete `rca-agent-signing-key` during restore unless you are also
+- Do **not** delete `dbagent-signing-key` during restore unless you are also
   re-enrolling every probe.

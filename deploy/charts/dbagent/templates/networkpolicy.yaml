@@ -1,0 +1,30 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dbagent.fullname" . }}-probe-gateway-internal
+  labels:
+    {{- include "dbagent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: probe-gateway
+  policyTypes: ["Ingress"]
+  ingress:
+    # mTLS session/bootstrap from any (probes are data-plane).
+    - ports:
+        - port: 8443
+          protocol: TCP
+        - port: 8444
+          protocol: TCP
+    # Internal ExecuteTool listener: temporal-worker only.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: temporal-worker
+      ports:
+        - port: 8080
+          protocol: TCP
+{{- end }}

@@ -20,7 +20,7 @@ import (
 // 8.3's interface signature.
 type Config struct {
 	PlatformKey           string
-	CredentialsMountPath  string // default /etc/rca-probe/platform-credentials (D15)
+	CredentialsMountPath  string // default /etc/dbagent-probe/platform-credentials (D15)
 	DeploymentCAPEM       []byte // deployment parameter CA (Section 8.4 TLS resolution order)
 	InsecureSkipVerify    bool   // test environments only (Section 8.4 TLS notes)
 	HealthQuery           string // per-platform configured health_query (Appendix E)
@@ -33,7 +33,7 @@ func (c Config) mountPath() string {
 	if c.CredentialsMountPath != "" {
 		return c.CredentialsMountPath
 	}
-	return "/etc/rca-probe/platform-credentials"
+	return "/etc/dbagent-probe/platform-credentials"
 }
 
 type Adapter struct {

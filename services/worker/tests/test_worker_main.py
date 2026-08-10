@@ -17,7 +17,7 @@ def _config(**overrides):
             "postgres_dsn": "sqlite:///:memory:",
             "s3": {
                 "endpoint": "http://minio.local:9000",
-                "bucket": "rca-agent",
+                "bucket": "dbagent",
                 "access_key": "minioadmin",
                 "secret_key": "minioadmin",
             },
@@ -45,7 +45,7 @@ def test_build_llm_client_wires_expected_backends():
     assert isinstance(llm_client._object_store, S3ObjectStore)
     assert isinstance(llm_client._trace_store, PGTraceStore)
     assert llm_client._tracing_backend == "builtin"
-    assert llm_client._object_store._bucket == "rca-agent"
+    assert llm_client._object_store._bucket == "dbagent"
 
 
 def test_build_llm_client_defaults_to_owned_http_client():
@@ -83,7 +83,7 @@ async def test_run_worker_starts_and_hosts_ping_workflow_against_injected_client
 def test_main_invokes_run_worker_with_loaded_config(monkeypatch, tmp_path):
     config_file = tmp_path / "config.yaml"
     config_file.write_text('storage:\n  postgres_dsn: "sqlite:///:memory:"\n')
-    monkeypatch.setenv("RCA_WORKER_CONFIG", str(config_file))
+    monkeypatch.setenv("DBAGENT_WORKER_CONFIG", str(config_file))
 
     captured = {}
 
@@ -102,7 +102,7 @@ def test_build_investigation_activities_fails_closed_without_ephemeral(monkeypat
     from worker.worker_main import build_investigation_activities
     from unittest.mock import MagicMock
 
-    config = _config(signing={"key_path": "/etc/rca-agent/signing/ed25519.key", "allow_ephemeral": False})
+    config = _config(signing={"key_path": "/etc/dbagent/signing/ed25519.key", "allow_ephemeral": False})
 
     def boom(_path):
         raise OSError("read-only filesystem")
@@ -123,7 +123,7 @@ def test_build_investigation_activities_allows_ephemeral_when_flagged(monkeypatc
     from worker.worker_main import build_investigation_activities
     from unittest.mock import MagicMock
 
-    config = _config(signing={"key_path": "/etc/rca-agent/signing/ed25519.key", "allow_ephemeral": True})
+    config = _config(signing={"key_path": "/etc/dbagent/signing/ed25519.key", "allow_ephemeral": True})
 
     def boom(_path):
         raise OSError("read-only filesystem")

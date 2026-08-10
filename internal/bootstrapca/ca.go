@@ -69,7 +69,7 @@ func generate(certPath, keyPath string) (*CA, error) {
 	}
 	template := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "rca-agent probe-gateway bootstrap CA"},
+		Subject:               pkix.Name{CommonName: "dbagent probe-gateway bootstrap CA"},
 		NotBefore:             time.Now().Add(-5 * time.Minute),
 		NotAfter:              time.Now().Add(caValidity),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,

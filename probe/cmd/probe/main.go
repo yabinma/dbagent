@@ -34,7 +34,7 @@ import (
 func main() {
 	configPath := os.Getenv("PROBE_CONFIG")
 	if configPath == "" {
-		configPath = "/etc/rca-probe/config.yaml"
+		configPath = "/etc/dbagent-probe/config.yaml"
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -44,14 +44,22 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	enrollment, err := ensureEnrolled(ctx, cfg)
-	if err != nil {
-		log.Fatalf("probe: enrollment: %v", err)
-	}
-
+	// design.md §11.2.3 B (FP-SW-3): build the runtime environment BEFORE
+	// enrolling. A misconfigured docker_api_base_url must be fatal while the
+	// single-use bootstrap token is still unspent; the previous order enrolled
+	// first, burned the token, and only then discovered it could not reach
+	// Docker. The Swarm branch issues a real GET /_ping on unix:// so socket
+	// permission errors (non-root + root:docker 0660 without group_add) also
+	// surface pre-token-spend. The K8s branch stays lazy (client-go's
+	// NewForConfig does not dial).
 	env, _, err := buildRuntimeEnv(cfg)
 	if err != nil {
 		log.Fatalf("probe: build runtime env: %v", err)
+	}
+
+	enrollment, err := ensureEnrolled(ctx, cfg)
+	if err != nil {
+		log.Fatalf("probe: enrollment: %v", err)
 	}
 
 	adapter := presto.New(presto.Config{
@@ -215,12 +223,18 @@ var inClusterConfig = rest.InClusterConfig
 func buildRuntimeEnv(cfg config.Probe) (platform.RuntimeEnv, platform.EnvKind, error) {
 	if cfg.CoordinatorService != "" {
 		// Swarm deployment (Appendix E: "Swarm: coordinator_service: presto-coordinator").
-		dockerClient := dockerapi.New(cfg.DockerAPIBaseURL, nil)
+		// design.md §11.2.3 B: the base URL decides the transport, and an
+		// unusable one is a fatal startup error (FP-SW-3).
+		dockerClient, err := dockerapi.NewForBaseURL(cfg.DockerAPIBaseURL)
+		if err != nil {
+			return nil, "", err
+		}
 		env := dockerenv.New(dockerClient, dockerenv.Config{
 			CoordinatorService: cfg.CoordinatorService,
 			WorkerService:      cfg.WorkerService,
 			CoordinatorHTTPS:   cfg.CoordinatorHTTPS,
 			CoordinatorPort:    cfg.CoordinatorPort,
+			ConfigPaths:        cfg.ConfigPaths,
 		})
 		return env, platform.EnvKindSwarm, nil
 	}

@@ -6,7 +6,7 @@ external dependencies)").
 - Postgres: an ephemeral `testcontainers` Postgres, migrated to head via
   the real `libs/py/rca_common` alembic migration (Section 4.3).
 - MinIO: an ephemeral `testcontainers` MinIO container, with the
-  `rca-agent` bucket pre-created.
+  `dbagent` bucket pre-created.
 - Temporal: `temporalio.testing.WorkflowEnvironment.start_local()`, a real
   local Temporal dev server binary (not a mock) per the previous session's
   approved plan.
@@ -56,7 +56,7 @@ def _run_migrations(sync_dsn: str) -> None:
 def postgres_dsn() -> str:
     """Real ephemeral Postgres, migrated to head (Section 4.3 DDL, verified
     end to end against a live database -- not just compiled DDL)."""
-    with PostgresContainer("postgres:16-alpine", dbname="rca_agent", username="rca_agent", password="rca_agent") as pg:
+    with PostgresContainer("postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent") as pg:
         dsn = pg.get_connection_url()  # postgresql+psycopg2://...
         _run_migrations(dsn)
         yield dsn
@@ -65,7 +65,7 @@ def postgres_dsn() -> str:
 @pytest.fixture(scope="session")
 def minio_endpoint() -> str:
     """Real ephemeral MinIO (S3-compatible object store, Section 3.2), with
-    the `rca-agent` bucket pre-created."""
+    the `dbagent` bucket pre-created."""
     access_key = "minioadmin"
     secret_key = "minioadmin"
     container = (
@@ -87,7 +87,7 @@ def minio_endpoint() -> str:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
         )
-        client.create_bucket(Bucket="rca-agent")
+        client.create_bucket(Bucket="dbagent")
 
         yield endpoint
 

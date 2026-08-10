@@ -25,7 +25,7 @@ export function AdminPage() {
           platformKey={p.platform_key}
           guidance={
             p.credential_guidance ||
-            "Mount credentials at /etc/rca-probe/platform-credentials (Section 8.4 step 6)."
+            "Mount credentials at /etc/dbagent-probe/platform-credentials (Section 8.4 step 6)."
           }
         />
       ))}

@@ -12,8 +12,12 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 ARG PYTHON_IMAGE=python:3.12-slim
 FROM ${PYTHON_IMAGE}
+# Create /etc/dbagent/signing so a fresh Docker named volume mounted there
+# initializes with rca (10001) ownership -- Compose seeds an empty named volume
+# from the image path's owner/mode, and without this the mountpoint is created
+# root-owned and the signing-key job (USER 10001) cannot write its keypair.
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin rca \
- && mkdir -p /etc/rca-agent /app/scripts /app/migrations && chown -R rca:rca /etc/rca-agent /app
+ && mkdir -p /etc/dbagent/signing /app/scripts /app/migrations && chown -R rca:rca /etc/dbagent /app
 COPY --from=builder /opt/venv /opt/venv
 COPY services/worker/scripts/ /app/scripts/
 COPY libs/py/rca_common/migrations/ /app/migrations/

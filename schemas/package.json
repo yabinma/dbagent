@@ -1,5 +1,5 @@
 {
-  "name": "@rca-agent/schemas-codegen",
+  "name": "@dbagent/schemas-codegen",
   "private": true,
   "version": "0.0.0",
   "description": "TypeScript type generation from the JSON Schema source of truth (design.md Section 11).",

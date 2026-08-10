@@ -47,9 +47,9 @@ func startMigratedPostgres(t *testing.T) string {
 	ctx := context.Background()
 
 	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("rca_agent"),
-		postgres.WithUsername("rca_agent"),
-		postgres.WithPassword("rca_agent"),
+		postgres.WithDatabase("dbagent"),
+		postgres.WithUsername("dbagent"),
+		postgres.WithPassword("dbagent"),
 		testcontainers.WithWaitStrategy(
 			tcwait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
 		),
@@ -77,7 +77,7 @@ func startMigratedPostgres(t *testing.T) string {
 
 	cmd := exec.Command(pythonBin, "-m", "alembic", "upgrade", "head")
 	cmd.Dir = rcaCommonDir
-	cmd.Env = append(os.Environ(), "RCA_PG_DSN="+alembicDSN)
+	cmd.Env = append(os.Environ(), "DBAGENT_PG_DSN="+alembicDSN)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("alembic upgrade head failed: %v\n%s", err, out)

@@ -5,7 +5,7 @@
       "playbook_id": "presto.update_config_restart_workers",
       "playbook_params": {
         "name": "presto-coordinator-config",
-        "namespace": "rca",
+        "namespace": "dbagent",
         "patches": [
           {"key": "connector.name", "value": "hive"}
         ]

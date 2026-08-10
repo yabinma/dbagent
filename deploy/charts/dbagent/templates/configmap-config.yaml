@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dbagent.fullname" . }}-config
+  labels:
+    {{- include "dbagent.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- /*
+      Release-qualify internal Service hostnames (review C2).
+      Helm names Services as {{ .Release.Name }}-<component>; bare defaults
+      like http://minio:9000 do not resolve. When a dependency is bundled (or
+      always rendered, for probe-gateway), rewrite the endpoint to the
+      release-qualified Service DNS name unless the operator set an explicit
+      non-default URL (external override).
+    */ -}}
+    {{- $cfg := deepCopy .Values.config -}}
+    {{- $fullname := include "dbagent.fullname" . -}}
+    {{- /* Temporal */ -}}
+    {{- if eq .Values.temporal.mode "external" -}}
+    {{- $_ := set $cfg.temporal "address" .Values.temporal.address -}}
+    {{- else if eq .Values.temporal.mode "dev" -}}
+    {{- $_ := set $cfg.temporal "address" (printf "%s-temporal:7233" $fullname) -}}
+    {{- end -}}
+    {{- /* MinIO — only rewrite when bundled; external installs keep operator values. */ -}}
+    {{- if .Values.minio.bundled -}}
+    {{- $ep := dig "storage" "s3_endpoint" "" $cfg -}}
+    {{- if or (empty $ep) (eq $ep "http://minio:9000") -}}
+    {{- $_ := set $cfg.storage "s3_endpoint" (printf "http://%s-minio:9000" $fullname) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /* LiteLLM model-gateway — same pattern as MinIO. */ -}}
+    {{- if .Values.modelGateway.bundled -}}
+    {{- if not $cfg.model_gateway -}}{{- $_ := set $cfg "model_gateway" dict -}}{{- end -}}
+    {{- $mg := dig "model_gateway" "url" "" $cfg -}}
+    {{- if or (empty $mg) (eq $mg "http://model-gateway:4000") -}}
+    {{- $_ := set $cfg.model_gateway "url" (printf "http://%s-model-gateway:4000" $fullname) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      probe-gateway is always rendered by this chart. Absent config.probe_gateway
+      falls through to rca_common's bare default http://probe-gateway:8080, which
+      does not match the release-qualified Service. Rewrite when missing or bare.
+    */ -}}
+    {{- if not $cfg.probe_gateway -}}{{- $_ := set $cfg "probe_gateway" dict -}}{{- end -}}
+    {{- $pgw := dig "probe_gateway" "url" "" $cfg -}}
+    {{- if or (empty $pgw) (eq $pgw "http://probe-gateway:8080") -}}
+    {{- $_ := set $cfg.probe_gateway "url" (printf "http://%s-probe-gateway:8080" $fullname) -}}
+    {{- end -}}
+    {{- toYaml $cfg | nindent 4 }}

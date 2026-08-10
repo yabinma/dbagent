@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/yabinma/dbagent/probe/internal/bootstrapclient"
 	"github.com/yabinma/dbagent/probe/internal/config"
 	"github.com/yabinma/dbagent/probe/internal/platform"
+	"github.com/yabinma/dbagent/probe/internal/runtimeenv/dockerenv"
 	"k8s.io/client-go/rest"
 )
 
@@ -187,7 +189,11 @@ func TestEnsureEnrolled_PersistFailurePropagates(t *testing.T) {
 }
 
 func TestBuildRuntimeEnv_SwarmDeployment(t *testing.T) {
-	env, kind, err := buildRuntimeEnv(config.Probe{CoordinatorService: "presto-coordinator", WorkerService: "presto-worker"})
+	env, kind, err := buildRuntimeEnv(config.Probe{
+		CoordinatorService: "presto-coordinator",
+		WorkerService:      "presto-worker",
+		DockerAPIBaseURL:   "unix://" + newTestDockerSocket(t),
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -862,5 +868,102 @@ func TestSessionClientReconnect_KeepsPreviousKeyAndOriginalGraceDeadline(t *test
 	}
 	if ring.Previous != nil || !bytes.Equal(ring.Current, keyB) {
 		t.Fatalf("at T_obs Previous must be nil and Current=B; got {%v,%v}", ring.Current, ring.Previous)
+	}
+}
+
+// --- UT-SW-4 (design.md §11.2.5, FP-SW-1/FP-SW-3) --------------------------
+
+// newTestDockerSocket creates a real unix socket that answers GET /_ping so
+// dockerapi.NewForBaseURL's connectivity preflight passes without a Docker daemon.
+func newTestDockerSocket(t *testing.T) string {
+	t.Helper()
+	socketPath := filepath.Join(t.TempDir(), "docker.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/_ping" {
+			_, _ = w.Write([]byte("OK"))
+			return
+		}
+		http.NotFound(w, r)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = ln.Close()
+	})
+	return socketPath
+}
+
+// FP-SW-1: config_paths reaches dockerenv.Config.
+func TestBuildRuntimeEnv_SwarmPropagatesConfigPaths(t *testing.T) {
+	paths := map[string]string{
+		"config":       "/opt/presto-server/etc/config.properties",
+		"catalog:hive": "/opt/presto-server/etc/catalog/hive.properties",
+	}
+	env, kind, err := buildRuntimeEnv(config.Probe{
+		CoordinatorService: "presto-coordinator",
+		WorkerService:      "presto-worker",
+		DockerAPIBaseURL:   "unix://" + newTestDockerSocket(t),
+		ConfigPaths:        paths,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if kind != platform.EnvKindSwarm {
+		t.Fatalf("kind = %s", kind)
+	}
+	swarmEnv, ok := env.(*dockerenv.Env)
+	if !ok {
+		t.Fatalf("expected a *dockerenv.Env, got %T", env)
+	}
+	if len(swarmEnv.Cfg.ConfigPaths) != len(paths) {
+		t.Fatalf("ConfigPaths = %#v, want %#v", swarmEnv.Cfg.ConfigPaths, paths)
+	}
+	for k, v := range paths {
+		if swarmEnv.Cfg.ConfigPaths[k] != v {
+			t.Fatalf("ConfigPaths[%q] = %q, want %q", k, swarmEnv.Cfg.ConfigPaths[k], v)
+		}
+	}
+}
+
+// FP-SW-3: the NewForBaseURL error propagates out of the Swarm branch, so
+// main's log.Fatalf runs before ensureEnrolled can spend the token.
+func TestBuildRuntimeEnv_SwarmPropagatesDockerAPIError(t *testing.T) {
+	cases := []struct{ name, baseURL, want string }{
+		{"unsupported scheme", "tcp://docker:2375", `dockerapi: unsupported docker_api_base_url scheme "tcp://docker:2375" (want unix://, http:// or https://)`},
+		{"relative unix path", "unix://docker.sock", `dockerapi: docker socket path "docker.sock" must be absolute (use unix:///var/run/docker.sock)`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _, err := buildRuntimeEnv(config.Probe{
+				CoordinatorService: "presto-coordinator",
+				DockerAPIBaseURL:   tc.baseURL,
+			})
+			if err == nil {
+				t.Fatalf("expected an error, got env %#v", env)
+			}
+			if err.Error() != tc.want {
+				t.Fatalf("error = %q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// FP-SW-3: a missing socket is named, not swallowed.
+func TestBuildRuntimeEnv_SwarmMissingSocketIsNamed(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "docker.sock")
+	_, _, err := buildRuntimeEnv(config.Probe{
+		CoordinatorService: "presto-coordinator",
+		DockerAPIBaseURL:   "unix://" + missing,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a missing socket")
+	}
+	want := "dockerapi: docker socket " + missing + " not found (mount /var/run/docker.sock into the probe container)"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
 	}
 }

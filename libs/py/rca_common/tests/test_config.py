@@ -38,7 +38,7 @@ def test_defaults_applied():
     assert cfg.signing.backend == "mounted"
     assert cfg.signing.allow_ephemeral is False
     assert cfg.temporal.address == "localhost:7233"
-    assert cfg.temporal.namespace == "default"
+    assert cfg.temporal.namespace == "dbagent"
     assert cfg.ingest.correlation_window_seconds == 1800
     assert cfg.raw_commands.policy == "approve"
     assert cfg.probe_gateway.url == "http://probe-gateway:8080"
@@ -70,7 +70,7 @@ def test_full_config_roundtrip():
             "s3": {"endpoint": "http://minio:9000", "bucket": "b", "access_key": "a", "secret_key": "s"},
         },
         "model_gateway": {"url": "http://model-gateway:4000", "master_key": "mk"},
-        "temporal": {"address": "temporal-frontend:7233", "namespace": "rca-agent"},
+        "temporal": {"address": "temporal-frontend:7233", "namespace": "dbagent"},
         "ingest": {
             "sources": [{"name": "grafana-prod", "secret": "s"}],
             "correlation_window_seconds": 900,
@@ -101,7 +101,7 @@ def test_full_config_roundtrip():
     assert cfg.dashboard.cors_origins == ["http://localhost:5173"]
     assert cfg.dashboard.bootstrap_ca_cert_path == "/etc/rca/ca.crt"
     assert cfg.temporal.address == "temporal-frontend:7233"
-    assert cfg.temporal.namespace == "rca-agent"
+    assert cfg.temporal.namespace == "dbagent"
     assert cfg.ingest.sources[0].name == "grafana-prod"
     assert cfg.ingest.correlation_window_seconds == 900
     assert cfg.raw_commands.policy == "validate_only"

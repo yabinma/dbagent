@@ -23,12 +23,12 @@ mint short-lived mTLS certificates for probes. Key material lives on a PVC
    or the chart's documented CA key names — see `docs/security.md`).
 3. Install the new Secret and point the chart at it:
    ```bash
-   kubectl -n rca create secret generic rca-bootstrap-ca-v2 \
+   kubectl -n dbagent create secret generic dbagent-bootstrap-ca-v2 \
      --from-file=ca.crt=./new-ca.crt \
      --from-file=ca.key=./new-ca.key
-   helm upgrade rca-agent deploy/charts/rca-agent -n rca \
+   helm upgrade dbagent deploy/charts/dbagent -n dbagent \
      -f your-values.yaml \
-     --set probeGateway.bootstrapCA.existingSecret=rca-bootstrap-ca-v2
+     --set probeGateway.bootstrapCA.existingSecret=dbagent-bootstrap-ca-v2
    ```
 4. Roll probe-gateway so it loads the new CA. Confirm gateway logs show the new
    CA fingerprint (operators without `dashboard.bootstrap_ca_cert_path` read it

@@ -225,7 +225,7 @@ def _approve_pending(
 
 def _kubectl(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["kubectl", "-n", "rca", *args],
+        ["kubectl", "-n", "dbagent", *args],
         capture_output=True,
         text=True,
         check=False,
@@ -236,7 +236,7 @@ def _kubectl_ok(*args: str) -> subprocess.CompletedProcess:
     """Fail closed: a scenario that cannot inject its fault has not run."""
     proc = _kubectl(*args)
     assert proc.returncode == 0, (
-        f"kubectl -n rca {' '.join(args)} failed (rc={proc.returncode}): "
+        f"kubectl -n dbagent {' '.join(args)} failed (rc={proc.returncode}): "
         f"{proc.stderr.strip() or proc.stdout.strip()}"
     )
     return proc
@@ -466,11 +466,11 @@ def _query_states(presto_url: str) -> dict[str, str]:
 # the assertions can be made against the real stored bytes rather than against a
 # summary the API happened to render.
 IN_CLUSTER_FETCH_WORKLOAD = os.environ.get(
-    "E2E_FETCH_WORKLOAD", "deploy/rca-agent-dashboard-api"
+    "E2E_FETCH_WORKLOAD", "deploy/dbagent-dashboard-api"
 )
-PG_WORKLOAD = os.environ.get("E2E_PG_WORKLOAD", "deploy/rca-agent-postgresql")
+PG_WORKLOAD = os.environ.get("E2E_PG_WORKLOAD", "deploy/dbagent-postgresql")
 PG_DSN_IN_POD = os.environ.get(
-    "E2E_PG_DSN_IN_POD", "postgresql://rca_agent:rca_agent@127.0.0.1:5432/rca_agent"
+    "E2E_PG_DSN_IN_POD", "postgresql://dbagent:dbagent@127.0.0.1:5432/dbagent"
 )
 
 _FETCH_SNIPPET = (
@@ -627,8 +627,8 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
         f"phase 6 must seed remediation.settle_seconds=15; got {cfg.get('remediation')!r}"
     )
     targets = cfg.get("remediation_targets") or {}
-    assert targets.get("namespace") == "rca", (
-        f"phase 6 must seed remediation_targets.namespace=rca; got {targets!r}"
+    assert targets.get("namespace") == "dbagent", (
+        f"phase 6 must seed remediation_targets.namespace=dbagent; got {targets!r}"
     )
     assert targets.get("worker_configmap") == WORKER_CONFIGMAP, targets
     assert targets.get("config_file_key") == "config.properties", targets
@@ -839,7 +839,7 @@ def test_e2_broken_catalog_redacted(dashboard_url, ingest_url, presto_url):
                 }
             )
     apply_dep = subprocess.run(
-        ["kubectl", "-n", "rca", "apply", "-f", "-"],
+        ["kubectl", "-n", "dbagent", "apply", "-f", "-"],
         input=json.dumps(dep),
         capture_output=True,
         text=True,

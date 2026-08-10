@@ -8,7 +8,7 @@ describe("Admin surfaces (FP-M4-16)", () => {
     render(
       <PendingCredentialsGuide
         platformKey="presto-us1"
-        guidance="Mount Secret at /etc/rca-probe/platform-credentials"
+        guidance="Mount Secret at /etc/dbagent-probe/platform-credentials"
       />
     );
     expect(screen.getByTestId("pending-credentials-guide")).toHaveTextContent(

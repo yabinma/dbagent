@@ -11,16 +11,16 @@ but never stores the raw password after install.
 
 1. Create a **new** Secret in the probe's namespace with the rotated credentials
    (same keys the probe expects — see `docs/deployment/probe.md` and the
-   `rca-probe` chart's `platformCredentials` values). Prefer a new Secret name
+   `dbagent-probe` chart's `platformCredentials` values). Prefer a new Secret name
    so the old one remains available for rollback:
    ```bash
-   kubectl -n rca create secret generic presto-creds-v2 \
+   kubectl -n dbagent create secret generic presto-creds-v2 \
      --from-literal=username=presto \
      --from-literal=password="$NEW_PASSWORD"
    ```
 2. Point the probe at the new Secret and roll it:
    ```bash
-   helm upgrade rca-probe deploy/charts/rca-probe -n rca \
+   helm upgrade dbagent-probe deploy/charts/dbagent-probe -n dbagent \
      -f your-probe-values.yaml \
      --set platformCredentials.existingSecret=presto-creds-v2
    ```

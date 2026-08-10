@@ -1,0 +1,40 @@
+# Sample mounted config for compose apps profile (secrets via env interpolation).
+# Agent model routes (Appendix E `models:`). The role keys are the Section 6
+# vocabulary and are retained by the product rename (design.md §11.2.3 C.5):
+# `rca` names the analysis step, not the product.
+models:
+  planner:     {model: "ollama/qwen2.5:14b",                max_tokens: 2000}
+  collector:   {model: "ollama/qwen2.5:14b",                max_tokens: 2000}
+  rca:         {model: "bedrock/anthropic.claude-fable-5",  max_tokens: 8000}
+  remediation: {model: "bedrock/anthropic.claude-fable-5",  max_tokens: 4000}
+rca_confidence_threshold: 0.85
+temporal:
+  address: temporal:7233
+  namespace: dbagent
+  task_queue: rca-worker
+storage:
+  postgres_dsn: ${PG_DSN}
+  s3_endpoint: http://minio:9000
+  s3_bucket: dbagent
+  s3_access_key: ${S3_ACCESS_KEY}
+  s3_secret_key: ${S3_SECRET_KEY}
+  s3_region: us-east-1
+model_gateway:
+  url: http://model-gateway:4000
+  master_key: ${LITELLM_MASTER_KEY}
+signing:
+  key_path: /etc/dbagent/signing/ed25519.key
+  rotation_grace_seconds: 600
+dashboard:
+  jwt_secret: ${DASHBOARD_JWT_SECRET}
+  cors_origins: []
+notifications:
+  outbound_webhooks: []
+ingest:
+  sources: []
+budget_defaults:
+  max_rounds: 15
+  max_cost_usd: 10.0
+  max_wall_seconds: 1800
+tracing:
+  backend: builtin

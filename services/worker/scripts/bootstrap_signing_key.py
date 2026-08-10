@@ -4,7 +4,7 @@
 once by an idempotent pre-install job").
 
 Intended to be wired as:
-  - a Helm pre-install/pre-upgrade hook Job (`deploy/charts/rca-agent`), or
+  - a Helm pre-install/pre-upgrade hook Job (`deploy/charts/dbagent`), or
   - an init container / one-shot service in `deploy/compose/control-plane.yml`,
   - or invoked directly by an operator before first start-up.
 
@@ -32,6 +32,7 @@ import ssl
 import sys
 from pathlib import Path
 
+from rca_common.envcompat import reject_legacy_env
 from rca_common.signing.signer import bootstrap_signing_key
 
 logger = logging.getLogger("bootstrap_signing_key")
@@ -232,12 +233,13 @@ def _create_secret(client, url: str, headers: dict, key_path: str, secret_name: 
 
 
 def main(argv: list[str] | None = None) -> int:
+    reject_legacy_env()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--key-path",
-        default=os.environ.get("RCA_SIGNING_KEY_PATH", "/etc/rca-agent/signing/ed25519.key"),
+        default=os.environ.get("DBAGENT_SIGNING_KEY_PATH", "/etc/dbagent/signing/ed25519.key"),
         help="Mounted signing key file path (design.md Appendix E `signing.key_path`).",
     )
     parser.add_argument(
