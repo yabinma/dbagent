@@ -94,36 +94,69 @@ async def test_temporal_starter_does_not_import_worker(monkeypatch):
     package is ever present in the real deployed image. A previous version of
     start_investigation imported worker.workflows.investigation.InvestigationWorkflow
     directly, which raised ModuleNotFoundError on every real investigation in
-    any real deployment; it was masked here only by a fake `worker` module this
-    test injected into sys.modules, which made the bug invisible. This test
-    instead asserts `worker` is genuinely absent and that start_workflow is
-    called with the plain string "InvestigationWorkflow" (Temporal's untyped
-    workflow-start form, which needs no import of worker's code at all)."""
+    any real deployment; it was masked here only by a fake `worker` module a
+    previous version of this test injected into sys.modules, which made the
+    bug invisible. This test instead poisons every `worker`/`worker.*` entry
+    in sys.modules with the None sentinel -- CPython's own convention for
+    "this import was already attempted and disallowed", which makes any
+    `import worker` (or `from worker.x import y`) inside start_investigation
+    raise ImportError immediately. This has to be poison rather than absence:
+    the real `services/worker` package IS legitimately installed in this
+    job's shared venv (services/worker/tests import it directly, elsewhere in
+    the same pytest session), so a bare `assert "worker" not in sys.modules`
+    is order-dependent and was false whenever a worker test ran first in the
+    same process -- exactly what broke this test the first time it ran as
+    part of the full functional suite rather than gateway's tests alone. And
+    poisoning only the top-level `worker` entry is not enough either: CPython
+    resolves `from worker.workflows.investigation import X` by checking each
+    dotted level's own sys.modules entry, and when `worker.workflows.
+    investigation` is *already* fully cached from an earlier worker test in
+    the same session, that check succeeds without re-touching the poisoned
+    `worker` entry at all -- confirmed by reverting the gateway/main.py fix
+    locally and finding this exact gap: poisoning only "worker" let the old
+    buggy import through silently in a combined worker+gateway test run.
+    Every existing dotted level must be poisoned for the same reason a
+    partial mock would be. Also asserts start_workflow is called with the
+    plain string "InvestigationWorkflow" (Temporal's untyped workflow-start
+    form, which needs no import of worker's code at all)."""
     import sys
 
-    assert "worker" not in sys.modules, (
-        "an earlier test left a fake `worker` module in sys.modules; this "
-        "test needs it genuinely absent to prove no import is attempted"
-    )
+    sentinel = object()
+    # Poison every dotted level already cached (handles "worker already
+    # imported by an earlier test this session"), AND poison the top-level
+    # name pre-emptively even if absent (handles "worker never imported yet
+    # this process, but is installed on disk in this shared venv" -- a fresh
+    # import would otherwise succeed silently).
+    to_poison = {name for name in sys.modules if name == "worker" or name.startswith("worker.")}
+    to_poison.add("worker")
+    previous = {name: sys.modules.get(name, sentinel) for name in to_poison}
+    for name in to_poison:
+        sys.modules[name] = None  # type: ignore[assignment]
+    try:
+        class FakeHandle:
+            id = "wf-1"
 
-    class FakeHandle:
-        id = "wf-1"
+        calls: list[tuple[tuple, dict]] = []
 
-    calls: list[tuple[tuple, dict]] = []
+        class FakeClient:
+            async def start_workflow(self, *a, **k):
+                calls.append((a, k))
+                return FakeHandle()
 
-    class FakeClient:
-        async def start_workflow(self, *a, **k):
-            calls.append((a, k))
-            return FakeHandle()
+        starter = TemporalWorkflowStarter(FakeClient())
+        import uuid
 
-    starter = TemporalWorkflowStarter(FakeClient())
-    import uuid
+        wid = await starter.start_investigation(
+            {"platform_key": "p", "error_summary": "x"}, uuid.uuid4()
+        )
+    finally:
+        for name, value in previous.items():
+            if value is sentinel:
+                del sys.modules[name]
+            else:
+                sys.modules[name] = value
 
-    wid = await starter.start_investigation(
-        {"platform_key": "p", "error_summary": "x"}, uuid.uuid4()
-    )
     assert wid == "wf-1"
-    assert "worker" not in sys.modules, "start_investigation imported the worker package"
     assert calls[0][0][0] == "InvestigationWorkflow", (
         f"expected the untyped workflow type name, got {calls[0][0]!r}"
     )
