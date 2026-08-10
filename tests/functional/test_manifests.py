@@ -175,7 +175,7 @@ EXPECTED_NEEDS_GRAPH: dict[str, tuple[str, ...]] = {
 assert set(EXPECTED_NEEDS_GRAPH) == EXPECTED_CI_JOBS
 
 EXPECTED_GO_TEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
-    "unit-go": [(None, "go test ./... -race -timeout 300s")],
+    "unit-go": [(None, "go test ./... -race -timeout 300s -p 1")],
     "functional": [(None, "go test ./tests/functional/... -v -timeout 300s")],
     "benchmark": [
         (None, "go test ./services/probe-gateway/internal/gwserver/... -run TestB3 -v -timeout 60s"),

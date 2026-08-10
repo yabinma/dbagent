@@ -261,8 +261,16 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -e ".[test]"
+      # -p 1: serialize package execution. This job runs at least two
+      # packages (registry, tests/functional/m2_probe_link) that each spin
+      # up their own real ephemeral Postgres testcontainer; run concurrently
+      # (go test's default per-package parallelism) on a standard 2-core
+      # GitHub-hosted runner, they starve each other for Docker/CPU and the
+      # later container becomes unreachable -- observed failing 3 of 4 CI
+      # runs with "connection refused" before this was added. Serializing
+      # doesn't weaken the race detector or any assertion, just scheduling.
       - name: go test -race (100% pass rate)
-        run: go test ./... -race -timeout 300s
+        run: go test ./... -race -timeout 300s -p 1
       - name: per-package coverage gate (>80%, excluding generated code + main())
         run: bash scripts/go-coverage-check.sh 80
 
