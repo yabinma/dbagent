@@ -1,6 +1,8 @@
-# RCA Agent documentation
+# dbagent documentation
 
-Operator documentation for the RCA Agent system.
+Operator documentation for dbagent. For what the product is, how the
+investigation loop works, and how to build and test the repository, see the
+[project README](../README.md).
 
 ## Architecture
 
@@ -37,4 +39,4 @@ Operator documentation for the RCA Agent system.
 
 - Python 3.12, Go 1.26.4, Node 20, Docker, Helm (pinned in `deploy/versions.env`), kind (for e2e)
 - Delivery tests (`tests/delivery/`) require `helm` and `docker compose` on PATH; a missing binary is a hard failure, never a skip
-- The e2e job (kind + Presto 0.298) runs on every PR targeting `main`, on `main` pushes, on tags, and nightly on schedule
+- The e2e job (kind + Presto 0.298) runs on every PR targeting `main`, on tags, nightly on schedule, and on manual `workflow_dispatch` — not on a plain push to `main`

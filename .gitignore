@@ -229,6 +229,12 @@ node_modules/
 # Local-only code review report (not published to the remote repo)
 /review.md
 
+# Local-only design-review report from the opt-in Claude-opus `design-reviewer`
+# (the default `codex-design-reviewer` writes into /design/, already covered
+# above; this one lands at repo root and was untracked-but-not-ignored until
+# now — flagged as housekeeping across several review rounds, 2026-08-10).
+/design-review.md
+
 # Walkthrough acceptance artifacts (operator/self-test output; not committed).
 # Dated report names and bootstrap-token files can carry raw secrets.
 /walkthrough-report.json
