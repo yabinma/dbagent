@@ -12,7 +12,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import shutil
+import signal
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -571,3 +576,400 @@ def test_e2e_smoke_inline_env_lookups_exist_in_rendered_dashboard_pod():
         f"explicit={sorted(explicit_env)} secret_keys={sorted(secret_keys)}; "
         f"missing={missing}"
     )
+
+
+# --- e2e fixture QoS + failure diagnostics (first real-CI e2e run). ---
+#
+# Presto e2e manifests had no resources: block, so those pods were BestEffort
+# QoS and were first starved under node pressure on a 4-vCPU ubuntu-latest
+# runner — cascading into E1–E4 failures. Product pods already declare
+# resources; Presto and the other non-chart fixtures (mock-llm,
+# webhook-capture) must match that pattern. B1 ingest errors are a separate
+# defect and are out of scope for this guard.
+
+
+_K8S_CPU_RE = re.compile(
+    r"^(?P<num>\d+(?:\.\d+)?)(?P<unit>m)?$"
+)
+_K8S_MEM_RE = re.compile(
+    r"^(?P<num>\d+(?:\.\d+)?)(?P<unit>Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|K|)$"
+)
+_JVM_XMX_RE = re.compile(r"-Xmx(?P<num>\d+(?:\.\d+)?)(?P<unit>[kKmMgG])\b")
+
+# Binary (1024) for Ki/Mi/Gi…; decimal (1000) for K/M/G… — Kubernetes rules.
+_MEM_UNIT_BYTES = {
+    "Ki": 1024,
+    "Mi": 1024**2,
+    "Gi": 1024**3,
+    "Ti": 1024**4,
+    "Pi": 1024**5,
+    "Ei": 1024**6,
+    "K": 1000,
+    "M": 1000**2,
+    "G": 1000**3,
+    "T": 1000**4,
+    "P": 1000**5,
+    "E": 1000**6,
+    "": 1,
+}
+# HotSpot -Xmx units are binary powers of 1024.
+_JVM_UNIT_BYTES = {
+    "k": 1024,
+    "K": 1024,
+    "m": 1024**2,
+    "M": 1024**2,
+    "g": 1024**3,
+    "G": 1024**3,
+}
+
+EXPECTED_PRESTO_DEPLOYMENTS = frozenset({"presto-coordinator", "presto-worker"})
+# Fixtures applied by run.sh that are not chart-managed; same BestEffort risk.
+EXPECTED_E2E_AUX_DEPLOYMENTS = frozenset({"mock-llm", "webhook-capture"})
+MIN_CPU_MILLICORES = 100  # modest floor so the pod is Burstable, not BestEffort
+MEM_HEADROOM_OVER_XMX = 1.5
+
+
+def _parse_cpu_millicores(raw: str) -> int:
+    text = str(raw).strip()
+    m = _K8S_CPU_RE.fullmatch(text)
+    assert m, f"unparseable CPU quantity: {raw!r}"
+    num = float(m.group("num"))
+    if m.group("unit") == "m":
+        return int(num)
+    return int(num * 1000)
+
+
+def _parse_memory_bytes(raw: str) -> int:
+    text = str(raw).strip()
+    m = _K8S_MEM_RE.fullmatch(text)
+    assert m, f"unparseable memory quantity: {raw!r}"
+    num = float(m.group("num"))
+    unit = m.group("unit") or ""
+    return int(num * _MEM_UNIT_BYTES[unit])
+
+
+def _parse_jvm_xmx_bytes(jvm_config: str) -> int:
+    m = _JVM_XMX_RE.search(jvm_config)
+    assert m, f"jvm.config missing -Xmx: {jvm_config!r}"
+    num = float(m.group("num"))
+    return int(num * _JVM_UNIT_BYTES[m.group("unit")])
+
+
+def _presto_xmx_bytes() -> int:
+    """Derive the memory floor from the real jvm.config, not a hardcoded size."""
+    sizes: set[int] = set()
+    for path in sorted((E2E / "presto").glob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            if not doc or doc.get("kind") != "ConfigMap":
+                continue
+            data = doc.get("data") or {}
+            jvm = data.get("jvm.config")
+            if jvm:
+                sizes.add(_parse_jvm_xmx_bytes(jvm))
+    assert sizes, "expected jvm.config with -Xmx under tests/e2e/presto/"
+    assert len(sizes) == 1, f"inconsistent -Xmx across Presto configmaps: {sizes}"
+    return next(iter(sizes))
+
+
+def _deployments_in(*relative_dirs: str) -> list[tuple[Path, dict]]:
+    out: list[tuple[Path, dict]] = []
+    for rel in relative_dirs:
+        root = E2E / rel
+        paths = sorted(root.glob("*.yaml")) if root.is_dir() else [root]
+        for path in paths:
+            if not path.is_file():
+                continue
+            for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+                if not doc or doc.get("kind") != "Deployment":
+                    continue
+                out.append((path, doc))
+    return out
+
+
+def _presto_deployments() -> list[tuple[Path, dict]]:
+    """Load Deployment docs from the e2e Presto manifests."""
+    return _deployments_in("presto")
+
+
+def test_presto_e2e_deployments_declare_cpu_and_memory_resources():
+    """Regression: Presto e2e pods must not be BestEffort QoS.
+
+    A container with no resource requests is BestEffort — first starved or
+    evicted under node pressure on a 4-vCPU kind node. Coordinator/worker must
+    declare a real CPU request floor and a memory request/limit sized from the
+    configured -Xmx (not merely a unit-suffixed string). limits.cpu is optional
+    so the JVM can burst free cores during startup/rollout.
+    """
+    deployments = _presto_deployments()
+    names = {
+        (doc.get("metadata") or {}).get("name")
+        for _, doc in deployments
+        if (doc.get("metadata") or {}).get("name")
+    }
+    assert EXPECTED_PRESTO_DEPLOYMENTS <= names, (
+        f"expected Presto Deployments {sorted(EXPECTED_PRESTO_DEPLOYMENTS)}, "
+        f"found {sorted(names)}"
+    )
+
+    xmx = _presto_xmx_bytes()
+    mem_floor = int(xmx * MEM_HEADROOM_OVER_XMX)
+
+    for path, doc in deployments:
+        name = (doc.get("metadata") or {}).get("name") or path.name
+        if name not in EXPECTED_PRESTO_DEPLOYMENTS:
+            continue
+        containers = (
+            ((doc.get("spec") or {}).get("template") or {})
+            .get("spec") or {}
+        ).get("containers") or []
+        assert containers, f"{path.name}: Deployment {name!r} has no containers"
+        for container in containers:
+            cname = container.get("name") or "<unnamed>"
+            resources = container.get("resources") or {}
+            requests = resources.get("requests") or {}
+            limits = resources.get("limits") or {}
+
+            assert "cpu" in requests, (
+                f"{path.name} container {cname!r} missing resources.requests.cpu "
+                f"(BestEffort QoS under CI node pressure)"
+            )
+            assert "memory" in requests, (
+                f"{path.name} container {cname!r} missing resources.requests.memory "
+                f"(BestEffort QoS under CI node pressure)"
+            )
+            assert "memory" in limits, (
+                f"{path.name} container {cname!r} missing resources.limits.memory"
+            )
+
+            cpu_m = _parse_cpu_millicores(requests["cpu"])
+            assert cpu_m >= MIN_CPU_MILLICORES, (
+                f"{path.name} container {cname!r}: requests.cpu={requests['cpu']!r} "
+                f"({cpu_m}m) below floor {MIN_CPU_MILLICORES}m"
+            )
+
+            mem_req = _parse_memory_bytes(requests["memory"])
+            mem_lim = _parse_memory_bytes(limits["memory"])
+            assert mem_req >= mem_floor, (
+                f"{path.name} container {cname!r}: requests.memory={requests['memory']!r} "
+                f"({mem_req} B) below -Xmx*{MEM_HEADROOM_OVER_XMX} floor "
+                f"({mem_floor} B from -Xmx={xmx} B)"
+            )
+            assert mem_lim >= mem_req, (
+                f"{path.name} container {cname!r}: limits.memory={limits['memory']!r} "
+                f"({mem_lim} B) < requests.memory={requests['memory']!r} ({mem_req} B)"
+            )
+
+
+def test_e2e_aux_deployments_declare_resource_requests():
+    """Regression: mock-llm and webhook-capture must not be BestEffort either.
+
+    Both are applied by run.sh into the same namespace; mock-llm backs every
+    investigation LLM call (E4's path). Same QoS rule as Presto: requests
+    required so the kubelet does not rank them first for starvation.
+    """
+    deployments = _deployments_in("mockllm", "webhook-capture")
+    names = {
+        (doc.get("metadata") or {}).get("name")
+        for _, doc in deployments
+        if (doc.get("metadata") or {}).get("name")
+    }
+    assert EXPECTED_E2E_AUX_DEPLOYMENTS <= names, (
+        f"expected aux Deployments {sorted(EXPECTED_E2E_AUX_DEPLOYMENTS)}, "
+        f"found {sorted(names)}"
+    )
+    for path, doc in deployments:
+        name = (doc.get("metadata") or {}).get("name") or path.name
+        if name not in EXPECTED_E2E_AUX_DEPLOYMENTS:
+            continue
+        containers = (
+            ((doc.get("spec") or {}).get("template") or {})
+            .get("spec") or {}
+        ).get("containers") or []
+        assert containers, f"{path.name}: Deployment {name!r} has no containers"
+        for container in containers:
+            cname = container.get("name") or "<unnamed>"
+            requests = (container.get("resources") or {}).get("requests") or {}
+            assert "cpu" in requests, (
+                f"{path.name} container {cname!r} missing resources.requests.cpu"
+            )
+            assert "memory" in requests, (
+                f"{path.name} container {cname!r} missing resources.requests.memory"
+            )
+            assert _parse_cpu_millicores(requests["cpu"]) >= 1
+            assert _parse_memory_bytes(requests["memory"]) >= 1
+
+
+def test_run_sh_failure_path_collects_pod_logs_and_events(tmp_path: Path):
+    """Regression: phase failure must actually collect cluster diagnostics.
+
+    The CI upload packs /tmp/rca-e2e/**, but run.sh historically only wrote
+    phases.txt — the first real-CI e2e failure had no kubectl describe/logs/
+    events. Static text matching of run.sh is forgeable (echo hints, dead
+    branches, later redefinitions); this test instead runs bash on the real
+    functions with a stub kubectl on PATH and asserts observed behaviour.
+    """
+    # W3: dynamic execution cannot see past the sourcing guard (~line 75-77).
+    # A redefinition of collect_failure_diagnostics / phase / check_budget after
+    # the guard would be invisible to the runtime check; count definitions in
+    # the file so each name exists exactly once (bash uses the last definition).
+    # Checked first so a duplicate definition fails with a clear uniqueness
+    # message rather than an opaque runtime symptom.
+    def _definition_count(text: str, name: str) -> int:
+        # [ \t\r\n]*\{ also matches brace-on-next-line bash style
+        # (function foo\n{\n...\n}), which the same-line-only form misses.
+        #
+        # This is a small, deliberately over-approximating heuristic, not a
+        # bash grammar (see rounds 3-5 of review.md for why we stopped
+        # reimplementing one). It does not see a comment inserted between the
+        # name and the brace, or a function defined via `eval`, and it can
+        # false-positive on a bare call immediately followed by an unrelated
+        # `{ ... }` group command (fails closed: red, not a missed defect).
+        # A redefinition mid-script is not a plausible accident, so these are
+        # accepted, named boundaries rather than gaps to keep chasing -- the
+        # same call this project's manifest-honesty checker makes for general
+        # control-flow/reachability (design.md §11.1.3, clause (L)).
+        return len(re.findall(
+            rf"^[ \t]*(?:function[ \t]+)?{re.escape(name)}[ \t]*(?:\([ \t]*\))?[ \t\r\n]*\{{",
+            text, re.M))
+
+    run_sh_text = RUN_SH.read_text(encoding="utf-8")
+    for fn in ("collect_failure_diagnostics", "phase", "check_budget"):
+        count = _definition_count(run_sh_text, fn)
+        assert count == 1, (
+            f"run.sh must define {fn} exactly once, found {count}"
+        )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    kubectl_log = tmp_path / "kubectl-argv.log"
+    # Marker files prove the shim ran (immune to string-only forgeries).
+    marker_dir = tmp_path / "kubectl-markers"
+    marker_dir.mkdir()
+
+    # Single synthetic pod name shared by the kubectl shim and expected_artifacts
+    # so renaming stays consistent (and the tr name-mangling stays intentional).
+    FAKE_POD = "fake-pod-0"
+
+    # Stub kubectl: log argv, emit a fake pod name for the logs loop, exit 0.
+    # PATH is overridden only in the subprocess env — never the real process.
+    kubectl_shim = bin_dir / "kubectl"
+    kubectl_shim.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            # Log argv (one invocation per line) for assertion.
+            printf '%s\\n' "$*" >>"{kubectl_log}"
+            # Touch a marker so presence of a real call is filesystem-observable.
+            : >"{marker_dir}/called"
+            # The collector iterates `kubectl get pods -n dbagent -o name`.
+            # Return one synthetic pod so the per-pod logs branch is exercised.
+            if [[ " $* " == *" get pods "* && " $* " == *" -o name "* ]]; then
+              echo "pod/{FAKE_POD}"
+            fi
+            exit 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    kubectl_shim.chmod(0o755)
+
+    diag_dir = Path("/tmp/rca-e2e/diagnostics")
+    # Isolate from any prior e2e debris so emptiness is meaningful.
+    if diag_dir.exists():
+        shutil.rmtree(diag_dir)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    # Source run.sh (top-level guard returns after function defs), then force
+    # phase() down its failure branch with a command that exits non-zero.
+    script = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        # shellcheck disable=SC1091
+        source "{RUN_SH}"
+        phase "forced_failure" 5 false
+        """
+    )
+    # start_new_session=True puts bash in its own process group so a timeout can
+    # kill the whole tree.  Without it, subprocess's timeout SIGKILLs only bash
+    # and orphans its grandchildren -- and if the sourcing guard ever regresses,
+    # those grandchildren are a real `docker build` and `kind create cluster`.
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        env=env,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        raise AssertionError(
+            "sourcing run.sh must return at its sourcing guard within seconds; "
+            "it did not, so the guard is gone and the real e2e pipeline started "
+            f"(process group killed). stdout so far:\n{stdout}"
+        ) from None
+    result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+    assert result.returncode == 1, (
+        "phase() must exit 1 on a failing command; "
+        f"got rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    # W2: sourcing must stop at the guard and run only the forced phase.
+    # Without this, a deleted guard can pass in CI (kind missing → preflight
+    # fails → collector fires from the wrong phase) or hang on a dev box.
+    phases_seen = re.findall(r"^==> phase: (\S+)", result.stdout, re.M)
+    assert phases_seen == ["forced_failure"], (
+        "sourcing run.sh must stop at the sourcing guard and run only the "
+        f"forced failure; phases observed: {phases_seen}"
+    )
+    assert (marker_dir / "called").is_file(), (
+        "collect_failure_diagnostics must invoke kubectl on phase failure "
+        f"(no marker written under {marker_dir})"
+    )
+    assert diag_dir.is_dir() and any(diag_dir.iterdir()), (
+        "diagnostics directory must be non-empty after phase failure "
+        f"({diag_dir})"
+    )
+    # W1: assert named artifact files were written, not merely that the dir is
+    # non-empty / that argv text contains keywords (redirect drops pass those).
+    produced = {q.name for q in diag_dir.iterdir()}
+    # tr '/:' '--' mangling of "pod/<FAKE_POD>" → logs-pod-<FAKE_POD>*.txt
+    expected_artifacts = {
+        "nodes-wide.txt", "describe-nodes.txt", "pods-wide.txt", "events.txt",
+        "describe-dbagent-pods.txt",
+        f"logs-pod-{FAKE_POD}.txt", f"logs-pod-{FAKE_POD}-previous.txt",
+    }
+    assert expected_artifacts <= produced, (
+        f"missing diagnostics artifacts: {sorted(expected_artifacts - produced)}; "
+        f"produced={sorted(produced)}"
+    )
+
+    assert kubectl_log.is_file() and kubectl_log.stat().st_size > 0, (
+        "kubectl shim must have recorded at least one invocation"
+    )
+    lines = [
+        line for line in kubectl_log.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    joined = "\n".join(lines)
+    assert re.search(r"\bget events\b", joined), (
+        f"expected kubectl get events; recorded invocations:\n{joined}"
+    )
+    assert re.search(r"\bdescribe\b", joined), (
+        f"expected kubectl describe; recorded invocations:\n{joined}"
+    )
+    assert re.search(r"\blogs\b", joined), (
+        f"expected kubectl logs; recorded invocations:\n{joined}"
+    )
+    for line in lines:
+        assert "--request-timeout" in line, (
+            "every kubectl invocation must carry --request-timeout; "
+            f"got: {line!r}"
+        )

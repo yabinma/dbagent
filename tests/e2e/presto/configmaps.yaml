@@ -16,6 +16,7 @@ data:
   jvm.config: |
     -server
     -Xmx1G
+    -XX:MaxDirectMemorySize=256M
     -XX:+UseG1GC
     -XX:G1HeapRegionSize=32M
     -XX:+UseGCOverheadLimit
@@ -96,6 +97,7 @@ data:
   jvm.config: |
     -server
     -Xmx1G
+    -XX:MaxDirectMemorySize=256M
     -XX:+UseG1GC
     -XX:G1HeapRegionSize=32M
     -XX:+UseGCOverheadLimit

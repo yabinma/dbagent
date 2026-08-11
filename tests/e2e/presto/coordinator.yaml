@@ -16,6 +16,13 @@ spec:
           image: prestodb/presto:0.298
           ports:
             - containerPort: 8080
+          # Sized for -Xmx1G heap + off-heap/native headroom. Without
+          # resources the pod is BestEffort QoS and is first starved under
+          # node pressure on a 4-vCPU CI runner. No limits.cpu so the JVM
+          # can still burst free cores during startup (rollout timeouts).
+          resources:
+            requests: { cpu: 100m, memory: 1536Mi }
+            limits: { memory: 2Gi }
           volumeMounts:
             - name: config
               mountPath: /opt/presto-server/etc/config.properties

@@ -74,6 +74,9 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # Avoid BestEffort QoS under node pressure on a 4-vCPU CI runner.
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
           volumeMounts:
             - name: script
               mountPath: /app

@@ -22,6 +22,10 @@ spec:
           ports:
             - name: http
               containerPort: 8090
+          # Avoid BestEffort QoS: mock-llm backs model-gateway / investigations
+          # and must not be first starved under node pressure on a 4-vCPU CI runner.
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
           readinessProbe:
             tcpSocket:
               port: http

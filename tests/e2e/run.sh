@@ -13,6 +13,37 @@ PHASE_LOG="/tmp/rca-e2e/phases.txt"
 mkdir -p /tmp/rca-e2e
 : >"$PHASE_LOG"
 
+# On phase failure, dump cluster state into /tmp/rca-e2e so the CI step
+# "Upload phase timing and pod logs on failure" actually has pod logs /
+# describes / events (not only phases.txt). Best-effort: never mask the
+# original failure exit. Bound every kubectl call so a wedged API server
+# cannot hang past the job timeout and cancel the artifact upload.
+collect_failure_diagnostics() {
+  local dir="/tmp/rca-e2e/diagnostics"
+  local ktimeout=(--request-timeout=20s)
+  mkdir -p "$dir"
+  echo "collect_failure_diagnostics: writing to $dir" | tee -a "$PHASE_LOG"
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "kubectl not available; skipping cluster diagnostics" | tee -a "$PHASE_LOG"
+    return 0
+  fi
+  kubectl "${ktimeout[@]}" get nodes -o wide >"$dir/nodes-wide.txt" 2>&1 || true
+  kubectl "${ktimeout[@]}" describe node >"$dir/describe-nodes.txt" 2>&1 || true
+  kubectl "${ktimeout[@]}" get pods -A -o wide >"$dir/pods-wide.txt" 2>&1 || true
+  kubectl "${ktimeout[@]}" get events -A --sort-by='.lastTimestamp' >"$dir/events.txt" 2>&1 || true
+  kubectl "${ktimeout[@]}" describe pods -n dbagent >"$dir/describe-dbagent-pods.txt" 2>&1 || true
+  # Per-pod current + previous logs (previous catches OOMKilled restarts).
+  local pod
+  for pod in $(kubectl "${ktimeout[@]}" get pods -n dbagent -o name 2>/dev/null || true); do
+    local safe
+    safe=$(echo "$pod" | tr '/:' '--')
+    kubectl "${ktimeout[@]}" logs -n dbagent "$pod" --all-containers --tail=500 \
+      >"$dir/logs-${safe}.txt" 2>&1 || true
+    kubectl "${ktimeout[@]}" logs -n dbagent "$pod" --all-containers --previous --tail=200 \
+      >"$dir/logs-${safe}-previous.txt" 2>&1 || true
+  done
+}
+
 phase() {
   local name="$1" budget="$2"
   shift 2
@@ -20,6 +51,7 @@ phase() {
   echo "==> phase: $name (budget ${budget}s)"
   if ! "$@"; then
     echo "phase $name FAILED" | tee -a "$PHASE_LOG"
+    collect_failure_diagnostics || true
     exit 1
   fi
   local elapsed=$(( $(date +%s) - pstart ))
@@ -37,6 +69,12 @@ check_budget() {
     exit 1
   fi
 }
+
+# When sourced (e.g. delivery tests exercising phase/collect_failure_diagnostics),
+# stop after function definitions so the full e2e pipeline does not run.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
 
 phase "preflight" 20 bash -c '
   for b in helm docker kind buf; do
