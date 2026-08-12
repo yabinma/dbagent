@@ -627,3 +627,144 @@ def test_configmap_internal_endpoints_match_rendered_service_names():
     )
     cfg_ext = yaml.safe_load(cm_ext["data"]["config.yaml"])
     assert cfg_ext["storage"]["s3_endpoint"] == external
+
+
+# --- FP-IG-1 / FP-IG-2 / FP-IG-4 (design.md §11.3) ---
+
+PRODUCT_WORKLOADS = (
+    "ingest-gateway",
+    "temporal-worker",
+    "probe-gateway",
+    "dashboard-api",
+    "dashboard-web",
+)
+
+PROBE_KEYS = ("timeoutSeconds", "periodSeconds", "failureThreshold", "successThreshold")
+
+
+def _probe_blocks(docs):
+    """Yield (deploy_name, container_name, probe_kind, probe_dict)."""
+    for d in docs:
+        if d.get("kind") != "Deployment":
+            continue
+        name = d["metadata"]["name"]
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            for kind in ("livenessProbe", "readinessProbe"):
+                if kind in c:
+                    yield name, c["name"], kind, c[kind]
+
+
+def test_probe_parameters_are_explicit_on_every_product_workload():
+    """FP-IG-1: every product workload declares all four probe parameters."""
+    out = helm_template(DBAGENT, values=[str(DBAGENT / "values-dev.yaml")])
+    docs = parse_manifests(out)
+    seen = set()
+    for deploy, cname, kind, probe in _probe_blocks(docs):
+        short = next((w for w in PRODUCT_WORKLOADS if w in deploy), None)
+        if short is None:
+            continue
+        seen.add((short, kind))
+        for k in PROBE_KEYS:
+            assert k in probe, f"{deploy} {kind} missing {k}: {probe}"
+            assert probe[k] is not None
+    for w in PRODUCT_WORKLOADS:
+        assert (w, "livenessProbe") in seen, f"missing liveness for {w}"
+        assert (w, "readinessProbe") in seen, f"missing readiness for {w}"
+
+
+def _shed_before_kill(t_r, p_r, F_r, t_l, p_l, F_l) -> bool:
+    """FP-IG-2 five conditions."""
+    if not (t_r < t_l):
+        return False
+    if not (p_r * F_r + t_r < (F_l - 1) * p_l):
+        return False
+    if not ((F_l - 1) * p_l >= 90):
+        return False
+    if not (t_l >= 5):
+        return False
+    if not (t_r <= p_r and t_l <= p_l):
+        return False
+    return True
+
+
+def test_liveness_cannot_fire_before_readiness_sheds():
+    """FP-IG-2: shed-before-kill over every rendered product workload + fixtures."""
+    # Named negative fixtures from errata rounds 1 and 2.
+    assert not _shed_before_kill(1, 89, 1, 5, 30, 3), "round1 counterexample must fail"
+    assert not _shed_before_kill(4, 60, 1, 5, 30, 3), "round2 counterexample must fail"
+    # Shipped HTTP assignment
+    assert _shed_before_kill(3, 10, 3, 5, 15, 7)
+    # Shipped worker assignment
+    assert _shed_before_kill(3, 15, 3, 5, 30, 4)
+
+    for values in (None, [str(DBAGENT / "values-dev.yaml")]):
+        out = helm_template(DBAGENT, values=values)
+        docs = parse_manifests(out)
+        by_deploy: dict = {}
+        for deploy, cname, kind, probe in _probe_blocks(docs):
+            if not any(w in deploy for w in PRODUCT_WORKLOADS):
+                continue
+            by_deploy.setdefault(deploy, {})[kind] = probe
+        for deploy, probes in by_deploy.items():
+            r = probes["readinessProbe"]
+            l = probes["livenessProbe"]
+            ok = _shed_before_kill(
+                r["timeoutSeconds"],
+                r["periodSeconds"],
+                r["failureThreshold"],
+                l["timeoutSeconds"],
+                l["periodSeconds"],
+                l["failureThreshold"],
+            )
+            assert ok, f"{deploy} fails shed-before-kill: readiness={r} liveness={l}"
+
+
+def test_ingest_gateway_cpu_sizing_is_derived_from_b1():
+    """FP-IG-4: requests.cpu == ceil(basis × 200); limits >= 5×; basis literal."""
+    import math
+
+    values = yaml.safe_load((DBAGENT / "values.yaml").read_text(encoding="utf-8"))
+    basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
+    # Literal identity — basis equals the test's own constant (FP-IG-4).
+    # Five-run collection 2026-08-12: 2.031, 1.983, 2.205, 2.102, 2.096 →
+    # max+(max−min) = 2.427.
+    INGEST_GATEWAY_CPU_MS_PER_REQUEST = 2.427
+    assert basis == INGEST_GATEWAY_CPU_MS_PER_REQUEST
+
+    out = helm_template(DBAGENT)
+    docs = parse_manifests(out)
+    dep = next(
+        d
+        for d in docs
+        if d.get("kind") == "Deployment" and "ingest-gateway" in d["metadata"]["name"]
+    )
+    res = dep["spec"]["template"]["spec"]["containers"][0]["resources"]
+    req_cpu = res["requests"]["cpu"]
+    lim_cpu = res["limits"]["cpu"]
+
+    def millicores(v) -> int:
+        s = str(v)
+        if s.endswith("m"):
+            return int(s[:-1])
+        return int(float(s) * 1000)
+
+    expected = math.ceil(basis * 200)
+    assert millicores(req_cpu) == expected, f"requests.cpu={req_cpu} want {expected}m"
+    assert millicores(lim_cpu) >= 5 * millicores(req_cpu)
+
+
+def test_probe_tuning_template_renders_all_four_keys():
+    """UT-IG-4: dbagent.probeTuning emits all four keys; override moves one workload."""
+    out = helm_template(
+        DBAGENT,
+        set_args=["ingestGateway.probes.liveness.timeoutSeconds=9"],
+    )
+    docs = parse_manifests(out)
+    for deploy, cname, kind, probe in _probe_blocks(docs):
+        if "ingest-gateway" in deploy and kind == "livenessProbe":
+            assert probe["timeoutSeconds"] == 9
+            for k in PROBE_KEYS:
+                assert k in probe
+        elif "dashboard-api" in deploy and kind == "livenessProbe":
+            # Unchanged from defaults
+            assert probe["timeoutSeconds"] == 5

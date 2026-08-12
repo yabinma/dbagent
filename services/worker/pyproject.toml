@@ -29,5 +29,8 @@ test = [
 [tool.setuptools.packages.find]
 include = ["worker*"]
 
+[tool.setuptools.package-data]
+worker = ["agents/prompts/*.txt"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

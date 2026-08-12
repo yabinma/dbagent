@@ -147,7 +147,7 @@ GUARDED_STEPS: dict[str, list[int]] = {
     "unit-dashboard-api": [3],
     "unit-go": [7],
     "functional": [9, 10],
-    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17],
+    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 19],
     "manifest-guard": [5, 6],
 }
 
@@ -203,7 +203,8 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
     "unit-gateway": [(
         "services/gateway",
         ".venv/bin/python -m pytest tests/ --cov=gateway "
-        "--cov-report=term-missing --cov-fail-under=81",
+        "--cov-report=term-missing --cov-fail-under=81 "
+        "--ignore=tests/test_b1_ingest_burst.py",
     )],
     "unit-dashboard-api": [(
         "services/dashboard-api",
@@ -215,7 +216,8 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         "services/worker/.venv/bin/python -m pytest "
         "services/worker/tests services/gateway/tests "
         "services/dashboard-api/tests tests/functional tests/delivery "
-        "tests/mocks/llm -v --ignore=tests/functional/m2_probe_link",
+        "tests/mocks/llm -v --ignore=tests/functional/m2_probe_link "
+        "--ignore=services/gateway/tests/test_b1_ingest_burst.py",
     )],
     "benchmark": [
         (None, "services/worker/.venv/bin/python -m pytest tests/functional/test_manifests.py -v"),
@@ -229,6 +231,8 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         (None, "services/worker/.venv/bin/python -m pytest "
          "services/worker/tests/test_context_assembly.py"
          "::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v"),
+        (None, "services/worker/.venv/bin/python -m pytest "
+         "services/gateway/tests/test_b1_ingest_burst.py -v -s"),
         (None, "services/worker/.venv/bin/python -m pytest tests/benchmark/test_pg_scale.py -v -s"),
     ],
     "manifest-guard": [
@@ -269,7 +273,7 @@ EXPECTED_IMAGES_PUSH_RUN = (
 
 UNPARSED_RUN_STEPS: dict[str, list[str]] = {
     "functional": [EXPECTED_CI_HYGIENE_RUN],
-    "benchmark": [EXPECTED_CI_HYGIENE_RUN],
+    "benchmark": [EXPECTED_CI_HYGIENE_RUN, EXPECTED_CI_HYGIENE_RUN],
     "manifest-guard": [EXPECTED_CI_HYGIENE_RUN],
     "images": [EXPECTED_IMAGES_PUSH_RUN],
 }
@@ -1289,10 +1293,87 @@ def _python_basename_collected(path: Path) -> bool:
     return (name.startswith("test_") and name.endswith(".py")) or name.endswith("_test.py")
 
 
+def _python_qualifying_comparison(
+    tree: ast.Module,
+    test_name: str,
+    *,
+    operators: tuple[type, ...],
+    operand_rule: Callable[[ast.Compare], bool],
+) -> list[ast.AST]:
+    """Shared seam: §11.1.3 candidacy + reachability + *is-a-comparison* (FP-IG-19).
+
+    Steps (design.md §11.3 FP-IG-19):
+      1. locate the collected top-level ``test*`` function over tree.body
+      2. enumerate candidate ``ast.Assert`` / ``ast.If`` nodes with the
+         ancestor-chain filter (no nested FunctionDef/AsyncFunctionDef/Lambda/ClassDef)
+      3. reject dead branches via ``_is_constant_false`` / ``_is_constant_true``
+      4. qualify: an Assert whose ``test`` *is* a comparison over ``operators``,
+         or an If whose ``test`` *is* one and whose body holds a statement-level
+         Raise or ``fail(...)`` call. *Is*, not *contains*.
+
+    ``operand_rule`` is applied to the comparison node. Equality admission and
+    named-quantity matching are call-site concerns (FP-IG-19 only); the manifest
+    checker passes the ordering set and the numeric-term rule.
+    """
+    if not isinstance(tree, ast.Module):
+        return []
+    matches = [
+        n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == test_name
+    ]
+    if not matches:
+        return []
+    func = matches[0]
+    parents = _build_parent_map(tree)
+
+    def _is_cmp_over(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Compare) or not node.ops:
+            return False
+        return all(isinstance(op, operators) for op in node.ops)
+
+    def _qualifies(node: ast.AST) -> bool:
+        if isinstance(node, ast.Assert):
+            test = node.test
+            if not _is_cmp_over(test):
+                return False
+            assert isinstance(test, ast.Compare)
+            return bool(operand_rule(test))
+        if isinstance(node, ast.If):
+            test = node.test
+            if not _is_cmp_over(test):
+                return False
+            if not _body_has_explicit_fail(node.body, tree):
+                return False
+            assert isinstance(test, ast.Compare)
+            return bool(operand_rule(test))
+        return False
+
+    out: list[ast.AST] = []
+    for node in ast.walk(func):
+        if not isinstance(node, (ast.Assert, ast.If)):
+            continue
+        if _in_nested_scope(node, func, parents):
+            continue
+        if _in_constantly_dead_branch(node, func, parents):
+            continue
+        if _qualifies(node):
+            out.append(node)
+    out.sort(key=lambda n: getattr(n, "lineno", 0) or 0)
+    return out
+
+
 def _python_test_asserts_threshold(
     src: str, name: str, *, path: Path | None = None
 ) -> tuple[bool, str | None]:
-    """Return (ok, reason_or_None) with exact threshold vocabulary tokens."""
+    """Return (ok, reason_or_None) with exact threshold vocabulary tokens.
+
+    Real caller of ``_python_qualifying_comparison`` with the ordering operator
+    set and the numeric-term operand rule (design.md FP-IG-19 seam). Full
+    reason vocabulary (skip / dead / swallowed / …) is preserved for the
+    fixture table: dead/swallowed filters and detailed reasons run around the
+    shared core, which alone decides *is-a-threshold-comparison*.
+    """
     try:
         tree = ast.parse(src)
     except SyntaxError:
@@ -1334,7 +1415,35 @@ def _python_test_asserts_threshold(
     bindings = _numeric_name_bindings(tree)
     parents = _build_parent_map(tree)
 
-    # candidates: Assert/If under func, not in nested scope (AB: dead branch IS candidate)
+    # Shared seam: candidacy + reachability + *is-a-comparison* (FP-IG-19).
+    # Operand rule is the numeric-term rule; equality is NOT admitted here.
+    def _manifest_operand_rule(cmp: ast.Compare) -> bool:
+        operands: list[ast.AST] = [cmp.left, *cmp.comparators]
+        return _operand_reasons(operands, bindings, tree, func) is None
+
+    qualifying = _python_qualifying_comparison(
+        tree,
+        name,
+        operators=_ORDERED_OPS,
+        operand_rule=_manifest_operand_rule,
+    )
+    # Seam does not encode dead-after-return / swallowed; filter those here so
+    # the shared core is the comparison qualifier and vocabulary stays intact.
+    # Acceptance is *only* via a live shared-seam result (review C3): an empty
+    # or fully-filtered seam must never be rescued into success by the
+    # diagnostic fallback below.
+    for node in qualifying:
+        if _candidate_is_dead(node, func, parents, tree):
+            continue
+        if _candidate_failure_is_swallowed(node, func, parents, tree):
+            continue
+        return True, None
+
+    # No live qualifier from the shared seam — reject. Emit the first failing
+    # reason from the full candidate set (including constantly-dead branches
+    # the seam skipped) so the fixture table's vocabulary is unchanged. The
+    # fallback may diagnose; it must never turn an empty shared result into
+    # acceptance.
     candidates: list[ast.AST] = []
     for node in ast.walk(func):
         if not isinstance(node, (ast.Assert, ast.If)):
@@ -1342,8 +1451,6 @@ def _python_test_asserts_threshold(
         if _in_nested_scope(node, func, parents):
             continue
         candidates.append(node)
-
-    # source order
     candidates.sort(key=lambda n: getattr(n, "lineno", 0) or 0)
 
     if not candidates:
@@ -1353,10 +1460,12 @@ def _python_test_asserts_threshold(
     for cand in candidates:
         reason = _evaluate_candidate(cand, func, parents, tree, bindings)
         if reason is None:
-            return True, None
+            # Qualifies under evaluate but was absent/filtered from the seam —
+            # never accept; keep scanning for a vocabulary reason.
+            continue
         if first_reason is None:
             first_reason = reason
-    return False, first_reason
+    return False, first_reason or "not_a_threshold_comparison"
 
 
 def _evaluate_candidate(
@@ -2204,7 +2313,7 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
     # UNPARSED equality — pin is a hard-coded literal (AG)(5) / review C2
     unparsed_expected: dict[str, list[str]] = {
         "functional": [EXPECTED_CI_HYGIENE_RUN],
-        "benchmark": [EXPECTED_CI_HYGIENE_RUN],
+        "benchmark": [EXPECTED_CI_HYGIENE_RUN, EXPECTED_CI_HYGIENE_RUN],
         "manifest-guard": [EXPECTED_CI_HYGIENE_RUN],
         "images": [EXPECTED_IMAGES_PUSH_RUN],
     }
@@ -2830,6 +2939,130 @@ def test_threshold_assertion_checker_accepts_real_shapes(
     ok, reason = _python_test_asserts_threshold(src, _TEST_NAME)
     assert ok is True, f"{case_id}: expected accept, got reason={reason!r}"
     assert reason is None
+
+
+def test_manifest_checker_is_real_caller_of_shared_seam_with_identical_fixture_verdicts(
+    monkeypatch, tmp_path: Path
+):
+    """C3 / FP-IG-19: ``_python_test_asserts_threshold`` must call the shared
+    core, and every existing fixture must produce the same verdict it did
+    before the refactor (positive control).
+    """
+    # Patch the same module dict the checker closes over.
+    mod = sys.modules[_python_test_asserts_threshold.__module__]
+    calls: list[tuple] = []
+    real_seam = mod._python_qualifying_comparison
+
+    def tracking_seam(tree, test_name, *, operators, operand_rule):
+        calls.append((test_name, operators, operand_rule))
+        return real_seam(
+            tree, test_name, operators=operators, operand_rule=operand_rule
+        )
+
+    monkeypatch.setattr(mod, "_python_qualifying_comparison", tracking_seam)
+
+    # Reasons that exit before the shared seam is consulted.
+    _EARLY_EXIT = {
+        "nonexistent_linked_test",
+        "not_collected",
+        "skipped",
+        "star_import",
+        "ambiguous_test_name",
+    }
+
+    # Negative fixtures — identical reject reasons.
+    for case_id, expected_reason, builder in THRESHOLD_ASSERTION_FIXTURES:
+        src = builder()
+        name = _TEST_NAME
+        path = None
+        if case_id == "top_level_function_not_named_test":
+            name = "check_b99"
+        if case_id == "linked_file_basename_not_collected":
+            path = tmp_path / f"helpers_{case_id}.py"
+            path.write_text(src, encoding="utf-8")
+        before_calls = len(calls)
+        ok, reason = _python_test_asserts_threshold(src, name, path=path)
+        assert ok is False, f"{case_id}: expected reject"
+        assert reason == expected_reason, (
+            f"{case_id}: got {reason!r} want {expected_reason!r}"
+        )
+        if expected_reason not in _EARLY_EXIT:
+            assert len(calls) > before_calls, (
+                f"{case_id}: seam was not invoked — checker is not a real caller"
+            )
+
+    # Positive fixtures — identical accepts, seam always invoked.
+    for case_id, builder in THRESHOLD_ASSERTION_POSITIVE_CONTROLS:
+        src = builder()
+        before_calls = len(calls)
+        ok, reason = _python_test_asserts_threshold(src, _TEST_NAME)
+        assert ok is True, f"{case_id}: expected accept, got reason={reason!r}"
+        assert reason is None
+        assert len(calls) > before_calls, (
+            f"{case_id}: seam was not invoked — checker is not a real caller"
+        )
+
+    assert calls, "shared seam was never invoked across the fixture table"
+    # Every seam call used the ordering operator set (no Eq admitted).
+    for _name, operators, _rule in calls:
+        assert operators == _ORDERED_OPS, operators
+
+
+def test_manifest_checker_rejects_when_shared_seam_returns_empty(monkeypatch, tmp_path: Path):
+    """C3 / FP-IG-19: emptying the shared seam must change every positive
+    fixture's verdict to reject. Invocation alone is not authority — the
+    shared result is the only route to acceptance.
+    """
+    mod = sys.modules[_python_test_asserts_threshold.__module__]
+    calls: list[int] = []
+
+    def empty_seam(tree, test_name, *, operators, operand_rule):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(mod, "_python_qualifying_comparison", empty_seam)
+
+    # Every positive fixture must flip from accept → reject when the seam
+    # yields nothing; the fallback must not rescue them.
+    for case_id, builder in THRESHOLD_ASSERTION_POSITIVE_CONTROLS:
+        src = builder()
+        before = len(calls)
+        ok, reason = _python_test_asserts_threshold(src, _TEST_NAME)
+        assert ok is False, (
+            f"{case_id}: empty seam still ACCEPTED (reason={reason!r}) — "
+            "shared result is not authoritative"
+        )
+        assert reason is not None
+        assert len(calls) > before, f"{case_id}: seam was not consulted"
+
+    # Negative fixtures keep rejecting (verdict identical: still False).
+    for case_id, expected_reason, builder in THRESHOLD_ASSERTION_FIXTURES:
+        src = builder()
+        name = _TEST_NAME
+        path = None
+        if case_id == "top_level_function_not_named_test":
+            name = "check_b99"
+        if case_id == "linked_file_basename_not_collected":
+            path = tmp_path / f"helpers_empty_seam_{case_id}.py"
+            path.write_text(src, encoding="utf-8")
+        ok, reason = _python_test_asserts_threshold(src, name, path=path)
+        assert ok is False, f"{case_id}: expected reject under empty seam"
+        # Early-exit reasons never reach the seam and stay exact; post-seam
+        # reasons may differ when evaluate-None paths no longer accept, but
+        # the reject verdict is mandatory.
+        _EARLY = {
+            "nonexistent_linked_test",
+            "not_collected",
+            "skipped",
+            "star_import",
+            "ambiguous_test_name",
+        }
+        if expected_reason in _EARLY:
+            assert reason == expected_reason, (
+                f"{case_id}: early-exit reason changed {reason!r} vs {expected_reason!r}"
+            )
+
+    assert calls, "empty-seam control never invoked the shared seam"
 
 
 # ---------------------------------------------------------------------------
@@ -4132,3 +4365,35 @@ def test_ci_pin_rejects_known_drift(case_id, kind, expected, mutator, tmp_path: 
             assert expected in fails, f"{case_id}: {fails}"
     else:
         raise AssertionError(kind)
+
+
+def test_b1_entry_matches_its_declared_contract():
+    """FP-IG-10: whole-object equality for B1 against literals of its own."""
+    data = yaml.safe_load((REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text())
+    b1 = next(e for e in data["benchmarks"] if e["id"] == "B1")
+    assert b1["id"] == "B1"
+    assert b1["description"] == (
+        "Ingest webhook: HMAC verify + normalize + fingerprint + dedup lookup "
+        "(alert-storm front door)"
+    )
+    assert b1["threshold"] == (
+        ">= 200 req/s sustained, p99 < 150 ms, 0 errors at 5x burst for 30s"
+    )
+    assert b1["owning_milestone"] == "M3"
+    assert b1["status"] == "covered"
+    assert b1["tests"] == [
+        "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
+        "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile",
+        "services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile",
+    ]
+    assert "concurrency_model" not in b1
+    notes = b1["notes"]
+    for clause in (
+        "reference",
+        "SUSTAINED_FLOOR",
+        "kind",
+        "nested",
+        "open-loop",
+        "MAX_IN_FLIGHT",
+    ):
+        assert clause in notes, f"B1 notes missing {clause!r}"

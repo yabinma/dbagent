@@ -149,22 +149,12 @@ def test_open_case_from_event():
 def test_find_open_by_fingerprint_hits_and_misses():
     session = MagicMock()
     inv_id = uuid.uuid4()
-    event = MagicMock()
-    event.investigation_id = inv_id
     inv = MagicMock()
     inv.status = "INVESTIGATING"
     inv.investigation_id = inv_id
 
-    # First scalars call returns events; second returns investigation.
-    calls = {"n": 0}
-
-    def scalars(stmt):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return [event]
-        return MagicMock(first=MagicMock(return_value=inv))
-
-    session.scalars = scalars
+    # FP-IG-6: single SELECT … LIMIT 1; scalars().first() returns the Investigation.
+    session.scalars = MagicMock(return_value=MagicMock(first=MagicMock(return_value=inv)))
     found = find_open_by_fingerprint(
         session,
         fingerprint="fp",
@@ -173,20 +163,10 @@ def test_find_open_by_fingerprint_hits_and_misses():
         now=datetime.now(timezone.utc),
     )
     assert found is inv
+    session.scalars.assert_called_once()
 
-    # Terminal investigation is skipped.
-    inv.status = "RESOLVED"
-    calls["n"] = 0
-    found2 = find_open_by_fingerprint(
-        session,
-        fingerprint="fp",
-        platform_key="p",
-        correlation_window_seconds=1800,
-    )
-    assert found2 is None
-
-    # No events
-    session.scalars = MagicMock(return_value=[])
+    # Empty window → None
+    session.scalars = MagicMock(return_value=MagicMock(first=MagicMock(return_value=None)))
     assert (
         find_open_by_fingerprint(
             session, fingerprint="x", platform_key="p", correlation_window_seconds=60

@@ -189,7 +189,8 @@ jobs:
         working-directory: services/gateway
         run: |
           .venv/bin/python -m pytest tests/ \
-            --cov=gateway --cov-report=term-missing --cov-fail-under=81
+            --cov=gateway --cov-report=term-missing --cov-fail-under=81 \
+            --ignore=tests/test_b1_ingest_burst.py
           bash ../../scripts/py-coverage-check.sh 80 gateway
 
   unit-dashboard-api:
@@ -339,7 +340,8 @@ jobs:
             services/worker/tests services/gateway/tests \
             services/dashboard-api/tests \
             tests/functional tests/delivery tests/mocks/llm -v \
-            --ignore=tests/functional/m2_probe_link
+            --ignore=tests/functional/m2_probe_link \
+            --ignore=services/gateway/tests/test_b1_ingest_burst.py
       - name: Run Go cross-service functional tests (F8/F9; real probe +
           probe-gateway binaries over real mTLS + ephemeral Postgres)
         run: go test ./tests/functional/... -v -timeout 300s
@@ -403,6 +405,17 @@ jobs:
         run: |
           services/worker/.venv/bin/python -m pytest \
             services/worker/tests/test_context_assembly.py::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v
+
+      # FP-IG-7 / FP-IG-12: B1 reference burst before B2/B10/B11 so a red B11
+      # cannot skip the measurement of record (§11.3.3 S). Hygiene gate is
+      # byte-identical to the pinned A10(v) command.
+      - name: FP-M6-31 A10(v) environment hygiene before B1 reference burst
+        run: |
+          bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
+      - name: B1 -- ingest-gateway reference burst (FP-IG-7)
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            services/gateway/tests/test_b1_ingest_burst.py -v -s
 
       # One step so the session-scoped scale_pg seed is shared by B2/B10/B11
       # (§11.1.3 — seeding thrice would triple the cost). Test ids name each bar.

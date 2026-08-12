@@ -70,16 +70,17 @@ data:
         }
       ]
     }
-  # Empty by default -- inert. Presto's resource-groups.configuration-manager
-  # and resource-groups.config-file properties MUST live in their own
-  # etc/resource-groups.properties file (a Presto plugin-config convention,
-  # like catalog properties): the core Bootstrap injector validates
-  # config.properties against only its own modules and fails startup with
-  # "Configuration property ... was not used" if they are appended there
-  # instead (confirmed against the real prestodb/presto:0.298 image). E3
-  # writes both properties into this key via _put_configmap_key and restores
-  # it to empty afterward; it must never touch config.properties for this.
-  resource-groups.properties: ""
+  # resource-groups.properties is INTENTIONALLY ABSENT by default.
+  # Presto 0.298's InternalResourceGroupManager treats the mere *existence*
+  # of etc/resource-groups.properties as a request to configure resource
+  # groups and hard-fails when the file has no
+  # resource-groups.configuration-manager key. An empty file is therefore
+  # not inert — only an absent file is. E3 patches the Deployment to add
+  # the mount when it injects the fault and removes it on cleanup (mirroring
+  # E2's BROKEN_CATALOG_MOUNT pattern). Presto's resource-groups.configuration-
+  # manager and resource-groups.config-file properties MUST live in their own
+  # etc/resource-groups.properties file (plugin-config convention), never in
+  # config.properties.
 ---
 apiVersion: v1
 kind: ConfigMap

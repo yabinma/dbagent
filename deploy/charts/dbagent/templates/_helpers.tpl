@@ -53,3 +53,14 @@ has no external-datastore configuration surface).
 {{- fail "temporal.mode=dev requires postgresql.bundled=true (the bundled dev Temporal server has no external-datastore configuration surface); use -f deploy/charts/dbagent/values-dev.yaml for dev/e2e, or temporal.mode=chart | external with an operator-managed database for production." -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+FP-IG-1: render the four probe tuning parameters from a values block.
+Usage: {{ include "dbagent.probeTuning" .Values.<workload>.probes.liveness }}
+*/}}
+{{- define "dbagent.probeTuning" -}}
+timeoutSeconds: {{ .timeoutSeconds }}
+periodSeconds: {{ .periodSeconds }}
+failureThreshold: {{ .failureThreshold }}
+successThreshold: {{ .successThreshold }}
+{{- end -}}

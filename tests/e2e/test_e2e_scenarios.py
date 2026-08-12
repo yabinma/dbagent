@@ -331,6 +331,30 @@ def _put_configmap_key(configmap: str, key: str, content: str) -> None:
 def _restart_and_wait(workload: str, timeout: str = "120s") -> None:
     _kubectl_ok("rollout", "restart", workload)
     _kubectl_ok("rollout", "status", workload, f"--timeout={timeout}")
+    # D2: same blind spot as deploy_presto — require restartCount==0 after a
+    # short settle so a crashlooping pod cannot pass rollout status alone.
+    if "presto-coordinator" in workload:
+        time.sleep(15)
+        _kubectl_ok(
+            "wait",
+            "--for=condition=Ready",
+            "pod",
+            "-l",
+            "app=presto,role=coordinator",
+            f"--timeout={timeout}",
+        )
+        out = _kubectl_ok(
+            "get",
+            "pod",
+            "-l",
+            "app=presto,role=coordinator",
+            "-o",
+            "jsonpath={.items[0].status.containerStatuses[0].restartCount}",
+        ).stdout.strip()
+        assert out == "0", (
+            f"{workload} restartCount={out!r} after settle (expected 0); "
+            "coordinator is crashlooping"
+        )
 
 
 def _mounted_property(workload: str, path: str, prop: str) -> str | None:
@@ -435,9 +459,47 @@ def _is_presto_local_memory_limit_failure(result: dict) -> bool:
     return PRESTO_LOCAL_MEMORY_LIMIT_ERROR in blob
 
 
+def _rewrite_cluster_internal_origin(uri: str, public_base: str) -> str:
+    """Rewrite only the origin of a cluster-internal nextUri; preserve path/query.
+
+    Presto may advertise ``http://coordinator:8080/v1/statement/...`` which is
+    unreachable from the test host. Replace scheme/host/port with the public
+    ``presto_url`` origin and keep path + query intact (W1 / D3).
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    advertised = urlparse(uri)
+    public = urlparse(public_base)
+    # Cluster-internal hostnames lack a dotted public DNS name / localhost.
+    host = (advertised.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return uri
+    if "." in host and not host.endswith(".svc") and not host.endswith(".local"):
+        # Likely already reachable (external DNS) — leave alone.
+        return uri
+    return urlunparse(
+        (
+            public.scheme or advertised.scheme,
+            public.netloc,
+            advertised.path,
+            advertised.params,
+            advertised.query,
+            advertised.fragment,
+        )
+    )
+
+
 def _submit_query(presto_url: str, sql: str) -> str:
+    """POST /v1/statement and follow nextUri once so Presto dispatches the query.
+
+    The POST alone only queues a statement; the query is invisible to /v1/query
+    until the client GETs nextUri at least once (D3). Do not drain the query —
+    E3 needs it running/queued. ``/v1/query/{id}`` is NOT a substitute for the
+    statement-protocol nextUri (W1).
+    """
+    base = presto_url.rstrip("/")
     r = httpx.post(
-        f"{presto_url.rstrip('/')}/v1/statement",
+        f"{base}/v1/statement",
         content=sql,
         headers={
             "X-Presto-User": "e2e",
@@ -447,8 +509,16 @@ def _submit_query(presto_url: str, sql: str) -> str:
         timeout=30,
     )
     assert r.status_code == 200, r.text
-    query_id = r.json().get("id")
+    body = r.json()
+    query_id = body.get("id")
     assert query_id, r.text
+    next_uri = body.get("nextUri")
+    assert next_uri, f"POST /v1/statement returned no nextUri: {body}"
+    follow = _rewrite_cluster_internal_origin(next_uri, base)
+    got = httpx.get(follow, timeout=30)
+    assert got.status_code == 200, (
+        f"nextUri GET failed: status={got.status_code} uri={follow} body={got.text[:500]}"
+    )
     return query_id
 
 
@@ -1020,10 +1090,10 @@ RESOURCE_GROUP_FILE = "/opt/presto-server/etc/resource-groups.json"
 # startup ("Configuration property ... was not used") if they are appended
 # there instead of their own etc/resource-groups.properties file -- confirmed
 # against the real prestodb/presto:0.298 image (docs:
-# https://prestodb.io/docs/current/admin/resource-groups.html). Empty by
-# default (see configmaps.yaml); E3 writes both lines into this whole key via
-# _put_configmap_key and empties it again on cleanup -- never into
-# config.properties.
+# https://prestodb.io/docs/current/admin/resource-groups.html).
+# The key and its volumeMount are ABSENT by default: Presto 0.298 hard-fails
+# on a present-but-empty resource-groups.properties (D1). E3 adds the
+# ConfigMap key + mount when injecting the fault and removes both on cleanup.
 RESOURCE_GROUPS_PROPERTIES_KEY = "resource-groups.properties"
 RESOURCE_GROUPS_PROPERTIES_PATH = "/opt/presto-server/etc/resource-groups.properties"
 E3_LONG_QUERY = (
@@ -1031,6 +1101,47 @@ E3_LONG_QUERY = (
     "JOIN tpch.sf1.orders o ON l.orderkey = o.orderkey"
 )
 E3_CONCURRENT_QUERIES = 6
+
+
+def _patch_coordinator_rg_mount(*, present: bool) -> None:
+    """Add or remove the resource-groups.properties volumeMount on the coordinator."""
+    get = _kubectl_ok("get", "deploy", "presto-coordinator", "-o", "json")
+    dep = json.loads(get.stdout)
+    containers = (
+        dep.setdefault("spec", {})
+        .setdefault("template", {})
+        .setdefault("spec", {})
+        .setdefault("containers", [])
+    )
+    assert containers, "presto-coordinator has no containers"
+    c0 = containers[0]
+    mounts = list(c0.get("volumeMounts") or [])
+    mounts = [
+        m
+        for m in mounts
+        if m.get("mountPath") != RESOURCE_GROUPS_PROPERTIES_PATH
+        and m.get("subPath") != RESOURCE_GROUPS_PROPERTIES_KEY
+    ]
+    if present:
+        mounts.append(
+            {
+                "name": "config",
+                "mountPath": RESOURCE_GROUPS_PROPERTIES_PATH,
+                "subPath": RESOURCE_GROUPS_PROPERTIES_KEY,
+            }
+        )
+    c0["volumeMounts"] = mounts
+    patched = json.dumps(dep)
+    apply = subprocess.run(
+        ["kubectl", "-n", "dbagent", "apply", "-f", "-"],
+        input=patched,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert apply.returncode == 0, (
+        f"patch resource-groups mount failed: {apply.stderr or apply.stdout}"
+    )
 
 
 def _wait_for_states(
@@ -1049,6 +1160,112 @@ def _wait_for_states(
     return states
 
 
+def _e3_cm_key_present() -> bool:
+    """State-observed: is the fault ConfigMap key currently present?
+
+    Returns False only after a *successful* read proves the key is absent.
+    Observation / kubectl failures propagate (review W1) so cleanup cannot
+    treat "could not observe" as "already clean".
+    """
+    get = _kubectl_ok("get", "configmap", COORDINATOR_CONFIGMAP, "-o", "json")
+    cm = json.loads(get.stdout)
+    return RESOURCE_GROUPS_PROPERTIES_KEY in (cm.get("data") or {})
+
+
+def _e3_mount_present() -> bool:
+    """State-observed: is the resource-groups volumeMount currently present?
+
+    Returns False only after a *successful* read proves the mount is absent.
+    Observation / kubectl failures propagate (review W1).
+    """
+    get = _kubectl_ok("get", "deploy", "presto-coordinator", "-o", "json")
+    dep = json.loads(get.stdout)
+    containers = (
+        dep.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    if not containers:
+        return False
+    mounts = containers[0].get("volumeMounts") or []
+    return any(
+        m.get("mountPath") == RESOURCE_GROUPS_PROPERTIES_PATH
+        or m.get("subPath") == RESOURCE_GROUPS_PROPERTIES_KEY
+        for m in mounts
+    )
+
+
+def _e3_remove_cm_key() -> None:
+    """Idempotent: delete the fault ConfigMap key if present."""
+    get = _kubectl_ok("get", "configmap", COORDINATOR_CONFIGMAP, "-o", "json")
+    cm = json.loads(get.stdout)
+    data = cm.get("data") or {}
+    if RESOURCE_GROUPS_PROPERTIES_KEY not in data:
+        return
+    del data[RESOURCE_GROUPS_PROPERTIES_KEY]
+    cm["data"] = data
+    apply = subprocess.run(
+        ["kubectl", "-n", "dbagent", "apply", "-f", "-"],
+        input=json.dumps(cm),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if apply.returncode != 0:
+        raise RuntimeError(
+            f"failed to remove {RESOURCE_GROUPS_PROPERTIES_KEY} from "
+            f"{COORDINATOR_CONFIGMAP}: {apply.stderr or apply.stdout}"
+        )
+
+
+def _e3_cleanup_fault() -> None:
+    """State-observed, idempotent E3 fault cleanup (review W1).
+
+    Always attempts every restoration regardless of setup flags; verifies the
+    key and mount are absent; restarts the coordinator; aggregates and
+    propagates failures so a half-cleaned cluster cannot go unnoticed.
+    """
+    errors: list[str] = []
+
+    try:
+        _patch_coordinator_rg_mount(present=False)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"remove mount: {exc}")
+
+    try:
+        _e3_remove_cm_key()
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"remove cm key: {exc}")
+
+    try:
+        _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"restart coordinator: {exc}")
+
+    # Verify restoration — state-observed, not flag-driven.
+    try:
+        if _e3_cm_key_present():
+            errors.append(
+                f"ConfigMap key {RESOURCE_GROUPS_PROPERTIES_KEY!r} still present "
+                f"after cleanup"
+            )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"verify cm key absent: {exc}")
+
+    try:
+        if _e3_mount_present():
+            errors.append(
+                f"volumeMount for {RESOURCE_GROUPS_PROPERTIES_PATH!r} still "
+                f"present after cleanup"
+            )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"verify mount absent: {exc}")
+
+    if errors:
+        raise RuntimeError("E3 cleanup failed: " + "; ".join(errors))
+
+
 @pytest.mark.e2e
 def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_url):
     """Section 13.5: constrain concurrency, submit N long queries, and prove the
@@ -1059,18 +1276,21 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
     # Fault injection: switch the coordinator to the file resource-group
     # manager, whose shipped root group runs one query at a time. These two
     # properties live in their own resource-groups.properties key/file, never
-    # in config.properties -- see RESOURCE_GROUPS_PROPERTIES_KEY.
-    _put_configmap_key(
-        COORDINATOR_CONFIGMAP,
-        RESOURCE_GROUPS_PROPERTIES_KEY,
-        f"{RESOURCE_GROUP_MANAGER_PROP}=file\n{RESOURCE_GROUP_FILE_PROP}={RESOURCE_GROUP_FILE}\n",
-    )
-    _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
-    # Everything after the constraint is installed runs under `finally`: a
-    # failure in mount verification or query submission used to leave hard
-    # concurrency pinned at 1 for every later scenario (code review round 5,
-    # W1).
+    # in config.properties. The key and mount are ABSENT by default (D1) —
+    # add both for the fault, remove both on cleanup.
+    #
+    # Whole installation is under outer try/finally so a failure mid-setup
+    # still tears down whatever cluster state was mutated (W1: cleanup is
+    # state-observed, not dependent on post-success flags).
     try:
+        _put_configmap_key(
+            COORDINATOR_CONFIGMAP,
+            RESOURCE_GROUPS_PROPERTIES_KEY,
+            f"{RESOURCE_GROUP_MANAGER_PROP}=file\n{RESOURCE_GROUP_FILE_PROP}={RESOURCE_GROUP_FILE}\n",
+        )
+        _patch_coordinator_rg_mount(present=True)
+        _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
+
         mounted = _mounted_property(
             COORDINATOR_WORKLOAD, RESOURCE_GROUPS_PROPERTIES_PATH, RESOURCE_GROUP_MANAGER_PROP
         )
@@ -1107,11 +1327,7 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
         assert inv_id
         _e3_assert_case(dashboard_url, token, inv_id, queued=queued)
     finally:
-        # Recovery: empty resource-groups.properties back out (never
-        # config.properties -- see RESOURCE_GROUPS_PROPERTIES_KEY) and require
-        # the backlog to drain.
-        _put_configmap_key(COORDINATOR_CONFIGMAP, RESOURCE_GROUPS_PROPERTIES_KEY, "")
-        _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
+        _e3_cleanup_fault()
 
     drained_deadline = time.time() + 120
     remaining = {}

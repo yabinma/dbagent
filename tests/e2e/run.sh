@@ -206,6 +206,19 @@ phase "deploy_presto" 150 bash -c '
   kubectl apply -n dbagent -f tests/e2e/presto/
   kubectl -n dbagent rollout status deploy/presto-coordinator --timeout=120s
   kubectl -n dbagent wait --for=condition=Ready pod -l app=presto --timeout=120s
+  # D2: prove the coordinator *stayed* up — a crashloop can briefly report
+  # Ready (successThreshold window) then die. Settle, re-check Ready, and
+  # require restartCount == 0.
+  sleep 15
+  kubectl -n dbagent wait --for=condition=Ready pod -l app=presto,role=coordinator --timeout=30s
+  rc=$(kubectl -n dbagent get pod -l app=presto,role=coordinator \
+    -o jsonpath="{.items[0].status.containerStatuses[0].restartCount}")
+  if [ "${rc:-1}" != "0" ]; then
+    echo "deploy_presto: coordinator restartCount=${rc} (expected 0) — crashlooping" >&2
+    kubectl -n dbagent describe pod -l app=presto,role=coordinator >&2 || true
+    kubectl -n dbagent logs -l app=presto,role=coordinator --tail=80 >&2 || true
+    exit 1
+  fi
 '
 
 # Create platform + issue bootstrap token BEFORE installing the probe (C2.3/C2.5).

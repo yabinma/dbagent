@@ -4,11 +4,13 @@ and the ingest-gateway correlation path.
 """
 from __future__ import annotations
 
+import hashlib
+import struct
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from rca_common.audit import actor_system, write_audit
@@ -48,6 +50,68 @@ def get_platform(session: Session, platform_key: str) -> Platform | None:
     return session.get(Platform, platform_key)
 
 
+def correlation_lock_key(platform_key: str, fingerprint: str) -> int:
+    """Deterministic signed 64-bit advisory-lock key for one correlation slot.
+
+    BLAKE2b digest of ``platform_key + "\\x00" + fingerprint``, first 8 bytes
+    as a signed big-endian int64 (design.md §11.3.3 O / FP-IG-16).
+    """
+    digest = hashlib.blake2b(
+        (platform_key + "\x00" + fingerprint).encode("utf-8"), digest_size=8
+    ).digest()
+    return struct.unpack(">q", digest)[0]
+
+
+def acquire_correlation_lock(session: Session, platform_key: str, fingerprint: str) -> None:
+    """``SELECT pg_advisory_xact_lock(:key)`` — released at COMMIT or ROLLBACK.
+
+    Session-scoped ``pg_advisory_lock`` is forbidden: a pooled connection
+    returned while holding one leaks the lock for the process lifetime.
+    """
+    key = correlation_lock_key(platform_key, fingerprint)
+    session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
+
+def find_open_by_fingerprint_stmt(
+    *,
+    fingerprint: str,
+    platform_key: str,
+    correlation_window_seconds: int,
+    now: datetime | None = None,
+):
+    """Build the production correlation SELECT (FP-IG-6 / FP-IG-17).
+
+    Factored so FP-IG-17 can EXPLAIN the exact statement the product emits,
+    rather than a hand-written facsimile (C6).
+    """
+    now = now or datetime.now(timezone.utc)
+    window_start = now - timedelta(seconds=correlation_window_seconds)
+    # Drive FROM alert_events so the planner can use the (fingerprint,
+    # received_at) index for both the equality filter and ORDER BY … LIMIT 1
+    # as an Index Scan (FP-IG-6 (c) / FP-IG-17). Starting from investigations
+    # forces a Bitmap Heap Scan + Sort on small fixtures.
+    return (
+        select(Investigation)
+        .select_from(AlertEventRow)
+        .join(
+            Investigation,
+            AlertEventRow.investigation_id == Investigation.investigation_id,
+        )
+        .where(
+            AlertEventRow.fingerprint == fingerprint,
+            AlertEventRow.platform_key == platform_key,
+            AlertEventRow.investigation_id.is_not(None),
+            AlertEventRow.received_at >= window_start,
+            Investigation.status.in_(tuple(NON_TERMINAL_STATUSES)),
+        )
+        # Order by received_at only so the (fingerprint, received_at) index can
+        # satisfy ORDER BY … LIMIT 1 without an Incremental Sort that pulls an
+        # extra row (FP-IG-6 (c) / FP-IG-17: one row examined on the active shape).
+        .order_by(AlertEventRow.received_at.desc())
+        .limit(1)
+    )
+
+
 def find_open_by_fingerprint(
     session: Session,
     *,
@@ -58,26 +122,17 @@ def find_open_by_fingerprint(
 ) -> Investigation | None:
     """Return the most recent non-terminal investigation whose trigger
     (or a related event) shares ``fingerprint`` inside the correlation window.
-    """
-    now = now or datetime.now(timezone.utc)
-    window_start = now - timedelta(seconds=correlation_window_seconds)
 
-    # Prefer matching via alert_events (covers both opened + merged rows).
-    stmt = (
-        select(AlertEventRow)
-        .where(
-            AlertEventRow.fingerprint == fingerprint,
-            AlertEventRow.platform_key == platform_key,
-            AlertEventRow.investigation_id.is_not(None),
-            AlertEventRow.received_at >= window_start,
-        )
-        .order_by(AlertEventRow.received_at.desc())
+    FP-IG-6: one round trip, at most one ORM row, LIMIT 1 join on non-terminal
+    investigations ordered by alert_events.received_at DESC.
+    """
+    stmt = find_open_by_fingerprint_stmt(
+        fingerprint=fingerprint,
+        platform_key=platform_key,
+        correlation_window_seconds=correlation_window_seconds,
+        now=now,
     )
-    for event in session.scalars(stmt):
-        inv = _latest_investigation(session, event.investigation_id)
-        if inv is not None and inv.status in NON_TERMINAL_STATUSES:
-            return inv
-    return None
+    return session.scalars(stmt).first()
 
 
 def _latest_investigation(session: Session, investigation_id: uuid.UUID) -> Investigation | None:

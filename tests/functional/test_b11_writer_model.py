@@ -79,8 +79,8 @@ EXPECTED_CONCURRENCY_MODEL = {
             "call_sites": [
                 {
                     "file": "services/gateway/gateway/ingest.py",
-                    "line": 113,
-                    "in": "IngestService.ingest",
+                    "line": 131,
+                    "in": "IngestService._ingest_txn",
                     "symbol": "write_audit",
                     "expr": "write_audit(",
                 }
@@ -999,6 +999,14 @@ def _callee_name(call: ast.Call) -> str | None:
 # plugin, any of which could patch `yaml.safe_load` for the guard's own reads.
 # --------------------------------------------------------------------------
 
+# FP-IG-11: closed allowlist of exactly two keys.
+MANIFEST_ALLOWED_KEYS = frozenset(
+    {
+        "benchmarks[id=B11].concurrency_model",
+        "benchmarks[id=B11].notes",
+    }
+)
+
 MANIFEST_READ_SCRIPT = r'''
 import json, sys
 from pathlib import Path
@@ -1006,11 +1014,18 @@ from pathlib import Path
 import yaml
 
 path, key_path = sys.argv[1], sys.argv[2]
-if key_path != "benchmarks[id=B11].concurrency_model":
+allowed = {
+    "benchmarks[id=B11].concurrency_model",
+    "benchmarks[id=B11].notes",
+}
+if key_path not in allowed:
     raise SystemExit("unsupported key path: %r" % (key_path,))
 data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 by_id = {entry["id"]: entry for entry in data["benchmarks"]}
-print(json.dumps(by_id["B11"]["concurrency_model"]))
+if key_path.endswith(".notes"):
+    print(json.dumps(by_id["B11"]["notes"]))
+else:
+    print(json.dumps(by_id["B11"]["concurrency_model"]))
 '''
 
 
@@ -3225,7 +3240,8 @@ def _run_all_checkers(repo_root: Path) -> None:
 
 def test_b11_declares_exactly_four_writer_processes_matching_shipped_code():
     """(i) the whole object against the guard's literal; (ii) every call site is
-    a real production call in the declaring process's own code."""
+    a real production call in the declaring process's own code.
+    FP-IG-11: also parse notes for event_*:NNN line references."""
     model = read_manifest_isolated()
     assert model == EXPECTED_CONCURRENCY_MODEL, (
         "B11.concurrency_model differs from EXPECTED_CONCURRENCY_MODEL"
@@ -3240,6 +3256,32 @@ def test_b11_declares_exactly_four_writer_processes_matching_shipped_code():
     assert {
         wp["process"] for wp in model["writer_processes"] if "llm_calls" in wp["tables"]
     } == {"temporal-worker"}
+
+    # FP-IG-11 notes extension: three event_*:NNN references equal resolved lines.
+    notes = read_manifest_isolated(key_path="benchmarks[id=B11].notes")
+    import re
+
+    refs = dict(re.findall(r"(event_(?:merged|received|rejected)):(\d+)", notes))
+    assert set(refs) == {"event_merged", "event_received", "event_rejected"}, refs
+    # Resolve write_audit lines from the shipped file by action string.
+    ingest_src = (REPO_ROOT / "services/gateway/gateway/ingest.py").read_text(
+        encoding="utf-8"
+    )
+    lines = ingest_src.splitlines()
+    resolved: dict[str, int] = {}
+    for i, line in enumerate(lines, start=1):
+        if "write_audit(" not in line:
+            continue
+        # Look ahead a few lines for the action=
+        window = "\n".join(lines[i - 1 : i + 5])
+        for action in ("event_merged", "event_received", "event_rejected"):
+            if f'action="{action}"' in window or f"action='{action}'" in window:
+                resolved.setdefault(action, i)
+    for action, lineno in refs.items():
+        assert action in resolved, f"notes cites {action} but file has no write_audit"
+        assert int(lineno) == resolved[action], (
+            f"notes {action}:{lineno} != resolved {resolved[action]}"
+        )
 
 
 def test_b11_harness_derives_its_width_from_the_manifest_and_widens_nothing():

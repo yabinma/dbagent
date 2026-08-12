@@ -1,9 +1,13 @@
-"""Webhook ingest + fingerprint correlation (design.md Section 4.1).
+"""Webhook ingest + fingerprint correlation (design.md Section 4.1, §11.3).
 
 Responses:
 - ``202 {investigation_id}`` opened
 - ``200 {status: merged, investigation_id}`` correlated into open case
 - ``200 {status: rejected, reason}`` platform not ready / unknown platform
+
+FP-IG-5: the database transaction runs off the event loop via
+``run_in_threadpool``. FP-IG-16: open-path correlation uses a transaction-
+scoped advisory lock with a lock-free merge fast path.
 """
 from __future__ import annotations
 
@@ -11,9 +15,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
+from starlette.concurrency import run_in_threadpool
+
 from rca_common.audit import actor_system, write_audit
 from rca_common.fingerprint import compute_fingerprint
 from rca_common.investigation_repo import (
+    acquire_correlation_lock,
+    create_investigation,
     find_open_by_fingerprint,
     get_platform,
     insert_alert_event,
@@ -72,16 +80,25 @@ class IngestService:
         if event["source"] and self._known_sources and event["source"] not in self._known_sources:
             return 200, {"status": "rejected", "reason": "unknown_source"}
 
+        status, payload, investigation_id = await run_in_threadpool(self._ingest_txn, event)
+        if investigation_id is not None and self._workflow_starter is not None:
+            await self._workflow_starter.start_investigation(event, investigation_id)
+        return status, payload
+
+    def _ingest_txn(
+        self, event: dict[str, Any]
+    ) -> tuple[int, dict[str, Any], uuid.UUID | None]:
+        """Synchronous DB transaction; invoked via run_in_threadpool (FP-IG-5)."""
         with self._session_factory() as session:
             platform = get_platform(session, event["platform_key"])
             if platform is None:
                 self._reject(session, event, "unknown_platform_key")
                 session.commit()
-                return 200, {"status": "rejected", "reason": "unknown_platform_key"}
+                return 200, {"status": "rejected", "reason": "unknown_platform_key"}, None
             if (platform.status or "").lower() != "online":
                 self._reject(session, event, "platform_not_ready")
                 session.commit()
-                return 200, {"status": "rejected", "reason": "platform_not_ready"}
+                return 200, {"status": "rejected", "reason": "platform_not_ready"}, None
 
             # Per-platform correlation window override.
             window = self._correlation_window_seconds
@@ -91,6 +108,7 @@ class IngestService:
             elif "correlation_window" in cfg:
                 window = int(cfg["correlation_window"])
 
+            # Lock-free correlation read — merge path takes no lock (FP-IG-16).
             existing = find_open_by_fingerprint(
                 session,
                 fingerprint=event["fingerprint"],
@@ -121,7 +139,41 @@ class IngestService:
                 return 200, {
                     "status": "merged",
                     "investigation_id": str(existing.investigation_id),
-                }
+                }, None
+
+            # Open path: advisory lock then re-read under the lock.
+            acquire_correlation_lock(session, event["platform_key"], event["fingerprint"])
+            existing = find_open_by_fingerprint(
+                session,
+                fingerprint=event["fingerprint"],
+                platform_key=event["platform_key"],
+                correlation_window_seconds=window,
+            )
+            if existing is not None:
+                insert_alert_event(
+                    session,
+                    event_id=uuid.UUID(event["event_id"]),
+                    fingerprint=event["fingerprint"],
+                    source=event["source"],
+                    platform_key=event["platform_key"],
+                    severity=event["severity"],
+                    payload_ref=None,
+                    normalized=event,
+                    disposition="merged",
+                    investigation_id=existing.investigation_id,
+                )
+                write_audit(
+                    session,
+                    action="event_merged",
+                    actor=actor_system(),
+                    investigation_id=existing.investigation_id,
+                    detail={"event_id": event["event_id"], "fingerprint": event["fingerprint"]},
+                )
+                session.commit()
+                return 200, {
+                    "status": "merged",
+                    "investigation_id": str(existing.investigation_id),
+                }, None
 
             investigation_id = uuid.uuid4()
             budget = merge_platform_budget(
@@ -152,10 +204,6 @@ class IngestService:
                 investigation_id=investigation_id,
                 detail={"event_id": event["event_id"], "fingerprint": event["fingerprint"]},
             )
-            # Persist a RECEIVED investigation row so correlation can find it
-            # even before the workflow's create_case activity runs.
-            from rca_common.investigation_repo import create_investigation
-
             create_investigation(
                 session,
                 investigation_id=investigation_id,
@@ -166,11 +214,7 @@ class IngestService:
                 budget=budget,
             )
             session.commit()
-
-        if self._workflow_starter is not None:
-            await self._workflow_starter.start_investigation(event, investigation_id)
-
-        return 202, {"investigation_id": str(investigation_id)}
+            return 202, {"investigation_id": str(investigation_id)}, investigation_id
 
     def _reject(self, session, event: dict[str, Any], reason: str) -> None:
         insert_alert_event(

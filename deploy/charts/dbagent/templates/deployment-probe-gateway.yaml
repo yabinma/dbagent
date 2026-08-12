@@ -56,11 +56,11 @@ spec:
           livenessProbe:
             httpGet: { path: /healthz, port: internal }
             initialDelaySeconds: 10
-            periodSeconds: 15
+            {{- include "dbagent.probeTuning" .Values.probeGateway.probes.liveness | nindent 12 }}
           readinessProbe:
             httpGet: { path: /healthz, port: internal }
             initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- include "dbagent.probeTuning" .Values.probeGateway.probes.readiness | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
       volumes:

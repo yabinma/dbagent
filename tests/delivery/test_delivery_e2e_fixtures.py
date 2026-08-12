@@ -973,3 +973,208 @@ def test_run_sh_failure_path_collects_pod_logs_and_events(tmp_path: Path):
             "every kubectl invocation must carry --request-timeout; "
             f"got: {line!r}"
         )
+
+
+# Product workloads that must satisfy FP-IG-1/2 under every shipped overlay
+# (design.md FP-IG-3; review C8). Sizing (FP-IG-4) stays ingest-gateway only.
+_PRODUCT_WORKLOADS = (
+    "ingest-gateway",
+    "temporal-worker",
+    "probe-gateway",
+    "dashboard-api",
+    "dashboard-web",
+)
+_PROBE_KEYS = ("timeoutSeconds", "periodSeconds", "failureThreshold", "successThreshold")
+
+
+def _shed_before_kill(t_r, p_r, F_r, t_l, p_l, F_l) -> bool:
+    """FP-IG-2 five conditions (same predicate as test_delivery_charts)."""
+    if not (t_r < t_l):
+        return False
+    if not (p_r * F_r + t_r < (F_l - 1) * p_l):
+        return False
+    if not ((F_l - 1) * p_l >= 90):
+        return False
+    if not (t_l >= 5):
+        return False
+    if not (t_r <= p_r and t_l <= p_l):
+        return False
+    return True
+
+
+def test_shipped_values_overlays_do_not_weaken_probe_or_sizing_defaults():
+    """FP-IG-3: every product workload under both overlays satisfies FP-IG-1/2/4."""
+    import math
+
+    from delivery_helpers import CHARTS, helm_template, parse_manifests
+
+    dbagent = CHARTS / "dbagent"
+    overlays = [
+        REPO_ROOT / "tests/e2e/values-dbagent.yaml",
+        dbagent / "values-dev.yaml",
+    ]
+    values = yaml.safe_load((dbagent / "values.yaml").read_text(encoding="utf-8"))
+    basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
+
+    def millicores(v):
+        s = str(v)
+        return int(s[:-1]) if s.endswith("m") else int(float(s) * 1000)
+
+    for overlay in overlays:
+        out = helm_template(dbagent, values=[str(overlay)])
+        docs = parse_manifests(out)
+        # Index every product Deployment by short workload name.
+        by_workload: dict[str, dict] = {}
+        for d in docs:
+            if d.get("kind") != "Deployment":
+                continue
+            name = d["metadata"]["name"]
+            short = next((w for w in _PRODUCT_WORKLOADS if w in name), None)
+            if short is None:
+                continue
+            by_workload[short] = d
+
+        # Every product workload must be present and checked (review C8).
+        for w in _PRODUCT_WORKLOADS:
+            assert w in by_workload, (
+                f"{overlay}: missing Deployment for product workload {w}"
+            )
+            dep = by_workload[w]
+            containers = dep["spec"]["template"]["spec"]["containers"]
+            assert containers, f"{overlay} {w}: no containers"
+            c = containers[0]
+            for kind in ("livenessProbe", "readinessProbe"):
+                assert kind in c, f"{overlay} {w}: missing {kind}"
+                probe = c[kind]
+                for k in _PROBE_KEYS:
+                    assert k in probe, f"{overlay} {w} {kind} missing {k}"
+                    assert probe[k] is not None
+            r, l = c["readinessProbe"], c["livenessProbe"]
+            ok = _shed_before_kill(
+                r["timeoutSeconds"],
+                r["periodSeconds"],
+                r["failureThreshold"],
+                l["timeoutSeconds"],
+                l["periodSeconds"],
+                l["failureThreshold"],
+            )
+            assert ok, (
+                f"{overlay} {w} fails FP-IG-2 shed-before-kill: "
+                f"readiness={r} liveness={l}"
+            )
+
+        # Sizing (FP-IG-4) is specific to ingest-gateway only.
+        gw = by_workload["ingest-gateway"]["spec"]["template"]["spec"]["containers"][0]
+        res = gw["resources"]
+        assert millicores(res["requests"]["cpu"]) == math.ceil(basis * 200)
+        assert millicores(res["limits"]["cpu"]) >= 5 * millicores(res["requests"]["cpu"])
+
+
+# ---------------------------------------------------------------------------
+# W1 — E3 cleanup observation failures must reach the aggregate
+# ---------------------------------------------------------------------------
+
+
+def _load_e2e_scenarios_module():
+    """Load test_e2e_scenarios.py without collecting the e2e suite."""
+    path = E2E / "test_e2e_scenarios.py"
+    name = "e2e_scenarios_w1_cleanup"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    # Register before exec so dataclasses / relative patterns work if any.
+    import sys
+
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_e3_observation_helpers_propagate_errors(monkeypatch):
+    """W1: observation failure is not treated as successful absence."""
+    mod = _load_e2e_scenarios_module()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("observation unavailable")
+
+    monkeypatch.setattr(mod, "_kubectl_ok", boom)
+    with pytest.raises(RuntimeError, match="observation unavailable"):
+        mod._e3_cm_key_present()
+    with pytest.raises(RuntimeError, match="observation unavailable"):
+        mod._e3_mount_present()
+
+
+def test_e3_cleanup_aggregates_every_step_failure(monkeypatch):
+    """W1: every removal/restart/verification is attempted; all failures aggregate."""
+    mod = _load_e2e_scenarios_module()
+    attempts: list[str] = []
+
+    def boom_mount(*, present):
+        attempts.append(f"patch_mount:{present}")
+        raise RuntimeError("mount patch failed")
+
+    def boom_cm():
+        attempts.append("remove_cm_key")
+        raise RuntimeError("cm remove failed")
+
+    def boom_restart(workload, timeout="180s"):
+        attempts.append(f"restart:{workload}")
+        raise RuntimeError("restart failed")
+
+    def boom_cm_present():
+        attempts.append("verify_cm")
+        raise RuntimeError("observation unavailable")
+
+    def boom_mount_present():
+        attempts.append("verify_mount")
+        raise RuntimeError("observation unavailable")
+
+    monkeypatch.setattr(mod, "_patch_coordinator_rg_mount", boom_mount)
+    monkeypatch.setattr(mod, "_e3_remove_cm_key", boom_cm)
+    monkeypatch.setattr(mod, "_restart_and_wait", boom_restart)
+    monkeypatch.setattr(mod, "_e3_cm_key_present", boom_cm_present)
+    monkeypatch.setattr(mod, "_e3_mount_present", boom_mount_present)
+
+    with pytest.raises(RuntimeError, match="E3 cleanup failed") as ei:
+        mod._e3_cleanup_fault()
+    msg = str(ei.value)
+    # Every step attempted.
+    assert attempts == [
+        "patch_mount:False",
+        "remove_cm_key",
+        f"restart:{mod.COORDINATOR_WORKLOAD}",
+        "verify_cm",
+        "verify_mount",
+    ], attempts
+    # Every failure reaches the aggregate message.
+    for fragment in (
+        "remove mount",
+        "remove cm key",
+        "restart coordinator",
+        "verify cm key absent",
+        "verify mount absent",
+        "mount patch failed",
+        "cm remove failed",
+        "restart failed",
+        "observation unavailable",
+    ):
+        assert fragment in msg, f"missing {fragment!r} in {msg!r}"
+
+
+def test_e3_cleanup_false_only_after_successful_absent_read(monkeypatch):
+    """W1: successful observation of absence is quiet; residual state fails."""
+    mod = _load_e2e_scenarios_module()
+
+    monkeypatch.setattr(mod, "_patch_coordinator_rg_mount", lambda **_k: None)
+    monkeypatch.setattr(mod, "_e3_remove_cm_key", lambda: None)
+    monkeypatch.setattr(mod, "_restart_and_wait", lambda *_a, **_k: None)
+    # Successful reads prove absence → cleanup succeeds.
+    monkeypatch.setattr(mod, "_e3_cm_key_present", lambda: False)
+    monkeypatch.setattr(mod, "_e3_mount_present", lambda: False)
+    mod._e3_cleanup_fault()  # must not raise
+
+    # Residual key after "cleanup" must surface.
+    monkeypatch.setattr(mod, "_e3_cm_key_present", lambda: True)
+    monkeypatch.setattr(mod, "_e3_mount_present", lambda: False)
+    with pytest.raises(RuntimeError, match="still present"):
+        mod._e3_cleanup_fault()

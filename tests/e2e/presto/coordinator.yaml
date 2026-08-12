@@ -45,16 +45,26 @@ spec:
             - name: config
               mountPath: /opt/presto-server/etc/resource-groups.json
               subPath: resource_groups.json
-            # The file resource-group manager is selected here, NOT in
-            # config.properties -- see configmaps.yaml's resource-groups.properties
-            # key for why. Empty by default (inert); E3 patches its content.
-            - name: config
-              mountPath: /opt/presto-server/etc/resource-groups.properties
-              subPath: resource-groups.properties
+            # resource-groups.properties is NOT mounted by default. Presto 0.298
+            # hard-fails if the file exists without
+            # resource-groups.configuration-manager. E3 adds the mount when it
+            # injects the fault (see test_e2e_scenarios.py).
           readinessProbe:
             httpGet: { path: /v1/info, port: 8080 }
             initialDelaySeconds: 20
+            periodSeconds: 5
+            # D2: require consecutive successes so a crashlooping coordinator
+            # cannot pass the Ready gate during the brief window where /v1/info
+            # serves before the config check kills the process.
+            successThreshold: 3
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 30
             periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
       volumes:
         - name: config
           configMap:

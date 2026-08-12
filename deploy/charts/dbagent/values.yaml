@@ -77,12 +77,49 @@ ingestGateway:
   service:
     type: ClusterIP
     nodePort: null
+  # FP-IG-1/2: every probe parameter explicit; sourced from one place.
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
+  # FP-IG-4: sizingBasis is the per-request CPU cost (ms) measured by
+  # FP-IG-7's reference-tier benchmark. requests.cpu = ceil(basis × 200) m;
+  # limits.cpu ≥ 5 × requests.cpu. Basis = max+(max−min) over five consecutive
+  # runs after C2 (disjoint warmup/prologue). Recorded 2026-08-12:
+  #   run1: 2.031 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run2: 1.983 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run3: 2.205 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run4: 2.102 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run5: 2.096 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  # basis = 2.205 + (2.205 − 1.983) = 2.427 ms/req. Signature cpus=16 (not the
+  # §14.4 reference 4); CI ubuntu-latest re-derivation may replace this.
+  sizingBasis:
+    cpuMsPerRequest: 2.427
   resources:
-    requests: { cpu: 50m, memory: 128Mi }
-    limits: { cpu: 500m, memory: 512Mi }
+    # ceil(2.427 × 200) = 486m; limits = 5 × requests
+    requests: { cpu: 486m, memory: 128Mi }
+    limits: { cpu: 2430m, memory: 512Mi }
 
 temporalWorker:
   replicaCount: 1
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 30
+      failureThreshold: 4
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 15
+      failureThreshold: 3
+      successThreshold: 1
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
@@ -94,6 +131,17 @@ probeGateway:
     # NodePort for the internal (:8080) health/admin port when type=NodePort.
     nodePort: null
   extraSANs: []
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
@@ -112,6 +160,17 @@ dashboardApi:
   service:
     type: ClusterIP
     nodePort: null
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
@@ -121,6 +180,17 @@ dashboardWeb:
   service:
     type: ClusterIP
     nodePort: null
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
   resources:
     requests: { cpu: 25m, memory: 64Mi }
     limits: { cpu: 200m, memory: 128Mi }

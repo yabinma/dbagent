@@ -44,12 +44,12 @@ spec:
             exec:
               command: ["python", "-c", "import worker; print('ok')"]
             initialDelaySeconds: 20
-            periodSeconds: 30
+            {{- include "dbagent.probeTuning" .Values.temporalWorker.probes.liveness | nindent 12 }}
           readinessProbe:
             exec:
               command: ["python", "-c", "import worker; print('ok')"]
             initialDelaySeconds: 10
-            periodSeconds: 15
+            {{- include "dbagent.probeTuning" .Values.temporalWorker.probes.readiness | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
       volumes:
