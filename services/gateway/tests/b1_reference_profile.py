@@ -8,8 +8,10 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import httpx
@@ -25,6 +27,9 @@ MAX_IN_FLIGHT = BURST_RATE  # one second of offered load
 PROLOGUE_REQUESTS = int(BURST_RATE * P99_MS / 1000)  # 150
 KEEPALIVE_EXPIRY = float(BURST_SECONDS)
 CLIENT_TIMEOUT = float(BURST_SECONDS)
+INGEST_GATEWAY_WORKERS = 4
+TRACKER_CMDLINE_MARK = "multiprocessing.resource_tracker"
+WORKER_CMDLINE_MARK = "multiprocessing.spawn"
 
 
 class Transport(Protocol):
@@ -505,3 +510,138 @@ def run_acceptance_matrix(name: str) -> dict[str, str]:
         fails = fn(result)
         out[key] = "pass" if not fails else "fail"
     return out
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def iter_live_descendants(root_pid: int) -> list[int]:
+    """AA: enumerate live descendants via /proc/<pid>/task/*/children."""
+    seen: set[int] = set()
+    out: list[int] = []
+    queue = [root_pid]
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if pid != root_pid:
+            out.append(pid)
+        task = Path(f"/proc/{pid}/task")
+        if not task.is_dir():
+            continue
+        for tdir in task.iterdir():
+            children_file = tdir / "children"
+            try:
+                text = children_file.read_text().strip()
+            except OSError:
+                continue
+            if text:
+                queue.extend(int(tok) for tok in text.split())
+    return out
+
+
+def classify_tree(root_pid: int) -> tuple[set[int], set[int]]:
+    """Return (tracker_pids, worker_pids) classified by cmdline."""
+    trackers: set[int] = set()
+    workers: set[int] = set()
+    for pid in iter_live_descendants(root_pid):
+        cmd = _proc_cmdline(pid)
+        if TRACKER_CMDLINE_MARK in cmd:
+            trackers.add(pid)
+        elif WORKER_CMDLINE_MARK in cmd:
+            workers.add(pid)
+    return trackers, workers
+
+
+def pid_cpu_seconds(pid: int) -> float:
+    """utime + stime only — cutime/cstime are not used (AA)."""
+    clk = os.sysconf("SC_CLK_TCK")
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            fields = f.read().split()
+    except OSError:
+        return 0.0
+    return (int(fields[13]) + int(fields[14])) / clk
+
+
+def tree_cpu_seconds(root_pid: int) -> float:
+    total = pid_cpu_seconds(root_pid)
+    for pid in iter_live_descendants(root_pid):
+        total += pid_cpu_seconds(pid)
+    return total
+
+
+def wait_for_classified_workers(
+    root_pid: int,
+    *,
+    workers: int = INGEST_GATEWAY_WORKERS,
+    timeout_s: float = 30.0,
+) -> tuple[set[int], set[int]]:
+    """Bounded wait until the tree holds one tracker and exactly ``workers`` pids."""
+    deadline = time.time() + timeout_s
+    last: tuple[set[int], set[int]] = (set(), set())
+    while time.time() < deadline:
+        trackers, worker_pids = classify_tree(root_pid)
+        last = (trackers, worker_pids)
+        if len(trackers) == 1 and len(worker_pids) == workers:
+            return trackers, worker_pids
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"classified tree never reached 1 tracker + {workers} workers; "
+        f"last trackers={sorted(last[0])} workers={sorted(last[1])}"
+    )
+
+
+def format_pid_list(pids: set[int] | list[int]) -> str:
+    return "+".join(str(p) for p in sorted(set(pids)))
+
+
+def create_benchmark_app():
+    """Import-string factory for the multi-worker B1 child (AA / FP-IG-22).
+
+    Calls the shipped ``build_app()`` and attaches the recording Temporal stub
+    in a startup handler. Config path comes from the child env set by the
+    harness (gateway.main reads it; this file does not).
+    """
+    from gateway.main import build_app
+
+    app, _config, service = build_app()
+
+    class Stub:
+        async def start_investigation(self, event, investigation_id):
+            return f"investigation-{investigation_id}"
+
+    @app.on_event("startup")
+    async def _attach_stub() -> None:
+        service._workflow_starter = Stub()
+
+    return app
+
+
+def serve_benchmark(*, host: str, port: int) -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "b1_reference_profile:create_benchmark_app",
+        factory=True,
+        workers=INGEST_GATEWAY_WORKERS,
+        host=host,
+        port=port,
+        log_level="warning",
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, required=True)
+    ns = parser.parse_args()
+    serve_benchmark(host=ns.host, port=ns.port)

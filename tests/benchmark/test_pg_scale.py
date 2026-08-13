@@ -94,20 +94,26 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     """Combined audit + llm_calls insert rate under durable Postgres.
 
     Writer count and mapping come from B11's structured concurrency_model
-    (design.md §11.1.3 / FP-M6-22): four processes in the default deployment,
-    each with an independent make_engine-default pool. Threads proxy processes.
+    (design.md §11.1.3 / FP-M6-22 / FP-IG-21): four writer *services*, seven
+    process *instances* in the default deployment, each with an independent
+    make_engine-default pool. Threads proxy process instances.
     """
     dsn = scale_pg["dsn"]
     writers = load_b11_writer_model()
+    instances = [
+        (entry, i)
+        for entry in writers
+        for i in range(entry["processes"])
+    ]
     n_iters = 800
     now = datetime.now(timezone.utc)
 
-    # One independent engine per writer at make_engine defaults.
+    # One independent engine per process instance at make_engine defaults.
     # Built and warmed *outside* the timed window so we measure insert rate only.
     engines = []
     factories = []
     stores = []
-    for _ in writers:
+    for _ in instances:
         eng = make_engine(dsn)
         fac = make_session_factory(eng)
         with eng.connect() as conn:
@@ -117,7 +123,7 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         stores.append(PGTraceStore(session_factory=fac))
 
     def _run_writer(idx: int) -> int:
-        """Return rows committed by writers[idx].
+        """Return rows committed by instances[idx].
 
         One commit per row — production shape for write_audit / insert_llm_call.
         Session is held open across commits (same connection from the pool),
@@ -125,7 +131,7 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         """
         factory = factories[idx]
         store = stores[idx]
-        process = writers[idx]["process"]
+        process = instances[idx][0]["process"]
         rows = 0
         with factory() as session:
             for i in range(n_iters):
@@ -160,12 +166,14 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         return rows
 
     writer_map = ",".join(
-        f"{w['process']}:{'+'.join(w['tables'])}" for w in writers
+        f"{(entry['process'] + '#' + str(i)) if entry['process'] == 'ingest-gateway' else entry['process']}"
+        f":{'+'.join(entry['tables'])}"
+        for entry, i in instances
     )
 
     def _warmup(idx: int) -> None:
         factory = factories[idx]
-        process = writers[idx]["process"]
+        process = instances[idx][0]["process"]
         with factory() as session:
             for i in range(50):
                 write_audit(
@@ -177,11 +185,11 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
                 session.commit()
 
     # Pool created and warmed outside the timed window.
-    pool = ThreadPoolExecutor(max_workers=len(writers))
+    pool = ThreadPoolExecutor(max_workers=len(instances))
     try:
-        list(pool.map(_warmup, range(len(writers))))
+        list(pool.map(_warmup, range(len(instances))))
         t0 = time.perf_counter()
-        committed = list(pool.map(_run_writer, range(len(writers))))
+        committed = list(pool.map(_run_writer, range(len(instances))))
         elapsed = time.perf_counter() - t0
     finally:
         pool.shutdown(wait=True)
@@ -210,12 +218,12 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         f"serial_commit_ms={serial_commit_ms:.3f},"
         f"combined_over_single={combined_over_single:.2f}"
     )
-    print(f"B11 writers={len(writers)}")
+    print(f"B11 writers={len(instances)}")
     print(f"B11 writer_map={writer_map}")
     print(f"B11 single_writer_rate={single_writer_rate:.1f}/s")
     print(env_line)
     assert rate >= 1000.0, (
         f"B11 combined insert rate={rate:.1f}/s (threshold 1000); "
-        f"B11 writers={len(writers)}; B11 writer_map={writer_map}; "
+        f"B11 writers={len(instances)}; B11 writer_map={writer_map}; "
         f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"
     )

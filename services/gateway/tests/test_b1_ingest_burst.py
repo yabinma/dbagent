@@ -182,14 +182,6 @@ def _build_requests(count: int) -> list[tuple[bytes, dict[str, str]]]:
     return out
 
 
-def _cpu_seconds(pid: int) -> float:
-    clk = os.sysconf("SC_CLK_TCK")
-    with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
-        fields = f.read().split()
-    # utime 14, stime 15, cutime 16, cstime 17 (1-indexed)
-    return (int(fields[13]) + int(fields[14]) + int(fields[15]) + int(fields[16])) / clk
-
-
 def _host_fingerprint() -> dict[str, str | int]:
     cpus = os.cpu_count() or 0
     model = "unknown"
@@ -309,26 +301,17 @@ def b1_reference_run():
             yaml.safe_dump(cfg, f)
             cfg_path = f.name
 
-        # Child process: build_app with stub workflow starter, serve uvicorn.
-        child_src = textwrap.dedent(
-            f"""
-            import os, uvicorn
-            os.environ["DBAGENT_GATEWAY_CONFIG"] = {cfg_path!r}
-            from gateway.main import build_app
-            app, config, service = build_app({cfg_path!r})
-            class Stub:
-                async def start_investigation(self, event, investigation_id):
-                    return f"investigation-{{investigation_id}}"
-            service._workflow_starter = Stub()
-            uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
-            """
-        )
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(REPO_ROOT / "services" / "gateway") + os.pathsep + str(
-            REPO_ROOT / "libs" / "py" / "rca_common"
+        env["DBAGENT_GATEWAY_CONFIG"] = cfg_path
+        env["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(_PROFILE_PATH.parent),
+                str(REPO_ROOT / "services" / "gateway"),
+                str(REPO_ROOT / "libs" / "py" / "rca_common"),
+            ]
         )
         proc = subprocess.Popen(
-            [sys.executable, "-c", child_src],
+            [sys.executable, str(_PROFILE_PATH), "--host", "127.0.0.1", "--port", str(port)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -354,6 +337,13 @@ def b1_reference_run():
             assert httpx.get(health, timeout=5).status_code == 200
             platform_online = True
 
+            # FP-IG-22: wait for the classified serving tree before any CPU read.
+            workers_pre: set[int]
+            trackers_pre: set[int]
+            trackers_pre, workers_pre = b1.wait_for_classified_workers(
+                proc.pid, workers=b1.INGEST_GATEWAY_WORKERS
+            )
+
             warmup = _build_requests(1)[0]
             prologue = _build_requests(b1.PROLOGUE_REQUESTS)
             measured = _build_requests(b1.TOTAL_REQUESTS)
@@ -363,7 +353,7 @@ def b1_reference_run():
 
             def _after_prologue() -> None:
                 # Snapshot AFTER unmeasured prologue so CPU/audit exclude it (C2).
-                marks["cpu_before"] = _cpu_seconds(proc.pid)
+                marks["cpu_before"] = b1.tree_cpu_seconds(proc.pid)
                 engine_p = make_engine(dsn)
                 sf_p = make_session_factory(engine_p)
                 with sf_p() as session:
@@ -392,12 +382,17 @@ def b1_reference_run():
                     on_prologue_complete=_after_prologue,
                 )
             )
-            cpu_after = _cpu_seconds(proc.pid)
+            cpu_after = b1.tree_cpu_seconds(proc.pid)
             cpu_before = float(marks.get("cpu_before", cpu_after))
+            span = result.t_last_complete - result.due0
             cpu_ms = (
                 (cpu_after - cpu_before) * 1000.0 / result.served if result.served else float("inf")
             )
-            alive = proc.poll() is None
+            cpu_cores_used = (cpu_after - cpu_before) / span if span > 0 else 0.0
+            trackers_post, workers_post = b1.classify_tree(proc.pid)
+            worker_set_ok = (
+                trackers_post == trackers_pre and workers_post == workers_pre
+            )
 
             # committed count of the measured window only
             engine = make_engine(dsn)
@@ -424,11 +419,17 @@ def b1_reference_run():
             med_a, med_b = b1.half_window_medians(result.latencies_ms)
             fingerprint_line = (
                 f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
-                f"tier=reference,max_lateness_ms={result.max_lateness_ms:.1f},"
+                f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
+                f"max_lateness_ms={result.max_lateness_ms:.1f},"
                 f"p99_ms={result.p99:.1f},served_rate={result.served_rate:.1f},"
+                f"served={result.served},errors={result.errors},committed={int(committed)},"
+                f"platform_online={1 if platform_online else 0},"
+                f"workers_pre={b1.format_pid_list(workers_pre)},"
+                f"workers_post={b1.format_pid_list(workers_post)},"
                 f"median_lateness_a_ms={med_a:.1f},median_lateness_b_ms={med_b:.1f},"
                 f"lateness_drift_ms={result.lateness_drift_ms:.1f},"
-                f"cpu_ms_per_req={cpu_ms:.3f},basis_ms_per_req={basis},"
+                f"cpu_ms_per_req={cpu_ms:.3f},cpu_cores_used={cpu_cores_used:.2f},"
+                f"basis_ms_per_req={basis},"
                 f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog}"
             )
             print(fingerprint_line, flush=True)
@@ -437,7 +438,11 @@ def b1_reference_run():
                 "result": result,
                 "committed": int(committed),
                 "cpu_ms_per_request": cpu_ms,
-                "alive": alive,
+                "cpu_cores_used": cpu_cores_used,
+                "alive": proc.poll() is None,
+                "worker_set_ok": worker_set_ok,
+                "workers_pre": workers_pre,
+                "workers_post": workers_post,
                 "fingerprint": fingerprint_line,
                 "host": fp,
                 "platform_online": platform_online,
@@ -494,7 +499,11 @@ def test_b1_ingest_burst_reference_profile(b1_reference_run):
     assert max_in_flight < MAX_IN_FLIGHT, (
         f"max_in_flight={max_in_flight} hit ceiling; harness was binding"
     )
-    assert b1_reference_run["alive"], "gateway child exited during burst"
+    assert b1_reference_run["worker_set_ok"], (
+        f"worker set changed or under-populated; "
+        f"pre={sorted(b1_reference_run['workers_pre'])} "
+        f"post={sorted(b1_reference_run['workers_post'])}"
+    )
 
 
 def test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis(b1_reference_run):
@@ -506,3 +515,195 @@ def test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis(b1_referenc
         f"cpu_ms_per_request={measured} exceeds basis={basis}; "
         f"{b1_reference_run['fingerprint']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# UT-IG-9 / FP-IG-22 — process-tree CPU reader and classified integrity
+# Against the unfixed single-pid four-field /proc read: red (grandchild burn
+# is invisible; poll() is None accepts a respawned or under-populated tree).
+# ---------------------------------------------------------------------------
+
+
+def _spawn(src: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", src],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def test_cpu_accounting_sums_the_whole_process_tree():
+    """FP-IG-22: tree sum sees a grandchild's burn; a single-pid read does not."""
+    src = textwrap.dedent(
+        """
+        import os, time
+        def burn():
+            t = time.time() + 0.4
+            x = 0
+            while time.time() < t:
+                x += 1
+        if os.fork() == 0:
+            burn()
+            os._exit(0)
+        time.sleep(2)
+        """
+    )
+    proc = _spawn(src)
+    try:
+        time.sleep(0.15)
+        single = b1.pid_cpu_seconds(proc.pid)
+        tree = b1.tree_cpu_seconds(proc.pid)
+        # Parent sleeps; grandchild burns. Tree must exceed the parent.
+        assert tree > single + 0.05, (
+            f"tree={tree:.3f}s single={single:.3f}s — unfixed single-pid "
+            "reader cannot see the grandchild (UT-IG-9 discriminating pair)"
+        )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+
+def test_worker_set_identity_changes_when_a_grandchild_is_replaced():
+    """Identity: a replaced grandchild between reads changes the reported set."""
+    src = textwrap.dedent(
+        """
+        import os, signal, time, sys
+        kids = []
+        for _ in range(2):
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(30)
+                os._exit(0)
+            kids.append(pid)
+        sys.stdout.write("ready\\n")
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        os.kill(kids[0], signal.SIGKILL)
+        os.waitpid(kids[0], 0)
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        sys.stdout.write("replaced\\n")
+        sys.stdout.flush()
+        time.sleep(30)
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", src],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        first = set(b1.iter_live_descendants(proc.pid))
+        assert len(first) >= 2, first
+        proc.stdin.write("go\n")
+        proc.stdin.flush()
+        assert proc.stdout.readline().strip() == "replaced"
+        second = set(b1.iter_live_descendants(proc.pid))
+        assert first != second, (
+            f"replaced grandchild left the descendant set unchanged: {first}"
+        )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+
+def test_cardinality_precondition_rejects_stable_underpopulated_tree():
+    """A tree stable at W-1 grandchildren fails the pre-snapshot wait.
+
+    Red only with the cardinality precondition present (errata pass 9, D3).
+    """
+    n = b1.INGEST_GATEWAY_WORKERS - 1
+    src = textwrap.dedent(
+        f"""
+        import os, time
+        for _ in range({n}):
+            if os.fork() == 0:
+                time.sleep(30)
+                os._exit(0)
+        time.sleep(30)
+        """
+    )
+    proc = _spawn(src)
+    try:
+        time.sleep(0.2)
+        try:
+            b1.wait_for_classified_workers(
+                proc.pid, workers=b1.INGEST_GATEWAY_WORKERS, timeout_s=0.6
+            )
+        except TimeoutError as exc:
+            msg = str(exc)
+            assert "workers" in msg
+        else:
+            raise AssertionError(
+                "stable W-1 tree must fail the cardinality wait; "
+                "pid-set equality alone would accept it"
+            )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+
+def test_classification_rejects_tracker_shaped_helper_in_worker_count():
+    """W-1 worker-shaped grandchildren + one tracker-shaped helper.
+
+    Raw descendant count is W; classified worker count is W-1. Red only
+    with cmdline classification present (errata pass 11, D1).
+    """
+    w = b1.INGEST_GATEWAY_WORKERS
+    src = textwrap.dedent(
+        f"""
+        import os, sys, time
+        # tracker-shaped helper
+        if os.fork() == 0:
+            sys.argv = ["python", "-c", "from multiprocessing.resource_tracker import main; main(0)"]
+            time.sleep(30)
+            os._exit(0)
+        for _ in range({w - 1}):
+            if os.fork() == 0:
+                sys.argv = ["python", "-c", "from multiprocessing.spawn import spawn_main"]
+                time.sleep(30)
+                os._exit(0)
+        time.sleep(30)
+        """
+    )
+    # cmdline is what classify_tree reads, not sys.argv of the parent.
+    # Rewrite: exec a dummy that puts the mark in /proc/pid/cmdline.
+    src = textwrap.dedent(
+        f"""
+        import os, sys, time
+        def child(mark):
+            os.execv(sys.executable, [sys.executable, "-c",
+                "import time; time.sleep(30)  # " + mark])
+        if os.fork() == 0:
+            child("multiprocessing.resource_tracker")
+        for _ in range({w - 1}):
+            if os.fork() == 0:
+                child("multiprocessing.spawn")
+        time.sleep(30)
+        """
+    )
+    proc = _spawn(src)
+    try:
+        time.sleep(0.25)
+        trackers, workers = b1.classify_tree(proc.pid)
+        raw = len(b1.iter_live_descendants(proc.pid))
+        assert len(trackers) == 1, trackers
+        assert len(workers) == w - 1, workers
+        assert raw == w, f"raw count {raw} want {w}"
+        try:
+            b1.wait_for_classified_workers(proc.pid, workers=w, timeout_s=0.5)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError(
+                "W-1 workers + tracker must fail classified wait; "
+                "a raw count of W would accept it"
+            )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)

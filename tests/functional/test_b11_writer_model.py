@@ -68,13 +68,14 @@ SHARED_LIB_ROOT = "libs/py/rca_common/"
 # --------------------------------------------------------------------------
 
 EXPECTED_CONCURRENCY_MODEL = {
-    "writers": 4,
+    "writers": 7,
     "pool": "per-writer-independent",
     "pool_widening": "none",
     "durability": "stock",
     "writer_processes": [
         {
             "process": "ingest-gateway",
+            "processes": 4,
             "tables": ["audit_log"],
             "call_sites": [
                 {
@@ -88,6 +89,7 @@ EXPECTED_CONCURRENCY_MODEL = {
         },
         {
             "process": "dashboard-api",
+            "processes": 1,
             "tables": ["audit_log"],
             "call_sites": [
                 {
@@ -101,6 +103,7 @@ EXPECTED_CONCURRENCY_MODEL = {
         },
         {
             "process": "probe-gateway",
+            "processes": 1,
             "tables": ["audit_log"],
             "call_sites": [
                 {
@@ -114,6 +117,7 @@ EXPECTED_CONCURRENCY_MODEL = {
         },
         {
             "process": "temporal-worker",
+            "processes": 1,
             "tables": ["audit_log", "llm_calls"],
             "call_sites": [
                 {
@@ -684,11 +688,17 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     \"\"\"Combined audit + llm_calls insert rate under durable Postgres.
 
     Writer count and mapping come from B11's structured concurrency_model
-    (design.md §11.1.3 / FP-M6-22): four processes in the default deployment,
-    each with an independent make_engine-default pool. Threads proxy processes.
+    (design.md §11.1.3 / FP-M6-22 / FP-IG-21): four writer *services*, seven
+    process *instances* in the default deployment, each with an independent
+    make_engine-default pool. Threads proxy process instances.
     \"\"\"
     dsn = scale_pg["dsn"]
     writers = load_b11_writer_model()
+    instances = [
+        (entry, i)
+        for entry in writers
+        for i in range(entry["processes"])
+    ]
     n_iters = 800
     now = datetime.now(timezone.utc)
 
@@ -697,7 +707,7 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     engines = []
     factories = []
     stores = []
-    for _ in writers:
+    for _ in instances:
         eng = make_engine(dsn)
         fac = make_session_factory(eng)
         with eng.connect() as conn:
@@ -715,7 +725,7 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         \"\"\"
         factory = factories[idx]
         store = stores[idx]
-        process = writers[idx]["process"]
+        process = instances[idx][0]["process"]
         rows = 0
         with factory() as session:
             for i in range(n_iters):
@@ -750,12 +760,14 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         return rows
 
     writer_map = ",".join(
-        f"{w['process']}:{'+'.join(w['tables'])}" for w in writers
+        f"{(entry['process'] + '#' + str(i)) if entry['process'] == 'ingest-gateway' else entry['process']}"
+        f":{'+'.join(entry['tables'])}"
+        for entry, i in instances
     )
 
     def _warmup(idx: int) -> None:
         factory = factories[idx]
-        process = writers[idx]["process"]
+        process = instances[idx][0]["process"]
         with factory() as session:
             for i in range(50):
                 write_audit(
@@ -767,11 +779,11 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
                 session.commit()
 
     # Pool created and warmed outside the timed window.
-    pool = ThreadPoolExecutor(max_workers=len(writers))
+    pool = ThreadPoolExecutor(max_workers=len(instances))
     try:
-        list(pool.map(_warmup, range(len(writers))))
+        list(pool.map(_warmup, range(len(instances))))
         t0 = time.perf_counter()
-        committed = list(pool.map(_run_writer, range(len(writers))))
+        committed = list(pool.map(_run_writer, range(len(instances))))
         elapsed = time.perf_counter() - t0
     finally:
         pool.shutdown(wait=True)
@@ -800,13 +812,13 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         f"serial_commit_ms={serial_commit_ms:.3f},"
         f"combined_over_single={combined_over_single:.2f}"
     )
-    print(f"B11 writers={len(writers)}")
+    print(f"B11 writers={len(instances)}")
     print(f"B11 writer_map={writer_map}")
     print(f"B11 single_writer_rate={single_writer_rate:.1f}/s")
     print(env_line)
     assert rate >= 1000.0, (
         f"B11 combined insert rate={rate:.1f}/s (threshold 1000); "
-        f"B11 writers={len(writers)}; B11 writer_map={writer_map}; "
+        f"B11 writers={len(instances)}; B11 writer_map={writer_map}; "
         f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"
     )
 """
@@ -1613,11 +1625,33 @@ def check_L3(conftest_path: Path, thresholds_path: Path) -> None:
         "EXPECTED_CONCURRENCY_MODEL literal — a matched manifest-and-loader edit "
         "still fails here",
     )
+    expected_names = [e["process"] for e in EXPECTED_CONCURRENCY_MODEL["writer_processes"]]
+    got_names = [e.get("process") for e in out["returned"]]
     _require(
-        len(out["returned"]) == out["writers"] == EXPECTED_CONCURRENCY_MODEL["writers"],
+        got_names == expected_names,
         "L3",
-        f"writers={out['writers']} but the loader returned "
-        f"{len(out['returned'])} elements",
+        f"writer_processes must be the four named entries {expected_names}; "
+        f"got {got_names}",
+    )
+    proc_counts: list[int] = []
+    for entry in out["returned"]:
+        _require(
+            "processes" in entry,
+            "L3",
+            "every writer_processes entry must carry an explicit int "
+            "processes >= 1 (no default, no .get fallback)",
+        )
+        n = entry["processes"]
+        _require(
+            type(n) is int and not isinstance(n, bool) and n >= 1,
+            "L3",
+            f"processes must be int >= 1, got {n!r}",
+        )
+        proc_counts.append(n)
+    _require(
+        sum(proc_counts) == out["writers"] == EXPECTED_CONCURRENCY_MODEL["writers"],
+        "L3",
+        f"writers={out['writers']} but Σ processes={sum(proc_counts)}",
     )
 
 
@@ -1665,6 +1699,62 @@ def check_W2(src: str) -> None:
     target = loads[0].targets[0]
     assert isinstance(target, ast.Name)
     width = target.id
+
+    def _is_processes_range(node: ast.AST, entry_name: str) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "range"
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Subscript)
+            and isinstance(node.args[0].value, ast.Name)
+            and node.args[0].value.id == entry_name
+            and isinstance(node.args[0].slice, ast.Constant)
+            and node.args[0].slice.value == "processes"
+        )
+
+    expansions = []
+    for n in ast.walk(b11):
+        if not (
+            isinstance(n, ast.Assign)
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name)
+            and isinstance(n.value, ast.ListComp)
+        ):
+            continue
+        gens = n.value.generators
+        if (
+            len(gens) == 2
+            and not gens[0].ifs
+            and not gens[1].ifs
+            and isinstance(gens[0].iter, ast.Name)
+            and gens[0].iter.id == width
+            and isinstance(gens[0].target, ast.Name)
+            and _is_processes_range(gens[1].iter, gens[0].target.id)
+        ):
+            expansions.append(n)
+    _require(
+        len(expansions) == 1,
+        "W2",
+        "expected exactly one expansion assignment — a single list "
+        f"comprehension over {width} whose inner iterator is "
+        "range(entry[\"processes\"]) and nothing else",
+    )
+    expansion = expansions[0].targets[0]
+    assert isinstance(expansion, ast.Name)
+    instances = expansion.id
+    exp_rebindings = [
+        (name, kind)
+        for name, kind, _node in collect_binding_occurrences(b11)
+        if name == instances
+    ]
+    _require(
+        len(exp_rebindings) == 1,
+        "W2",
+        f"{instances!r} is bound {len(exp_rebindings)} times; it may be bound "
+        "only by the expansion",
+    )
 
     rebindings = [
         (name, kind)
@@ -1729,10 +1819,10 @@ def check_W2(src: str) -> None:
         and len(max_workers.args) == 1
         and not max_workers.keywords
         and isinstance(max_workers.args[0], ast.Name)
-        and max_workers.args[0].id == width,
+        and max_workers.args[0].id == instances,
         "W2",
-        f"max_workers must be exactly len({width}); arithmetic on the derived "
-        "width is unwritable",
+        f"max_workers must be exactly len({instances}) (the expansion), not "
+        f"len({width}); arithmetic on the derived width is unwritable",
     )
     _require(
         any(n is executor for n in ast.walk(b11)),
@@ -1745,14 +1835,14 @@ def check_W2(src: str) -> None:
         for n in ast.walk(b11)
         if isinstance(n, (ast.For, ast.AsyncFor))
         and isinstance(n.iter, ast.Name)
-        and n.iter.id == width
+        and n.iter.id == instances
     ]
     engine_comps = [
         n
         for n in ast.walk(b11)
         if isinstance(n, ast.comprehension)
         and isinstance(n.iter, ast.Name)
-        and n.iter.id == width
+        and n.iter.id == instances
         and any(
             isinstance(c, ast.Call) and _callee_name(c) == "make_engine"
             for c in ast.walk(n)
@@ -1762,7 +1852,7 @@ def check_W2(src: str) -> None:
     _require(
         len(builders) >= 1,
         "W2",
-        f"the engine list must be built by one iteration over {width}",
+        f"the engine list must be built by one iteration over {instances}",
     )
     engine_builders = [
         b
@@ -1775,7 +1865,7 @@ def check_W2(src: str) -> None:
     _require(
         len(engine_builders) == 1,
         "W2",
-        f"exactly one iteration over {width} may construct engines, found "
+        f"exactly one iteration over {instances} may construct engines, found "
         f"{len(engine_builders)}",
     )
     engine_calls = [
@@ -1831,7 +1921,7 @@ def check_W2(src: str) -> None:
         f"the pool name {pool_name!r} must be bound exactly once, to the "
         f"checked ThreadPoolExecutor constructor; found {pool_bindings}",
     )
-    _check_w2_measured_rate(b11, width, pool_name)
+    _check_w2_measured_rate(b11, instances, pool_name)
 
 
 def _is_perf_counter_call(node: ast.AST) -> bool:
@@ -3251,7 +3341,8 @@ def test_b11_declares_exactly_four_writer_processes_matching_shipped_code():
         tables.update(wp["tables"])
         for site in wp["call_sites"]:
             check_call_site(site, wp["process"], REPO_ROOT)
-    assert model["writers"] == len(model["writer_processes"]) == 4
+    assert len(model["writer_processes"]) == 4
+    assert model["writers"] == sum(wp["processes"] for wp in model["writer_processes"]) == 7
     assert tables == {"audit_log", "llm_calls"}
     assert {
         wp["process"] for wp in model["writer_processes"] if "llm_calls" in wp["tables"]
@@ -3442,8 +3533,8 @@ def _bypass_pool_rebound_to_fake(root: Path) -> None:
     _replace(
         root,
         TIER_BENCH,
-        "    pool = ThreadPoolExecutor(max_workers=len(writers))\n",
-        "    pool = ThreadPoolExecutor(max_workers=len(writers))\n"
+        "    pool = ThreadPoolExecutor(max_workers=len(instances))\n",
+        "    pool = ThreadPoolExecutor(max_workers=len(instances))\n"
         "    class _FakePool:\n"
         "        def map(self, fn, indexes):\n"
         "            return [800 for _ in indexes]\n"
@@ -3839,8 +3930,38 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
             lambda root: _replace(
                 root,
                 "tests/benchmark/thresholds.yaml",
-                "    writers: 4\n",
+                "    writers: 7\n",
                 "    writers: 8\n",
+            ),
+            lambda root: check_L3(
+                root / TIER_CONFTEST, root / "tests" / "benchmark" / "thresholds.yaml"
+            ),
+        ),
+    )
+    add(
+        "manifest_processes_sum_not_writers",
+        "L3",
+        _seeded(
+            lambda root: _replace(
+                root,
+                "tests/benchmark/thresholds.yaml",
+                "        processes: 4\n",
+                "        processes: 3\n",
+            ),
+            lambda root: check_L3(
+                root / TIER_CONFTEST, root / "tests" / "benchmark" / "thresholds.yaml"
+            ),
+        ),
+    )
+    add(
+        "manifest_entry_missing_processes_key",
+        "L3",
+        _seeded(
+            lambda root: _replace(
+                root,
+                "tests/benchmark/thresholds.yaml",
+                "      - process: dashboard-api\n        processes: 1\n",
+                "      - process: dashboard-api\n",
             ),
             lambda root: check_L3(
                 root / TIER_CONFTEST, root / "tests" / "benchmark" / "thresholds.yaml"
@@ -3855,11 +3976,20 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         )
 
     add(
+        "width_executor_bound_to_loader_len",
+        "W2",
+        bench_case(
+            "max_workers=len(instances)",
+            "max_workers=len(writers)",
+            lambda root: check_W2(_bench_src(root)),
+        ),
+    )
+    add(
         "width_arithmetic",
         "W2",
         bench_case(
-            "max_workers=len(writers)",
-            "max_workers=len(writers) * 2",
+            "max_workers=len(instances)",
+            "max_workers=len(instances) * 2",
             lambda root: check_W2(_bench_src(root)),
         ),
     )
@@ -3876,7 +4006,7 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "width_zero_executors_serialized_writers",
         "W2",
         bench_case(
-            "    pool = ThreadPoolExecutor(max_workers=len(writers))",
+            "    pool = ThreadPoolExecutor(max_workers=len(instances))",
             "    pool = None",
             lambda root: check_W2(_bench_src(root)),
         ),
@@ -3885,8 +4015,8 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "width_shared_engine_for_every_writer",
         "W2",
         bench_case(
-            "    for _ in writers:\n        eng = make_engine(dsn)",
-            "    eng = make_engine(dsn)\n    for _ in writers:",
+            "    for _ in instances:\n        eng = make_engine(dsn)",
+            "    eng = make_engine(dsn)\n    for _ in instances:",
             lambda root: check_W2(_bench_src(root)),
         ),
     )
@@ -3897,8 +4027,8 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "width_serial_substitution_for_the_map_call",
         "W2",
         bench_case(
-            "        committed = list(pool.map(_run_writer, range(len(writers))))",
-            "        committed = [_run_writer(i) for i in range(len(writers))]",
+            "        committed = list(pool.map(_run_writer, range(len(instances))))",
+            "        committed = [_run_writer(i) for i in range(len(instances))]",
             lambda root: check_W2(_bench_src(root)),
         ),
     )
@@ -3907,7 +4037,7 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "W2",
         bench_case(
             "        elapsed = time.perf_counter() - t0",
-            "        elapsed = (time.perf_counter() - t0) / len(writers)",
+            "        elapsed = (time.perf_counter() - t0) / len(instances)",
             lambda root: check_W2(_bench_src(root)),
         ),
     )
@@ -3915,8 +4045,8 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "width_executor_results_left_lazy",
         "W2",
         bench_case(
-            "        committed = list(pool.map(_run_writer, range(len(writers))))",
-            "        committed = pool.map(_run_writer, range(len(writers)))",
+            "        committed = list(pool.map(_run_writer, range(len(instances))))",
+            "        committed = pool.map(_run_writer, range(len(instances)))",
             lambda root: check_W2(_bench_src(root)),
         ),
     )
@@ -3924,7 +4054,7 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "width_writer_index_set_shrunk",
         "W2",
         bench_case(
-            "pool.map(_run_writer, range(len(writers)))",
+            "pool.map(_run_writer, range(len(instances)))",
             "pool.map(_run_writer, range(1))",
             lambda root: check_W2(_bench_src(root)),
         ),
@@ -4619,7 +4749,7 @@ def _bypass_zero_executors(root: Path) -> None:
     _replace(
         root,
         TIER_BENCH,
-        "    pool = ThreadPoolExecutor(max_workers=len(writers))",
+        "    pool = ThreadPoolExecutor(max_workers=len(instances))",
         "    pool = None",
     )
 
@@ -4690,10 +4820,10 @@ def _bypass_serial_writers_with_forged_elapsed(root: Path) -> None:
     _replace(
         root,
         TIER_BENCH,
-        "        committed = list(pool.map(_run_writer, range(len(writers))))\n"
+        "        committed = list(pool.map(_run_writer, range(len(instances))))\n"
         "        elapsed = time.perf_counter() - t0",
-        "        committed = [_run_writer(i) for i in range(len(writers))]\n"
-        "        elapsed = (time.perf_counter() - t0) / len(writers)",
+        "        committed = [_run_writer(i) for i in range(len(instances))]\n"
+        "        elapsed = (time.perf_counter() - t0) / len(instances)",
     )
 
 

@@ -74,6 +74,10 @@ secrets:
 
 ingestGateway:
   replicaCount: 1
+  # FP-IG-20: worker count is the reference environment's core count (§14.4
+  # = 4). One uvicorn event loop per core inside the single replica; not a
+  # uvicorn default and not replicaCount (which stays 1).
+  workers: 4
   service:
     type: ClusterIP
     nodePort: null
@@ -98,14 +102,26 @@ ingestGateway:
   #   run3: 2.205 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
   #   run4: 2.102 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
   #   run5: 2.096 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
-  # basis = 2.205 + (2.205 − 1.983) = 2.427 ms/req. Signature cpus=16 (not the
-  # §14.4 reference 4); CI ubuntu-latest re-derivation may replace this.
+  # basis = 2.205 + (2.205 − 1.983) = 2.427 ms/req. VOID as provenance
+  # (FP-IG-23/Z): every recorded run failed B1 clauses, reached MAX_IN_FLIGHT,
+  # and carried cpus=16 (not §14.4's reference 4). observations stays empty
+  # until five valid CI benchmark-job runs at this change's head are recorded
+  # — do not fabricate runIds. signature.cpus/workers name the required
+  # collection identity; they do not re-certify the void 2.427 figure.
   sizingBasis:
     cpuMsPerRequest: 2.427
+    signature:
+      cpus: 4
+      cpuModel: ""
+      image: ""
+      workers: 4
+    observations: []
   resources:
-    # ceil(2.427 × 200) = 486m; limits = 5 × requests
-    requests: { cpu: 486m, memory: 128Mi }
-    limits: { cpu: 2430m, memory: 512Mi }
+    # ceil(2.427 × 200) = 486m; limits = 5 × requests (CPU still from the
+    # void basis until five valid runs are recorded). Memory is W × the
+    # shipped per-process 128Mi / 512Mi (copied, not derived — §11.3.3 X).
+    requests: { cpu: 486m, memory: 512Mi }
+    limits: { cpu: 2430m, memory: 2Gi }
 
 temporalWorker:
   replicaCount: 1

@@ -170,7 +170,7 @@ EXPECTED_NEEDS_GRAPH: dict[str, tuple[str, ...]] = {
     ),
     "benchmark": ("functional",),
     "images": ("lint",),
-    "e2e": ("benchmark",),
+    "e2e": ("functional",),
 }
 assert set(EXPECTED_NEEDS_GRAPH) == EXPECTED_CI_JOBS
 
@@ -353,7 +353,8 @@ _BRACED_PARAM_RE = re.compile(
 CONDITIONAL_JOBS = {
     "e2e": (
         "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || "
-        "startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request'"
+        "startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' || "
+        "github.ref == 'refs/heads/main'"
     ),
 }
 CONDITIONAL_STEPS = {
@@ -3464,7 +3465,7 @@ def test_threshold_assertion_fixture_count():
     assert len(THRESHOLD_ASSERTION_FIXTURES) == 38
     assert len(THRESHOLD_ASSERTION_POSITIVE_CONTROLS) == 14
     assert len(LINK_LOOP_FIXTURES) == 9
-    assert len(CI_PIN_FIXTURES) == 104
+    assert len(CI_PIN_FIXTURES) == 106
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -4048,6 +4049,20 @@ def _ci_pin_workflow_cases():
         lambda wf: wf["jobs"]["benchmark"].__setitem__("needs", "lint"),
     )
     add(
+        "e2e_needs_rewired_back_to_benchmark",
+        "needs_graph_drift",
+        lambda wf: wf["jobs"]["e2e"].__setitem__("needs", "benchmark"),
+    )
+    add(
+        "e2e_if_drops_main_push_clause",
+        "step_envelope_drift",
+        lambda wf: wf["jobs"]["e2e"].__setitem__(
+            "if",
+            "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || "
+            "startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request'",
+        ),
+    )
+    add(
         "guard_job_gains_a_job_level_condition",
         "step_envelope_drift",
         lambda wf: wf["jobs"]["manifest-guard"].__setitem__(
@@ -4395,5 +4410,6 @@ def test_b1_entry_matches_its_declared_contract():
         "nested",
         "open-loop",
         "MAX_IN_FLIGHT",
+        "workers=4",
     ):
         assert clause in notes, f"B1 notes missing {clause!r}"

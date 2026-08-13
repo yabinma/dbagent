@@ -15,7 +15,7 @@ All control-plane Python services load one YAML file (Appendix E) with `${ENV_VA
 - `signing` / `signing.backend` / `signing.key_path` / `signing.rotation_grace_seconds` / `signing.allow_ephemeral`
 - `storage` / `storage.postgres_dsn` / `storage.s3_endpoint` / `storage.s3_bucket` / `storage.s3_access_key` / `storage.s3_secret_key`
 - `model_gateway` / `model_gateway.url` / `model_gateway.master_key`
-- `temporal` / `temporal.address` / `temporal.namespace`
+- `temporal` / `temporal.address` / `temporal.namespace` / `temporal.task_queue`
 - `ingest` / `ingest.sources` / `ingest.correlation_window_seconds`
 - `raw_commands` / `raw_commands.policy` / `raw_commands.timeout_seconds` / `raw_commands.max_output_bytes`
 - `probe_gateway` / `probe_gateway.url` / `probe_gateway.timeout_seconds`

@@ -55,6 +55,52 @@ def test_build_llm_client_defaults_to_owned_http_client():
 
 
 @pytest.mark.asyncio
+async def test_run_worker_polls_the_configured_task_queue(monkeypatch):
+    """W1 / FP-IG-25: a non-default temporal.task_queue reaches Worker().
+
+    Against the hardcoded ``TASK_QUEUE = "rca-worker"`` form this is red —
+    the gateway starts workflows on the configured queue while the worker
+    still polls the constant, and investigations are silently stranded.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeWorker:
+        def __init__(self, client, *, task_queue, workflows, activities):
+            captured["task_queue"] = task_queue
+
+        async def run(self):
+            return None
+
+    monkeypatch.setattr(worker_main, "Worker", FakeWorker)
+    monkeypatch.setattr(worker_main, "build_llm_client", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        worker_main, "build_investigation_activities", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(worker_main, "investigation_activity_list", lambda *_a, **_k: [])
+
+    class FakeDemo:
+        generate = None
+
+        def __init__(self, _llm):
+            pass
+
+    monkeypatch.setattr(worker_main, "LLMDemoActivities", FakeDemo)
+
+    config = _config(
+        temporal={
+            "address": "localhost:7233",
+            "namespace": "default",
+            "task_queue": "non-default-queue",
+        }
+    )
+    await run_worker(config, client=object())
+    assert captured.get("task_queue") == "non-default-queue", (
+        f"worker polled {captured.get('task_queue')!r}; "
+        "a hardcoded TASK_QUEUE ignores temporal.task_queue"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_worker_starts_and_hosts_ping_workflow_against_injected_client():
     """Exercises `run_worker`'s real wiring path (build_llm_client -> Worker
     construction -> `worker.run()`) using an injected time-skipping test

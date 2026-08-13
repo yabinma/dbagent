@@ -28,63 +28,23 @@ temporal:
     assert service is not None
 
 
-def test_main_starts_async(monkeypatch, tmp_path):
+def test_main_invokes_uvicorn_worker_manager(monkeypatch, tmp_path):
     cfg = tmp_path / "config.yaml"
     cfg.write_text("storage:\n  postgres_dsn: 'sqlite:///:memory:'\n")
     monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
+    monkeypatch.setenv("DBAGENT_GATEWAY_WORKERS", "4")
 
     called = {}
 
-    async def fake_async_main():
-        called["ok"] = True
+    def fake_run(app, **kwargs):
+        called["app"] = app
+        called["kwargs"] = kwargs
 
-    monkeypatch.setattr(main_mod, "_async_main", fake_async_main)
+    monkeypatch.setattr(main_mod.uvicorn, "run", fake_run)
     main_mod.main()
-    assert called["ok"] is True
-
-
-@pytest.mark.asyncio
-async def test_async_main_wires_starter(monkeypatch, tmp_path):
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(
-        """
-storage:
-  postgres_dsn: "sqlite:///:memory:"
-ingest:
-  sources:
-    - {name: manual, secret: s}
-temporal:
-  address: localhost:7233
-  namespace: default
-"""
-    )
-    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
-    monkeypatch.setenv("DBAGENT_GATEWAY_PORT", "0")
-
-    class FakeClient:
-        pass
-
-    async def fake_connect(*a, **k):
-        return FakeClient()
-
-    served = {}
-
-    class FakeServer:
-        async def serve(self):
-            served["ok"] = True
-
-    class FakeConfig:
-        def __init__(self, app, host, port, log_level="info"):
-            self.app = app
-            self.host = host
-            self.port = port
-
-    monkeypatch.setattr("gateway.main.Client.connect", fake_connect)
-    monkeypatch.setattr("gateway.main.uvicorn.Config", FakeConfig)
-    monkeypatch.setattr("gateway.main.uvicorn.Server", lambda cfg: FakeServer())
-
-    await main_mod._async_main()
-    assert served["ok"] is True
+    assert called["app"] == "gateway.main:create_worker_app"
+    assert called["kwargs"]["factory"] is True
+    assert called["kwargs"]["workers"] == 4
 
 
 @pytest.mark.asyncio

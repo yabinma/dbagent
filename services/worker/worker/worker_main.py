@@ -156,13 +156,14 @@ async def run_worker(config: AppConfig, *, client: Client | None = None) -> None
         config.temporal.address, namespace=config.temporal.namespace
     )
 
+    task_queue = config.temporal.task_queue
     worker = Worker(
         temporal_client,
-        task_queue=TASK_QUEUE,
+        task_queue=task_queue,
         workflows=[PingWorkflow, InvestigationWorkflow],
         activities=[echo, llm_demo.generate, *investigation_activity_list(inv_acts)],
     )
-    logger.info("worker starting: task_queue=%s temporal=%s", TASK_QUEUE, config.temporal.address)
+    logger.info("worker starting: task_queue=%s temporal=%s", task_queue, config.temporal.address)
     await worker.run()
 
 

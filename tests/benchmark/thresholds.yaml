@@ -10,7 +10,7 @@ benchmarks:
   - services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path
   - tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile
   - services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile
-  notes: "In-process micro-benchmark of the HMAC verify + normalize + fingerprint hot path    \ (services/gateway/tests/test_hmac_auth.py). The full 5x-burst 30s profile with real    \ HTTP and PG dedup lookup is measured of record by the CI benchmark job via    \ services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile    \ (open-loop 1000 req/s for 30 s; asserts served+errors==offered, errors==0, served==offered,    \ due-time p99<150ms, committed==served, served_rate>=SUSTAINED_FLOOR=200, platform ONLINE),    \ because section 14.4's reference environment excludes a nested scheduler and the e2e job    \ runs inside kind. A green nested run is a sufficient demonstration; a red one is not a    \ refutation. The e2e link (tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile) exercises    \ the sustained profile (open-loop baseline at 200 req/s) and a closed-loop saturation phase    \ against the shipped image and chart with real kubelet probes, asserting completion/p99/accounting    \ and 0 restarts / no Unhealthy events — no rate comparison at the baseline (the floor's    \ assertion of record is the reference tier). max_lateness_ms is a reported diagnostic rather    \ than a bar. Beyond the floor a finite-window burst certifies no sustained served-rate figure    \ near the offered 1000/s. Profile: open-loop, due-time latency, MAX_IN_FLIGHT=BURST_RATE,    \ unmeasured prologue, no environment knob. Sizing basis for ingestGateway is max+(max-min)    \ over five consecutive runs of cpu_ms_per_request after C2 (disjoint warmup/prologue):    \ 2.031, 1.983, 2.205, 2.102, 2.096 ms/req → basis 2.427; fingerprint    \ cpus=16,cpu_model=11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz,image=os-release:01af466feb100306    \ (same on all five). Signature cpus≠§14.4 reference 4; CI may re-derive."
+  notes: "In-process micro-benchmark of the HMAC verify + normalize + fingerprint hot path    \ (services/gateway/tests/test_hmac_auth.py). The full 5x-burst 30s profile with real    \ HTTP and PG dedup lookup is measured of record by the CI benchmark job via    \ services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile    \ (open-loop 1000 req/s for 30 s; asserts served+errors==offered, errors==0, served==offered,    \ due-time p99<150ms, committed==served, served_rate>=SUSTAINED_FLOOR=200, platform ONLINE),    \ because section 14.4's reference environment excludes a nested scheduler and the e2e job    \ runs inside kind. A green nested run is a sufficient demonstration; a red one is not a    \ refutation. The e2e link (tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile) exercises    \ the sustained profile (open-loop baseline at 200 req/s) and a closed-loop saturation phase    \ against the shipped image and chart with real kubelet probes, asserting completion/p99/accounting    \ and 0 restarts / no Unhealthy events — no rate comparison at the baseline (the floor's    \ assertion of record is the reference tier). max_lateness_ms is a reported diagnostic rather    \ than a bar. Beyond the floor a finite-window burst certifies no sustained served-rate figure    \ near the offered 1000/s. Profile: open-loop, due-time latency, MAX_IN_FLIGHT=BURST_RATE,    \ unmeasured prologue, no environment knob. Serving shape is uvicorn workers=4    \ (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers). Sizing basis for ingestGateway is max+(max-min)    \ over five consecutive runs of cpu_ms_per_request after C2 (disjoint warmup/prologue):    \ 2.031, 1.983, 2.205, 2.102, 2.096 ms/req → basis 2.427; fingerprint    \ cpus=16,cpu_model=11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz,image=os-release:01af466feb100306    \ (same on all five). That basis is void as provenance (cpus=16, clause-failing,    \ ceiling-reaching runs); observations stays empty until five valid CI    \ benchmark-job runs at this head are recorded. Signature cpus≠§14.4 reference 4; CI may re-derive."
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms
@@ -154,21 +154,21 @@ benchmarks:
   - tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput
   notes: "M6 measured the scale-shaped \u22651000 inserts/s bar through the real write_audit + PGTraceStore.insert_llm_call\
     \ against the shared seeded 12-partition fixture (tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput).\
-    \ Writer model: four concurrent writers (one per process that writes these tables in the default\
-    \ single-replica deployment: ingest-gateway, dashboard-api, probe-gateway, temporal-worker), each\
-    \ with an independent unwidened engine at make_engine defaults, stock durability. Combined means\
-    \ the two tables. M1 test_audit.py still covers unit-level write_audit correctness.\
-    \ The 1000/s figure is derived from B1 rather than from this entry: B1 requires\
+    \ Writer model: seven concurrent writer process instances (four services in the\
+    \ default single-replica deployment: ingest-gateway x4, dashboard-api, probe-gateway,\
+    \ temporal-worker), each with an independent unwidened engine at make_engine defaults,\
+    \ stock durability. The input to the topology derivation moved with FP-IG-20\
+    \ (ingest-gateway is four processes); writers is the derived sum, not a tuning knob.\
+    \ Combined means the two tables. M1 test_audit.py still covers unit-level write_audit\
+    \ correctness. The 1000/s figure is derived from B1 rather than from this entry: B1 requires\
     \ the ingest front door to sustain a 5x burst of 200 req/s for 30 s with 0\
     \ errors, and services/gateway/gateway/ingest.py writes exactly one audit_log row\
     \ per ingested alert on three mutually exclusive branches (event_merged:131,\
     \ event_received:200, event_rejected:233), so the storage tier absorbs 1000 audit\
-    \ inserts/s at that burst. Measured with the model as pinned: ~995/s combined at\
-    \ ~500/s single-writer (1.99x scaling, five consecutive runs) on the implementing\
-    \ host, which is the only measurement of the unwidened model so far - the\
-    \ round-3 figure of 1866.6/s at width 4 was taken on the earlier fixture with a\
-    \ shared pool_size=16, max_overflow=16 pool, on a host whose single-writer rate\
-    \ was 484.0/s, so it is not a like-for-like comparison. Per the reference\
+    \ inserts/s at that burst. The recorded ~995/s was measured under the four-writer\
+    \ model and is not comparable with any seven-writer figure (section 14.4 rule 3).\
+    \ The first seven-writer reference measurement is read by the existing B11 branch\
+    \ pair; this pass does not re-measure or re-derive the threshold. Per the reference\
     \ benchmark environment in design section 14.4, the measurement of\
     \ record is the CI benchmark job on ubuntu-latest; an off-reference run is\
     \ diagnostic and cannot re-derive a threshold in either direction. The benchmark\
@@ -177,12 +177,13 @@ benchmarks:
     \ rate, so a storage-class difference and a compute difference between two hosts\
     \ are distinguishable from a log."
   concurrency_model:
-    writers: 4
+    writers: 7
     pool: per-writer-independent
     pool_widening: none
     durability: stock
     writer_processes:
       - process: ingest-gateway
+        processes: 4
         tables: [audit_log]
         call_sites:
           - file: services/gateway/gateway/ingest.py
@@ -191,6 +192,7 @@ benchmarks:
             symbol: write_audit
             expr: "write_audit("
       - process: dashboard-api
+        processes: 1
         tables: [audit_log]
         call_sites:
           - file: services/dashboard-api/dashboard_api/services.py
@@ -199,6 +201,7 @@ benchmarks:
             symbol: write_audit
             expr: "write_audit("
       - process: probe-gateway
+        processes: 1
         tables: [audit_log]
         call_sites:
           - file: services/probe-gateway/internal/gwserver/server.go
@@ -207,6 +210,7 @@ benchmarks:
             symbol: Write
             expr: "audit.Write(ctx, s.AuditDB,"
       - process: temporal-worker
+        processes: 1
         tables: [audit_log, llm_calls]
         call_sites:
           - file: services/worker/worker/activities/investigation.py

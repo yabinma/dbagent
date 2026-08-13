@@ -1,10 +1,10 @@
 """ingest-gateway process entrypoint."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
@@ -55,7 +55,7 @@ def build_app(config_path: str | None = None):
     engine = make_engine(config.storage.postgres_dsn)
     session_factory = make_session_factory(engine)
     secrets = {s.name: s.secret for s in config.ingest.sources}
-    # Workflow starter is attached after Temporal connects in main().
+    # Workflow starter is attached after Temporal connects in create_worker_app().
     service = IngestService(
         session_factory,
         budget_defaults={
@@ -70,21 +70,43 @@ def build_app(config_path: str | None = None):
     return create_app(ingest_service=service, source_secrets=secrets), config, service
 
 
-async def _async_main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    app, config, service = build_app()
-    client = await Client.connect(config.temporal.address, namespace=config.temporal.namespace)
-    service._workflow_starter = TemporalWorkflowStarter(client)
-    host = os.environ.get("DBAGENT_GATEWAY_HOST", "0.0.0.0")
-    port = int(os.environ.get("DBAGENT_GATEWAY_PORT", "8080"))
-    uvicorn_config = uvicorn.Config(app, host=host, port=port, log_level="info")
-    server = uvicorn.Server(uvicorn_config)
-    await server.serve()
+def create_worker_app(config_path: str | None = None):
+    """Factory for uvicorn's worker manager (FP-IG-20 / FP-IG-25).
+
+    Each spawned worker builds its own app and engine via ``build_app()`` and
+    owns its Temporal lifecycle. A connect failure on startup ends the worker
+    the same way it ended the former single process.
+    """
+    app, config, service = build_app(config_path)
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        client = await Client.connect(
+            config.temporal.address, namespace=config.temporal.namespace
+        )
+        service._workflow_starter = TemporalWorkflowStarter(
+            client, task_queue=config.temporal.task_queue
+        )
+        yield
+
+    app.router.lifespan_context = _lifespan
+    return app
 
 
 def main() -> None:
     reject_legacy_env()
-    asyncio.run(_async_main())
+    logging.basicConfig(level=logging.INFO)
+    host = os.environ.get("DBAGENT_GATEWAY_HOST", "0.0.0.0")
+    port = int(os.environ.get("DBAGENT_GATEWAY_PORT", "8080"))
+    workers = int(os.environ.get("DBAGENT_GATEWAY_WORKERS", "4"))
+    uvicorn.run(
+        "gateway.main:create_worker_app",
+        factory=True,
+        workers=workers,
+        host=host,
+        port=port,
+        log_level="info",
+    )
 
 
 if __name__ == "__main__":

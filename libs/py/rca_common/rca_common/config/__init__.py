@@ -90,6 +90,9 @@ class ModelGatewayConfig:
 class TemporalConfig:
     address: str = "localhost:7233"
     namespace: str = "dbagent"
+    # Default coincides with TemporalWorkflowStarter's class default so a
+    # missing key is behaviour-preserving (FP-IG-25).
+    task_queue: str = "rca-worker"
 
 
 @dataclass
@@ -238,6 +241,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     temporal = TemporalConfig(
         address=tm.get("address", "localhost:7233"),
         namespace=tm.get("namespace", "dbagent"),
+        task_queue=tm.get("task_queue", "rca-worker"),
     )
 
     ig = raw.get("ingest") or {}

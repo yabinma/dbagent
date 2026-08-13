@@ -52,14 +52,16 @@ def test_e2e_job_gate_order_and_timeout():
     needs = e2e.get("needs")
     if isinstance(needs, str):
         needs = [needs]
-    assert "benchmark" in needs
-    # if: narrows triggers — e2e runs on every PR targeting main, plus
-    # schedule/workflow_dispatch/tags; no PR-label gate anymore.
+    assert needs == ["functional"]
+    # if: every benchmark-producing event, main-branch pushes included
+    # (FP-IG-24; against the unfixed tree: red on needs: benchmark and on
+    # a four-class condition that omitted refs/heads/main).
     iff = e2e.get("if") or ""
     assert "schedule" in iff
     assert "workflow_dispatch" in iff
     assert "tags" in iff or "refs/tags" in iff
     assert "pull_request" in iff
+    assert "refs/heads/main" in iff
 
 
 # Code review round 5, C8: the worker job ran

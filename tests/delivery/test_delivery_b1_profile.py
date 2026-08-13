@@ -354,6 +354,14 @@ def test_b1_harness_surface_is_pinned_and_environment_independent():
         _assert_timeout_constants_pinned(path, assigns)
         text = path.read_text(encoding="utf-8")
         assert "E2E_B1_CONCURRENCY" not in text
+        if path == REF_PATH:
+            assert "INGEST_GATEWAY_WORKERS" in assigns, (
+                "reference profile missing INGEST_GATEWAY_WORKERS"
+            )
+            node = assigns["INGEST_GATEWAY_WORKERS"]
+            assert isinstance(node, ast.Constant) and node.value == 4, (
+                f"INGEST_GATEWAY_WORKERS={getattr(node, 'value', node)}"
+            )
         assert not _has_environ_read(path), f"{path} reads os.environ/getenv"
         _assert_httpx_fully_pinned(path, text)
         _assert_phase_capacity_bindings(path, text)

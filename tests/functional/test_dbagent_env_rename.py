@@ -87,14 +87,16 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-def _run(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+def _run(
+    argv: list[str], env: dict[str, str], *, timeout: float = 120
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, *argv],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=timeout,
     )
 
 
@@ -116,8 +118,21 @@ def test_entry_points_reject_legacy_rca_env_vars(name, legacy, argv):
 def test_clean_environment_does_not_trip_the_detector(name, legacy, argv):
     # The entry points may still fail for unrelated reasons (no database, no
     # alembic context, ...); what must not happen is the legacy diagnostic.
-    proc = _run(argv, _clean_env())
-    combined = proc.stdout + proc.stderr
+    # gateway.main is now uvicorn's worker-manager (FP-IG-20): a clean
+    # environment starts the supervisor and does not exit, which is not a
+    # detector trip. Bound that case so the suite does not wait 120s.
+    timeout = 8 if name == "gateway.main:main" else 120
+    try:
+        proc = _run(argv, _clean_env(), timeout=timeout)
+        combined = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or b""
+        err = exc.stderr or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        combined = out + err
     for old in LEGACY_ENV_RENAMES:
         assert _sentence(old) not in combined, f"{name} tripped on a clean environment:\n{combined}"
 

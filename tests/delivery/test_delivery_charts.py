@@ -768,3 +768,380 @@ def test_probe_tuning_template_renders_all_four_keys():
         elif "dashboard-api" in deploy and kind == "livenessProbe":
             # Unchanged from defaults
             assert probe["timeoutSeconds"] == 5
+
+
+def _parse_memory_mi(v) -> int:
+    s = str(v)
+    if s.endswith("Gi"):
+        return int(float(s[:-2]) * 1024)
+    if s.endswith("Mi"):
+        return int(s[:-2])
+    raise AssertionError(f"unparseable memory {v!r}")
+
+
+def _ingest_env(docs, name: str) -> str | None:
+    dep = next(
+        d
+        for d in docs
+        if d.get("kind") == "Deployment" and "ingest-gateway" in d["metadata"]["name"]
+    )
+    for env in dep["spec"]["template"]["spec"]["containers"][0].get("env") or []:
+        if env.get("name") == name:
+            return str(env.get("value"))
+    return None
+
+
+def test_ingest_gateway_worker_count_is_derived_and_identical_in_every_carrier():
+    """FP-IG-20: one worker count, five carriers, memory scaled by W.
+
+    Against the unfixed tree: red on every leg — main.py serves an app object
+    through uvicorn.Config/Server, no env key, no workers value, no
+    processes: field, memory at the per-process figures.
+    """
+    import ast
+
+    pinned = 4
+    main_path = REPO_ROOT / "services" / "gateway" / "gateway" / "main.py"
+    tree = ast.parse(main_path.read_text(encoding="utf-8"))
+    run_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "run":
+            if isinstance(func.value, ast.Name) and func.value.id == "uvicorn":
+                run_calls.append(node)
+        if isinstance(func, ast.Attribute) and func.attr in {"Config", "Server"}:
+            if isinstance(func.value, ast.Name) and func.value.id == "uvicorn":
+                raise AssertionError(
+                    "gateway.main still constructs uvicorn.Config/Server "
+                    "(single-process form)"
+                )
+    assert len(run_calls) == 1, run_calls
+    run = run_calls[0]
+    assert run.args and isinstance(run.args[0], ast.Constant)
+    assert run.args[0].value == "gateway.main:create_worker_app"
+    kwargs = {k.arg: k.value for k in run.keywords}
+    assert isinstance(kwargs.get("factory"), ast.Constant) and kwargs["factory"].value is True
+    # workers bound from the DBAGENT_GATEWAY_WORKERS read whose default is 4.
+    workers_kw = kwargs.get("workers")
+    assert isinstance(workers_kw, ast.Name), workers_kw
+    # Find the env read that feeds that name.
+    default_literal = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        if not isinstance(node.targets[0], ast.Name):
+            continue
+        if node.targets[0].id != workers_kw.id:
+            continue
+        call = node.value
+        # int(os.environ.get("DBAGENT_GATEWAY_WORKERS", "4"))
+        assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        assert call.func.id == "int"
+        inner = call.args[0]
+        assert isinstance(inner, ast.Call)
+        assert isinstance(inner.func, ast.Attribute) and inner.func.attr == "get"
+        assert isinstance(inner.args[0], ast.Constant)
+        assert inner.args[0].value == "DBAGENT_GATEWAY_WORKERS"
+        assert isinstance(inner.args[1], ast.Constant)
+        default_literal = inner.args[1].value
+    assert default_literal == str(pinned), default_literal
+
+    values = yaml.safe_load((DBAGENT / "values.yaml").read_text(encoding="utf-8"))
+    assert values["ingestGateway"]["workers"] == pinned
+    assert values["ingestGateway"]["replicaCount"] == 1
+
+    profile = REPO_ROOT / "services" / "gateway" / "tests" / "b1_reference_profile.py"
+    assigns = {
+        n.targets[0].id: n.value
+        for n in ast.parse(profile.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+    }
+    assert isinstance(assigns["INGEST_GATEWAY_WORKERS"], ast.Constant)
+    assert assigns["INGEST_GATEWAY_WORKERS"].value == pinned
+
+    b11 = yaml.safe_load(
+        (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(encoding="utf-8")
+    )
+    model = next(e for e in b11["benchmarks"] if e["id"] == "B11")["concurrency_model"]
+    ingest = next(p for p in model["writer_processes"] if p["process"] == "ingest-gateway")
+    assert ingest["processes"] == pinned
+
+    overlays = [
+        None,
+        [str(DBAGENT / "values-dev.yaml")],
+        [str(REPO_ROOT / "tests" / "e2e" / "values-dbagent.yaml")],
+    ]
+    set_matrices = [
+        None,
+        ["temporal.mode=dev", "postgresql.bundled=true"],
+        ["temporal.mode=external", "temporal.address=temporal.other:7233"],
+        ["temporal.mode=chart", "temporal.chart.enabled=true"],
+    ]
+    for values_files in overlays:
+        for set_args in set_matrices:
+            try:
+                out = helm_template(DBAGENT, values=values_files, set_args=set_args)
+            except RuntimeError:
+                # Some mode/overlay combinations are rejected by the chart;
+                # those are not this FP's subject.
+                continue
+            docs = parse_manifests(out)
+            try:
+                env = _ingest_env(docs, "DBAGENT_GATEWAY_WORKERS")
+            except StopIteration:
+                continue
+            assert env == str(pinned), (values_files, set_args, env)
+            dep = next(
+                d
+                for d in docs
+                if d.get("kind") == "Deployment"
+                and "ingest-gateway" in d["metadata"]["name"]
+            )
+            res = dep["spec"]["template"]["spec"]["containers"][0]["resources"]
+            assert _parse_memory_mi(res["requests"]["memory"]) == pinned * 128
+            assert _parse_memory_mi(res["limits"]["memory"]) == pinned * 512
+
+
+VOID_SIZING_BASIS = 2.427
+_RUN_ID_RE = re.compile(r"^[0-9]+/[0-9]+$")
+_LEDGER_ENTRY_KEYS = (
+    "runId",
+    "cpuMsPerRequest",
+    "cpus",
+    "cpuModel",
+    "image",
+    "workers",
+    "served",
+    "errors",
+    "committed",
+    "p99Ms",
+    "servedRate",
+    "maxInFlight",
+    "platformOnline",
+    "workerPidsPre",
+    "workerPidsPost",
+)
+
+
+def validate_sizing_ledger(ig: dict, *, check_rendered_cpu: bool = True) -> None:
+    """FP-IG-23 validity + recompute. Factored so mutation fixtures can
+    drive the same checks against a weakened ledger.
+
+    Exactly five observations are required unconditionally. An empty
+    ledger — including the shipped void 2.427 / observations: [] state —
+    is red until five valid CI benchmark-job runs are recorded. A void
+    2.427 basis with any observations is also red unless those five
+    entries independently recompute to 2.427 (they will not: the void
+    figure came from invalid cpus=16 runs).
+    """
+    assert "sizingBasis" in ig, "ingestGateway.sizingBasis missing (unfixed tree)"
+    sb = ig["sizingBasis"]
+    assert "signature" in sb, "sizingBasis.signature missing (unfixed tree)"
+    assert "observations" in sb, "sizingBasis.observations missing (unfixed tree)"
+    sig = sb["signature"]
+    for key in ("cpus", "cpuModel", "image", "workers"):
+        assert key in sig, key
+    assert isinstance(sb["observations"], list)
+    assert sig["cpus"] == 4
+    assert sig["workers"] == ig["workers"]
+
+    obs = sb["observations"]
+    assert len(obs) == 5, f"want exactly five observations, got {len(obs)}"
+    run_ids = []
+    cpu_vals = []
+    for entry in obs:
+        for key in _LEDGER_ENTRY_KEYS:
+            assert key in entry, key
+        assert entry["cpus"] == sig["cpus"] == 4
+        assert entry["cpuModel"] == sig["cpuModel"]
+        assert entry["image"] == sig["image"]
+        assert entry["workers"] == sig["workers"] == ig["workers"]
+        assert entry["errors"] == 0
+        assert entry["served"] == 30000
+        assert entry["committed"] == entry["served"]
+        assert entry["p99Ms"] < 150
+        assert entry["servedRate"] >= 200
+        assert entry["maxInFlight"] < 1000
+        assert entry["platformOnline"] is True
+        pre = list(entry["workerPidsPre"])
+        post = list(entry["workerPidsPost"])
+        assert pre == sorted(set(pre)), pre
+        assert post == sorted(set(post)), post
+        assert len(pre) == sig["workers"]
+        assert pre == post
+        rid = entry["runId"]
+        assert isinstance(rid, str) and _RUN_ID_RE.fullmatch(rid), rid
+        run_ids.append(rid)
+        cpu_vals.append(float(entry["cpuMsPerRequest"]))
+    assert len(set(run_ids)) == 5, run_ids
+    recomputed = max(cpu_vals) + (max(cpu_vals) - min(cpu_vals))
+    assert abs(float(sb["cpuMsPerRequest"]) - recomputed) < 1e-9
+    if not check_rendered_cpu:
+        return
+    import math
+
+    expected_req = math.ceil(recomputed * 200)
+    out = helm_template(DBAGENT)
+    docs = parse_manifests(out)
+    dep = next(
+        d
+        for d in docs
+        if d.get("kind") == "Deployment" and "ingest-gateway" in d["metadata"]["name"]
+    )
+    req = dep["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["cpu"]
+    s = str(req)
+    millicores = int(s[:-1]) if s.endswith("m") else int(float(s) * 1000)
+    assert millicores == expected_req
+
+
+def test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run():
+    """FP-IG-23: ledger schema + five valid observations + recompute.
+
+    Against the unfixed tree: red — no signature block and no observations.
+    Against the current tree: still red — observations is empty. Valid
+    runIds cannot be fabricated here (Z: five consecutive CI
+    benchmark-job runs at this change's head on the four-vCPU reference
+    runner). The void 2.427 figure stays in values.yaml as a historical
+    label only; it does not satisfy this test. The batch is not complete
+    until five real observations, a re-derived basis, and recomputed CPU
+    resources are recorded.
+    """
+    values = yaml.safe_load((DBAGENT / "values.yaml").read_text(encoding="utf-8"))
+    validate_sizing_ledger(values["ingestGateway"])
+
+
+def _valid_observation(run_id: str, cpu: float, workers: int = 4) -> dict:
+    pids = [1000 + i for i in range(workers)]
+    return {
+        "runId": run_id,
+        "cpuMsPerRequest": cpu,
+        "cpus": 4,
+        "cpuModel": "ref",
+        "image": "ref-image",
+        "workers": workers,
+        "served": 30000,
+        "errors": 0,
+        "committed": 30000,
+        "p99Ms": 40.0,
+        "servedRate": 990.0,
+        "maxInFlight": 200,
+        "platformOnline": True,
+        "workerPidsPre": pids,
+        "workerPidsPost": list(pids),
+    }
+
+
+def _filled_ledger(*, cpu_vals=None, mutate=None) -> dict:
+    cpus = list(cpu_vals or [1.0, 1.1, 1.2, 1.05, 1.08])
+    ig = {
+        "workers": 4,
+        "sizingBasis": {
+            "cpuMsPerRequest": max(cpus) + (max(cpus) - min(cpus)),
+            "signature": {
+                "cpus": 4,
+                "cpuModel": "ref",
+                "image": "ref-image",
+                "workers": 4,
+            },
+            "observations": [
+                _valid_observation(f"{1000 + i}/1", cpus[i]) for i in range(5)
+            ],
+        },
+    }
+    if mutate:
+        mutate(ig)
+    return ig
+
+
+def test_sizing_ledger_mutations_are_red_only_with_validity_rules():
+    """Standing test for FP-IG-23: each named weakening fails the helper.
+
+    Against the unfixed tree every case is independently red (no
+    signature, no observations, void 2.427 cannot be re-encoded).
+    Cases are red only while the corresponding rule is present.
+    """
+    validate_sizing_ledger(_filled_ledger(), check_rendered_cpu=False)
+
+    def _expect_red(name, mutate):
+        try:
+            validate_sizing_ledger(_filled_ledger(mutate=mutate), check_rendered_cpu=False)
+        except AssertionError:
+            return
+        raise AssertionError(f"{name} stayed green; the validity rule is absent")
+
+    _expect_red("missing_signature", lambda ig: ig["sizingBasis"].pop("signature"))
+    _expect_red("missing_observations", lambda ig: ig["sizingBasis"].pop("observations"))
+    _expect_red(
+        "void_basis_with_fabricated_obs",
+        lambda ig: ig["sizingBasis"].__setitem__("cpuMsPerRequest", VOID_SIZING_BASIS),
+    )
+    _expect_red(
+        "duplicate_run_ids",
+        lambda ig: ig["sizingBasis"]["observations"].__setitem__(
+            1, _valid_observation("1000/1", 1.1)
+        ),
+    )
+    _expect_red(
+        "duplicate_pids",
+        lambda ig: ig["sizingBasis"]["observations"][0].__setitem__(
+            "workerPidsPre", [1, 1, 1, 1]
+        ),
+    )
+    _expect_red(
+        "committed_ne_served",
+        lambda ig: ig["sizingBasis"]["observations"][0].__setitem__("committed", 29999),
+    )
+    _expect_red(
+        "platform_not_online",
+        lambda ig: ig["sizingBasis"]["observations"][0].__setitem__(
+            "platformOnline", False
+        ),
+    )
+    _expect_red(
+        "worker_set_changed",
+        lambda ig: ig["sizingBasis"]["observations"][0].__setitem__(
+            "workerPidsPost", [9, 10, 11, 12]
+        ),
+    )
+    _expect_red(
+        "cpus_not_reference_4",
+        lambda ig: (
+            ig["sizingBasis"]["signature"].__setitem__("cpus", 16),
+            [
+                e.__setitem__("cpus", 16)
+                for e in ig["sizingBasis"]["observations"]
+            ],
+        ),
+    )
+    _expect_red(
+        "recompute_mismatch",
+        lambda ig: ig["sizingBasis"].__setitem__("cpuMsPerRequest", 9.999),
+    )
+    _expect_red(
+        "empty_observations",
+        lambda ig: ig["sizingBasis"].__setitem__("observations", []),
+    )
+    _expect_red(
+        "malformed_run_id_extra_segment",
+        lambda ig: ig["sizingBasis"]["observations"][0].__setitem__(
+            "runId", "1000/bogus/extra"
+        ),
+    )
+    _expect_red(
+        "malformed_run_id_non_numeric_attempt",
+        lambda ig: ig["sizingBasis"]["observations"][0].__setitem__(
+            "runId", "1000/bogus"
+        ),
+    )
+
+    # Unfixed-tree shape: no ledger at all.
+    try:
+        validate_sizing_ledger({"workers": 4}, check_rendered_cpu=False)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("unfixed (no sizingBasis) stayed green")
