@@ -147,7 +147,7 @@ GUARDED_STEPS: dict[str, list[int]] = {
     "unit-dashboard-api": [3],
     "unit-go": [7],
     "functional": [9, 10],
-    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 19],
+    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 19, 20],
     "manifest-guard": [5, 6],
 }
 
@@ -217,7 +217,8 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         "services/worker/tests services/gateway/tests "
         "services/dashboard-api/tests tests/functional tests/delivery "
         "tests/mocks/llm -v --ignore=tests/functional/m2_probe_link "
-        "--ignore=services/gateway/tests/test_b1_ingest_burst.py",
+        "--ignore=services/gateway/tests/test_b1_ingest_burst.py "
+        "--ignore=tests/delivery/test_delivery_sizing_ledger.py",
     )],
     "benchmark": [
         (None, "services/worker/.venv/bin/python -m pytest tests/functional/test_manifests.py -v"),
@@ -234,6 +235,8 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         (None, "services/worker/.venv/bin/python -m pytest "
          "services/gateway/tests/test_b1_ingest_burst.py -v -s"),
         (None, "services/worker/.venv/bin/python -m pytest tests/benchmark/test_pg_scale.py -v -s"),
+        (None, "services/worker/.venv/bin/python -m pytest "
+         "tests/delivery/test_delivery_sizing_ledger.py -v"),
     ],
     "manifest-guard": [
         (None, "services/worker/.venv/bin/python -m pytest tests/functional/test_manifests.py -v"),

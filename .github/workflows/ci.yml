@@ -341,7 +341,8 @@ jobs:
             services/dashboard-api/tests \
             tests/functional tests/delivery tests/mocks/llm -v \
             --ignore=tests/functional/m2_probe_link \
-            --ignore=services/gateway/tests/test_b1_ingest_burst.py
+            --ignore=services/gateway/tests/test_b1_ingest_burst.py \
+            --ignore=tests/delivery/test_delivery_sizing_ledger.py
       - name: Run Go cross-service functional tests (F8/F9; real probe +
           probe-gateway binaries over real mTLS + ephemeral Postgres)
         run: go test ./tests/functional/... -v -timeout 300s
@@ -429,6 +430,15 @@ jobs:
         run: |
           services/worker/.venv/bin/python -m pytest \
             tests/benchmark/test_pg_scale.py -v -s
+      # FP-IG-23 / FP-IG-26: ledger gate after B1 (step 17). A later step
+      # cannot prevent an earlier one from running, so this siting cannot
+      # deadlock the producer. No third A10(v) gate: every uses: step
+      # precedes index 7 and only parsed run: bodies sit between the
+      # pinned gate at 18 and this step.
+      - name: FP-IG-23 -- sizing-ledger provenance gate
+        run: |
+          services/worker/.venv/bin/python -m pytest \
+            tests/delivery/test_delivery_sizing_ledger.py -v
       # v1.5 manifest honesty rule (design.md Section 14.4): a
       # thresholds.yaml entry cannot stay `deferred` once its hot-path code
       # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14; M4 flipped B12.
