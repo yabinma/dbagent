@@ -583,7 +583,7 @@ def test_configmap_internal_endpoints_match_rendered_service_names():
     cfg = yaml.safe_load(cm["data"]["config.yaml"])
 
     checks = {
-        "storage.s3_endpoint": cfg["storage"]["s3_endpoint"],
+        "storage.s3.endpoint": cfg["storage"]["s3"]["endpoint"],
         "model_gateway.url": cfg["model_gateway"]["url"],
         "probe_gateway.url": cfg["probe_gateway"]["url"],
         "temporal.address": cfg["temporal"]["address"],
@@ -613,7 +613,7 @@ def test_configmap_internal_endpoints_match_rendered_service_names():
             "-f",
             str(DBAGENT / "values-dev.yaml"),
             "--set",
-            f"config.storage.s3_endpoint={external}",
+            f"config.storage.s3.endpoint={external}",
         ],
         cwd=str(REPO_ROOT),
     )
@@ -626,7 +626,110 @@ def test_configmap_internal_endpoints_match_rendered_service_names():
         and d.get("metadata", {}).get("name") == f"{release}-config"
     )
     cfg_ext = yaml.safe_load(cm_ext["data"]["config.yaml"])
-    assert cfg_ext["storage"]["s3_endpoint"] == external
+    assert cfg_ext["storage"]["s3"]["endpoint"] == external
+
+
+# Appendix E roles. Worker `_model_for` falls back to these names when
+# config.models is empty; a bundled gateway that only serves `mock` 400s.
+_APPENDIX_E_MODEL_ROLES = ("planner", "collector", "rca", "remediation")
+
+
+def _configmap_data(docs, name_suffix: str, release: str = "t") -> dict:
+    target = f"{release}-{name_suffix}"
+    cm = next(
+        (
+            d
+            for d in docs
+            if d.get("kind") == "ConfigMap"
+            and (d.get("metadata") or {}).get("name") == target
+        ),
+        None,
+    )
+    assert cm is not None, f"missing ConfigMap {target}"
+    return cm["data"]
+
+
+def _load_rendered_app_config(docs, tmp_path, monkeypatch, release: str = "t"):
+    """Write the chart ConfigMap through rca_common.config.load_config.
+
+    Interpolation of ${S3_*} is what the worker does in-cluster (the Secret
+    supplies those env vars). The test sets them so a nested-but-uninterpolated
+    render cannot pass by leaving the ${} placeholders in place.
+    """
+    from rca_common.config import load_config
+
+    monkeypatch.setenv("S3_ACCESS_KEY", "minioadmin")
+    monkeypatch.setenv("S3_SECRET_KEY", "minioadmin")
+    raw = _configmap_data(docs, "config", release)["config.yaml"]
+    path = tmp_path / "rendered-config.yaml"
+    path.write_text(raw, encoding="utf-8")
+    return load_config(str(path))
+
+
+def test_bundled_chart_config_parses_to_nonempty_s3_credentials(tmp_path, monkeypatch):
+    """F2: helm template + load_config must yield real storage credentials.
+
+    Red at 2276405: the chart writes flat storage.s3_* keys, rca_common
+    reads nested storage.s3.*, so s3_endpoint/access_key/secret_key are
+    all "". Asserting the ConfigMap merely contains the string
+    's3_access_key', or that helm template exits 0, is green on the
+    broken chart and would not have caught this.
+    """
+    out = helm_template(
+        DBAGENT,
+        values=[str(DBAGENT / "values-dev.yaml")],
+    )
+    docs = parse_manifests(out)
+    cfg = _load_rendered_app_config(docs, tmp_path, monkeypatch)
+    assert cfg.storage.s3_endpoint, (
+        "parsed s3_endpoint is empty — chart storage is not Appendix E nested "
+        f"storage.s3.endpoint (raw storage={cfg.raw.get('storage')!r})"
+    )
+    assert cfg.storage.s3_access_key, (
+        "parsed s3_access_key is empty — credentials never reach StorageConfig"
+    )
+    assert cfg.storage.s3_secret_key, (
+        "parsed s3_secret_key is empty — credentials never reach StorageConfig"
+    )
+
+
+def test_bundled_model_gateway_serves_every_configured_model():
+    """F1: every role a bundled install will call must be on the gateway.
+
+    Red at 2276405: worker defaults (and Appendix E) ask for
+    ollama/qwen2.5:14b and bedrock/anthropic.claude-fable-5; the bundled
+    LiteLLM config declares only `mock`. A string-contains check on
+    'model_name: mock' is green on that chart.
+    """
+    out = helm_template(
+        DBAGENT,
+        values=[str(DBAGENT / "values-dev.yaml")],
+    )
+    docs = parse_manifests(out)
+    app_raw = yaml.safe_load(_configmap_data(docs, "config")["config.yaml"])
+    litellm = yaml.safe_load(_configmap_data(docs, "litellm")["config.yaml"])
+    served = {
+        entry.get("model_name")
+        for entry in (litellm.get("model_list") or [])
+        if entry.get("model_name")
+    }
+    assert served, "bundled model-gateway ConfigMap declared no models"
+
+    configured = app_raw.get("models") or {}
+    assert set(configured) >= set(_APPENDIX_E_MODEL_ROLES), (
+        "bundled chart must route every Appendix E role through config.models "
+        f"so the worker does not fall back to names the gateway does not serve; "
+        f"got {sorted(configured)}"
+    )
+    missing = []
+    for role, spec in configured.items():
+        name = (spec or {}).get("model") if isinstance(spec, dict) else None
+        if name not in served:
+            missing.append((role, name))
+    assert not missing, (
+        f"bundled gateway serves {sorted(served)}; these config.models names "
+        f"are not among them: {missing}"
+    )
 
 
 # --- FP-IG-1 / FP-IG-2 / FP-IG-4 (design.md §11.3) ---

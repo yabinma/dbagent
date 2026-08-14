@@ -60,7 +60,7 @@ do not resolve under Helm's release-prefixed Service names.
 **Bundled PostgreSQL / MinIO / model-gateway are dev/e2e only.** Bundled PG uses
 `emptyDir` — data does not survive a pod restart, node drain, or re-install.
 Production must use `postgresql.bundled: false` with an external DSN and set
-`config.storage.s3_endpoint` / `config.model_gateway.url` to the external hosts.
+`config.storage.s3.endpoint` / `config.model_gateway.url` to the external hosts.
 
 ## Temporal modes
 

@@ -24,9 +24,12 @@ data:
     {{- end -}}
     {{- /* MinIO — only rewrite when bundled; external installs keep operator values. */ -}}
     {{- if .Values.minio.bundled -}}
-    {{- $ep := dig "storage" "s3_endpoint" "" $cfg -}}
+    {{- if not $cfg.storage -}}{{- $_ := set $cfg "storage" dict -}}{{- end -}}
+    {{- $s3 := default dict $cfg.storage.s3 -}}
+    {{- $ep := index $s3 "endpoint" | default "" -}}
     {{- if or (empty $ep) (eq $ep "http://minio:9000") -}}
-    {{- $_ := set $cfg.storage "s3_endpoint" (printf "http://%s-minio:9000" $fullname) -}}
+    {{- $_ := set $s3 "endpoint" (printf "http://%s-minio:9000" $fullname) -}}
+    {{- $_ := set $cfg.storage "s3" $s3 -}}
     {{- end -}}
     {{- end -}}
     {{- /* LiteLLM model-gateway — same pattern as MinIO. */ -}}
@@ -36,6 +39,25 @@ data:
     {{- if or (empty $mg) (eq $mg "http://model-gateway:4000") -}}
     {{- $_ := set $cfg.model_gateway "url" (printf "http://%s-model-gateway:4000" $fullname) -}}
     {{- end -}}
+    {{- /*
+      The bundled gateway serves only `mock`. Rewrite every role so the
+      worker does not fall back to Appendix E names the gateway rejects.
+    */ -}}
+    {{- $models := default dict $cfg.models -}}
+    {{- $roleTokens := dict "planner" 2000 "collector" 2000 "rca" 8000 "remediation" 4000 -}}
+    {{- range $role, $tok := $roleTokens -}}
+    {{- if not (index $models $role) -}}
+    {{- $_ := set $models $role (dict "model" "mock" "max_tokens" $tok) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $role, $route := $models -}}
+    {{- if kindIs "map" $route -}}
+    {{- $_ := set $route "model" "mock" -}}
+    {{- else -}}
+    {{- $_ := set $models $role (dict "model" "mock") -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $_ := set $cfg "models" $models -}}
     {{- end -}}
     {{- /*
       probe-gateway is always rendered by this chart. Absent config.probe_gateway

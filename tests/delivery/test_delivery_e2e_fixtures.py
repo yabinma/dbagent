@@ -10,6 +10,7 @@ Two classes of defect this tier catches before a 25-minute cluster run does:
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -1178,3 +1179,520 @@ def test_e3_cleanup_false_only_after_successful_absent_read(monkeypatch):
     monkeypatch.setattr(mod, "_e3_mount_present", lambda: False)
     with pytest.raises(RuntimeError, match="still present"):
         mod._e3_cleanup_fault()
+
+
+# ---------------------------------------------------------------------------
+# D-A / D-B — e2e readiness barrier + failure diagnostics (fix.md)
+# ---------------------------------------------------------------------------
+
+CONFTEST = E2E / "conftest.py"
+_FIRST_COLLECTED_E2E = "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
+
+
+def _load_e2e_conftest():
+    """Import tests/e2e/conftest.py without collecting the e2e suite."""
+    spec = importlib.util.spec_from_file_location(
+        "e2e_conftest_under_test", CONFTEST
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _session_autouse_fixture_nodes(
+    source: str,
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    tree = ast.parse(source)
+    nodes: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            call = dec if isinstance(dec, ast.Call) else None
+            func = call.func if call is not None else dec
+            is_fixture = (
+                (isinstance(func, ast.Attribute) and func.attr == "fixture")
+                or (isinstance(func, ast.Name) and func.id == "fixture")
+            )
+            if not is_fixture:
+                continue
+            kwargs = {}
+            if call is not None:
+                for kw in call.keywords:
+                    if kw.arg and isinstance(kw.value, ast.Constant):
+                        kwargs[kw.arg] = kw.value.value
+            if kwargs.get("scope") == "session" and kwargs.get("autouse") is True:
+                nodes.append(node)
+    return nodes
+
+
+def _session_autouse_fixture_names(source: str) -> list[str]:
+    return [node.name for node in _session_autouse_fixture_nodes(source)]
+
+
+def _names_called_by(fn: ast.AST) -> set[str]:
+    return {
+        c.func.id
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+    }
+
+
+def _assert_session_autouse_calls_wait_for_platform_online(source: str) -> None:
+    """W1: the autouse fixture must actually invoke the barrier helper.
+
+    A session-autouse fixture whose body is `return None` still has the
+    right decorator; without this check the D-A guard is fail-open.
+    """
+    fixtures = _session_autouse_fixture_nodes(source)
+    assert fixtures, (
+        "tests/e2e/conftest.py must define a session-scoped autouse fixture "
+        "that blocks until the platform is online; without it B1 is the first "
+        f"collected test ({_FIRST_COLLECTED_E2E}) and races the probe"
+    )
+    called: set[str] = set()
+    for fn in fixtures:
+        called |= _names_called_by(fn)
+    assert "wait_for_platform_online" in called, (
+        "the session-autouse fixture must actually call the barrier; a no-op "
+        "autouse fixture leaves B1 racing the probe"
+    )
+
+
+# Reviewer's exact W1 mutant (review.md): fixture body replaced with `return None`.
+# Used as a negative fixture so the guard stays red if the linkage check is dropped.
+_W1_DISABLED_BARRIER_MUTANT = textwrap.dedent(
+    """\
+    import pytest
+
+    def wait_for_platform_online(dashboard_url: str) -> None:
+        raise AssertionError("platform did not reach 'online'; last observed status='pending'")
+
+    @pytest.fixture(scope="session", autouse=True)
+    def wait_until_platform_online(dashboard_url: str) -> None:
+        return None  # MUTANT: barrier disabled
+    """
+)
+
+
+def _conftest_with_return_none_barrier() -> str:
+    """Apply the reviewer's exact mutation to the real conftest source."""
+    source = CONFTEST.read_text(encoding="utf-8")
+    needle = "    wait_for_platform_online(dashboard_url)\n"
+    mutant = "    return None  # MUTANT: barrier disabled\n"
+    assert needle in source, (
+        "could not apply the W1 return-None mutant; the autouse fixture "
+        "no longer calls wait_for_platform_online(dashboard_url)"
+    )
+    return source.replace(needle, mutant, 1)
+
+
+def _first_collected_e2e_nodeid() -> str:
+    """Pytest default collection: test_*.py alphabetical, then def order."""
+    files = sorted(p for p in E2E.glob("test_*.py") if p.is_file())
+    assert files, "tests/e2e must contain test_*.py files"
+    tree = ast.parse(files[0].read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+            "test_"
+        ):
+            return f"tests/e2e/{files[0].name}::{node.name}"
+    raise AssertionError(f"no test_ functions in {files[0]}")
+
+
+def _hygiene_gate_to_pytest_e2e_span(run_sh: str) -> str:
+    lines = run_sh.splitlines()
+    gate = [i for i, ln in enumerate(lines) if ln.strip() == "env_hygiene_gate"]
+    assert len(gate) == 1, f"expected one bare env_hygiene_gate call, found {len(gate)}"
+    phase = [
+        i
+        for i, ln in enumerate(lines)
+        if ln.lstrip().startswith('phase "pytest_e2e"')
+    ]
+    assert phase, 'missing phase "pytest_e2e"'
+    start, end = gate[0] + 1, phase[0]
+    assert start <= end, "hygiene gate must precede phase pytest_e2e"
+    return "\n".join(lines[start:end])
+
+
+def _platform_dashboard_stub(items: list[dict]):
+    """Tiny dashboard stand-in: login + GET /api/v1/platforms."""
+    from contextlib import contextmanager
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    @contextmanager
+    def _serve():
+        class _Dash(BaseHTTPRequestHandler):
+            def _send(self, payload, code=200):
+                raw = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                if self.path.rstrip("/").endswith("/auth/login"):
+                    self._send({"access_token": "stub-token"})
+                    return
+                self.send_error(404)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0].rstrip("/")
+                if path.endswith("/platforms"):
+                    self._send({"items": items})
+                    return
+                self.send_error(404)
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Dash)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    return _serve()
+
+
+def _shorten_barrier_defaults(mod, monkeypatch, *, deadline_s=0.05, poll_s=0.0):
+    """So the session-autouse fixture (no explicit deadline) can be driven in-process."""
+    kw = getattr(mod.wait_for_platform_online, "__kwdefaults__", None)
+    assert isinstance(kw, dict) and "deadline_s" in kw, (
+        "wait_for_platform_online must expose keyword defaults so the autouse "
+        "fixture's call can be bounded without a cluster"
+    )
+    monkeypatch.setitem(kw, "deadline_s", deadline_s)
+    if "poll_s" in kw:
+        monkeypatch.setitem(kw, "poll_s", poll_s)
+    monkeypatch.setattr(mod, "PLATFORM_ONLINE_DEADLINE_S", deadline_s)
+    monkeypatch.setattr(mod, "PLATFORM_ONLINE_POLL_S", poll_s)
+
+
+def test_e2e_conftest_session_autouse_barrier_blocks_on_platform_online(monkeypatch):
+    """D-A: order-independent readiness barrier, red at 2276405.
+
+    Alphabetical collection puts test_e2e_load.py::test_b1_ingest_burst_profile
+    first and the E0 online check last. A session-scoped autouse fixture in
+    conftest.py is what actually runs before B1 regardless of file order. A
+    test that only asserted "E0 passes" would have been green on the failing
+    run and is worthless here.
+    """
+    source = CONFTEST.read_text(encoding="utf-8")
+    fixtures = _session_autouse_fixture_names(source)
+    assert fixtures, (
+        "tests/e2e/conftest.py must define a session-scoped autouse fixture "
+        "that blocks until the platform is online; without it B1 is the first "
+        f"collected test ({_FIRST_COLLECTED_E2E}) and races the probe"
+    )
+    _assert_session_autouse_calls_wait_for_platform_online(source)
+
+    first = _first_collected_e2e_nodeid()
+    assert first == _FIRST_COLLECTED_E2E, (
+        f"alphabetically-first e2e test is {first}; the barrier must still "
+        "run first because it is session-autouse in conftest, not a per-file fix"
+    )
+
+    # The fixture (or a helper it calls) must poll for status 'online' and
+    # bound the wait. Source-shape only would miss a no-op autouse fixture.
+    lowered = source.lower()
+    assert "online" in lowered
+    assert any(
+        token in lowered
+        for token in ("deadline", "timeout", "monotonic", "time.time")
+    ), "barrier must bound the wait; an unbounded poll hangs the 420s pytest_e2e phase"
+
+    mod = _load_e2e_conftest()
+    wait = getattr(mod, "wait_for_platform_online", None)
+    assert callable(wait), (
+        "conftest must expose wait_for_platform_online so the barrier can be "
+        "exercised without a cluster"
+    )
+
+    polls = {"n": 0}
+
+    class _Resp:
+        def __init__(self, payload, status_code=200):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, **_kwargs):
+        assert "login" in url
+        return _Resp({"access_token": "tok"})
+
+    def fake_get_then_online(url, **_kwargs):
+        assert "platforms" in url
+        polls["n"] += 1
+        status = "online" if polls["n"] >= 3 else "enrolling"
+        return _Resp({"items": [{"platform_key": "presto-e2e", "status": status}]})
+
+    monkeypatch.setattr(mod.httpx, "post", fake_post)
+    monkeypatch.setattr(mod.httpx, "get", fake_get_then_online)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    wait("http://dash.example", deadline_s=30, poll_s=0)
+    assert polls["n"] >= 3, "barrier must poll until status is online, not sample once"
+
+    def always_pending(url, **_kwargs):
+        return _Resp({"items": [{"platform_key": "presto-e2e", "status": "pending"}]})
+
+    monkeypatch.setattr(mod.httpx, "get", always_pending)
+    with pytest.raises(AssertionError, match="pending") as excinfo:
+        wait("http://dash.example", deadline_s=0.01, poll_s=0)
+    message = str(excinfo.value)
+    assert "online" in message.lower()
+    assert "pending" in message
+    assert "presto-e2e" in message, (
+        "failure must name the platform the barrier was waiting for; got "
+        f"{message!r}"
+    )
+
+
+def test_e2e_autouse_fixture_blocks_on_stub_that_never_reports_online(monkeypatch):
+    """W1 runtime: drive the helper *and* the autouse fixture against a stub.
+
+    A fixture body of `return None` leaves the helper red and the fixture
+    call green — that is the mutant review.md proved the old guard missed.
+    """
+    source = CONFTEST.read_text(encoding="utf-8")
+    _assert_session_autouse_calls_wait_for_platform_online(source)
+    fixtures = _session_autouse_fixture_names(source)
+    mod = _load_e2e_conftest()
+    wait = mod.wait_for_platform_online
+    fixture_fn = getattr(mod, fixtures[0])
+    # pytest 8+ refuses to call FixtureFunctionDefinition directly.
+    fixture_body = getattr(fixture_fn, "__wrapped__", None) or getattr(
+        fixture_fn, "_fixture_function", fixture_fn
+    )
+
+    never_online = [{"platform_key": "presto-e2e", "status": "enrolling"}]
+    with _platform_dashboard_stub(never_online) as dash_url:
+        with pytest.raises(AssertionError) as never_exc:
+            wait(dash_url, deadline_s=0.05, poll_s=0)
+        never_msg = str(never_exc.value)
+        assert "online" in never_msg.lower()
+        assert "presto-e2e" in never_msg
+        assert "enrolling" in never_msg
+
+        _shorten_barrier_defaults(mod, monkeypatch)
+        with pytest.raises(AssertionError) as fixture_exc:
+            fixture_body(dash_url)
+        fixture_msg = str(fixture_exc.value)
+        assert "online" in fixture_msg.lower()
+        assert "presto-e2e" in fixture_msg
+
+
+def test_da_guard_rejects_return_none_autouse_barrier_mutant():
+    """W1 negative fixture: the reviewer's exact `return None` body is red.
+
+    The previous guard stayed green against this mutant (review.md, 0.04s)
+    because it only checked that *some* session-autouse fixture existed.
+    """
+    with pytest.raises(AssertionError, match="must actually call the barrier"):
+        _assert_session_autouse_calls_wait_for_platform_online(
+            _W1_DISABLED_BARRIER_MUTANT
+        )
+    with pytest.raises(AssertionError, match="must actually call the barrier"):
+        _assert_session_autouse_calls_wait_for_platform_online(
+            _conftest_with_return_none_barrier()
+        )
+
+
+def test_e2e_barrier_requires_the_specific_platform_not_any_online():
+    """W2: B1's precondition is platform 'presto-e2e', not any online row.
+
+    The shared-waiter anti-pattern (CLAUDE.md) is returning as soon as any
+    entry in /api/v1/platforms is online. A leaked platform from a prior
+    KEEP_CLUSTER=1 run would let the barrier pass while B1 still fails
+    FP-IG-19 against /api/v1/platforms/presto-e2e.
+    """
+    mod = _load_e2e_conftest()
+    wait = mod.wait_for_platform_online
+
+    other_online = [
+        {"platform_key": "other-platform", "status": "online"},
+        {"platform_key": "presto-e2e", "status": "enrolling"},
+    ]
+    with _platform_dashboard_stub(other_online) as dash_url:
+        with pytest.raises(AssertionError) as excinfo:
+            wait(dash_url, deadline_s=0.05, poll_s=0)
+    wrong = str(excinfo.value)
+    assert "presto-e2e" in wrong, (
+        "failure must name the required platform; got " f"{wrong!r}"
+    )
+    assert "enrolling" in wrong, (
+        "failure must report what the required platform actually showed; "
+        f"got {wrong!r}"
+    )
+    assert "online" in wrong.lower()
+
+    required_online = [
+        {"platform_key": "other-platform", "status": "pending"},
+        {"platform_key": "presto-e2e", "status": "online"},
+    ]
+    with _platform_dashboard_stub(required_online) as dash_url:
+        wait(dash_url, deadline_s=1, poll_s=0)
+
+    only_other = [{"platform_key": "other-platform", "status": "online"}]
+    with _platform_dashboard_stub(only_other) as dash_url:
+        with pytest.raises(AssertionError) as missing:
+            wait(dash_url, deadline_s=0.05, poll_s=0)
+    missing_msg = str(missing.value)
+    assert "presto-e2e" in missing_msg
+    assert "other-platform" in missing_msg or "missing" in missing_msg.lower() or "not in" in missing_msg.lower()
+
+
+def test_run_sh_failure_diagnostics_platform_status(tmp_path: Path):
+    """Failure path dumps platform status; not between A10(v) and pytest_e2e.
+
+    The pre-existing collect_failure_diagnostics() already gathers pod logs
+    and events. The only extra dump that is not a duplicate is the dashboard
+    API platform-status snapshot. Named-service kubectl logs were a false
+    finding (D-B withdrawn) and must not come back.
+    """
+    run_sh = RUN_SH.read_text(encoding="utf-8")
+    between = _hygiene_gate_to_pytest_e2e_span(run_sh)
+    for needle in (
+        "kubectl get pods",
+        "kubectl describe",
+        "kubectl logs",
+        "/api/v1/platforms",
+        "collect_failure_diagnostics",
+    ):
+        assert needle not in between, (
+            f"{needle!r} must not sit between the A10(v) hygiene gate and "
+            f'phase "pytest_e2e" (negative fixture 26); found in:\n{between}'
+        )
+
+    assert "collect_failure_diagnostics()" in run_sh
+    assert "/api/v1/platforms" in run_sh, (
+        "failure path must dump platform status as the dashboard API reports it"
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    kubectl_shim = bin_dir / "kubectl"
+    kubectl_shim.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [[ " $* " == *" get pods "* && " $* " == *" -o name "* ]]; then
+              echo "pod/fake-pod-0"
+            fi
+            exit 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    kubectl_shim.chmod(0o755)
+
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    class _Dash(BaseHTTPRequestHandler):
+        def _send(self, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            if self.path.rstrip("/").endswith("/auth/login"):
+                self._send({"access_token": "diag-token"})
+                return
+            self.send_error(404)
+
+        def do_GET(self):
+            if "/platforms" in self.path:
+                self._send(
+                    {
+                        "items": [
+                            {"platform_key": "presto-e2e", "status": "enrolling"}
+                        ]
+                    }
+                )
+                return
+            self.send_error(404)
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Dash)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    dash_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    diag_dir = Path("/tmp/rca-e2e/diagnostics")
+    if diag_dir.exists():
+        shutil.rmtree(diag_dir)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["E2E_DASHBOARD_URL"] = dash_url
+    env["E2E_ADMIN_USER"] = "admin"
+    env["E2E_ADMIN_PASS"] = "admin-e2e-password"
+
+    script = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        source "{RUN_SH}"
+        phase "forced_failure" 5 false
+        """
+    )
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        env=env,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        raise AssertionError(
+            f"platform-status collector hung. stdout:\n{stdout}\nstderr:\n{stderr}"
+        ) from None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert proc.returncode == 1, (
+        f"phase() must exit 1; rc={proc.returncode}\n{stdout}\n{stderr}"
+    )
+    combined = stdout + "\n" + stderr
+
+    status_file = diag_dir / "platform-status.txt"
+    assert status_file.is_file(), (
+        "failure path must write the platform status the API reported "
+        f"(missing {status_file})"
+    )
+    status_text = status_file.read_text(encoding="utf-8")
+    assert "presto-e2e" in status_text
+    assert "enrolling" in status_text
+    # Job log must carry the status too — artifacts alone were not enough
+    # to diagnose E2/E3/E4 on the failing run.
+    assert "enrolling" in combined or "presto-e2e" in combined

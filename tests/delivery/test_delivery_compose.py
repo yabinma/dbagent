@@ -479,14 +479,14 @@ def test_project_names_volumes_and_datastore_defaults_are_dbagent():
 
     # Chart values and the compose app config.
     chart_values = yaml.safe_load((CHARTS / "dbagent" / "values.yaml").read_text(encoding="utf-8"))
-    assert chart_values["config"]["storage"]["s3_bucket"] == "dbagent"
+    assert chart_values["config"]["storage"]["s3"]["bucket"] == "dbagent"
     assert chart_values["config"]["temporal"]["namespace"] == "dbagent"
     assert chart_values["postgresql"]["auth"]["database"] == "dbagent"
     assert chart_values["postgresql"]["auth"]["username"] == "dbagent"
 
     app_config = yaml.safe_load((COMPOSE / "config/dbagent.yaml").read_text(encoding="utf-8"))
     assert app_config["temporal"]["namespace"] == "dbagent"
-    assert app_config["storage"]["s3_bucket"] == "dbagent"
+    assert app_config["storage"]["s3"]["bucket"] == "dbagent"
 
     # rca_common.config's own dataclass defaults (the library keeps its name;
     # only the deployment-scoped values move -- C.5).

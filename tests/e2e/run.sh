@@ -42,6 +42,47 @@ collect_failure_diagnostics() {
     kubectl "${ktimeout[@]}" logs -n dbagent "$pod" --all-containers --previous --tail=200 \
       >"$dir/logs-${safe}-previous.txt" 2>&1 || true
   done
+
+  # Platform status as the dashboard API reports it — not collected by the
+  # kubectl dumps above, and the moment the platform reached `online` is
+  # otherwise missing from the failure artifact.
+  echo "==== platform status (dashboard API) ====" | tee -a "$PHASE_LOG"
+  python3 - <<'PY' | tee "$dir/platform-status.txt" || true
+import json, os, urllib.error, urllib.request
+
+dash = os.environ.get("E2E_DASHBOARD_URL", "http://127.0.0.1:30081").rstrip("/")
+user = os.environ.get("E2E_ADMIN_USER", "admin")
+password = os.environ.get("E2E_ADMIN_PASS", "admin-e2e-password")
+try:
+    req = urllib.request.Request(
+        f"{dash}/api/v1/auth/login",
+        data=json.dumps({"username": user, "password": password}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        login = json.loads(resp.read().decode() or "{}")
+    token = login.get("access_token") or login.get("token") or ""
+    if not token:
+        print("platform-status: login returned no token", login)
+        raise SystemExit(0)
+    req = urllib.request.Request(
+        f"{dash}/api/v1/platforms",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = json.loads(resp.read().decode() or "{}")
+    plats = body.get("items") or body.get("platforms") or body
+    print("platform-status:", json.dumps(plats, default=str))
+    if isinstance(plats, list):
+        for p in plats:
+            if not isinstance(p, dict):
+                continue
+            key = p.get("platform_key") or p.get("key") or p.get("id")
+            print(f"  {key}: status={p.get('status')!r}")
+except Exception as exc:  # noqa: BLE001 — diagnostics must never mask the failure
+    print(f"platform-status: unavailable: {exc}")
+PY
 }
 
 phase() {

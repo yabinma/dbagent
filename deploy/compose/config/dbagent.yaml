@@ -14,11 +14,11 @@ temporal:
   task_queue: rca-worker
 storage:
   postgres_dsn: ${PG_DSN}
-  s3_endpoint: http://minio:9000
-  s3_bucket: dbagent
-  s3_access_key: ${S3_ACCESS_KEY}
-  s3_secret_key: ${S3_SECRET_KEY}
-  s3_region: us-east-1
+  s3:
+    endpoint: http://minio:9000
+    bucket: dbagent
+    access_key: ${S3_ACCESS_KEY}
+    secret_key: ${S3_SECRET_KEY}
 model_gateway:
   url: http://model-gateway:4000
   master_key: ${LITELLM_MASTER_KEY}

@@ -13,7 +13,7 @@ All control-plane Python services load one YAML file (Appendix E) with `${ENV_VA
 - `data_egress_policy`
 - `tracing` / `tracing.backend` / `tracing.langfuse_host` / `tracing.langfuse_public_key` / `tracing.langfuse_secret_key`
 - `signing` / `signing.backend` / `signing.key_path` / `signing.rotation_grace_seconds` / `signing.allow_ephemeral`
-- `storage` / `storage.postgres_dsn` / `storage.s3_endpoint` / `storage.s3_bucket` / `storage.s3_access_key` / `storage.s3_secret_key`
+- `storage` / `storage.postgres_dsn` / `storage.s3.endpoint` (StorageConfig.s3_endpoint) / `storage.s3.bucket` (StorageConfig.s3_bucket) / `storage.s3.access_key` (StorageConfig.s3_access_key) / `storage.s3.secret_key` (StorageConfig.s3_secret_key)
 - `model_gateway` / `model_gateway.url` / `model_gateway.master_key`
 - `temporal` / `temporal.address` / `temporal.namespace` / `temporal.task_queue`
 - `ingest` / `ingest.sources` / `ingest.correlation_window_seconds`

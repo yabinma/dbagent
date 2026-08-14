@@ -13,6 +13,14 @@ images:
   dashboardWeb: dashboard-web
 
 config:
+  # Appendix E role routes. When modelGateway.bundled=true the ConfigMap
+  # rewrites every role's model to `mock` (the only name the bundled
+  # gateway serves).
+  models:
+    planner:     {model: "ollama/qwen2.5:14b",               max_tokens: 2000}
+    collector:   {model: "ollama/qwen2.5:14b",               max_tokens: 2000}
+    rca:         {model: "bedrock/anthropic.claude-fable-5", max_tokens: 8000}
+    remediation: {model: "bedrock/anthropic.claude-fable-5", max_tokens: 4000}
   temporal:
     # When temporal.mode=dev the ConfigMap rewrites this to {{Release}}-temporal:7233.
     # For mode=external, set temporal.address (or this field) to the operator endpoint.
@@ -21,16 +29,17 @@ config:
     task_queue: rca-worker
   storage:
     postgres_dsn: "${PG_DSN}"
-    # Bare compose-style default. When minio.bundled=true the ConfigMap rewrites
-    # this to http://{{Release.Name}}-minio:9000. For external MinIO, set the full
-    # URL here (or leave bundled=false and override).
-    s3_endpoint: "http://minio:9000"
-    s3_bucket: dbagent
-    s3_access_key: "${S3_ACCESS_KEY}"
-    s3_secret_key: "${S3_SECRET_KEY}"
-    s3_region: us-east-1
+    # Appendix E nested shape (storage.s3.*). When minio.bundled=true the
+    # ConfigMap rewrites endpoint to http://{{Release.Name}}-minio:9000.
+    # For external MinIO, set the full URL here (or leave bundled=false).
+    # No s3.region: Appendix E and rca_common have no home for it.
+    s3:
+      endpoint: "http://minio:9000"
+      bucket: dbagent
+      access_key: "${S3_ACCESS_KEY}"
+      secret_key: "${S3_SECRET_KEY}"
   model_gateway:
-    # Same rewrite rule as s3_endpoint when modelGateway.bundled=true.
+    # Same rewrite rule as storage.s3.endpoint when modelGateway.bundled=true.
     url: "http://model-gateway:4000"
     master_key: "${LITELLM_MASTER_KEY}"
   # Always rendered by this chart as {{Release.Name}}-probe-gateway. The ConfigMap
