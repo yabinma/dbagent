@@ -191,16 +191,25 @@ def _approve_pending(
     r = httpx.get(
         f"{dashboard_url.rstrip('/')}/api/v1/approvals",
         headers=_auth(token),
-        params={"pending": "true"},
+        params={"pending": "true", "investigation_id": str(inv_id)},
         timeout=30,
     )
     assert r.status_code == 200, (
-        f"GET /approvals?pending=true -> {r.status_code}: {r.text}"
+        f"GET /approvals?pending=true&investigation_id={inv_id} -> "
+        f"{r.status_code}: {r.text}"
     )
     body = r.json()
     items = body.get("items") if isinstance(body, dict) else body
     if not isinstance(items, list):
         items = []
+    # Filter-honour check: a server that ignores investigation_id returns
+    # the unfiltered oldest-first page. Red whenever any other
+    # investigation holds a pending approval (B1's burst in this suite).
+    assert all(str(a.get("investigation_id")) == str(inv_id) for a in items), (
+        f"GET /approvals?investigation_id={inv_id} returned items for other "
+        f"investigations: "
+        f"{[(a.get('approval_id'), a.get('investigation_id')) for a in items]}"
+    )
     targets = [
         a
         for a in items

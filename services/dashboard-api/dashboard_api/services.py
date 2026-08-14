@@ -394,11 +394,14 @@ def list_approvals(
     *,
     pending: bool = True,
     limit: int = 50,
+    investigation_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit or 50), 100))
     stmt = select(Approval).order_by(Approval.created_at.asc())
     if pending:
         stmt = stmt.where(Approval.decision.is_(None))
+    if investigation_id is not None:
+        stmt = stmt.where(Approval.investigation_id == investigation_id)
     rows = list(session.scalars(stmt.limit(limit)).all())
     now = _now()
     items = []

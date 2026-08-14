@@ -94,7 +94,7 @@ EXPECTED_CONCURRENCY_MODEL = {
             "call_sites": [
                 {
                     "file": "services/dashboard-api/dashboard_api/services.py",
-                    "line": 467,
+                    "line": 470,
                     "in": "decide_approval_atomic",
                     "symbol": "write_audit",
                     "expr": "write_audit(",

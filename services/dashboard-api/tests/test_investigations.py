@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -88,6 +88,68 @@ def _seed_inv(
             )
         s.commit()
     return inv_id, wf
+
+
+_APPROVAL_ITEM_FIELDS = frozenset(
+    {
+        "approval_id",
+        "investigation_id",
+        "kind",
+        "subject",
+        "decision",
+        "comment",
+        "created_at",
+        "age_seconds",
+        "investigation_link",
+    }
+)
+
+
+def _seed_pending_approvals_across_investigations(
+    sf,
+    n: int,
+    *,
+    start: datetime,
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """Seed n investigations, each with one pending approval. Target-last
+    callers pass a start so created_at[i] = start + i seconds (oldest-first
+    puts index n-1 beyond any 50/100 page when n > 100)."""
+    rows: list[tuple[uuid.UUID, uuid.UUID]] = []
+    with sf() as s:
+        for i in range(n):
+            inv_id = uuid.uuid4()
+            aid = uuid.uuid4()
+            created = start + timedelta(seconds=i)
+            s.add(
+                Investigation(
+                    investigation_id=inv_id,
+                    created_at=created,
+                    platform_key="presto-us1",
+                    status="AWAITING_APPROVAL",
+                    trigger_event=None,
+                    workflow_id=f"investigation-{inv_id}",
+                    budget={
+                        "max_rounds": 15,
+                        "max_cost_usd": 10.0,
+                        "max_wall_seconds": 1800,
+                    },
+                    spent={"rounds": 1, "cost_usd": 0},
+                    rca_report={"status": "concluded", "rca_compact": f"seed-{i}"},
+                )
+            )
+            s.add(
+                Approval(
+                    approval_id=aid,
+                    investigation_id=inv_id,
+                    kind="raw_command",
+                    subject={"i": i},
+                    decision=None,
+                    created_at=created,
+                )
+            )
+            rows.append((inv_id, aid))
+        s.commit()
+    return rows
 
 
 def test_sum_llm_costs_batch_empty_missing_and_mixed(session_factory):
@@ -464,6 +526,266 @@ async def test_need_more_requires_comment(client, session_factory):
         json={"decision": "need_more", "comment": ""},
     )
     assert r.status_code == 400
+
+
+def test_list_approvals_filter_logic(session_factory):
+    """UT-AP-1: list_approvals WHERE investigation_id, pending interplay,
+    unknown id, and filter-before-LIMIT.
+
+    Against the unfixed service this is red: investigation_id is not a
+    parameter, so a call with it TypeErrors (or, if ignored, the
+    limit=2 read of a target seated after older foreign rows is empty).
+    Weak forms refused: a fixture with fewer foreign rows than `limit`
+    would pass a post-LIMIT Python filter; asserting "returns approvals"
+    passes today at any N.
+    """
+    from dashboard_api.services import list_approvals
+
+    _seed_platform(session_factory)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # 10 older pending for other investigations, then 5 pending for the
+    # target. If the filter is applied after LIMIT, limit=2 returns the
+    # two oldest foreign rows and the target set is empty.
+    others = _seed_pending_approvals_across_investigations(
+        session_factory, 10, start=start
+    )
+    target_inv = uuid.uuid4()
+    target_aids = []
+    with session_factory() as s:
+        s.add(
+            Investigation(
+                investigation_id=target_inv,
+                created_at=start + timedelta(seconds=100),
+                platform_key="presto-us1",
+                status="AWAITING_APPROVAL",
+                trigger_event=None,
+                workflow_id=f"investigation-{target_inv}",
+                budget={
+                    "max_rounds": 15,
+                    "max_cost_usd": 10.0,
+                    "max_wall_seconds": 1800,
+                },
+                spent={"rounds": 1, "cost_usd": 0},
+                rca_report={"status": "concluded", "rca_compact": "target"},
+            )
+        )
+        for j in range(5):
+            aid = uuid.uuid4()
+            s.add(
+                Approval(
+                    approval_id=aid,
+                    investigation_id=target_inv,
+                    kind="raw_command",
+                    subject={"j": j},
+                    decision=None,
+                    created_at=start + timedelta(seconds=100 + j),
+                )
+            )
+            target_aids.append(aid)
+        decided_aid = uuid.uuid4()
+        s.add(
+            Approval(
+                approval_id=decided_aid,
+                investigation_id=target_inv,
+                kind="remediation",
+                subject={"decided": True},
+                decision="approved",
+                comment="already decided",
+                created_at=start + timedelta(seconds=200),
+            )
+        )
+        s.commit()
+
+    with session_factory() as session:
+        filtered = list_approvals(
+            session, pending=True, limit=2, investigation_id=target_inv
+        )
+        assert len(filtered["items"]) == 2
+        assert {i["investigation_id"] for i in filtered["items"]} == {str(target_inv)}
+        assert {i["approval_id"] for i in filtered["items"]} <= {
+            str(a) for a in target_aids
+        }
+
+        unknown = list_approvals(
+            session, pending=True, investigation_id=uuid.uuid4()
+        )
+        assert unknown == {"items": []}
+
+        pending_only = list_approvals(
+            session, pending=True, investigation_id=target_inv, limit=50
+        )
+        pending_ids = {i["approval_id"] for i in pending_only["items"]}
+        assert str(decided_aid) not in pending_ids
+        assert pending_ids == {str(a) for a in target_aids}
+
+        including_decided = list_approvals(
+            session, pending=False, investigation_id=target_inv, limit=50
+        )
+        all_ids = {i["approval_id"] for i in including_decided["items"]}
+        assert str(decided_aid) in all_ids
+        assert {str(a) for a in target_aids} <= all_ids
+
+        no_filter = list_approvals(session, pending=True, limit=50)
+        assert {i["investigation_id"] for i in no_filter["items"]} >= {
+            str(inv) for inv, _ in others
+        }
+
+
+@pytest.mark.asyncio
+async def test_get_approvals_route_investigation_id_parameter(client, session_factory):
+    """UT-AP-2: route passes investigation_id through; malformed UUID → 422;
+    absent parameter → unfiltered call.
+
+    Against the unfixed route this is red: the parameter is undeclared, so
+    FastAPI ignores it (filtered call returns the unfiltered page) and a
+    malformed value is also ignored (200, not 422). Weak form refused:
+    asserting 200 on a well-formed id without checking item ids.
+    """
+    seed_user(session_factory, username="a", password="approver-pass12", role="approver")
+    _seed_platform(session_factory)
+    start = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    seeded = _seed_pending_approvals_across_investigations(
+        session_factory, 3, start=start
+    )
+    tok = await login(client, "a", "approver-pass12")
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    target_inv, target_aid = seeded[-1]
+    r = await client.get(
+        "/api/v1/approvals",
+        headers=headers,
+        params={"pending": "true", "investigation_id": str(target_inv)},
+    )
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert items
+    assert all(i["investigation_id"] == str(target_inv) for i in items)
+    assert any(i["approval_id"] == str(target_aid) for i in items)
+
+    r = await client.get(
+        "/api/v1/approvals",
+        headers=headers,
+        params={"pending": "true", "investigation_id": "not-a-uuid"},
+    )
+    assert r.status_code == 422
+
+    r = await client.get(
+        "/api/v1/approvals",
+        headers=headers,
+        params={"pending": "true"},
+    )
+    assert r.status_code == 200
+    unfiltered_ids = {i["investigation_id"] for i in r.json()["items"]}
+    assert {str(inv) for inv, _ in seeded} <= unfiltered_ids
+
+
+@pytest.mark.asyncio
+async def test_a_caller_holding_an_investigation_id_reaches_its_approval_past_the_page_cap(
+    client, session_factory
+):
+    """FP-AP-1: 120 pending approvals across 120 investigations, target last.
+
+    Control: the unfiltered default read must NOT contain the target —
+    otherwise the fixture is too small to exhibit the defect (a future
+    default-page raise that exceeds N must fail this control loudly).
+    Behaviour: `investigation_id=<target>` returns exactly the target's
+    approval(s), every item carrying that id.
+
+    Against the unfixed route: red. The parameter is undeclared, FastAPI
+    ignores it, the response is the unfiltered oldest-first page of 50,
+    and the target is absent.
+
+    Weak forms refused: N < 50 (passes today, which is why three green
+    runs never caught G1); asserting "the endpoint returns approvals"
+    (passes today at any N); asserting the filtered call is non-empty
+    without the id-match (passes against a filter-ignoring server
+    whenever any approval exists).
+    """
+    seed_user(session_factory, username="a", password="approver-pass12", role="approver")
+    _seed_platform(session_factory)
+    start = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    seeded = _seed_pending_approvals_across_investigations(
+        session_factory, 120, start=start
+    )
+    target_inv, target_aid = seeded[-1]
+    tok = await login(client, "a", "approver-pass12")
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    control = await client.get(
+        "/api/v1/approvals",
+        headers=headers,
+        params={"pending": "true"},
+    )
+    assert control.status_code == 200, control.text
+    control_items = control.json()["items"]
+    assert len(control_items) == 50
+    control_ids = {i["investigation_id"] for i in control_items}
+    assert str(target_inv) not in control_ids, (
+        "unfiltered default page already contains the newest target — "
+        "fixture is too small to exhibit the page-cap defect"
+    )
+    assert str(target_aid) not in {i["approval_id"] for i in control_items}
+
+    filtered = await client.get(
+        "/api/v1/approvals",
+        headers=headers,
+        params={"pending": "true", "investigation_id": str(target_inv)},
+    )
+    assert filtered.status_code == 200, filtered.text
+    items = filtered.json()["items"]
+    assert items, "filtered read returned no approvals for the target"
+    assert all(i["investigation_id"] == str(target_inv) for i in items)
+    assert {i["approval_id"] for i in items} == {str(target_aid)}
+
+
+@pytest.mark.asyncio
+async def test_approvals_list_contract_without_the_filter_is_unchanged(
+    client, session_factory
+):
+    """FP-AP-2 pinning test — deliberately green against the unfixed code.
+
+    Pins the unfiltered contract: `items` envelope, item field set,
+    oldest-first by created_at, default page of 50, cap limit=500 → 100.
+    This is not evidence for FP-AP-1. The weak form it forecloses is a
+    fix that flips the sort to newest-first so the test's approval lands
+    on page one, reordering the product's approval queue to serve a test.
+    """
+    seed_user(session_factory, username="a", password="approver-pass12", role="approver")
+    _seed_platform(session_factory)
+    start = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    seeded = _seed_pending_approvals_across_investigations(
+        session_factory, 120, start=start
+    )
+    tok = await login(client, "a", "approver-pass12")
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    default_page = await client.get("/api/v1/approvals", headers=headers)
+    assert default_page.status_code == 200, default_page.text
+    body = default_page.json()
+    assert set(body.keys()) == {"items"}
+    items = body["items"]
+    assert len(items) == 50
+    assert _APPROVAL_ITEM_FIELDS <= set(items[0].keys())
+
+    created = [i["created_at"] for i in items]
+    assert created == sorted(created), "unfiltered list must stay oldest-first"
+    expected_oldest = [str(aid) for _, aid in seeded[:50]]
+    assert [i["approval_id"] for i in items] == expected_oldest
+
+    capped = await client.get(
+        "/api/v1/approvals",
+        headers=headers,
+        params={"limit": 500},
+    )
+    assert capped.status_code == 200, capped.text
+    capped_items = capped.json()["items"]
+    assert len(capped_items) == 100
+    assert [i["approval_id"] for i in capped_items] == [
+        str(aid) for _, aid in seeded[:100]
+    ]
+    assert [i["created_at"] for i in capped_items] == sorted(
+        i["created_at"] for i in capped_items
+    )
 
 
 @pytest.mark.asyncio

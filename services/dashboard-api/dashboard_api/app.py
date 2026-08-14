@@ -252,10 +252,16 @@ def create_app(
     async def get_approvals(
         pending: bool = True,
         limit: int = 50,
+        investigation_id: uuid.UUID | None = None,
         user: AuthUser = Depends(require_role("approver")),
     ) -> dict[str, Any]:
         with session_factory() as session:
-            return svc.list_approvals(session, pending=pending, limit=limit)
+            return svc.list_approvals(
+                session,
+                pending=pending,
+                limit=limit,
+                investigation_id=investigation_id,
+            )
 
     @app.post("/api/v1/approvals/{approval_id}/decision")
     async def post_decision(

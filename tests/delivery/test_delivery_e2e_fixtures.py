@@ -253,7 +253,10 @@ def test_approve_pending_posts_approved_and_fails_closed(monkeypatch):
             return self._payload
 
     def fake_get(url, **kwargs):
-        assert "approvals" in url and "pending" in str(kwargs.get("params") or {})
+        params = kwargs.get("params") or {}
+        assert "approvals" in url
+        assert "pending" in str(params)
+        assert str(params.get("investigation_id")) == "inv-1"
         return _Resp(
             200,
             {
@@ -283,6 +286,28 @@ def test_approve_pending_posts_approved_and_fails_closed(monkeypatch):
         assert posts, f"decision POST never fired for {decision!r}"
         assert posts[0]["json"]["decision"] == decision
         assert "ap-1" in posts[0]["url"]
+
+    # FP-AP-3: a server that ignores investigation_id (returns another
+    # investigation's pending approval) must fail the all-items-match
+    # assertion. This is red whenever any other investigation holds a
+    # pending approval; the client-side filter that hid G1 is refused.
+    def ignore_filter_get(url, **kwargs):
+        return _Resp(
+            200,
+            {
+                "items": [
+                    {
+                        "approval_id": "ap-other",
+                        "investigation_id": "inv-OTHER",
+                        "decision": None,
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx, "get", ignore_filter_get)
+    with pytest.raises(AssertionError, match="other investigations"):
+        module._approve_pending("http://dash", "tok", "inv-1")
 
     # Invalid decision is rejected before any HTTP call.
     posts.clear()
@@ -321,6 +346,62 @@ def test_approve_pending_posts_approved_and_fails_closed(monkeypatch):
     monkeypatch.setattr(httpx, "post", fail_post)
     with pytest.raises(AssertionError, match="POST decision"):
         module._approve_pending("http://dash", "tok", "inv-1")
+
+
+def test_approve_pending_mixed_page_does_not_post(monkeypatch):
+    """Mixed page (target + foreign) must not be decided.
+
+    Lives in its own function so ``assert posts == []`` cannot be
+    shadowed by the other-only case's ``match="other investigations"``
+    prose assertion. The shipped helper raises before POSTing; a helper
+    that filters client-side POSTs the target. Swallowing AssertionError
+    lets the behavioural discriminator run either way.
+    """
+    import httpx
+
+    module = _scenarios_module()
+    posts: list[dict] = []
+
+    class _Resp:
+        def __init__(self, status_code: int, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload) if not isinstance(payload, str) else payload
+
+        def json(self):
+            return self._payload
+
+    def mixed_page_get(url, **kwargs):
+        return _Resp(
+            200,
+            {
+                "items": [
+                    {
+                        "approval_id": "ap-other",
+                        "investigation_id": "inv-OTHER",
+                        "decision": None,
+                    },
+                    {
+                        "approval_id": "ap-1",
+                        "investigation_id": "inv-1",
+                        "decision": None,
+                    },
+                ]
+            },
+        )
+
+    def fake_post(url, **kwargs):
+        posts.append({"url": url, "json": kwargs.get("json")})
+        return _Resp(200, {"ok": True})
+
+    monkeypatch.setattr(httpx, "get", mixed_page_get)
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    try:
+        module._approve_pending("http://dash", "tok", "inv-1")
+    except AssertionError:
+        pass
+    assert posts == [], "a page containing foreign items must not be decided"
 
 
 def test_e2e_scenarios_contain_no_status_only_case_selection():
