@@ -19,6 +19,44 @@ PLATFORM_ONLINE_DEADLINE_S = float(os.environ.get("E2E_PLATFORM_ONLINE_DEADLINE_
 PLATFORM_ONLINE_POLL_S = 2.0
 
 
+def lookup_platform(
+    dashboard_url: str,
+    token: str,
+    platform_key: str,
+    *,
+    timeout: float = 10,
+) -> tuple[str, dict | None]:
+    """Locate *platform_key* via GET /api/v1/platforms (no GET-by-key route).
+
+    Returns ``(observed_diagnostic, platform_or_None)``. There is no
+    ``GET /api/v1/platforms/{key}`` — PATCH occupies that path — so B1 and
+    the session barrier must share this list lookup.
+    """
+    resp = httpx.get(
+        f"{dashboard_url.rstrip('/')}/api/v1/platforms",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        return f"platforms status={resp.status_code}", None
+    payload = resp.json()
+    plats = payload.get("items") or payload.get("platforms") or payload
+    if not isinstance(plats, list):
+        plats = []
+    target = next(
+        (
+            p
+            for p in plats
+            if isinstance(p, dict) and p.get("platform_key") == platform_key
+        ),
+        None,
+    )
+    if target is None:
+        return f"platform {platform_key!r} not in listing; listed={plats!r}", None
+    status = target.get("status") or ""
+    return f"platform {platform_key!r} status={status!r}", target
+
+
 @pytest.fixture(scope="session")
 def ingest_url() -> str:
     return INGEST_URL
@@ -66,35 +104,11 @@ def wait_for_platform_online(
             if not token:
                 observed = f"login status={login.status_code}"
             else:
-                resp = httpx.get(
-                    f"{dashboard_url.rstrip('/')}/api/v1/platforms",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=10,
+                observed, target = lookup_platform(
+                    dashboard_url, token, key, timeout=10
                 )
-                if resp.status_code != 200:
-                    observed = f"platforms status={resp.status_code}"
-                else:
-                    payload = resp.json()
-                    plats = payload.get("items") or payload.get("platforms") or payload
-                    if not isinstance(plats, list):
-                        plats = []
-                    target = next(
-                        (
-                            p
-                            for p in plats
-                            if isinstance(p, dict) and p.get("platform_key") == key
-                        ),
-                        None,
-                    )
-                    if target is None:
-                        observed = (
-                            f"platform {key!r} not in listing; listed={plats!r}"
-                        )
-                    else:
-                        status = target.get("status") or ""
-                        observed = f"platform {key!r} status={status!r}"
-                        if status.lower() == "online":
-                            return
+                if target is not None and (target.get("status") or "").lower() == "online":
+                    return
         except Exception as exc:  # noqa: BLE001 — keep polling until the deadline
             observed = f"error: {exc}"
         if time.monotonic() >= deadline:

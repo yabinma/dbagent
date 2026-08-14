@@ -11,9 +11,12 @@ on `http.server.ThreadingHTTPServer` so it can be embedded directly in a
 test process (as a background thread) or run standalone for local/manual
 use (`python -m tests.mocks.llm.mock_llm_server`).
 
-Canned responses are keyed by `agent_role` (read from the request's
-`metadata.agent_role`, which `LLMClient.generate()` always sends -- Section
-7); a scenario without a specific canned response falls back to
+Canned responses are keyed by `agent_role`. Direct (functional-tier) callers
+send it as `metadata.agent_role`. litellm strips `metadata` before
+forwarding, so when that field is absent the mock also reads
+`response_format.json_schema.name` — the same name `LLMClient.generate()`
+sets to the agent role, and the field the pinned litellm image does
+forward. A scenario without a matching canned response falls back to
 `default_response`.
 
 M6 (FP-M6-17) adds a fixture-manifest mode: ``fixture_set`` / ``--fixtures``
@@ -205,6 +208,14 @@ class MockLLMServer:
     def _resolve_canned(self, body: dict[str, Any]) -> CannedResponse:
         metadata = body.get("metadata") or {}
         agent_role = metadata.get("agent_role")
+        # litellm strips metadata; json_schema.name is the role the client
+        # already sends and the proxy forwards.
+        if not agent_role:
+            rf = body.get("response_format") or {}
+            if isinstance(rf, dict):
+                schema = rf.get("json_schema") or {}
+                if isinstance(schema, dict):
+                    agent_role = schema.get("name")
         messages = body.get("messages") or []
         prompt_parts: list[str] = []
         for m in messages:

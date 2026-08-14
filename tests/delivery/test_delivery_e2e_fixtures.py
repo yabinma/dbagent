@@ -1200,6 +1200,17 @@ def _load_e2e_conftest():
     return module
 
 
+def _load_e2e_load():
+    """Import tests/e2e/test_e2e_load.py without collecting the e2e suite."""
+    spec = importlib.util.spec_from_file_location(
+        "e2e_load_under_test", E2E / "test_e2e_load.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _session_autouse_fixture_nodes(
     source: str,
 ) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -1346,6 +1357,74 @@ def _platform_dashboard_stub(items: list[dict]):
                 path = self.path.split("?", 1)[0].rstrip("/")
                 if path.endswith("/platforms"):
                     self._send({"items": items})
+                    return
+                self.send_error(404)
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Dash)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    return _serve()
+
+
+def _dashboard_stub_no_get_by_key(items: list[dict], requested: list[str] | None = None):
+    """Dashboard stand-in matching the shipped route table.
+
+    GET /api/v1/platforms            → 200 {"items": ...}
+    GET /api/v1/platforms/{key}      → 405 (PATCH occupies that path)
+    POST /api/v1/auth/login          → 200 {"access_token": ...}
+    """
+    from contextlib import contextmanager
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    log = requested if requested is not None else []
+
+    @contextmanager
+    def _serve():
+        class _Dash(BaseHTTPRequestHandler):
+            def _send(self, payload, code=200, extra_headers=None):
+                raw = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                for key, value in extra_headers or ():
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                log.append(f"POST {path}")
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                if path.rstrip("/").endswith("/auth/login"):
+                    self._send({"access_token": "stub-token"})
+                    return
+                self.send_error(404)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                log.append(f"GET {path}")
+                stripped = path.rstrip("/")
+                if stripped.endswith("/platforms"):
+                    self._send({"items": items})
+                    return
+                if "/platforms/" in stripped:
+                    # Same 405 FastAPI returns when PATCH owns this path.
+                    self.send_response(405)
+                    self.send_header("Allow", "PATCH")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                     return
                 self.send_error(404)
 
@@ -1552,6 +1631,57 @@ def test_e2e_barrier_requires_the_specific_platform_not_any_online():
     missing_msg = str(missing.value)
     assert "presto-e2e" in missing_msg
     assert "other-platform" in missing_msg or "missing" in missing_msg.lower() or "not in" in missing_msg.lower()
+
+
+def test_b1_platform_online_true_against_real_route_table():
+    """F3: B1's check must pass when the list endpoint reports the platform online.
+
+    GET /api/v1/platforms/{key} is not a route (405; PATCH occupies it). Driving
+    `_platform_online` against a stub that 405s that path and serves the real
+    list endpoint is the defect: at 698fff1 the helper returns False and B1
+    refuses to measure. A test that only asserts False-when-offline is green
+    today and is worthless.
+    """
+    requested: list[str] = []
+    online = [{"platform_key": "presto-e2e", "status": "ONLINE"}]
+    load = _load_e2e_load()
+    with _dashboard_stub_no_get_by_key(online, requested) as dash_url:
+        result = load._platform_online(dash_url, "stub-token")
+    assert result is True, (
+        "_platform_online must return True when GET /api/v1/platforms lists "
+        f"presto-e2e as online; got {result!r}. requested={requested!r}"
+    )
+    assert any(path.endswith("/platforms") for path in requested), (
+        "_platform_online must query GET /api/v1/platforms; requested="
+        f"{requested!r}"
+    )
+
+
+def test_b1_platform_online_false_when_listed_status_is_not_online():
+    """F3 companion: reading the list must not weaken B1's fail-closed check."""
+    load = _load_e2e_load()
+    enrolling = [{"platform_key": "presto-e2e", "status": "enrolling"}]
+    with _dashboard_stub_no_get_by_key(enrolling) as dash_url:
+        assert load._platform_online(dash_url, "stub-token") is False
+    missing = [{"platform_key": "other-platform", "status": "online"}]
+    with _dashboard_stub_no_get_by_key(missing) as dash_url:
+        assert load._platform_online(dash_url, "stub-token") is False
+
+
+def test_b1_and_barrier_share_list_lookup_against_real_routes():
+    """F3: B1 and the session barrier must not drift onto different platform URLs."""
+    requested: list[str] = []
+    online = [{"platform_key": "presto-e2e", "status": "online"}]
+    load = _load_e2e_load()
+    barrier = _load_e2e_conftest()
+    with _dashboard_stub_no_get_by_key(online, requested) as dash_url:
+        assert load._platform_online(dash_url, "stub-token") is True
+        barrier.wait_for_platform_online(dash_url, deadline_s=1, poll_s=0)
+    get_paths = [p.split(" ", 1)[1].rstrip("/") for p in requested if p.startswith("GET ")]
+    assert all(not path.split("/")[-1] == "presto-e2e" for path in get_paths), (
+        "neither helper may GET /api/v1/platforms/{key}; requested="
+        f"{requested!r}"
+    )
 
 
 def test_run_sh_failure_diagnostics_platform_status(tmp_path: Path):

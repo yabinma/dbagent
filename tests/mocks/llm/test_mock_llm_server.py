@@ -80,6 +80,89 @@ def test_start_stop_without_context_manager():
     assert url.startswith("http://127.0.0.1:")
 
 
+@pytest.mark.asyncio
+async def test_role_resolved_from_response_format_schema_name_when_metadata_absent():
+    """F4: litellm strips metadata; json_schema.name is what the backend sees.
+
+    The pinned litellm image forwards only messages/model/response_format.
+    A request that still carries metadata.agent_role is the functional-tier
+    path and does not exercise this defect.
+    """
+    with MockLLMServer(
+        responses={"planner": CannedResponse(content='{"tool_calls":[]}', cost_usd=0.02)}
+    ) as server:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{server.base_url}/chat/completions",
+                json={
+                    "model": "mock",
+                    "messages": [{"role": "user", "content": "plan"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "planner", "schema": {}},
+                    },
+                },
+            )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == '{"tool_calls":[]}'
+    assert resp.headers["x-litellm-response-cost"] == "0.02"
+
+
+@pytest.mark.asyncio
+async def test_metadata_agent_role_wins_over_response_format_schema_name():
+    """F4 companion: the functional tier still keys on metadata when present."""
+    with MockLLMServer(
+        responses={
+            "planner": CannedResponse(content='{"from":"planner"}'),
+            "rca": CannedResponse(content='{"from":"rca"}'),
+        }
+    ) as server:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{server.base_url}/chat/completions",
+                json={
+                    "model": "mock",
+                    "messages": [],
+                    "metadata": {"agent_role": "rca"},
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "planner", "schema": {}},
+                    },
+                },
+            )
+    assert resp.json()["choices"][0]["message"]["content"] == '{"from":"rca"}'
+
+
+def test_fixture_rule_matches_response_format_schema_name_without_metadata(tmp_path):
+    """F4 e2e path: fixture-manifest rules must match json_schema.name alone."""
+    (tmp_path / "planner.json").write_text('{"tool_calls":[{"name":"x"}]}', encoding="utf-8")
+    (tmp_path / "fixtures.yaml").write_text(
+        """
+- when: {agent_role: planner}
+  respond: planner.json
+  repeat: all
+""",
+        encoding="utf-8",
+    )
+    with MockLLMServer(
+        fixture_set=tmp_path,
+        default_response=CannedResponse(content='{"answer": "ok"}'),
+    ) as server:
+        resp = httpx.post(
+            f"{server.base_url}/chat/completions",
+            json={
+                "model": "mock",
+                "messages": [{"role": "user", "content": "plan"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "planner"},
+                },
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == '{"tool_calls":[{"name":"x"}]}'
+
+
 def test_placeholders_are_filled_from_earlier_prompts_of_the_same_case(tmp_path):
     """FP-M6-17 / review round 5 C6: a fixture that names a run-time value.
 

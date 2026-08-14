@@ -22,6 +22,8 @@ import pytest
 import importlib.util
 import sys
 
+from tests.e2e.conftest import lookup_platform
+
 _PROFILE_PATH = Path(__file__).resolve().parent / "b1_e2e_profile.py"
 _spec = importlib.util.spec_from_file_location("b1_e2e_profile", _PROFILE_PATH)
 assert _spec and _spec.loader
@@ -98,15 +100,12 @@ def _admin_token(dashboard_url: str) -> str:
 
 
 def _platform_online(dashboard_url: str, token: str) -> bool:
-    r = httpx.get(
-        f"{dashboard_url.rstrip('/')}/api/v1/platforms/{PLATFORM_KEY}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
+    _observed, target = lookup_platform(
+        dashboard_url, token, PLATFORM_KEY, timeout=30
     )
-    if r.status_code != 200:
+    if target is None:
         return False
-    status = (r.json().get("status") or "").lower()
-    return status == "online"
+    return (target.get("status") or "").lower() == "online"
 
 
 def _count_ingest_audit_rows(dashboard_url: str, token: str, since: datetime, cap: int) -> int:
