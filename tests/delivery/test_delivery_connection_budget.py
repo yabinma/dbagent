@@ -51,6 +51,15 @@ def _secret(name: str = "t-app", *, pg_dsn: bool = True, extra: dict[str, str] |
     }
 
 
+def _configmap(name: str, data: dict[str, str]) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": name},
+        "data": data,
+    }
+
+
 def _deploy(
     name: str,
     container: dict[str, Any],
@@ -425,6 +434,136 @@ def test_allowlist_predicate_fails_closed_when_secret_is_external():
     docs = [d for d in _ah_fixture() if d.get("kind") != "Secret"]
     with pytest.raises(BudgetError, match="allowlist reason predicate failed: model-gateway"):
         evaluate(docs)
+
+
+def test_envfrom_configmapref_pg_dsn_consumer_is_classified():
+    """Workload receiving PG_DSN via envFrom.configMapRef is a potential consumer.
+
+    Kills a secretRef-only envFrom reader: that reader never looks at
+    configMapRef, so this fixture would pass (demand still 145, no raise).
+    """
+    docs = _ah_fixture()
+    docs.append(_configmap("t-cm-dsn", {"PG_DSN": "postgresql://x"}))
+    docs.append(
+        _deploy(
+            "t-cmref",
+            {"name": "cmref", "envFrom": [{"configMapRef": {"name": "t-cm-dsn"}}]},
+        )
+    )
+    with pytest.raises(BudgetError, match="undeclared consumer: cmref"):
+        evaluate(docs)
+
+
+def test_envfrom_configmapref_absent_from_render_is_classified():
+    """envFrom of a ConfigMap not in the render makes the key set unknowable.
+
+    Kills a secretRef-only envFrom reader (and a configMapRef reader with
+    no fail-closed absent-reference branch): this fixture would pass
+    (demand still 145, no raise).
+    """
+    docs = _ah_fixture()
+    docs.append(
+        _deploy(
+            "t-cmext",
+            {"name": "cmext", "envFrom": [{"configMapRef": {"name": "nowhere"}}]},
+        )
+    )
+    with pytest.raises(BudgetError, match="undeclared consumer: cmext"):
+        evaluate(docs)
+
+
+def test_allowlisted_workload_with_envfrom_configmapref_database_url_fails_predicate():
+    """Allowlist predicate sees DATABASE_URL reachable via envFrom.configMapRef.
+
+    Kills a secretRef-only envFrom reader inside the reason predicate:
+    that reader would skip this spelling and the fixture would pass.
+    """
+    docs = _ah_fixture()
+    docs.append(_configmap("t-cm-dburl", {"DATABASE_URL": "postgresql://x"}))
+    for i, doc in enumerate(docs):
+        if doc.get("kind") == "Deployment" and (doc.get("metadata") or {}).get("name") == "t-model-gateway":
+            docs[i] = _deploy(
+                "t-model-gateway",
+                {
+                    "name": "model-gateway",
+                    "envFrom": [
+                        {"secretRef": {"name": "t-app"}},
+                        {"configMapRef": {"name": "t-cm-dburl"}},
+                    ],
+                },
+            )
+            break
+    with pytest.raises(
+        BudgetError,
+        match=r"allowlist reason predicate failed: model-gateway "
+        r"\(DATABASE_URL reachable via envFrom\)",
+    ):
+        evaluate(docs)
+
+
+def test_allowlist_predicate_fails_closed_when_configmap_is_external():
+    """envFrom of a ConfigMap not in the render makes the key set unknowable.
+
+    Kills a secretRef-only envFrom reader inside the reason predicate
+    (the secretRef path already has this fail-closed branch; configMapRef
+    had none). This fixture would pass under that reader.
+    """
+    docs = _ah_fixture()
+    for i, doc in enumerate(docs):
+        if doc.get("kind") == "Deployment" and (doc.get("metadata") or {}).get("name") == "t-model-gateway":
+            docs[i] = _deploy(
+                "t-model-gateway",
+                {
+                    "name": "model-gateway",
+                    "envFrom": [
+                        {"secretRef": {"name": "t-app"}},
+                        {"configMapRef": {"name": "nowhere"}},
+                    ],
+                },
+            )
+            break
+    with pytest.raises(
+        BudgetError,
+        match=r"allowlist reason predicate failed: model-gateway "
+        r"\(envFrom ConfigMap 'nowhere' is not in the render\)",
+    ):
+        evaluate(docs)
+
+
+def test_valueFrom_postgres_seeds_keeps_temporal_classified():
+    """Temporal-dev shape is recognized when POSTGRES_SEEDS arrives via valueFrom.
+
+    Kills a literal-value-only membership test at the POSTGRES_SEEDS leg:
+    that reader drops Temporal and demand reads 115 instead of 145.
+    """
+    docs = _ah_fixture()
+    for i, doc in enumerate(docs):
+        if doc.get("kind") == "Deployment" and (doc.get("metadata") or {}).get("name") == "t-temporal":
+            docs[i] = _deploy(
+                "t-temporal",
+                {
+                    "name": "temporal",
+                    "env": [
+                        {"name": "DB", "value": "postgres12"},
+                        {
+                            "name": "POSTGRES_SEEDS",
+                            "valueFrom": {
+                                "secretKeyRef": {
+                                    "name": "t-app",
+                                    "key": "POSTGRES_SEEDS",
+                                }
+                            },
+                        },
+                        {"name": "SQL_MAX_CONNS", "value": "20"},
+                        {"name": "SQL_VIS_MAX_CONNS", "value": "10"},
+                    ],
+                },
+            )
+            break
+    result = evaluate(docs)
+    assert result.demand == 145, result.per_consumer
+    assert result.per_consumer["temporal"] == 30
+    assert result.per_consumer == AH_DEMAND
 
 
 # ---------------------------------------------------------------------------

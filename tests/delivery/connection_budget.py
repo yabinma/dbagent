@@ -123,15 +123,13 @@ def evaluate(docs: list[Mapping[str, Any]]) -> BudgetResult:
     workloads = list(_iter_workload_containers(docs))
     secrets = _index_secrets(docs)
     configmaps = _index_configmaps(docs)
-    app_secret_names = {
-        name for name, keys in secrets.items() if "PG_DSN" in keys
-    }
+    cm_keys = _index_configmap_keys(docs)
 
     potential: list[WorkloadContainer] = []
     for wl in workloads:
         if wl.kind in _RESERVE_KINDS:
             continue
-        if _is_potential_consumer(wl, secrets, app_secret_names):
+        if _is_potential_consumer(wl, secrets, cm_keys):
             potential.append(wl)
 
     potential_names = [wl.container_name for wl in potential]
@@ -158,7 +156,7 @@ def evaluate(docs: list[Mapping[str, Any]]) -> BudgetResult:
                 f"consumer {name} is in both the declared-ceiling table and the allowlist"
             )
         if in_allowlist:
-            _assert_allowlist_predicate(wl, secrets)
+            _assert_allowlist_predicate(wl, secrets, cm_keys)
             allowlisted.add(name)
             continue
         if name in _PYTHON_SERVICES:
@@ -271,6 +269,18 @@ def _index_configmaps(docs: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, 
     return out
 
 
+def _index_configmap_keys(docs: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for doc in docs:
+        if doc.get("kind") != "ConfigMap":
+            continue
+        name = (doc.get("metadata") or {}).get("name") or ""
+        out[name] = set((doc.get("data") or {}).keys()) | set(
+            (doc.get("binaryData") or {}).keys()
+        )
+    return out
+
+
 def _env_map(container: Mapping[str, Any]) -> dict[str, str]:
     out: dict[str, str] = {}
     for entry in container.get("env") or []:
@@ -284,30 +294,44 @@ def _env_names(container: Mapping[str, Any]) -> set[str]:
     return {e["name"] for e in (container.get("env") or []) if "name" in e}
 
 
-def _envfrom_secret_names(container: Mapping[str, Any]) -> list[str]:
-    names: list[str] = []
+def _envfrom_sources(container: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Every envFrom source as (kind, name), total over the envFrom grammar."""
+    out: list[tuple[str, str]] = []
     for src in container.get("envFrom") or []:
-        ref = src.get("secretRef") or {}
-        if "name" in ref:
-            names.append(ref["name"])
-    return names
+        for key, kind in (("secretRef", "Secret"), ("configMapRef", "ConfigMap")):
+            ref = src.get(key) or {}
+            if "name" in ref:
+                out.append((kind, ref["name"]))
+                break
+        else:
+            out.append(("unknown", ""))
+    return out
+
+
+def _envfrom_keys(
+    kind: str,
+    name: str,
+    secrets: Mapping[str, set[str]],
+    cm_keys: Mapping[str, set[str]],
+) -> set[str] | None:
+    """Reachable env-key set, or None when unknowable (⇒ caller fails closed)."""
+    table = {"Secret": secrets, "ConfigMap": cm_keys}.get(kind)
+    if table is None or name not in table:
+        return None
+    return table[name]
 
 
 def _is_potential_consumer(
     wl: WorkloadContainer,
     secrets: Mapping[str, set[str]],
-    app_secret_names: set[str],
+    cm_keys: Mapping[str, set[str]],
 ) -> bool:
     env = _env_map(wl.container)
     names = _env_names(wl.container)
-    envfrom = _envfrom_secret_names(wl.container)
     receives_pg_dsn = "PG_DSN" in names
-    for sname in envfrom:
-        if sname in app_secret_names:
-            receives_pg_dsn = True
-        elif sname not in secrets:
-            # envFrom of a Secret that is not in the render: key set
-            # unknowable. Fail-closed — treat as a potential consumer.
+    for kind, sname in _envfrom_sources(wl.container):
+        keys = _envfrom_keys(kind, sname, secrets, cm_keys)
+        if keys is None or "PG_DSN" in keys:
             receives_pg_dsn = True
     temporal_shape = env.get("DB") == "postgres12" and "POSTGRES_SEEDS" in names
     return receives_pg_dsn or temporal_shape
@@ -316,24 +340,27 @@ def _is_potential_consumer(
 def _assert_allowlist_predicate(
     wl: WorkloadContainer,
     secrets: Mapping[str, set[str]],
+    cm_keys: Mapping[str, set[str]],
 ) -> None:
     """model-gateway: rendered container has no DATABASE_URL env.
 
-    Fail-closed when an envFrom names a Secret not in the rendered output
-    (key set unknowable).
+    Fail-closed when an envFrom names a Secret or ConfigMap not in the
+    rendered output (key set unknowable).
     """
     if "DATABASE_URL" in _env_names(wl.container):
         raise BudgetError(
             f"allowlist reason predicate failed: {wl.container_name} "
             f"(DATABASE_URL is set)"
         )
-    for sname in _envfrom_secret_names(wl.container):
-        if sname not in secrets:
+    for kind, sname in _envfrom_sources(wl.container):
+        keys = _envfrom_keys(kind, sname, secrets, cm_keys)
+        if keys is None:
+            label = "secret" if kind == "Secret" else kind
             raise BudgetError(
                 f"allowlist reason predicate failed: {wl.container_name} "
-                f"(envFrom secret {sname!r} is not in the render)"
+                f"(envFrom {label} {sname!r} is not in the render)"
             )
-        if "DATABASE_URL" in secrets[sname]:
+        if "DATABASE_URL" in keys:
             raise BudgetError(
                 f"allowlist reason predicate failed: {wl.container_name} "
                 f"(DATABASE_URL reachable via envFrom)"
