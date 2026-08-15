@@ -44,6 +44,14 @@ spec:
             # config.temporal.namespace; design.md §11.2.3 C.1 row 22).
             - name: DEFAULT_NAMESPACE
               value: {{ .Values.config.temporal.namespace | quote }}
+            # FP-IG-30(b): pin the image's datastore pool ceilings in the
+            # rendered manifest so the demand reader does not trust an image
+            # internal. Declared, not changed — SQL_MAX_CONNS / SQL_VIS_MAX_CONNS
+            # are the auto-setup image's own template variables.
+            - name: SQL_MAX_CONNS
+              value: "20"
+            - name: SQL_VIS_MAX_CONNS
+              value: "10"
           resources:
             {{- toYaml .Values.temporalDev.resources | nindent 12 }}
           livenessProbe:

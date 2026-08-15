@@ -151,6 +151,11 @@ temporalWorker:
 
 probeGateway:
   replicaCount: 1
+  # FP-IG-30(a): finite database/sql pool. Rendered as a bare unquoted int
+  # into the probe-gateway ConfigMap (`max_db_conns`); required at the serve
+  # path (absent / <= 0 refuses to start). No ${} — envexpand re-tags
+  # placeholder scalars !!str and yaml.v3 cannot decode !!str into int.
+  maxDbConns: 10
   service:
     type: ClusterIP
     # NodePort for the internal (:8080) health/admin port when type=NodePort.
@@ -271,6 +276,13 @@ temporal:
 # set bundled: false and supply an external DSN via secrets.
 postgresql:
   bundled: false
+  # FP-IG-29: connection supply for bundled PG only. Derived from AH's demand
+  # table (145 at the shipped topology) + RESERVE 13 (3 superuser_reserved
+  # + 10 transient) = 158, rounded up to 160 as one-direction slack. Slack
+  # can only widen supply; FP-IG-31 asserts the recomputed inequality, so
+  # the slack buys no laxity on demand. Edited only when AH's demand table
+  # changes, in the same commit.
+  maxConnections: 160
   image: postgres:16-alpine
   auth:
     database: dbagent

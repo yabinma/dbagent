@@ -235,6 +235,11 @@ node_modules/
 # now — flagged as housekeeping across several review rounds, 2026-08-10).
 /design-review.md
 
+# Local-only root-cause trail written by the /triage skill alongside fix.md.
+# Same class as /review.md and /fix.md above: an investigation artifact, not a
+# published document. Untracked-but-not-ignored until now (2026-08-15).
+/rca.md
+
 # Walkthrough acceptance artifacts (operator/self-test output; not committed).
 # Dated report names and bootstrap-token files can carry raw secrets.
 /walkthrough-report.json

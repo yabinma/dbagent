@@ -45,6 +45,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("probe-gateway: open registry: %v", err)
 	}
+	if err := applyDBConnCeiling(cfg, reg); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	ca, err := bootstrapca.Bootstrap(cfg.BootstrapCACertPath, cfg.BootstrapCAKeyPath)
 	if err != nil {
@@ -71,6 +74,20 @@ func main() {
 	}
 	go runBootstrapListener(ctx, cfg.BootstrapListenAddr, ca, reg, cfg.ServerCertSANs)
 	runSessionListener(ctx, cfg.SessionListenAddr, ca, gw, reg, cfg.ServerCertSANs)
+}
+
+// applyDBConnCeiling refuses an undeclared or unlimited pool and applies the
+// ConfigMap-declared cap to the registry handle. Extracted so its deletion
+// breaks TestApplyDBConnCeiling_AppliesLoadedMaxDBConns (UT-IG-12).
+func applyDBConnCeiling(cfg config.Config, reg *registry.PG) error {
+	if cfg.MaxDBConns <= 0 {
+		return fmt.Errorf(
+			"probe-gateway: max_db_conns is required and must be > 0 (got %d)",
+			cfg.MaxDBConns,
+		)
+	}
+	reg.DB.SetMaxOpenConns(cfg.MaxDBConns)
+	return nil
 }
 
 // newSessionServer constructs the Session server with production wiring

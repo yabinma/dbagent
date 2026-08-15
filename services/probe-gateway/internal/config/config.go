@@ -25,6 +25,12 @@ type Config struct {
 	BootstrapListenAddr string `yaml:"bootstrap_listen_addr"`
 
 	PostgresDSN string `yaml:"postgres_dsn"`
+	// MaxDBConns caps the registry's database/sql pool (SetMaxOpenConns).
+	// Required at the serve path: defaults() leaves 0 and applyDBConnCeiling
+	// errors on <= 0, so an absent, zero or negative key refuses to start.
+	// No default — a struct-tag rename that stops decoding yields 0, never
+	// a silent unlimited pool.
+	MaxDBConns int `yaml:"max_db_conns"`
 
 	BootstrapCACertPath string `yaml:"bootstrap_ca_cert_path"`
 	BootstrapCAKeyPath  string `yaml:"bootstrap_ca_key_path"`

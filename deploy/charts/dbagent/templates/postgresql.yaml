@@ -28,6 +28,7 @@ spec:
         - name: postgresql
           image: {{ .Values.postgresql.image | quote }}
           imagePullPolicy: IfNotPresent
+          args: ["-c", "max_connections={{ .Values.postgresql.maxConnections }}"]
           ports:
             - name: postgres
               containerPort: 5432

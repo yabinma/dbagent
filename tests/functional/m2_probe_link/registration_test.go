@@ -313,6 +313,7 @@ func startGatewaySubprocessOpts(t *testing.T, gatewayBin, dsn string, opts gatew
 session_listen_addr: %q
 bootstrap_listen_addr: %q
 postgres_dsn: %q
+max_db_conns: 10
 bootstrap_ca_cert_path: %q
 bootstrap_ca_key_path: %q
 signing_public_key_path: %q

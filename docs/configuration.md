@@ -135,5 +135,25 @@ or in the YAML document.
 ## Probe-gateway config keys
 
 - `session_listen_addr`, `bootstrap_listen_addr`, `internal_listen_addr`, `postgres_dsn`
+- `max_db_conns` — **required**. Cap on probe-gateway's `database/sql` pool
+  (`SetMaxOpenConns`). Absent, zero or negative refuses to start (the pod
+  crashloops). Chart default: `probeGateway.maxDbConns` (10). Rendered as a
+  bare unquoted integer in the ConfigMap — do not wrap it in `${…}`; the
+  loader re-tags placeholder scalars as strings and cannot decode them into
+  this int field.
 - `bootstrap_ca_cert_path`, `bootstrap_ca_key_path`, `signing_public_key_path`, `signing_key_grace_window`
 - `gateway_replica`, `heartbeat_timeout`, `heartbeat_check_interval`, `signing_key_poll_interval`, `server_cert_sans`
+
+## PostgreSQL connection budget
+
+Every consumer's worst-case ceiling × replicas × engines, plus **RESERVE 13**
+(3 `superuser_reserved_connections` + 10 transient Jobs / `psql` /
+`temporal-sql-tool`), must be ≤ the server's `max_connections`.
+
+At the shipped topology the declared demand is 145 (ingest-gateway 60,
+temporal-worker 30, dashboard-api 15, probe-gateway 10, Temporal dev server
+30). Bundled PostgreSQL (`postgresql.bundled: true`, dev/e2e only) sets
+`max_connections` from `postgresql.maxConnections` (160). Production
+(`bundled: false`) is the operator's PostgreSQL: apply the same formula to
+size the external server; this chart does not set `max_connections` on an
+external database.

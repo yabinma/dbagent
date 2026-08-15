@@ -163,8 +163,10 @@ benchmarks:
     \ correctness. The 1000/s figure is derived from B1 rather than from this entry: B1 requires\
     \ the ingest front door to sustain a 5x burst of 200 req/s for 30 s with 0\
     \ errors, and services/gateway/gateway/ingest.py writes exactly one audit_log row\
-    \ per ingested alert on three mutually exclusive branches (event_merged:131,\
-    \ event_received:200, event_rejected:233), so the storage tier absorbs 1000 audit\
+    \ per ingested alert on four mutually exclusive branches (event_merged:131,\
+    \ event_received:200, event_rejected:233; the merge action has a second call\
+    \ site at line 165 of the same file - one reference per action above, the\
+    \ representative first occurrence), so the storage tier absorbs 1000 audit\
     \ inserts/s at that burst. The recorded ~995/s was measured under the four-writer\
     \ model and is not comparable with any seven-writer figure (section 14.4 rule 3).\
     \ The first seven-writer reference measurement is read by the existing B11 branch\

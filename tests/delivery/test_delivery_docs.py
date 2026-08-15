@@ -127,15 +127,14 @@ def test_toolpack_tools_and_config_keys_are_documented():
     # Secret-file convention used by Swarm stack (not a YAML field).
     assert "BOOTSTRAP_TOKEN_FILE" in cfg_doc
 
-    # Probe-gateway keys (stable set; gateway has its own config package).
-    for key in [
-        "session_listen_addr",
-        "bootstrap_listen_addr",
-        "internal_listen_addr",
-        "postgres_dsn",
-        "signing_public_key_path",
-    ]:
-        assert key in cfg_doc, key
+    # Probe-gateway keys: every yaml tag of services/probe-gateway/internal/config.Config.
+    pgw_go = (
+        REPO_ROOT / "services/probe-gateway/internal/config/config.go"
+    ).read_text(encoding="utf-8")
+    pgw_keys = re.findall(r'`yaml:"([a-z0-9_]+)"`', pgw_go)
+    assert pgw_keys, "expected yaml tags on probe-gateway config.Config"
+    for key in pgw_keys:
+        assert key in cfg_doc, f"probe-gateway config key {key} not documented"
 
 
 def test_acceptance_walkthrough_document_structure():

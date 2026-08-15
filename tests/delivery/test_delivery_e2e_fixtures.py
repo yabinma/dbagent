@@ -1267,7 +1267,9 @@ def test_e3_cleanup_false_only_after_successful_absent_read(monkeypatch):
 # ---------------------------------------------------------------------------
 
 CONFTEST = E2E / "conftest.py"
-_FIRST_COLLECTED_E2E = "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
+_FIRST_COLLECTED_E2E = (
+    "tests/e2e/test_e2e_connection_budget.py::test_live_connection_supply_exceeds_configured_demand"
+)
 
 
 def _load_e2e_conftest():
@@ -1541,11 +1543,13 @@ def _shorten_barrier_defaults(mod, monkeypatch, *, deadline_s=0.05, poll_s=0.0):
 def test_e2e_conftest_session_autouse_barrier_blocks_on_platform_online(monkeypatch):
     """D-A: order-independent readiness barrier, red at 2276405.
 
-    Alphabetical collection puts test_e2e_load.py::test_b1_ingest_burst_profile
-    first and the E0 online check last. A session-scoped autouse fixture in
-    conftest.py is what actually runs before B1 regardless of file order. A
-    test that only asserted "E0 passes" would have been green on the failing
-    run and is worthless here.
+    Alphabetical collection currently puts
+    test_e2e_connection_budget.py::test_live_connection_supply_exceeds_configured_demand
+    first (ahead of test_e2e_load.py::test_b1_ingest_burst_profile) and the E0
+    online check last. A session-scoped autouse fixture in conftest.py is what
+    actually runs before whichever test is collected first. A test that only
+    asserted "E0 passes" would have been green on the failing run and is
+    worthless here.
     """
     source = CONFTEST.read_text(encoding="utf-8")
     fixtures = _session_autouse_fixture_names(source)

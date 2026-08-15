@@ -96,6 +96,7 @@ def test_probe_gateway_configmap_keys_incl_internal_listen_addr():
     cfg = cm["data"]["config.yaml"]
     for key in [
         "postgres_dsn",
+        "max_db_conns",
         "session_listen_addr",
         "bootstrap_listen_addr",
         "internal_listen_addr",

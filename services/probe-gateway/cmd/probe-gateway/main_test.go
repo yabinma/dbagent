@@ -32,6 +32,7 @@ import (
 
 	rcaprobev1 "github.com/yabinma/dbagent/gen/go/rcaprobe/v1"
 	"github.com/yabinma/dbagent/internal/bootstrapca"
+	"github.com/yabinma/dbagent/services/probe-gateway/internal/config"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/gwserver"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/registry"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/signingkeys"
@@ -63,6 +64,91 @@ func TestMainWiresAuditDBFromRegistry(t *testing.T) {
 	}
 	if gw.AuditDB != reg.DB {
 		t.Fatal("AuditDB must be the same *sql.DB as registry.PG.DB")
+	}
+}
+
+// UT-IG-12: the ConfigMap-shaped key is loaded by config.Load and applied
+// through applyDBConnCeiling. max_db_conns: 7 is a non-default value so a
+// struct-tag rename cannot pass on a hypothetical default-10 field (the
+// named weak form). Against the unfixed tree Stats().MaxOpenConnections
+// reads 0 (unlimited).
+func TestApplyDBConnCeiling_AppliesLoadedMaxDBConns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// Byte-shape the ConfigMap template renders: unquoted int, no ${}.
+	content := "" +
+		"postgres_dsn: postgres://rca:rca@127.0.0.1:1/rca?sslmode=disable\n" +
+		"session_listen_addr: \":8443\"\n" +
+		"bootstrap_listen_addr: \":8444\"\n" +
+		"internal_listen_addr: \":8080\"\n" +
+		"max_db_conns: 7\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if cfg.MaxDBConns != 7 {
+		t.Fatalf("Load did not decode max_db_conns: got %d", cfg.MaxDBConns)
+	}
+	reg, err := registry.Open(cfg.PostgresDSN)
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.DB.Close() })
+	if err := applyDBConnCeiling(cfg, reg); err != nil {
+		t.Fatalf("applyDBConnCeiling: %v", err)
+	}
+	got := reg.DB.Stats().MaxOpenConnections
+	if got != 7 {
+		t.Fatalf("MaxOpenConnections=%d, want 7 (0 is unlimited)", got)
+	}
+}
+
+func TestApplyDBConnCeiling_RefusesAbsentZeroAndNegative(t *testing.T) {
+	reg, err := registry.Open("postgres://rca:rca@127.0.0.1:1/rca?sslmode=disable")
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = reg.DB.Close() })
+
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "absent key",
+			yaml: "postgres_dsn: postgres://x\n",
+		},
+		{
+			name: "explicit zero",
+			yaml: "postgres_dsn: postgres://x\nmax_db_conns: 0\n",
+		},
+		{
+			name: "negative",
+			yaml: "postgres_dsn: postgres://x\nmax_db_conns: -1\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name+".yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			err = applyDBConnCeiling(cfg, reg)
+			if err == nil {
+				t.Fatalf("expected error for %s (got MaxDBConns=%d)", tc.name, cfg.MaxDBConns)
+			}
+			if reg.DB.Stats().MaxOpenConnections != 0 {
+				t.Fatalf("refusal must not apply a ceiling; MaxOpenConnections=%d", reg.DB.Stats().MaxOpenConnections)
+			}
+		})
 	}
 }
 

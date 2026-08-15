@@ -62,6 +62,33 @@ do not resolve under Helm's release-prefixed Service names.
 Production must use `postgresql.bundled: false` with an external DSN and set
 `config.storage.s3.endpoint` / `config.model_gateway.url` to the external hosts.
 
+## PostgreSQL connection budget
+
+Size the server so **declared demand + RESERVE ≤ `max_connections`**.
+
+Demand is each consumer's worst-case ceiling × replicas × engines, read from
+the rendered chart (not a hardcoded total):
+
+| Consumer | Ceiling at shipped topology |
+|---|---:|
+| ingest-gateway | `replicas` × `workers` × 1 engine × (5 + 10) = 60 |
+| temporal-worker | 1 replica × 2 engines × 15 = 30 |
+| dashboard-api | 1 replica × 1 engine × 15 = 15 |
+| probe-gateway | `replicas` × `max_db_conns` = 10 |
+| Temporal dev server | `SQL_MAX_CONNS` + `SQL_VIS_MAX_CONNS` = 30 |
+| **Total** | **145** |
+
+RESERVE is 13 (3 `superuser_reserved_connections` + 10 transient: migrate /
+signing-key / bootstrap-admin / seed-playbooks Jobs, `temporal-sql-tool`,
+operational `psql`). 145 + 13 = 158, rounded up to
+`postgresql.maxConnections: 160` as one-direction slack.
+
+When `postgresql.bundled: true` the chart renders
+`-c max_connections={{ .Values.postgresql.maxConnections }}` on the bundled
+postgres container. When `bundled: false` the operator's PostgreSQL is sized
+with this same formula; the chart does not set `max_connections` on an
+external database.
+
 ## Temporal modes
 
 | Mode | Values |

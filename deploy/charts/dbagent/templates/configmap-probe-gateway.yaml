@@ -7,6 +7,7 @@ metadata:
 data:
   config.yaml: |
     postgres_dsn: "${PG_DSN}"
+    max_db_conns: {{ int .Values.probeGateway.maxDbConns }}
     session_listen_addr: ":8443"
     bootstrap_listen_addr: ":8444"
     internal_listen_addr: ":8080"
