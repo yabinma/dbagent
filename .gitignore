@@ -279,6 +279,11 @@ bootstrap-token.txt.staging
 /libs/py/rca_common/rca_common/schemas/generated/
 /web/src/types/generated/
 
+# cursor-coder launcher workdirs (brief, launch.log, real_out.txt, status.txt).
+# Written into the repo by the dispatching caller, not by any change under
+# review -- flagged as out-of-scope artifacts by codex-reviewer 2026-08-16.
+/.cursor-coder-runs/
+
 # Recurring zero-byte artifact observed across multiple grok-coder/codex-reviewer
 # launcher runs during the M6 swarm-deploy review loop (2026-08-10); root cause
 # not in this repo's own scripts, harmless, but repeatedly flagged as review
