@@ -1262,6 +1262,270 @@ def test_e3_cleanup_false_only_after_successful_absent_read(monkeypatch):
         mod._e3_cleanup_fault()
 
 
+def test_e3_cleanup_removes_cm_key_that_was_added_by_merge_patch(monkeypatch):
+    """H-A: apply cannot delete a field that patch never recorded.
+
+    `_put_configmap_key` adds the key with merge-patch, which does not write
+    ``kubectl.kubernetes.io/last-applied-configuration``. ``kubectl apply``
+    therefore leaves the live field in place. Red before the fix: cleanup
+    raises 'still present' — the production E3 failure.
+    """
+    from subprocess import CompletedProcess
+
+    mod = _load_e2e_scenarios_module()
+    key = mod.RESOURCE_GROUPS_PROPERTIES_KEY
+    cm = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": mod.COORDINATOR_CONFIGMAP, "namespace": "dbagent"},
+        "data": {"config.properties": "coordinator=true\n"},
+    }
+
+    def kubectl_ok(*args):
+        if args[:3] == ("get", "configmap", mod.COORDINATOR_CONFIGMAP):
+            return CompletedProcess(args, 0, json.dumps(cm), "")
+        if args[:3] == ("patch", "configmap", mod.COORDINATOR_CONFIGMAP):
+            payload = json.loads(args[args.index("-p") + 1])
+            data = cm.setdefault("data", {})
+            for field, value in (payload.get("data") or {}).items():
+                if value is None:
+                    data.pop(field, None)
+                else:
+                    data[field] = value
+            return CompletedProcess(args, 0, "", "")
+        raise AssertionError(f"unexpected kubectl: {args}")
+
+    def apply_does_not_delete(cmd, **_kwargs):
+        # Three-way merge with no last-applied-configuration annotation:
+        # apply succeeds and does not remove a live data key.
+        return CompletedProcess(cmd, 0, "configmap/configured\n", "")
+
+    monkeypatch.setattr(mod, "_kubectl_ok", kubectl_ok)
+    monkeypatch.setattr(mod.subprocess, "run", apply_does_not_delete)
+    monkeypatch.setattr(mod, "_patch_coordinator_rg_mount", lambda **_k: None)
+    monkeypatch.setattr(mod, "_restart_and_wait", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_e3_mount_present", lambda: False)
+
+    mod._put_configmap_key(
+        mod.COORDINATOR_CONFIGMAP,
+        key,
+        "resource-groups.configuration-manager=file\n",
+    )
+    assert mod._e3_cm_key_present() is True, "precondition: patch must add the key"
+
+    mod._e3_cleanup_fault()
+    assert mod._e3_cm_key_present() is False
+
+
+def test_e1_restores_starved_memory_in_finally():
+    """H-B: E1 must restore query.max-memory-per-node on every exit path.
+
+    Red before the fix: the starve has no try/finally, so a failure at the
+    heavy-query assertion leaves the cluster at 1MB for E2/E3/E4.
+    """
+    body = _scenario_source("test_e1_worker_oom_to_resolved")
+    tree = ast.parse(body)
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.finalbody:
+            continue
+        for stmt in ast.walk(ast.Module(body=node.finalbody, type_ignores=[])):
+            if (
+                isinstance(stmt, ast.Call)
+                and isinstance(stmt.func, ast.Name)
+                and stmt.func.id == "_e1_cleanup_fault"
+            ):
+                found = True
+    assert found, (
+        "test_e1_worker_oom_to_resolved must restore the starved memory "
+        "config in a finally block via _e1_cleanup_fault"
+    )
+    assert "STARVED_MEMORY" in body
+    assert "_e1_cleanup_fault" in body
+
+
+def test_e1_captures_original_memory_before_mutating():
+    """C1: `before` must be assigned before `_patch_configmap_property`
+    mutates — not from that helper's return value.
+
+    The helper applies the patch, then reads/asserts. If a post-patch
+    observation fails, it raises without returning, leaving `before is
+    None` and skipping finally's cleanup (starved=True, cleanup_calls=[]).
+    """
+    body = _scenario_source("test_e1_worker_oom_to_resolved")
+    tree = ast.parse(body)
+    captured_before_patch = False
+    assigned_from_patch = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.finalbody:
+            continue
+        finally_calls_cleanup = any(
+            isinstance(stmt, ast.Call)
+            and isinstance(stmt.func, ast.Name)
+            and stmt.func.id == "_e1_cleanup_fault"
+            for stmt in ast.walk(ast.Module(body=node.finalbody, type_ignores=[]))
+        )
+        if not finally_calls_cleanup:
+            continue
+        before_lineno = None
+        patch_lineno = None
+        for inner in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if isinstance(inner, ast.Assign):
+                targets = [
+                    t.id for t in inner.targets if isinstance(t, ast.Name)
+                ]
+                if "before" not in targets:
+                    continue
+                if before_lineno is None:
+                    before_lineno = inner.lineno
+                if (
+                    isinstance(inner.value, ast.Call)
+                    and isinstance(inner.value.func, ast.Name)
+                    and inner.value.func.id == "_patch_configmap_property"
+                ):
+                    assigned_from_patch = True
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "_patch_configmap_property"
+                and patch_lineno is None
+            ):
+                patch_lineno = inner.lineno
+        if (
+            before_lineno is not None
+            and patch_lineno is not None
+            and before_lineno < patch_lineno
+        ):
+            captured_before_patch = True
+    assert not assigned_from_patch, (
+        "test_e1_worker_oom_to_resolved assigns `before` from "
+        "_patch_configmap_property(); a post-patch exception then skips "
+        "finally cleanup because `before` is still None"
+    )
+    assert captured_before_patch, (
+        "test_e1_worker_oom_to_resolved must capture the original memory "
+        "config into `before` before calling _patch_configmap_property"
+    )
+
+
+def test_e1_cleanup_runs_when_patch_helper_raises_after_mutating(monkeypatch):
+    """C1: patch is applied, then the helper raises; cleanup must still run.
+
+    Red before the fix: `before = _patch_configmap_property(...)` never
+    assigns when the helper raises, so finally sees `before is None`.
+    """
+    mod = _load_e2e_scenarios_module()
+    starved = {"applied": False}
+    cleanup_calls: list[str] = []
+
+    monkeypatch.setattr(mod, "_login", lambda *_a, **_k: "tok")
+    monkeypatch.setattr(
+        mod,
+        "_platform_config",
+        lambda *_a, **_k: {
+            "remediation": {"settle_seconds": 15},
+            "remediation_targets": {
+                "namespace": "dbagent",
+                "worker_configmap": mod.WORKER_CONFIGMAP,
+                "config_file_key": "config.properties",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "_configmap_data",
+        lambda *_a, **_k: {
+            "config.properties": f"{mod.MEMORY_PROP}=256MB\nother.prop=keep\n"
+        },
+    )
+
+    def fake_patch(configmap, file_key, prop, value):
+        starved["applied"] = True
+        starved["value"] = value
+        raise AssertionError(f"{prop}={value!r} after patch")
+
+    def fake_cleanup(restore_to):
+        cleanup_calls.append(restore_to)
+
+    monkeypatch.setattr(mod, "_patch_configmap_property", fake_patch)
+    monkeypatch.setattr(mod, "_e1_cleanup_fault", fake_cleanup)
+
+    with pytest.raises(AssertionError, match="after patch"):
+        mod.test_e1_worker_oom_to_resolved(
+            "http://dash", "http://ingest", "http://presto"
+        )
+
+    assert starved["applied"] is True
+    assert starved["value"] == mod.STARVED_MEMORY
+    assert cleanup_calls == ["256MB"], (
+        f"starved=True cleanup_calls={cleanup_calls!r} — a post-patch "
+        "exception skipped finally's _e1_cleanup_fault"
+    )
+
+
+def test_e1_cleanup_fault_restores_captured_value_and_aggregates(monkeypatch):
+    """H-B: cleanup matches _e3_cleanup_fault's state-observed shape."""
+    mod = _load_e2e_scenarios_module()
+    patched: list[tuple] = []
+    restarts: list[str] = []
+    mounted = {mod.MEMORY_PROP: mod.STARVED_MEMORY}
+
+    def fake_patch(configmap, file_key, prop, value):
+        patched.append((configmap, file_key, prop, value))
+        mounted[prop] = value
+        return {prop: "256MB"}
+
+    def fake_mounted(_workload, _path, prop):
+        return mounted.get(prop)
+
+    monkeypatch.setattr(mod, "_patch_configmap_property", fake_patch)
+    monkeypatch.setattr(
+        mod,
+        "_restart_and_wait",
+        lambda workload, timeout="120s": restarts.append(workload),
+    )
+    monkeypatch.setattr(mod, "_mounted_property", fake_mounted)
+
+    mod._e1_cleanup_fault("256MB")
+    assert patched == [
+        (mod.WORKER_CONFIGMAP, "config.properties", mod.MEMORY_PROP, "256MB")
+    ]
+    assert restarts == [mod.WORKER_WORKLOAD]
+    assert mounted[mod.MEMORY_PROP] == "256MB"
+
+    # Residual starve after a no-op restore must surface.
+    monkeypatch.setattr(mod, "_patch_configmap_property", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_restart_and_wait", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_mounted_property", lambda *_a, **_k: mod.STARVED_MEMORY)
+    with pytest.raises(RuntimeError, match="E1 cleanup failed"):
+        mod._e1_cleanup_fault("256MB")
+
+    # Every step is attempted; failures aggregate.
+    attempts: list[str] = []
+
+    def boom_patch(*_a, **_k):
+        attempts.append("patch")
+        raise RuntimeError("patch failed")
+
+    def boom_restart(*_a, **_k):
+        attempts.append("restart")
+        raise RuntimeError("restart failed")
+
+    def boom_mounted(*_a, **_k):
+        attempts.append("verify")
+        raise RuntimeError("observation unavailable")
+
+    monkeypatch.setattr(mod, "_patch_configmap_property", boom_patch)
+    monkeypatch.setattr(mod, "_restart_and_wait", boom_restart)
+    monkeypatch.setattr(mod, "_mounted_property", boom_mounted)
+    with pytest.raises(RuntimeError, match="E1 cleanup failed") as ei:
+        mod._e1_cleanup_fault("256MB")
+    msg = str(ei.value)
+    assert attempts == ["patch", "restart", "verify"], attempts
+    for fragment in ("restore", "restart", "verify", "patch failed", "restart failed"):
+        assert fragment in msg, f"missing {fragment!r} in {msg!r}"
+
+
 # ---------------------------------------------------------------------------
 # D-A / D-B — e2e readiness barrier + failure diagnostics (fix.md)
 # ---------------------------------------------------------------------------

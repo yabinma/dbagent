@@ -5,6 +5,9 @@ exactly the contract every future functional test relies on.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -350,3 +353,280 @@ def test_fixture_manifest_matching(tmp_path):
     assert not rule.matches("y", "p")
 
     server.stop()
+
+
+# Generic single-word discriminators that made ordering load-bearing (H-C).
+# A prompt for any later scenario can carry these as evidence noise.
+_HC_GENERIC_WORDS = (
+    "OOM",
+    "memory",
+    "catalog",
+    "queue",
+    "QUEUED",
+    "runaway",
+    "kill",
+)
+
+_REPO = Path(__file__).resolve().parents[3]
+_E2E_FIXTURES = _REPO / "tests" / "e2e" / "mockllm" / "fixtures"
+_WORKER_PROMPTS = _REPO / "services" / "worker" / "worker" / "agents" / "prompts"
+
+# labels.scenario value → fixture directory. Planner/RCA prompts carry the
+# sentinel via the alert; remediation carries the scenario's rca.json.
+_HC_SCENARIO_DIRS = {
+    "e1_oom": "e1",
+    "e2_catalog": "e2",
+    "e3_queue": "e3",
+    "e4_runaway": "e4",
+}
+
+
+def _e2e_fixture_rules():
+    from tests.mocks.llm.mock_llm_server import load_fixture_set
+
+    return load_fixture_set(_E2E_FIXTURES)
+
+
+def _first_match(rules, agent_role: str, prompt: str):
+    for rule in rules:
+        if rule.matches(agent_role, prompt):
+            return rule
+    return None
+
+
+def _render_worker_prompt(name: str, variables: dict) -> str:
+    """Substitute ``{{var}}`` the same way worker.agents.templates.render does.
+
+    Tests must feed the mock the prompt shape the worker actually sends;
+    an Alert/Evidence blob sent as a remediation prompt cannot detect
+    collector/remediation routing defects (W1).
+    """
+    out = (_WORKER_PROMPTS / name).read_text(encoding="utf-8")
+    for key, value in variables.items():
+        out = out.replace("{{" + key + "}}", str(value) if value is not None else "")
+    while "{{" in out and "}}" in out:
+        start = out.index("{{")
+        end = out.index("}}", start) + 2
+        out = out[:start] + out[end:]
+    return out
+
+
+def _alert_event(sentinel: str) -> dict:
+    return {
+        "error_summary": f"scenario {sentinel}",
+        "platform_key": "presto-e2e",
+        "labels": {"scenario": sentinel},
+    }
+
+
+def _planner_prompt(sentinel: str, *, noise: str = "") -> str:
+    event = _alert_event(sentinel)
+    mode_body = (
+        f"Alert: {json.dumps(event, default=str)}\n"
+        "Produce the first collection plan: choose 3-8 tool calls that most quickly "
+        "narrow the fault domain. Prioritize: error context (relevant logs, failed "
+        "query details), overall cluster state, resource snapshot."
+    )
+    if noise:
+        mode_body = f"{mode_body}\n{noise}"
+    return _render_worker_prompt(
+        "planner.txt",
+        {
+            "platform_type": "presto",
+            "engine_version": "0.298",
+            "deployment": "k8s",
+            "tool_catalog": "[]",
+            "mode": "initial",
+            "mode_body": mode_body,
+            "max_calls_per_round": "8",
+        },
+    )
+
+
+def _collector_prompt(tool: str, args: dict, payload: str = "") -> str:
+    return _render_worker_prompt(
+        "collector_summary.txt",
+        {
+            "tool": tool,
+            "args": json.dumps(args, default=str),
+            "payload_head_64kb": payload,
+        },
+    )
+
+
+def _rca_prompt(sentinel: str, *, noise: str = "") -> str:
+    event = _alert_event(sentinel)
+    summaries = [{"summary": noise}] if noise else []
+    return _render_worker_prompt(
+        "rca.txt",
+        {
+            "platform_type": "presto",
+            "engine_version": "0.298",
+            "alert_event": json.dumps(event, default=str),
+            "round": "1",
+            "max_rounds": "15",
+            "spent": "0.0000",
+            "evidence_summaries": json.dumps(summaries, default=str),
+            "latest_evidence_full": "[]",
+            "previous_reports_compact": "[]",
+            "approver_feedback": "",
+        },
+    )
+
+
+def _remediation_prompt(rca_report: dict, *, noise: str = "") -> str:
+    report = dict(rca_report)
+    if noise:
+        report = {**report, "evidence_note": noise}
+    return _render_worker_prompt(
+        "remediation.txt",
+        {
+            "rca_report": json.dumps(report, default=str),
+            "playbooks": "[]",
+            "write_ops": json.dumps(
+                [
+                    "k8s_patch_configmap",
+                    "k8s_rollout_restart",
+                    "k8s_delete_pod",
+                    "swarm_update_service_env",
+                    "swarm_restart_service",
+                    "presto_kill_query",
+                ]
+            ),
+            "health_query": "SELECT 1",
+            "risk_defs": "R0 no-op/read-only; R1 reversible low impact",
+        },
+    )
+
+
+def _scenario_rca(folder: str) -> dict:
+    return json.loads((_E2E_FIXTURES / folder / "rca.json").read_text(encoding="utf-8"))
+
+
+def _scenario_planner_calls(folder: str) -> list[dict]:
+    plan = json.loads(
+        (_E2E_FIXTURES / folder / "planner.json").read_text(encoding="utf-8")
+    )
+    return list(plan.get("tool_calls") or [])
+
+
+def test_e2_remediation_not_stolen_by_e1_memory_rule():
+    """H-C: E2's remediation must win even when the prompt also contains
+    the generic word ``memory``.
+
+    The worker's remediation prompt is the RCA report plus playbook
+    catalogs (remediation.txt), not an Alert/Evidence blob. Red before
+    the original H-C fix: fixtures.yaml listed E1's
+    ``prompt_contains: "memory"`` first and returned ``e1/remediation.json``.
+    """
+    rules = _e2e_fixture_rules()
+    prompt = _remediation_prompt(
+        _scenario_rca("e2"),
+        noise="Query exceeded local memory limit: EXCEEDED_LOCAL_MEMORY_LIMIT",
+    )
+    assert "Root cause conclusion:" in prompt
+    assert "Alert:" not in prompt
+    matched = _first_match(rules, "remediation", prompt)
+    assert matched is not None, "no remediation rule matched the E2 prompt"
+    assert matched.respond_path == "e2/remediation.json", (
+        "a remediation prompt carrying both 'memory' and E2's RCA phrase "
+        f"must serve e2/remediation.json; got {matched.respond_path!r} "
+        f"(prompt_contains={matched.prompt_contains!r})"
+    )
+
+
+def test_fixture_discriminators_are_scenario_unique_so_order_is_not_load_bearing():
+    """H-C companion: generic single-word discriminators are refused, and
+    each scenario's real worker-shaped prompt selects that scenario even
+    when every generic word is also present. Ordering must not be
+    load-bearing.
+    """
+    rules = _e2e_fixture_rules()
+    generics = set(_HC_GENERIC_WORDS)
+    for rule in rules:
+        if rule.prompt_contains in generics:
+            raise AssertionError(
+                f"{rule.respond_path} still discriminates on generic "
+                f"{rule.prompt_contains!r}; ordering is load-bearing"
+            )
+
+    noise = " ".join(_HC_GENERIC_WORDS)
+    for sentinel, folder in _HC_SCENARIO_DIRS.items():
+        planner_matched = _first_match(rules, "planner", _planner_prompt(sentinel, noise=noise))
+        assert planner_matched is not None, f"no planner rule matched {sentinel!r}"
+        assert planner_matched.respond_path == f"{folder}/planner.json", (
+            f"planner prompt with {sentinel!r} plus every generic word "
+            f"must serve {folder}/planner.json; got {planner_matched.respond_path!r} "
+            f"(prompt_contains={planner_matched.prompt_contains!r})"
+        )
+
+        rca_matched = _first_match(rules, "rca", _rca_prompt(sentinel, noise=noise))
+        assert rca_matched is not None, f"no rca rule matched {sentinel!r}"
+        assert rca_matched.respond_path == f"{folder}/rca.json", (
+            f"rca prompt with {sentinel!r} plus every generic word "
+            f"must serve {folder}/rca.json; got {rca_matched.respond_path!r} "
+            f"(prompt_contains={rca_matched.prompt_contains!r})"
+        )
+
+        rem_matched = _first_match(
+            rules, "remediation", _remediation_prompt(_scenario_rca(folder), noise=noise)
+        )
+        assert rem_matched is not None, f"no remediation rule matched {sentinel!r}"
+        assert rem_matched.respond_path == f"{folder}/remediation.json", (
+            f"remediation prompt with {folder} RCA plus every generic word "
+            f"must serve {folder}/remediation.json; got {rem_matched.respond_path!r} "
+            f"(prompt_contains={rem_matched.prompt_contains!r})"
+        )
+
+
+def test_collector_prompts_do_not_fall_through_to_e1():
+    """W1: real collector prompts are Tool/Args/Output — they never carry
+    ``labels.scenario``. A role-only fallback that serves e1/collector.json
+    contaminates E2/E3/E4 evidence summaries.
+
+    Representative routing before the fix: E2 collectors [e1, e1, e2],
+    E3 [e1, e1], E4 [e1, e4].
+    """
+    rules = _e2e_fixture_rules()
+    fallbacks = [
+        r for r in rules if r.agent_role == "collector" and r.prompt_contains is None
+    ]
+    assert fallbacks, "collector must have a role-only fallback"
+    assert fallbacks[0].respond_path != "e1/collector.json", (
+        f"collector role fallback must not serve e1/collector.json; "
+        f"got {fallbacks[0].respond_path!r}"
+    )
+    fallback_content = fallbacks[0].content.lower()
+    for banned in (
+        "oomkilled",
+        "query.max-memory-per-node",
+        "worker memory pressure",
+    ):
+        assert banned not in fallback_content, (
+            f"collector fallback {fallbacks[0].respond_path} still carries "
+            f"E1-shaped {banned!r}"
+        )
+
+    noise = " ".join(_HC_GENERIC_WORDS)
+    for sentinel, folder in _HC_SCENARIO_DIRS.items():
+        served: list[str] = []
+        for call in _scenario_planner_calls(folder):
+            prompt = _collector_prompt(
+                str(call.get("tool") or ""),
+                dict(call.get("args") or {}),
+                payload=noise,
+            )
+            assert "Tool:" in prompt and "Args:" in prompt
+            assert '"labels"' not in prompt
+            matched = _first_match(rules, "collector", prompt)
+            assert matched is not None, (
+                f"no collector rule matched {folder} tool {call.get('tool')!r}"
+            )
+            served.append(matched.respond_path)
+            if folder != "e1":
+                assert matched.respond_path != "e1/collector.json", (
+                    f"{folder} collector for tool {call.get('tool')!r} served "
+                    f"e1/collector.json (prompt_contains={matched.prompt_contains!r}); "
+                    f"routing={served}"
+                )
+        assert served, f"{folder} planner has no tool_calls to route"

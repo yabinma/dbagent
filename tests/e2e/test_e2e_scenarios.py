@@ -667,6 +667,60 @@ STARVED_MEMORY = "1MB"
 REMEDIATED_MEMORY = "128MB"
 
 
+def _e1_read_memory_properties() -> dict[str, str]:
+    """Capture ``query.max-memory-per-node`` without mutating the ConfigMap.
+
+    Must run *before* ``_patch_configmap_property``: that helper applies the
+    patch, then reads/asserts, so a post-patch exception never returns the
+    original value to the caller (C1).
+    """
+    data = _configmap_data(WORKER_CONFIGMAP)
+    assert "config.properties" in data, (
+        f"{WORKER_CONFIGMAP} has no config.properties key: {sorted(data)}"
+    )
+    before = _properties(data["config.properties"])
+    assert MEMORY_PROP in before, (
+        f"{WORKER_CONFIGMAP}/config.properties does not carry {MEMORY_PROP}; "
+        "nothing to restore"
+    )
+    return before
+
+
+def _e1_cleanup_fault(restore_to: str) -> None:
+    """State-observed, idempotent E1 memory-starve cleanup.
+
+    Restores ``query.max-memory-per-node`` to ``restore_to`` (the value
+    captured before the starve), restarts the workers, and verifies the
+    mounted property. Always attempts every step; aggregates and
+    propagates so a half-cleaned cluster cannot go unnoticed.
+    """
+    errors: list[str] = []
+
+    try:
+        _patch_configmap_property(
+            WORKER_CONFIGMAP, "config.properties", MEMORY_PROP, restore_to
+        )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"restore {MEMORY_PROP}: {exc}")
+
+    try:
+        _restart_and_wait(WORKER_WORKLOAD)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"restart workers: {exc}")
+
+    try:
+        mounted = _mounted_property(WORKER_WORKLOAD, PRESTO_CONFIG_PATH, MEMORY_PROP)
+        if mounted != restore_to:
+            errors.append(
+                f"{MEMORY_PROP}={mounted!r} after cleanup, expected {restore_to!r}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"verify {MEMORY_PROP} restored: {exc}")
+
+    if errors:
+        raise RuntimeError("E1 cleanup failed: " + "; ".join(errors))
+
+
 def _platform_config(dashboard_url: str, token: str) -> dict:
     pr = httpx.get(
         f"{dashboard_url.rstrip('/')}/api/v1/platforms",
@@ -715,128 +769,143 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
     # Fault injection: the worker mounts only the `config.properties` key (via
     # subPath), and the memory property lives *inside* that value — so the patch
     # has to rewrite the value, preserving its other properties.
-    before = _patch_configmap_property(
-        WORKER_CONFIGMAP, "config.properties", MEMORY_PROP, STARVED_MEMORY
-    )
-    assert before[MEMORY_PROP] != STARVED_MEMORY
-    _restart_and_wait(WORKER_WORKLOAD)
-    mounted = _mounted_property(WORKER_WORKLOAD, PRESTO_CONFIG_PATH, MEMORY_PROP)
-    assert mounted == STARVED_MEMORY, (
-        f"the starved value never reached the worker container: {mounted!r}"
-    )
+    # Capture the original value *before* any mutation (C1):
+    # `_patch_configmap_property` applies the patch then asserts, so a
+    # post-patch exception would otherwise leave `before` unassigned and
+    # skip finally's restore. Outer try/finally so a failure after the
+    # starve cannot leave the cluster at 1MB for E2–E4.
+    before = None
+    try:
+        before = _e1_read_memory_properties()
+        assert before[MEMORY_PROP] != STARVED_MEMORY
+        _patch_configmap_property(
+            WORKER_CONFIGMAP, "config.properties", MEMORY_PROP, STARVED_MEMORY
+        )
+        _restart_and_wait(WORKER_WORKLOAD)
+        mounted = _mounted_property(WORKER_WORKLOAD, PRESTO_CONFIG_PATH, MEMORY_PROP)
+        assert mounted == STARVED_MEMORY, (
+            f"the starved value never reached the worker container: {mounted!r}"
+        )
 
-    # Trip the fault with the required heavy tpch query (Section 13.1). A hash
-    # aggregation over sf1.lineitem cannot fit in 1MB per node.  Code review
-    # round 6, C3: accepting FINISHED/GONE let a normally completed query
-    # establish no memory fault while the canned alert still drove RCA.
-    result = _presto_query(
-        presto_url,
-        "SELECT orderkey, count(*) AS n FROM tpch.sf1.lineitem "
-        "GROUP BY orderkey ORDER BY n DESC LIMIT 10",
-    )
-    state = str(result.get("state") or "").upper()
-    assert state == "FAILED", (
-        f"E1 requires the heavy query to FAIL under the 1MB limit; got "
-        f"state={state!r} result={result}"
-    )
-    # Presto 0.298 names local-memory exhaustion EXCEEDED_LOCAL_MEMORY_LIMIT
-    # exactly. A generic word like "exceeded" alone is not a memory fault —
-    # e.g. execution-time limits (code review round 7, C2).
-    assert _is_presto_local_memory_limit_failure(result), (
-        f"E1 requires Presto error code {PRESTO_LOCAL_MEMORY_LIMIT_ERROR} "
-        f"(query.max-memory-per-node starve); got error names="
-        f"{_presto_error_names(result)} result={result}"
-    )
+        # Trip the fault with the required heavy tpch query (Section 13.1). A hash
+        # aggregation over sf1.lineitem cannot fit in 1MB per node.  Code review
+        # round 6, C3: accepting FINISHED/GONE let a normally completed query
+        # establish no memory fault while the canned alert still drove RCA.
+        result = _presto_query(
+            presto_url,
+            "SELECT orderkey, count(*) AS n FROM tpch.sf1.lineitem "
+            "GROUP BY orderkey ORDER BY n DESC LIMIT 10",
+        )
+        state = str(result.get("state") or "").upper()
+        assert state == "FAILED", (
+            f"E1 requires the heavy query to FAIL under the 1MB limit; got "
+            f"state={state!r} result={result}"
+        )
+        # Presto 0.298 names local-memory exhaustion EXCEEDED_LOCAL_MEMORY_LIMIT
+        # exactly. A generic word like "exceeded" alone is not a memory fault —
+        # e.g. execution-time limits (code review round 7, C2).
+        assert _is_presto_local_memory_limit_failure(result), (
+            f"E1 requires Presto error code {PRESTO_LOCAL_MEMORY_LIMIT_ERROR} "
+            f"(query.max-memory-per-node starve); got error names="
+            f"{_presto_error_names(result)} result={result}"
+        )
 
-    opened = _post_alert(ingest_url, summary="worker OOM / query.max-memory-per-node exceeded")
-    inv_id = opened.get("investigation_id")
-    assert inv_id, opened
+        opened = _post_alert(
+            ingest_url,
+            summary="worker OOM / query.max-memory-per-node exceeded",
+            extra={"labels": {"scenario": "e1_oom"}},
+        )
+        inv_id = opened.get("investigation_id")
+        assert inv_id, opened
 
-    _wait_case(
-        dashboard_url,
-        token,
-        investigation_id=inv_id,
-        statuses={"AWAITING_APPROVAL", "EXECUTING", "VERIFYING", "RESOLVED"},
-        timeout=200,
-    )
+        _wait_case(
+            dashboard_url,
+            token,
+            investigation_id=inv_id,
+            statuses={"AWAITING_APPROVAL", "EXECUTING", "VERIFYING", "RESOLVED"},
+            timeout=200,
+        )
 
-    # Approve remediation when proposed.
-    deadline = time.time() + 120
-    while time.time() < deadline:
+        # Approve remediation when proposed.
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            detail = _case_detail(dashboard_url, token, inv_id)
+            status = detail.get("status")
+            if status == "AWAITING_APPROVAL":
+                _approve_pending(dashboard_url, token, inv_id)
+            if status == "RESOLVED":
+                break
+            time.sleep(3)
+
         detail = _case_detail(dashboard_url, token, inv_id)
-        status = detail.get("status")
-        if status == "AWAITING_APPROVAL":
-            _approve_pending(dashboard_url, token, inv_id)
-        if status == "RESOLVED":
-            break
-        time.sleep(3)
+        cat = ((detail.get("rca_report") or {}).get("root_cause") or {}).get("category")
+        assert cat in {"resource", "configuration"}, f"RCA category={cat!r} detail={detail}"
 
-    detail = _case_detail(dashboard_url, token, inv_id)
-    cat = ((detail.get("rca_report") or {}).get("root_cause") or {}).get("category")
-    assert cat in {"resource", "configuration"}, f"RCA category={cat!r} detail={detail}"
-
-    # design.md §13 E1: `presto.adjust_memory_config` executed, and its
-    # `remediation_executions.pre_snapshot` non-empty. The previous loop passed
-    # when there were no executions at all, and when every execution omitted
-    # the field — which they all do, since the case-detail projection does not
-    # carry that column. So require the execution, then read the row (code
-    # review round 5, C4).
-    executions = detail.get("executions") or []
-    memory_execs = [
-        ex for ex in executions if ex.get("playbook_id") == "presto.adjust_memory_config"
-    ]
-    assert memory_execs, (
-        f"E1 must execute presto.adjust_memory_config; executions={executions}"
-    )
-    for ex in memory_execs:
-        execution_id = ex["execution_id"]
-        raw = _psql(
-            "SELECT coalesce(pre_snapshot::text, '') FROM remediation_executions "
-            f"WHERE execution_id = '{execution_id}'"
+        # design.md §13 E1: `presto.adjust_memory_config` executed, and its
+        # `remediation_executions.pre_snapshot` non-empty. The previous loop passed
+        # when there were no executions at all, and when every execution omitted
+        # the field — which they all do, since the case-detail projection does not
+        # carry that column. So require the execution, then read the row (code
+        # review round 5, C4).
+        executions = detail.get("executions") or []
+        memory_execs = [
+            ex for ex in executions if ex.get("playbook_id") == "presto.adjust_memory_config"
+        ]
+        assert memory_execs, (
+            f"E1 must execute presto.adjust_memory_config; executions={executions}"
         )
-        assert raw, f"execution {execution_id} has no pre_snapshot row value"
-        snapshot = json.loads(raw)
-        assert isinstance(snapshot, dict) and snapshot, (
-            f"execution {execution_id} pre_snapshot must be a non-empty object; got {snapshot!r}"
-        )
+        for ex in memory_execs:
+            execution_id = ex["execution_id"]
+            raw = _psql(
+                "SELECT coalesce(pre_snapshot::text, '') FROM remediation_executions "
+                f"WHERE execution_id = '{execution_id}'"
+            )
+            assert raw, f"execution {execution_id} has no pre_snapshot row value"
+            snapshot = json.loads(raw)
+            assert isinstance(snapshot, dict) and snapshot, (
+                f"execution {execution_id} pre_snapshot must be a non-empty object; got {snapshot!r}"
+            )
 
-    # Settle window via top-level audit API (no /investigations/{id}/audit route).
-    entries = _audit_entries(dashboard_url, token, inv_id)
-    assert entries, "expected audit rows for investigation"
-    by_action: dict[str, list] = {}
-    for e in entries:
-        by_action.setdefault(e.get("action"), []).append(e)
-    start = None
-    end = None
-    for a in ("remediation_finished", "remediation_started", "remediation_proposed"):
-        if by_action.get(a):
-            start = by_action[a][0].get("at")
-            break
-    if by_action.get("verification_run"):
-        end = by_action["verification_run"][0].get("at")
-    assert start and end, (
-        f"missing remediation/verification audit markers; actions={sorted(by_action)}"
-    )
-    t0 = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
-    t1 = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
-    window = (t1 - t0).total_seconds()
-    assert window >= 15.0, f"settle window {window}s < 15s (playbook default leaked?)"
-    assert window < 60.0, f"settle window {window}s >= 60s (override not applied?)"
-    assert detail.get("status") == "RESOLVED", detail.get("status")
-
-    # The closed loop must have rewritten the real mounted value, keeping every
-    # other Presto property in it (probe-side read-merge-write, FP-M6-29/S3).
-    after = _properties(_configmap_data(WORKER_CONFIGMAP)["config.properties"])
-    assert after[MEMORY_PROP] == REMEDIATED_MEMORY, (
-        f"{MEMORY_PROP}={after.get(MEMORY_PROP)!r} after remediation, expected "
-        f"{REMEDIATED_MEMORY}"
-    )
-    for key, value in before.items():
-        if key == MEMORY_PROP:
-            continue
-        assert after.get(key) == value, (
-            f"remediation dropped {key}={value!r} from the worker config"
+        # Settle window via top-level audit API (no /investigations/{id}/audit route).
+        entries = _audit_entries(dashboard_url, token, inv_id)
+        assert entries, "expected audit rows for investigation"
+        by_action: dict[str, list] = {}
+        for e in entries:
+            by_action.setdefault(e.get("action"), []).append(e)
+        start = None
+        end = None
+        for a in ("remediation_finished", "remediation_started", "remediation_proposed"):
+            if by_action.get(a):
+                start = by_action[a][0].get("at")
+                break
+        if by_action.get("verification_run"):
+            end = by_action["verification_run"][0].get("at")
+        assert start and end, (
+            f"missing remediation/verification audit markers; actions={sorted(by_action)}"
         )
+        t0 = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        window = (t1 - t0).total_seconds()
+        assert window >= 15.0, f"settle window {window}s < 15s (playbook default leaked?)"
+        assert window < 60.0, f"settle window {window}s >= 60s (override not applied?)"
+        assert detail.get("status") == "RESOLVED", detail.get("status")
+
+        # The closed loop must have rewritten the real mounted value, keeping every
+        # other Presto property in it (probe-side read-merge-write, FP-M6-29/S3).
+        after = _properties(_configmap_data(WORKER_CONFIGMAP)["config.properties"])
+        assert after[MEMORY_PROP] == REMEDIATED_MEMORY, (
+            f"{MEMORY_PROP}={after.get(MEMORY_PROP)!r} after remediation, expected "
+            f"{REMEDIATED_MEMORY}"
+        )
+        for key, value in before.items():
+            if key == MEMORY_PROP:
+                continue
+            assert after.get(key) == value, (
+                f"remediation dropped {key}={value!r} from the worker config"
+            )
+    finally:
+        if before is not None:
+            _e1_cleanup_fault(before[MEMORY_PROP])
 
 
 WEBHOOK_CAPTURE_URL = os.environ.get(
@@ -949,6 +1018,7 @@ def test_e2_broken_catalog_redacted(dashboard_url, ingest_url, presto_url):
     opened = _post_alert(
         ingest_url,
         summary="catalog broken.properties failed connection-url password leak check",
+        extra={"labels": {"scenario": "e2_catalog"}},
     )
     inv_id = opened.get("investigation_id")
     assert inv_id
@@ -1206,26 +1276,23 @@ def _e3_mount_present() -> bool:
 
 
 def _e3_remove_cm_key() -> None:
-    """Idempotent: delete the fault ConfigMap key if present."""
-    get = _kubectl_ok("get", "configmap", COORDINATOR_CONFIGMAP, "-o", "json")
-    cm = json.loads(get.stdout)
-    data = cm.get("data") or {}
-    if RESOURCE_GROUPS_PROPERTIES_KEY not in data:
+    """Idempotent: delete the fault ConfigMap key if present.
+
+    The key is added by ``_put_configmap_key`` via merge-patch, which does
+    not write last-applied-configuration. ``kubectl apply`` therefore cannot
+    delete it (H-A). A JSON Merge Patch null is the matching removal.
+    """
+    if not _e3_cm_key_present():
         return
-    del data[RESOURCE_GROUPS_PROPERTIES_KEY]
-    cm["data"] = data
-    apply = subprocess.run(
-        ["kubectl", "-n", "dbagent", "apply", "-f", "-"],
-        input=json.dumps(cm),
-        text=True,
-        capture_output=True,
-        check=False,
+    _kubectl_ok(
+        "patch",
+        "configmap",
+        COORDINATOR_CONFIGMAP,
+        "--type",
+        "merge",
+        "-p",
+        json.dumps({"data": {RESOURCE_GROUPS_PROPERTIES_KEY: None}}),
     )
-    if apply.returncode != 0:
-        raise RuntimeError(
-            f"failed to remove {RESOURCE_GROUPS_PROPERTIES_KEY} from "
-            f"{COORDINATOR_CONFIGMAP}: {apply.stderr or apply.stdout}"
-        )
 
 
 def _e3_cleanup_fault() -> None:
