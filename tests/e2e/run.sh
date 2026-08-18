@@ -85,6 +85,138 @@ except Exception as exc:  # noqa: BLE001 — diagnostics must never mask the fai
 PY
 }
 
+LIVE_LOG_SIDECAR_PID=""
+
+# Signal *pid* and wait until it is actually gone. "kill succeeded" is not
+# "it exited". Escalate to SIGKILL; report if it never disappears.
+# Only the in-shell LIVE_LOG_SIDECAR_PID is trusted — a leftover PID
+# file is never read (it could name an unrelated process).
+_stop_pid_until_gone() {
+  local pid="$1"
+  local label="${2:-process}"
+  local i=0
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if (( i == 20 )); then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    if (( i > 40 )); then
+      echo "stop_live_log_sidecar: ${label} pid ${pid} still present after SIGKILL" | tee -a "$PHASE_LOG"
+      return 1
+    fi
+    sleep 0.1
+  done
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+stop_live_log_sidecar() {
+  local pid="${LIVE_LOG_SIDECAR_PID:-}"
+  LIVE_LOG_SIDECAR_PID=""
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+  _stop_pid_until_gone "$pid" "sidecar" || true
+}
+
+# Per-pod-UID `kubectl logs -f` followers so a failure line emitted in the
+# last moments before a scenario's finally-restart is still captured.
+# Polling snapshots miss that window; following by name also misses
+# replacements (the stream dies with the old UID). Discovery of new UIDs
+# is polled; each UID is followed continuously until kubectl exits.
+start_live_log_sidecar() {
+  local dir="/tmp/rca-e2e/diagnostics/live"
+  local ktimeout=(--request-timeout=20s)
+  local poll="${LIVE_LOG_POLL_S:-5}"
+  mkdir -p "$dir"
+  echo "start_live_log_sidecar: writing to $dir (poll ${poll}s, per-uid follow)" | tee -a "$PHASE_LOG"
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "kubectl not available; skipping live log sidecar" | tee -a "$PHASE_LOG"
+    return 0
+  fi
+  stop_live_log_sidecar || true
+  (
+    set +e
+    uid_dir="$dir/followers"
+    rm -rf "$uid_dir"
+    mkdir -p "$uid_dir"
+
+    stop_followers() {
+      local pidfile fpid i any
+      for pidfile in "$uid_dir"/*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        fpid=$(cat "$pidfile" 2>/dev/null || true)
+        [[ -n "$fpid" ]] || continue
+        kill "$fpid" 2>/dev/null || true
+      done
+      i=0
+      while (( i < 20 )); do
+        any=0
+        for pidfile in "$uid_dir"/*.pid; do
+          [[ -f "$pidfile" ]] || continue
+          fpid=$(cat "$pidfile" 2>/dev/null || true)
+          [[ -n "$fpid" ]] || continue
+          if kill -0 "$fpid" 2>/dev/null; then
+            any=1
+            if (( i == 10 )); then
+              kill -KILL "$fpid" 2>/dev/null || true
+            fi
+          fi
+        done
+        (( any == 0 )) && break
+        i=$((i + 1))
+        sleep 0.1
+      done
+      for pidfile in "$uid_dir"/*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        fpid=$(cat "$pidfile" 2>/dev/null || true)
+        wait "$fpid" 2>/dev/null || true
+        rm -f "$pidfile"
+      done
+    }
+    cleanup() {
+      trap - EXIT TERM INT
+      stop_followers
+      exit 0
+    }
+    trap cleanup EXIT TERM INT
+
+    while true; do
+      : >"$uid_dir/current"
+      while IFS=$'\t' read -r name uid; do
+        [[ -n "${name:-}" && -n "${uid:-}" ]] || continue
+        printf '%s\n' "$uid" >>"$uid_dir/current"
+        safe=$(printf '%s' "pod/${name}" | tr '/:' '--')
+        pidfile="$uid_dir/${uid}.pid"
+        fpid=""
+        if [[ -f "$pidfile" ]]; then
+          fpid=$(cat "$pidfile" 2>/dev/null || true)
+        fi
+        if [[ -z "$fpid" ]] || ! kill -0 "$fpid" 2>/dev/null; then
+          kubectl "${ktimeout[@]}" logs -f -n dbagent "pod/${name}" --all-containers --tail=500 \
+            >>"$dir/follow-${safe}-${uid}.txt" 2>&1 &
+          echo $! >"$pidfile"
+        fi
+        kubectl "${ktimeout[@]}" logs -n dbagent "pod/${name}" --all-containers --previous --tail=200 \
+          >"$dir/previous-${safe}-${uid}.txt" 2>&1 || true
+      done < <(kubectl "${ktimeout[@]}" get pods -n dbagent \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\n"}{end}' \
+        2>/dev/null || true)
+      sleep "$poll"
+    done
+  ) &
+  LIVE_LOG_SIDECAR_PID=$!
+  echo "start_live_log_sidecar: pid ${LIVE_LOG_SIDECAR_PID}" | tee -a "$PHASE_LOG"
+}
+
 phase() {
   local name="$1" budget="$2"
   shift 2
@@ -383,12 +515,15 @@ PY
 env_hygiene_gate() {
   bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'e2e env hygiene: forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
 }
+trap 'stop_live_log_sidecar' EXIT
+start_live_log_sidecar
 env_hygiene_gate
 phase "pytest_e2e" 420 bash -c '
   python3 -m pip install -q -e libs/py/rca_common -e "services/worker[test]" \
     -e "services/gateway[test]" -e "services/dashboard-api[test]"
   python3 -m pytest tests/e2e -v --tb=short
 '
+stop_live_log_sidecar
 
 if [[ "$KEEP_CLUSTER" != "1" ]]; then
   phase "teardown" 20 bash -c 'kind delete cluster --name rca-e2e || true'

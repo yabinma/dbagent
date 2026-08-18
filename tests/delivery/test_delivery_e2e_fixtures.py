@@ -52,6 +52,28 @@ _PHASE_RE = re.compile(r'^\s*phase\s+"([a-z0-9_]+)"\s+(\d+)\s', re.MULTILINE)
 _PASS_RE = re.compile(r'^PASS\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
 
 
+def _bash_function_definition_count(text: str, name: str) -> int:
+    """Count bash function definitions of *name* in *text*.
+
+    ``[ \\t\\r\\n]*\\{`` also matches brace-on-next-line bash style
+    (``function foo\\n{\\n...\\n}``), which a same-line-only form misses.
+
+    This is a small, deliberately over-approximating heuristic, not a bash
+    grammar (see rounds 3-5 of review.md for why we stopped reimplementing
+    one). It does not see a comment inserted between the name and the brace,
+    or a function defined via ``eval``, and it can false-positive on a bare
+    call immediately followed by an unrelated ``{ ... }`` group command
+    (fails closed: red, not a missed defect). A redefinition mid-script is
+    not a plausible accident, so these are accepted, named boundaries
+    rather than gaps to keep chasing — the same call this project's
+    manifest-honesty checker makes for general control-flow/reachability
+    (design.md §11.1.3, clause (L)).
+    """
+    return len(re.findall(
+        rf"^[ \t]*(?:function[ \t]+)?{re.escape(name)}[ \t]*(?:\([ \t]*\))?[ \t\r\n]*\{{",
+        text, re.M))
+
+
 def _declared_phases() -> list[tuple[str, int]]:
     return [(name, int(budget)) for name, budget in _PHASE_RE.findall(
         RUN_SH.read_text(encoding="utf-8")
@@ -497,6 +519,347 @@ def test_e1_memory_error_predicate_rejects_unrelated_limits():
         assert mod._is_presto_local_memory_limit_failure(payload), payload
 
 
+def test_wait_query_terminal_expired_deadline_names_timeout_and_last_state(
+    monkeypatch,
+):
+    """G-1: an already-expired deadline must not return ``{}`` silently.
+
+    Today the while-loop never runs, so the helper returns its initial
+    ``last = {}`` and E1 renders that as ``state=''``. After the fix it
+    must signal a timeout that carries the last observed state.
+    """
+    mod = _scenarios_module()
+    monkeypatch.setattr(mod.time, "time", lambda: 10.0)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        lambda *_a, **_k: _FakeResponse(
+            {"queryId": "q-stuck", "state": "RUNNING"}
+        ),
+    )
+    with pytest.raises(AssertionError, match=r"(?s)timed out.*RUNNING"):
+        result = mod._wait_query_terminal(
+            "http://presto.example", "q-stuck", deadline=0.0
+        )
+        pytest.fail(
+            f"expired wait returned silently instead of signalling timeout: "
+            f"{result!r}"
+        )
+
+
+def test_wait_query_terminal_404_is_gone_even_after_deadline(monkeypatch):
+    """G-1 blast radius: the 404 → GONE sentinel must survive an expired wait."""
+    mod = _scenarios_module()
+    monkeypatch.setattr(mod.time, "time", lambda: 10.0)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        lambda *_a, **_k: _FakeResponse({}, status_code=404),
+    )
+    got = mod._wait_query_terminal(
+        "http://presto.example", "q-gone", deadline=0.0
+    )
+    assert got == {"queryId": "q-gone", "state": "GONE"}
+
+
+def test_presto_query_exhausted_follow_loop_names_timeout_not_empty_state(
+    monkeypatch,
+):
+    """G-1 / C1: a nextUri loop that consumes the whole budget must not report
+    ``state=''``, and must not grant extra runtime past the original timeout.
+
+    The follow loop and the terminal wait share one deadline. When nextUri
+    never terminates, the authoritative read still happens once (so E1 does
+    not render ``state=''``), but a later FAILED transition must not make
+    the wait succeed — that would let E1 pass a query that missed the bar.
+    The default 180s timeout is not under test here — a 1s budget plus a
+    stubbed clock keeps this docker-free and fast.
+    """
+    import inspect
+
+    mod = _scenarios_module()
+    assert inspect.signature(mod._presto_query).parameters["timeout"].default == 180.0
+    assert not hasattr(mod, "TERMINAL_WAIT_FLOOR_S"), (
+        "a terminal-wait floor grants extra query runtime past the 180s bar"
+    )
+
+    clock = {"t": 1000.0}
+    query_gets = {"n": 0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    def fake_sleep(seconds: float) -> None:
+        clock["t"] += float(seconds)
+
+    def fake_post(_url, **_kwargs):
+        return _FakeResponse(
+            {
+                "id": "q-slow",
+                "nextUri": "http://presto.example/v1/statement/q-slow/1",
+            }
+        )
+
+    def fake_get(url, **_kwargs):
+        url = str(url)
+        if "/v1/query/" in url:
+            query_gets["n"] += 1
+            if query_gets["n"] == 1:
+                return _FakeResponse({"queryId": "q-slow", "state": "RUNNING"})
+            # Post-deadline FAILED: extra polling past the bar would return
+            # this and E1 would treat the query as having failed in time.
+            return _FakeResponse(
+                {
+                    "queryId": "q-slow",
+                    "state": "FAILED",
+                    "errorCode": {"name": "EXCEEDED_LOCAL_MEMORY_LIMIT"},
+                }
+            )
+        # nextUri never terminates; consume the follow-loop budget on first GET.
+        clock["t"] += 2.0
+        return _FakeResponse(
+            {"id": "q-slow", "nextUri": "http://presto.example/v1/statement/q-slow/2"}
+        )
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    monkeypatch.setattr(mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(mod.httpx, "post", fake_post)
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+
+    with pytest.raises(AssertionError, match=r"timed out") as ei:
+        result = mod._presto_query(
+            "http://presto.example", "SELECT 1", timeout=1.0
+        )
+        pytest.fail(
+            f"post-deadline FAILED must not make the wait succeed: state="
+            f"{str(result.get('state') or '')!r} result={result!r}"
+        )
+    message = str(ei.value).lower()
+    assert "running" in message, str(ei.value)
+    # Distinguish a dispatch-loop exhaustion from a slow terminal wait.
+    assert "nexturi" in message or "follow" in message or "exhausted" in message, (
+        str(ei.value)
+    )
+    assert query_gets["n"] == 1, (
+        "a post-deadline transition must not be observed: only the mandatory "
+        f"authoritative GET is allowed, got {query_gets['n']}"
+    )
+
+
+def test_e1_still_requires_failed_state_and_does_not_extend_query_timeout():
+    """G-1 guard: the diagnostic fix must not turn E1 green by relaxing the bar."""
+    body = _scenario_source("test_e1_worker_oom_to_resolved")
+    assert 'state == "FAILED"' in body
+    assert "timeout=" not in body.split("_presto_query", 1)[1][:400]
+    source = (E2E / "test_e2e_scenarios.py").read_text(encoding="utf-8")
+    assert "timeout: float = 180.0" in source
+    assert "TERMINAL_WAIT_FLOOR_S" not in source
+
+
+def test_wait_query_terminal_does_not_get_again_after_deadline(monkeypatch):
+    """C1: the mandatory first GET is the last GET once the deadline has passed."""
+    mod = _scenarios_module()
+    clock = {"t": 10.0}
+    gets = {"n": 0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    def fake_sleep(seconds: float) -> None:
+        clock["t"] += float(seconds)
+
+    def fake_get(_url, **_kwargs):
+        gets["n"] += 1
+        if gets["n"] == 1:
+            return _FakeResponse({"queryId": "q-stuck", "state": "RUNNING"})
+        return _FakeResponse({"queryId": "q-stuck", "state": "FAILED"})
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    monkeypatch.setattr(mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+
+    with pytest.raises(AssertionError, match=r"(?s)timed out.*RUNNING"):
+        result = mod._wait_query_terminal(
+            "http://presto.example", "q-stuck", deadline=10.5
+        )
+        pytest.fail(
+            f"subsequent GET past the deadline returned {result!r}"
+        )
+    assert gets["n"] == 1, gets["n"]
+
+
+_MEMORY_LIMIT_FAILED = {
+    "queryId": "q-late",
+    "state": "FAILED",
+    "errorCode": {"name": "EXCEEDED_LOCAL_MEMORY_LIMIT"},
+}
+
+
+def test_wait_query_terminal_first_get_failed_after_deadline_is_timeout(
+    monkeypatch,
+):
+    """C1: the mandatory first GET is not a license to accept a late terminal.
+
+    A GET whose observation lands at or after the original deadline must
+    raise the diagnostic timeout (carrying the observed FAILED state), even
+    when that payload is the exact E1 memory-limit failure. Returning it as
+    success lets ``state == "FAILED"`` pass after the wait has expired.
+    """
+    mod = _scenarios_module()
+    clock = {"t": 1000.0}
+    gets = {"n": 0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    def fake_get(_url, **_kwargs):
+        gets["n"] += 1
+        # The GET itself is what crosses the deadline — not a later poll.
+        clock["t"] = 1010.0
+        return _FakeResponse(dict(_MEMORY_LIMIT_FAILED))
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+
+    with pytest.raises(AssertionError, match=r"(?s)timed out.*FAILED") as ei:
+        result = mod._wait_query_terminal(
+            "http://presto.example", "q-late", deadline=1001.0
+        )
+        pytest.fail(
+            f"post-deadline FAILED from the mandatory first GET must not "
+            f"succeed the wait: {result!r}"
+        )
+    assert gets["n"] == 1, (
+        f"only the mandatory first GET is allowed, got {gets['n']}"
+    )
+    message = str(ei.value)
+    assert "EXCEEDED_LOCAL_MEMORY_LIMIT" in message, message
+
+
+def test_wait_query_terminal_on_time_memory_failed_is_success(monkeypatch):
+    """C1 blast radius: an in-budget memory-limit FAILED is still a result."""
+    mod = _scenarios_module()
+    clock = {"t": 1000.0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    def fake_get(_url, **_kwargs):
+        return _FakeResponse(dict(_MEMORY_LIMIT_FAILED))
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+
+    got = mod._wait_query_terminal(
+        "http://presto.example", "q-late", deadline=1001.0
+    )
+    assert got.get("state") == "FAILED", got
+    assert got.get("errorCode", {}).get("name") == "EXCEEDED_LOCAL_MEMORY_LIMIT"
+
+
+def test_presto_query_mandatory_get_failed_after_deadline_is_timeout(
+    monkeypatch,
+):
+    """C1 through ``_presto_query``: nextUri expires, first query GET is FAILED.
+
+    Reviewer trace: deadline 1001.0, nextUri finishes at 1002.0, the
+    mandatory ``/v1/query`` GET returns the memory-limit FAILED payload at
+    1010.0. That must time out (with the observed state), not make E1's
+    ``state == "FAILED"`` assertion pass eight seconds late.
+    """
+    import inspect
+
+    mod = _scenarios_module()
+    assert inspect.signature(mod._presto_query).parameters["timeout"].default == 180.0
+
+    clock = {"t": 1000.0}
+    query_gets = {"n": 0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    def fake_post(_url, **_kwargs):
+        return _FakeResponse(
+            {
+                "id": "q-late",
+                "nextUri": "http://presto.example/v1/statement/q-late/1",
+            }
+        )
+
+    def fake_get(url, **_kwargs):
+        url = str(url)
+        if "/v1/query/" in url:
+            query_gets["n"] += 1
+            clock["t"] = 1010.0
+            payload = dict(_MEMORY_LIMIT_FAILED)
+            payload["queryId"] = "q-late"
+            return _FakeResponse(payload)
+        # nextUri consumes the 1s budget: 1000.0 → 1002.0, past deadline 1001.0.
+        clock["t"] = 1002.0
+        return _FakeResponse(
+            {"id": "q-late", "nextUri": "http://presto.example/v1/statement/q-late/2"}
+        )
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(mod.httpx, "post", fake_post)
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+
+    with pytest.raises(AssertionError, match=r"(?s)timed out.*FAILED") as ei:
+        result = mod._presto_query(
+            "http://presto.example", "SELECT 1", timeout=1.0
+        )
+        pytest.fail(
+            f"post-deadline FAILED from the mandatory first GET must not "
+            f"succeed _presto_query: state="
+            f"{str(result.get('state') or '')!r} result={result!r}"
+        )
+    assert query_gets["n"] == 1, query_gets["n"]
+    message = str(ei.value)
+    assert "EXCEEDED_LOCAL_MEMORY_LIMIT" in message, message
+    lower = message.lower()
+    assert "nexturi" in lower or "follow" in lower or "exhausted" in lower, message
+
+
+def test_presto_query_records_follow_exit_when_wait_returns_finished(monkeypatch):
+    """W3: a successful terminal wait must still carry the nextUri exit reason.
+
+    If the wait returns FINISHED and E1 then rejects it, the follow-loop
+    exit is the diagnostic that distinguishes 'query completed' from
+    'client lost the stream'. Recording it only on the raise path hides
+    that from the failure E1 actually emits.
+    """
+    mod = _scenarios_module()
+    clock = {"t": 1000.0}
+
+    def fake_time() -> float:
+        return clock["t"]
+
+    def fake_post(_url, **_kwargs):
+        return _FakeResponse({"id": "q-done"})
+
+    def fake_get(url, **_kwargs):
+        assert "/v1/query/" in str(url)
+        return _FakeResponse({"queryId": "q-done", "state": "FINISHED"})
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(mod.httpx, "post", fake_post)
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+
+    result = mod._presto_query("http://presto.example", "SELECT 1", timeout=1.0)
+    assert result.get("state") == "FINISHED", result
+    reason = result.get("_e2e_nexturi_follow_exit")
+    assert reason, (
+        f"follow_exit must be attached on a successful wait, got {result!r}"
+    )
+    assert "nexturi" in str(reason).lower() or reason == "no-nextUri", reason
+
+
 def test_e2_never_skips_its_sentinel_assertions():
     """C3: a non-200 iterations response used to skip the whole check."""
     body = _scenario_source("test_e2_broken_catalog_redacted")
@@ -896,27 +1259,16 @@ def test_run_sh_failure_path_collects_pod_logs_and_events(tmp_path: Path):
     # the file so each name exists exactly once (bash uses the last definition).
     # Checked first so a duplicate definition fails with a clear uniqueness
     # message rather than an opaque runtime symptom.
-    def _definition_count(text: str, name: str) -> int:
-        # [ \t\r\n]*\{ also matches brace-on-next-line bash style
-        # (function foo\n{\n...\n}), which the same-line-only form misses.
-        #
-        # This is a small, deliberately over-approximating heuristic, not a
-        # bash grammar (see rounds 3-5 of review.md for why we stopped
-        # reimplementing one). It does not see a comment inserted between the
-        # name and the brace, or a function defined via `eval`, and it can
-        # false-positive on a bare call immediately followed by an unrelated
-        # `{ ... }` group command (fails closed: red, not a missed defect).
-        # A redefinition mid-script is not a plausible accident, so these are
-        # accepted, named boundaries rather than gaps to keep chasing -- the
-        # same call this project's manifest-honesty checker makes for general
-        # control-flow/reachability (design.md §11.1.3, clause (L)).
-        return len(re.findall(
-            rf"^[ \t]*(?:function[ \t]+)?{re.escape(name)}[ \t]*(?:\([ \t]*\))?[ \t\r\n]*\{{",
-            text, re.M))
-
     run_sh_text = RUN_SH.read_text(encoding="utf-8")
-    for fn in ("collect_failure_diagnostics", "phase", "check_budget"):
-        count = _definition_count(run_sh_text, fn)
+    for fn in (
+        "collect_failure_diagnostics",
+        "phase",
+        "check_budget",
+        "start_live_log_sidecar",
+        "stop_live_log_sidecar",
+        "_stop_pid_until_gone",
+    ):
+        count = _bash_function_definition_count(run_sh_text, fn)
         assert count == 1, (
             f"run.sh must define {fn} exactly once, found {count}"
         )
@@ -1055,6 +1407,322 @@ def test_run_sh_failure_path_collects_pod_logs_and_events(tmp_path: Path):
             "every kubectl invocation must carry --request-timeout; "
             f"got: {line!r}"
         )
+
+
+def test_run_sh_captures_pod_logs_before_scenario_teardown(tmp_path: Path):
+    """G-2 / W1: failure-window logs must be captured while the failing pods still exist.
+
+    ``collect_failure_diagnostics`` runs once after the whole pytest session.
+    Each scenario's ``finally`` restarts Presto, so a post-session sweep
+    cannot see the coordinator that served the failure. A live sidecar
+    (started before ``pytest_e2e``, stopped on EXIT) follows each pod UID
+    with ``kubectl logs -f`` so a line emitted immediately before removal
+    is still captured; the end-of-run sweep stays as a complement.
+    """
+    run_sh_text = RUN_SH.read_text(encoding="utf-8")
+    for fn in (
+        "start_live_log_sidecar",
+        "stop_live_log_sidecar",
+        "_stop_pid_until_gone",
+        "collect_failure_diagnostics",
+        "phase",
+        "check_budget",
+    ):
+        count = _bash_function_definition_count(run_sh_text, fn)
+        assert count == 1, (
+            f"run.sh must define {fn} exactly once, found {count}"
+        )
+
+    # Executable path: after the sourcing guard, the sidecar must start
+    # before pytest_e2e. Must not sit *between* the hygiene gate and the
+    # phase line — that span is pinned empty of kubectl by A10(v).
+    guard = "if [[ \"${BASH_SOURCE[0]}\" != \"${0}\" ]]; then"
+    assert guard in run_sh_text
+    after_guard = run_sh_text.split(guard, 1)[1]
+    pytest_idx = after_guard.find('phase "pytest_e2e"')
+    assert pytest_idx != -1, "missing phase pytest_e2e after the sourcing guard"
+    before_pytest = after_guard[:pytest_idx]
+    assert re.search(r"^start_live_log_sidecar\b", before_pytest, re.M), (
+        "start_live_log_sidecar must be invoked after the sourcing guard and "
+        "before phase pytest_e2e so snapshots cover the session, not only "
+        "the post-session sweep"
+    )
+    between = _hygiene_gate_to_pytest_e2e_span(run_sh_text)
+    assert "start_live_log_sidecar" not in between, (
+        "sidecar start must not sit between the A10(v) hygiene gate and "
+        'phase "pytest_e2e"'
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    kubectl_log = tmp_path / "kubectl-argv.log"
+    state_file = tmp_path / "pod-generation"
+    state_file.write_text("old", encoding="utf-8")
+    OLD_POD = "presto-coordinator-old"
+    NEW_POD = "presto-coordinator-new"
+    OLD_UID = "uid-old-1"
+    NEW_UID = "uid-new-2"
+    DECISIVE = "DECISIVE-FAILURE-LINE-BEFORE-REMOVAL"
+
+    kubectl_shim = bin_dir / "kubectl"
+    kubectl_shim.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >>"{kubectl_log}"
+            gen=$(cat "{state_file}" 2>/dev/null || echo old)
+            if [[ " $* " == *" get pods "* && " $* " == *" -o name "* ]]; then
+              if [[ "$gen" == "new" ]]; then
+                echo "pod/{NEW_POD}"
+              else
+                echo "pod/{OLD_POD}"
+              fi
+              exit 0
+            fi
+            if [[ " $* " == *" get pods "* ]]; then
+              if [[ "$gen" == "new" ]]; then
+                printf '%s\\t%s\\n' "{NEW_POD}" "{NEW_UID}"
+              else
+                printf '%s\\t%s\\n' "{OLD_POD}" "{OLD_UID}"
+              fi
+              exit 0
+            fi
+            if [[ " $* " == *" logs "* ]]; then
+              following=0
+              [[ " $* " == *" -f "* ]] && following=1
+              old_pod=0
+              if [[ " $* " == *" {OLD_POD} "* || " $* " == *" pod/{OLD_POD} "* ]]; then
+                old_pod=1
+              fi
+              if (( following && old_pod )); then
+                # Stream current logs, then on pod death emit the line that
+                # only exists immediately before removal (W1).
+                echo "old-coordinator log line"
+                while true; do
+                  gen=$(cat "{state_file}" 2>/dev/null || echo old)
+                  if [[ "$gen" != "old" ]]; then
+                    echo "{DECISIVE}"
+                    exit 0
+                  fi
+                  sleep 0.05
+                done
+              fi
+              if (( old_pod )); then
+                echo "old-coordinator log line"
+              else
+                echo "new-coordinator log line"
+              fi
+            fi
+            exit 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    kubectl_shim.chmod(0o755)
+
+    diag_dir = Path("/tmp/rca-e2e/diagnostics")
+    live_dir = diag_dir / "live"
+    if diag_dir.exists():
+        shutil.rmtree(diag_dir)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["LIVE_LOG_POLL_S"] = "0.05"
+
+    script = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        source "{RUN_SH}"
+        start_live_log_sidecar
+        # Wait until the OLD pod is being followed, then replace it
+        # immediately — the decisive failure line is emitted by the
+        # follower only as the pod disappears, not before.
+        deadline=$(( SECONDS + 10 ))
+        while (( SECONDS < deadline )); do
+          if grep -rqs "old-coordinator log line" "{live_dir}" 2>/dev/null; then
+            break
+          fi
+          sleep 0.05
+        done
+        echo new >"{state_file}"
+        deadline=$(( SECONDS + 10 ))
+        while (( SECONDS < deadline )); do
+          if grep -rqs "{DECISIVE}" "{live_dir}" 2>/dev/null; then
+            break
+          fi
+          sleep 0.05
+        done
+        stop_live_log_sidecar
+        collect_failure_diagnostics
+        """
+    )
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        env=env,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        raise AssertionError(
+            "live-log sidecar test hung; process group killed. "
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        ) from None
+    assert proc.returncode == 0, (
+        f"sidecar + collect must succeed; rc={proc.returncode}\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+
+    live_files = list(live_dir.rglob("*.txt")) if live_dir.is_dir() else []
+    live_blob = "\n".join(
+        p.read_text(encoding="utf-8", errors="replace") for p in live_files
+    )
+    assert "old-coordinator log line" in live_blob, (
+        "live sidecar must capture the pre-teardown coordinator; "
+        f"live files={sorted(str(p) for p in live_files)} stdout:\n{stdout}"
+    )
+    assert DECISIVE in live_blob, (
+        "live sidecar must capture a line emitted immediately before pod "
+        "removal, not only a snapshot taken while waiting for the old pod; "
+        f"live files={sorted(str(p) for p in live_files)} stdout:\n{stdout}"
+    )
+
+    run_sh_text = RUN_SH.read_text(encoding="utf-8")
+    assert "sidecar.pid" not in run_sh_text, (
+        "stop_live_log_sidecar must not trust a PID file (W2)"
+    )
+    assert re.search(r"logs\s+-f\b", run_sh_text) or "logs -f" in run_sh_text, (
+        "sidecar must follow per-pod with kubectl logs -f (W1)"
+    )
+
+    # End-of-run sweep sees only the replacement pod — proving the two
+    # capture points are distinct, and that relying on the sweep alone
+    # would have lost the failure window.
+    sweep_old = diag_dir / f"logs-pod-{OLD_POD}.txt"
+    sweep_new = diag_dir / f"logs-pod-{NEW_POD}.txt"
+    assert sweep_new.is_file(), (
+        f"end-of-run sweep must still collect the live pods; "
+        f"produced={sorted(p.name for p in diag_dir.iterdir())}"
+    )
+    assert "new-coordinator log line" in sweep_new.read_text(encoding="utf-8")
+    assert not sweep_old.is_file() or "old-coordinator log line" not in (
+        sweep_old.read_text(encoding="utf-8")
+    )
+
+
+def test_stop_live_log_sidecar_ignores_stale_pid_file_and_reaps_until_gone(
+    tmp_path: Path,
+):
+    """W2: a planted sidecar.pid must not be signalled; stop must wait until gone.
+
+    The current shell already holds LIVE_LOG_SIDECAR_PID. Trusting a pid
+    file lets stop_live_log_sidecar kill an unrelated process. kill(1)
+    succeeding is also not the same as the process having exited — a
+    SIGTERM-ignoring child must be SIGKILL'd and polled until absent.
+
+    The stubborn child signals readiness (a file) only after installing
+    SIG_IGN, and this test waits for that file before calling stop. Without
+    that handshake the SIGTERM can land before SIG_IGN and the test would
+    exercise ordinary termination instead of SIGKILL escalation (W1).
+    """
+    run_sh_text = RUN_SH.read_text(encoding="utf-8")
+    assert "sidecar.pid" not in run_sh_text
+    assert "_stop_pid_until_gone" in run_sh_text
+    assert run_sh_text.count("LIVE_LOG_SIDECAR_PID") >= 2
+
+    diag_dir = Path("/tmp/rca-e2e/diagnostics")
+    live_dir = diag_dir / "live"
+    if diag_dir.exists():
+        shutil.rmtree(diag_dir)
+    live_dir.mkdir(parents=True)
+
+    marker = tmp_path / "w2-out.txt"
+    ready = tmp_path / "stubborn-ready"
+    script = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        source "{RUN_SH}"
+
+        sleep 60 &
+        victim=$!
+        echo "$victim" >"{live_dir}/sidecar.pid"
+        LIVE_LOG_SIDECAR_PID=""
+        stop_live_log_sidecar
+        if ! kill -0 "$victim" 2>/dev/null; then
+          echo PLANTED_PID_KILLED >"{marker}"
+          exit 1
+        fi
+        kill -KILL "$victim" 2>/dev/null || true
+        wait "$victim" 2>/dev/null || true
+        echo PLANTED_PID_SURVIVED >>"{marker}"
+
+        python3 -c 'import signal, time, pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(r"{ready}").write_text("ready"); time.sleep(60)' &
+        stubborn=$!
+        for _ in $(seq 1 100); do
+          if [[ -f "{ready}" ]]; then
+            break
+          fi
+          sleep 0.05
+        done
+        if [[ ! -f "{ready}" ]]; then
+          echo STUBBORN_NEVER_READY >>"{marker}"
+          kill -KILL "$stubborn" 2>/dev/null || true
+          wait "$stubborn" 2>/dev/null || true
+          exit 1
+        fi
+        LIVE_LOG_SIDECAR_PID=$stubborn
+        stop_live_log_sidecar
+        if kill -0 "$stubborn" 2>/dev/null; then
+          echo STUBBORN_STILL_ALIVE >>"{marker}"
+          kill -KILL "$stubborn" 2>/dev/null || true
+          wait "$stubborn" 2>/dev/null || true
+          exit 1
+        fi
+        echo STUBBORN_GONE >>"{marker}"
+        """
+    )
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        raise AssertionError(
+            "W2 sidecar stop test hung; process group killed. "
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        ) from None
+    assert proc.returncode == 0, (
+        f"W2 stop path must succeed; rc={proc.returncode}\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
+        f"marker={marker.read_text() if marker.is_file() else '<missing>'}"
+    )
+    text = marker.read_text(encoding="utf-8") if marker.is_file() else ""
+    assert "PLANTED_PID_SURVIVED" in text, text
+    assert "PLANTED_PID_KILLED" not in text, text
+    assert "STUBBORN_NEVER_READY" not in text, text
+    assert "STUBBORN_GONE" in text, text
+    assert "STUBBORN_STILL_ALIVE" not in text, text
+    assert ready.is_file(), "stubborn child must have installed SIG_IGN before stop"
+
 
 
 # Product workloads that must satisfy FP-IG-1/2 under every shipped overlay

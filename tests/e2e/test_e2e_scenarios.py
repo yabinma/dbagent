@@ -375,18 +375,45 @@ TERMINAL_QUERY_STATES = {"FINISHED", "FAILED", "CANCELED", "CANCELLED"}
 
 
 def _wait_query_terminal(base: str, query_id: str, deadline: float) -> dict:
-    """Authoritative state, read from the coordinator through the NodePort."""
+    """Authoritative state, read from the coordinator through the NodePort.
+
+    Always performs the first GET even if *deadline* has already passed, so
+    a follow-loop that consumed the shared budget cannot report ``{}``. A
+    404 is still ``GONE``. Subsequent GETs are gated on the original
+    deadline — extra query runtime past the caller's timeout is not
+    granted. A terminal state observed at or after that same original
+    deadline is a timeout that names the observed state, not a successful
+    wait: the mandatory GET is for diagnosis, not for accepting a late
+    result as on-time. Exhaustion raises, naming the timeout and the last
+    observed state rather than returning an empty dict.
+    """
     last: dict = {}
-    while time.time() < deadline:
+    first = True
+    while True:
+        if not first:
+            if time.time() >= deadline:
+                break
+            time.sleep(2)
+            if time.time() >= deadline:
+                break
+        first = False
         r = httpx.get(f"{base}/v1/query/{query_id}", timeout=30)
+        observed_at = time.time()
         if r.status_code == 404:
             return {"queryId": query_id, "state": "GONE"}
         assert r.status_code == 200, r.text
         last = r.json()
         if str(last.get("state") or "").upper() in TERMINAL_QUERY_STATES:
+            # Compare against the original deadline, never one recomputed
+            # after this GET. A terminal seen at/after expiry is late.
+            if observed_at >= deadline:
+                break
             return last
-        time.sleep(2)
-    return last
+    state = str(last.get("state") or "")
+    raise AssertionError(
+        f"timed out waiting for query {query_id} to reach a terminal state; "
+        f"last state {state!r} result={last}"
+    )
 
 
 def _presto_query(presto_url: str, sql: str, *, timeout: float = 180.0) -> dict:
@@ -410,17 +437,38 @@ def _presto_query(presto_url: str, sql: str, *, timeout: float = 180.0) -> dict:
     # Drive the statement by following nextUri where the coordinator's
     # advertised URI is reachable from here; the state we assert on comes from
     # /v1/query/{id}, which is reachable through the NodePort either way.
+    follow_exit = "exhausted"
     while body.get("nextUri") and time.time() < deadline:
         try:
             nxt = httpx.get(body["nextUri"], timeout=30)
-        except Exception:  # noqa: BLE001 - advertised URI may be cluster-internal
+        except Exception as exc:  # noqa: BLE001 - advertised URI may be cluster-internal
+            follow_exit = f"break-on-exception:{type(exc).__name__}"
             break
         if nxt.status_code != 200:
+            follow_exit = f"non-200:{nxt.status_code}"
             break
         body = nxt.json()
         if body.get("error"):
+            follow_exit = "error-body"
             break
-    return _wait_query_terminal(base, query_id, deadline)
+    else:
+        follow_exit = "no-nextUri" if not body.get("nextUri") else "exhausted"
+    # Pass the original deadline: the first /v1/query GET is mandatory even
+    # after expiry, but extra runtime past *timeout* is not granted.
+    try:
+        result = _wait_query_terminal(base, query_id, deadline)
+    except AssertionError as exc:
+        raise AssertionError(
+            f"{exc}; nextUri loop exited via {follow_exit}"
+        ) from exc
+    # Always attach the follow-loop exit reason. E1 may still reject a
+    # non-FAILED terminal state (FINISHED), and without this the nextUri
+    # path — the reason the diagnostic exists — is missing from that
+    # failure.
+    if isinstance(result, dict):
+        result = dict(result)
+        result["_e2e_nexturi_follow_exit"] = follow_exit
+    return result
 
 
 # Presto 0.298 StandardErrorCode for query.max-memory-per-node (1MB starve).
