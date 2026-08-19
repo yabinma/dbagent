@@ -87,7 +87,7 @@ def _seed_platform(session_factory, key="presto-us1", deployment="k8s", config=N
                     config=config
                     or {
                         "remediation_targets": {
-                            "namespace": "presto",
+                            "namespace": "ns-e2e",
                             "worker_configmap": "presto-worker-config",
                             "worker_workload_kind": "deployment",
                             "worker_workload_name": "presto-worker",
@@ -696,7 +696,7 @@ async def test_m5_settle_window_default_for_restart_playbook(
         factory,
         config={
             "remediation_targets": {
-                "namespace": "presto",
+                "namespace": "ns-e2e",
                 "worker_configmap": "presto-worker-config",
                 "worker_workload_kind": "deployment",
                 "worker_workload_name": "presto-worker",
@@ -820,6 +820,108 @@ async def test_m5_settle_window_default_for_restart_playbook(
             )
             result = await handle.result()
     assert result.get("status") == "RESOLVED"
+    writes = [c for c in probe.calls if c["kind"] == "write"]
+    assert writes, "expected signed write dispatch"
+    assert writes[0]["params"]["namespace"] == "ns-e2e"
+
+
+@pytest.mark.asyncio
+async def test_m5_execute_playbook_uses_platform_remediation_targets_namespace(
+    postgres_dsn, tmp_path
+):
+    """Regression: composite-PK Investigation + platform_key must resolve locators."""
+    from datetime import datetime, timezone
+
+    from rca_common.db.models import Investigation
+
+    platform_key = "presto-locator-test"
+    inv_id = uuid.uuid4()
+    engine = __import__("sqlalchemy").create_engine(postgres_dsn)
+    factory = make_session_factory(engine)
+    with factory() as session:
+        existing = session.get(Platform, platform_key)
+        if existing is None:
+            session.add(
+                Platform(
+                    platform_key=platform_key,
+                    platform_type="presto",
+                    deployment="k8s",
+                    display_name=platform_key,
+                    status="online",
+                    config={
+                        "remediation_targets": {
+                            "namespace": "ns-e2e",
+                            "worker_configmap": "presto-worker-config",
+                            "worker_workload_kind": "deployment",
+                            "worker_workload_name": "presto-worker",
+                        },
+                    },
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+        else:
+            existing.config = {
+                "remediation_targets": {
+                    "namespace": "ns-e2e",
+                    "worker_configmap": "presto-worker-config",
+                    "worker_workload_kind": "deployment",
+                    "worker_workload_name": "presto-worker",
+                },
+            }
+        session.commit()
+
+    with factory() as session:
+        session.add(
+            Investigation(
+                investigation_id=inv_id,
+                created_at=datetime.now(timezone.utc),
+                platform_key=platform_key,
+                status="AWAITING_APPROVAL",
+                trigger_event=None,
+                workflow_id=f"investigation-{inv_id}",
+                budget={"max_rounds": 15, "max_cost_usd": 10.0, "max_wall_seconds": 1800},
+                spent={"rounds": 0, "cost_usd": 0},
+            )
+        )
+        seed_playbooks(session)
+        session.commit()
+
+    key_path = str(tmp_path / "ed25519-locator.key")
+    signer = bootstrap_signing_key(key_path)
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_config": {"exit_code": 0, "data": {"content": "query.max-memory=50GB\n"}},
+            "presto_jmx": {"exit_code": 0, "data": {"heap": "ok"}},
+            "k8s_pods": {"exit_code": 0, "data": {"pods": []}},
+            "write": {"ok": True, "exit_code": 0},
+        }
+    )
+    acts = InvestigationActivities(
+        session_factory=factory,
+        llm_client=ScriptedLLM({}),
+        probe_client=probe,
+        object_store=FakeObjectStore(),
+        signer=signer,
+    )
+    r = await acts.execute_playbook(
+        {
+            "investigation_id": str(inv_id),
+            "platform_key": platform_key,
+            "deployment": "k8s",
+            "action": {
+                "playbook_id": "presto.adjust_memory_config",
+                "playbook_params": {
+                    "patches": [{"key": "query.max-memory", "value": "50GB"}],
+                },
+            },
+        }
+    )
+    assert r["ok"] is True
+    writes = [c for c in probe.calls if c["kind"] == "write"]
+    assert writes, "expected k8s_patch_configmap write"
+    patch = next(c for c in writes if c["op"] == "k8s_patch_configmap")
+    assert patch["params"]["namespace"] == "ns-e2e"
+    assert patch["params"]["name"] == "presto-worker-config"
 
 
 @pytest.mark.asyncio

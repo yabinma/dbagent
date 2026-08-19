@@ -122,7 +122,7 @@ EXPECTED_CONCURRENCY_MODEL = {
             "call_sites": [
                 {
                     "file": "services/worker/worker/activities/investigation.py",
-                    "line": 146,
+                    "line": 147,
                     "in": "InvestigationActivities.create_case",
                     "symbol": "write_audit",
                     "expr": "write_audit(",
@@ -135,7 +135,7 @@ EXPECTED_CONCURRENCY_MODEL = {
                     "expr": "self._trace_store.insert_llm_call(record)",
                     "via": {
                         "file": "services/worker/worker/activities/investigation.py",
-                        "line": 245,
+                        "line": 246,
                         "in": "InvestigationActivities._plan",
                         "symbol": "generate",
                         "expr": "await self._llm.generate(",

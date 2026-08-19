@@ -15,6 +15,7 @@ from temporalio import activity
 
 from rca_common.audit import actor_agent, actor_system, write_audit
 from rca_common.investigation_repo import (
+    _latest_investigation,
     create_approval,
     get_evidence,
     get_platform,
@@ -733,18 +734,14 @@ class InvestigationActivities:
         platform_config: dict[str, Any] = {}
         with self._session_factory() as session:
             inv = None
-            try:
-                from rca_common.db.models import Investigation
-
-                inv = session.get(Investigation, uuid.UUID(str(investigation_id)))
-            except Exception:  # noqa: BLE001
-                inv = None
+            if investigation_id:
+                inv = _latest_investigation(session, uuid.UUID(str(investigation_id)))
             if inv is not None:
                 platform_key = platform_key or getattr(inv, "platform_key", None)
-                plat = get_platform(session, platform_key) if platform_key else None
-                if plat is not None:
-                    deployment = payload.get("deployment") or getattr(plat, "deployment", None) or deployment
-                    platform_config = dict(plat.config or {})
+            plat = get_platform(session, platform_key) if platform_key else None
+            if plat is not None:
+                deployment = payload.get("deployment") or getattr(plat, "deployment", None) or deployment
+                platform_config = dict(plat.config or {})
             write_audit(
                 session,
                 action="remediation_started",
@@ -1028,18 +1025,14 @@ class InvestigationActivities:
             platform_key = payload.get("platform_key")
             health_query = payload.get("health_query")
             with self._session_factory() as session:
-                if not platform_key:
-                    try:
-                        from rca_common.db.models import Investigation
-
-                        inv = session.get(Investigation, uuid.UUID(str(investigation_id)))
-                        if inv is not None:
-                            platform_key = inv.platform_key
-                            plat = get_platform(session, platform_key)
-                            if plat is not None and plat.config:
-                                health_query = health_query or (plat.config or {}).get("health_query")
-                    except Exception:  # noqa: BLE001
-                        pass
+                if not platform_key and investigation_id:
+                    inv = _latest_investigation(session, uuid.UUID(str(investigation_id)))
+                    if inv is not None:
+                        platform_key = inv.platform_key
+                if platform_key:
+                    plat = get_platform(session, platform_key)
+                    if plat is not None and plat.config:
+                        health_query = health_query or (plat.config or {}).get("health_query")
             if platform_key and self._probe is not None and playbook_id:
                 result = await run_verification(
                     self._probe,
