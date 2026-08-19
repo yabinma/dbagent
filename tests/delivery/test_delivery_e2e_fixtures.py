@@ -469,6 +469,208 @@ def test_e1_requires_failed_memory_query_before_the_alert():
     assert "EXCEEDED_LOCAL_MEMORY_LIMIT" in body or "PRESTO_LOCAL_MEMORY_LIMIT_ERROR" in body
 
 
+def test_e1_waits_for_worker_discovery_after_restart():
+    """E1 must gate the trip query on current worker IPs in /v1/node."""
+    body = _scenario_source("test_e1_worker_oom_to_resolved")
+    restart_pos = body.find("_restart_and_wait(WORKER_WORKLOAD)")
+    wait_pos = body.find("_wait_presto_workers_discovered")
+    query_pos = body.find("_presto_query(")
+    assert restart_pos != -1, "E1 must restart workers after starve patch"
+    assert wait_pos != -1, "E1 must wait for coordinator worker discovery"
+    assert query_pos != -1, "E1 must submit the heavy query"
+    assert restart_pos < wait_pos < query_pos, (
+        "_wait_presto_workers_discovered must run after worker restart "
+        "and before _presto_query"
+    )
+
+
+def _fake_worker_pod_list_json(ips: set[str]) -> str:
+    """Build kubectl pod-list JSON for _worker_pod_ips unit fakes."""
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "metadata": {},
+                    "status": {
+                        "phase": "Running",
+                        "podIP": ip,
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                    },
+                }
+                for ip in sorted(ips)
+            ]
+        }
+    )
+
+
+def test_wait_presto_workers_discovered_accepts_matching_ips(monkeypatch):
+    """Matching /v1/node worker URIs must return success, not only time out."""
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.25", "10.244.0.26"}
+    nodes = [
+        {
+            "nodeId": f"node-{host.replace('.', '-')}",
+            "uri": f"http://{host}:8080",
+            "coordinator": False,
+        }
+        for host in sorted(current_ips)
+    ]
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        lambda *_a, **_k: _FakeResponse(nodes),
+    )
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+
+
+def test_wait_presto_workers_discovered_rejects_stale_uris(monkeypatch):
+    """Stale /v1/node URIs from the pre-rollout generation must not pass."""
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.25", "10.244.0.26"}
+    stale_nodes = [
+        {
+            "nodeId": "old-1",
+            "uri": "http://10.244.0.23:8080",
+            "coordinator": False,
+        },
+        {
+            "nodeId": "old-2",
+            "uri": "http://10.244.0.24:8080",
+            "coordinator": False,
+        },
+    ]
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        lambda *_a, **_k: _FakeResponse(stale_nodes),
+    )
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    clock = {"t": 1000.0}
+
+    def fake_time() -> float:
+        clock["t"] += 5.0
+        return clock["t"]
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+
+    with pytest.raises(AssertionError, match=r"(?s)worker discovery.*10\.244\.0\.2[34]"):
+        mod._wait_presto_workers_discovered(
+            "http://presto.example", timeout=10.0
+        )
+
+
+def test_wait_presto_workers_discovered_rejects_terminating_pod_ips(monkeypatch):
+    """Terminating previous-generation pod IPs must not count as current."""
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.25", "10.244.0.26"}
+    terminating_ip = "10.244.0.23"
+    kubectl_json = {
+        "items": [
+            {
+                "metadata": {"deletionTimestamp": "2026-08-18T16:45:10Z"},
+                "status": {
+                    "phase": "Running",
+                    "podIP": terminating_ip,
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            },
+            *[
+                {
+                    "metadata": {},
+                    "status": {
+                        "phase": "Running",
+                        "podIP": ip,
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                    },
+                }
+                for ip in sorted(current_ips)
+            ],
+        ]
+    }
+    node_hosts = [terminating_ip, *sorted(current_ips)]
+    nodes = [
+        {
+            "nodeId": f"node-{host.replace('.', '-')}",
+            "uri": f"http://{host}:8080",
+            "coordinator": False,
+        }
+        for host in node_hosts
+    ]
+
+    class _FakeProc:
+        stdout = json.dumps(kubectl_json)
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        lambda *_a, **_k: _FakeResponse(nodes),
+    )
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    clock = {"t": 1000.0}
+
+    def fake_time() -> float:
+        clock["t"] += 5.0
+        return clock["t"]
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+
+    with pytest.raises(AssertionError, match=r"(?s)worker discovery.*10\.244\.0\.23"):
+        mod._wait_presto_workers_discovered(
+            "http://presto.example", timeout=10.0
+        )
+
+
+def test_wait_presto_workers_discovered_retries_httpx_connection_error(
+    monkeypatch,
+):
+    """Transient /v1/node connect failures must retry until success."""
+    import httpx
+
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.25", "10.244.0.26"}
+    nodes = [
+        {
+            "nodeId": f"node-{host.replace('.', '-')}",
+            "uri": f"http://{host}:8080",
+            "coordinator": False,
+        }
+        for host in sorted(current_ips)
+    ]
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection refused")
+        return _FakeResponse(nodes)
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+    assert calls["n"] == 2, "helper must retry after a transient connect error"
+
+
 def test_e1_memory_error_predicate_rejects_unrelated_limits():
     """Round 7 C2: execution-time exceeded is not a memory fault."""
     import importlib.util
@@ -1203,6 +1405,49 @@ def test_presto_e2e_deployments_declare_cpu_and_memory_resources():
                 f"{path.name} container {cname!r}: limits.memory={limits['memory']!r} "
                 f"({mem_lim} B) < requests.memory={requests['memory']!r} ({mem_req} B)"
             )
+
+
+def test_presto_worker_deployment_has_http_readiness_probe():
+    """E1 regression: worker rollout must not pass before Presto listens.
+
+    Without an HTTP readiness probe mirroring the coordinator, kubectl rollout
+    status returns while workers are merely Running and the coordinator may
+    schedule onto stale discovery IPs from the previous generation.
+    """
+    deployments = _presto_deployments()
+    worker_docs = [
+        (path, doc)
+        for path, doc in deployments
+        if (doc.get("metadata") or {}).get("name") == "presto-worker"
+    ]
+    assert worker_docs, "presto-worker Deployment not found in e2e manifests"
+    for path, doc in worker_docs:
+        containers = (
+            ((doc.get("spec") or {}).get("template") or {})
+            .get("spec") or {}
+        ).get("containers") or []
+        assert containers, f"{path.name}: presto-worker has no containers"
+        presto = next((c for c in containers if c.get("name") == "presto"), containers[0])
+        readiness = presto.get("readinessProbe") or {}
+        http_get = readiness.get("httpGet") or {}
+        assert http_get.get("path") == "/v1/info", (
+            f"{path.name}: presto-worker readinessProbe.httpGet.path must be "
+            f"/v1/info (mirror coordinator); got {http_get!r}"
+        )
+        assert http_get.get("port") == 8080, (
+            f"{path.name}: presto-worker readinessProbe.httpGet.port must be "
+            f"8080; got {http_get!r}"
+        )
+        liveness = presto.get("livenessProbe") or {}
+        live_http = liveness.get("httpGet") or {}
+        assert live_http.get("path") == "/v1/info", (
+            f"{path.name}: presto-worker livenessProbe.httpGet.path must be "
+            f"/v1/info (mirror coordinator); got {live_http!r}"
+        )
+        assert live_http.get("port") == 8080, (
+            f"{path.name}: presto-worker livenessProbe.httpGet.port must be "
+            f"8080; got {live_http!r}"
+        )
 
 
 def test_e2e_aux_deployments_declare_resource_requests():

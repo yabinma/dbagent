@@ -23,6 +23,19 @@ spec:
           resources:
             requests: { cpu: 100m, memory: 1536Mi }
             limits: { memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            successThreshold: 3
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
           volumeMounts:
             - name: config
               mountPath: /opt/presto-server/etc/config.properties

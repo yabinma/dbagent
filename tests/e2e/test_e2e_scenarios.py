@@ -366,6 +366,110 @@ def _restart_and_wait(workload: str, timeout: str = "120s") -> None:
         )
 
 
+def _worker_pod_ips() -> set[str]:
+    """Pod IPs for the current worker ReplicaSet generation."""
+    out = _kubectl_ok(
+        "get",
+        "pod",
+        "-l",
+        "app=presto,role=worker",
+        "-o",
+        "json",
+    ).stdout
+    data = json.loads(out)
+    ips: set[str] = set()
+    for pod in data.get("items") or []:
+        if not isinstance(pod, dict):
+            continue
+        meta = pod.get("metadata") or {}
+        if meta.get("deletionTimestamp"):
+            continue
+        status = pod.get("status") or {}
+        if status.get("phase") != "Running":
+            continue
+        pod_ip = status.get("podIP")
+        if not pod_ip:
+            continue
+        conditions = status.get("conditions") or []
+        ready = any(
+            isinstance(c, dict)
+            and c.get("type") == "Ready"
+            and c.get("status") == "True"
+            for c in conditions
+        )
+        if not ready:
+            continue
+        ips.add(pod_ip)
+    return ips
+
+
+def _node_uri_host(uri: str) -> str | None:
+    from urllib.parse import urlparse
+
+    return urlparse(uri).hostname
+
+
+def _wait_presto_workers_discovered(
+    presto_url: str, *, timeout: float = 120.0
+) -> None:
+    """Wait until the coordinator's /v1/node lists the current worker IPs.
+
+    Readiness alone does not flush stale discovery entries: after a worker
+    rollout the coordinator may keep scheduling onto dead URIs until the new
+    pods register. E1 must not submit the trip query until /v1/node matches
+    the live worker pod IPs and no stale hosts remain.
+    """
+    base = presto_url.rstrip("/")
+    deadline = time.time() + timeout
+    last_detail = ""
+    while time.time() < deadline:
+        expected = _worker_pod_ips()
+        if len(expected) < 2:
+            last_detail = f"expected 2 worker pod IPs, got {sorted(expected)!r}"
+            time.sleep(2)
+            continue
+
+        try:
+            r = httpx.get(f"{base}/v1/node", timeout=30)
+        except httpx.HTTPError as exc:
+            last_detail = f"/v1/node request failed: {exc!r}"
+            time.sleep(2)
+            continue
+        if r.status_code != 200:
+            last_detail = f"/v1/node returned status {r.status_code}: {r.text}"
+            time.sleep(2)
+            continue
+        nodes = r.json()
+        if not isinstance(nodes, list):
+            last_detail = f"/v1/node returned non-list: {r.text}"
+            time.sleep(2)
+            continue
+
+        worker_hosts: set[str] = set()
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("coordinator"):
+                continue
+            host = _node_uri_host(str(node.get("uri") or ""))
+            if host:
+                worker_hosts.add(host)
+
+        stale = sorted(worker_hosts - expected)
+        missing = sorted(expected - worker_hosts)
+        if len(worker_hosts) >= 2 and not stale and not missing:
+            return
+
+        last_detail = (
+            f"expected worker IPs {sorted(expected)!r}; "
+            f"/v1/node worker hosts {sorted(worker_hosts)!r}; "
+            f"stale={stale!r} missing={missing!r}"
+        )
+        time.sleep(2)
+
+    raise AssertionError(
+        f"timed out waiting for Presto worker discovery; {last_detail}"
+    )
+
+
 def _mounted_property(workload: str, path: str, prop: str) -> str | None:
     out = _kubectl_ok("exec", workload, "--", "cat", path).stdout
     return _properties(out).get(prop)
@@ -834,6 +938,7 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
         assert mounted == STARVED_MEMORY, (
             f"the starved value never reached the worker container: {mounted!r}"
         )
+        _wait_presto_workers_discovered(presto_url)
 
         # Trip the fault with the required heavy tpch query (Section 13.1). A hash
         # aggregation over sf1.lineitem cannot fit in 1MB per node.  Code review
