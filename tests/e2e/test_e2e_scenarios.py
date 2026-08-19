@@ -755,6 +755,41 @@ def _psql(sql: str) -> str:
     ).stdout.strip()
 
 
+_PSQL_TSV_SEP = "\t"
+
+
+def _psql_tsv_row(sql: str) -> str:
+    """Tab-separated row from psql; trim trailing newlines only.
+
+    Uses an explicit tab field separator so a ``|`` inside JSON text cannot
+    be mistaken for a column boundary.  Do not ``strip()`` the whole row: an
+    empty second column is emitted as a trailing tab byte.
+    """
+    return _kubectl_ok(
+        "exec",
+        PG_WORKLOAD,
+        "--",
+        "psql",
+        PG_DSN_IN_POD,
+        "-At",
+        "-F",
+        _PSQL_TSV_SEP,
+        "-c",
+        sql,
+    ).stdout.rstrip("\n\r")
+
+
+def _parse_psql_exec_row(raw: str) -> tuple[str, str]:
+    """Parse ``status`` and ``verification_result`` from a tab-separated psql row."""
+    line = raw.rstrip("\n\r")
+    if not line:
+        return "", ""
+    if _PSQL_TSV_SEP in line:
+        status, verification_result = line.split(_PSQL_TSV_SEP, 1)
+        return status, verification_result
+    return line, ""
+
+
 def _iterations(dashboard_url: str, token: str, inv_id: str) -> list[dict]:
     """Every iteration of a case. A non-200 here is a failure, never a skip."""
     r = httpx.get(
@@ -821,6 +856,45 @@ def _audit_entries(dashboard_url: str, token: str, inv_id: str) -> list[dict]:
     entries = body.get("items") or body.get("entries") or body
     assert isinstance(entries, list), body
     return entries
+
+
+def _marker_failure_message(by_action: dict, exec_diagnostics: list) -> str:
+    """Why the remediation/verification markers are missing, in one message."""
+    parts = [f"actions={sorted(by_action)}"]
+
+    rf_entries = by_action.get("remediation_finished") or []
+    if rf_entries:
+        detail = rf_entries[0].get("detail")
+        if detail is not None:
+            parts.append(f"remediation_finished.detail={detail!r}")
+            if isinstance(detail, dict):
+                if not detail.get("ok"):
+                    parts.append("playbook failed")
+                    if detail.get("error") is not None:
+                        parts.append(f"error={detail['error']!r}")
+                    if detail.get("failed_step") is not None:
+                        parts.append(f"failed_step={detail['failed_step']!r}")
+                    if detail.get("op") is not None:
+                        parts.append(f"op={detail['op']!r}")
+            else:
+                parts.append(f"remediation_finished.detail unexpected type: {detail!r}")
+
+    for diag in exec_diagnostics:
+        execution_id = diag.get("execution_id", "?")
+        lookup_error = diag.get("lookup_error")
+        if lookup_error is not None:
+            parts.append(
+                f"execution {execution_id} diagnostics unavailable: {lookup_error!r}"
+            )
+            continue
+        status = diag.get("status", "")
+        verification_result = diag.get("verification_result", "")
+        parts.append(
+            f"execution {execution_id} status={status!r} "
+            f"verification_result={verification_result!r}"
+        )
+
+    return "missing remediation/verification audit markers; " + "; ".join(parts)
 
 
 WORKER_CONFIGMAP = "presto-worker-config"
@@ -1055,9 +1129,31 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
                 break
         if by_action.get("verification_run"):
             end = by_action["verification_run"][0].get("at")
-        assert start and end, (
-            f"missing remediation/verification audit markers; actions={sorted(by_action)}"
-        )
+        exec_diagnostics: list[dict] = []
+        if not (start and end):
+            for ex in memory_execs:
+                try:
+                    execution_id = ex["execution_id"]
+                    raw = _psql_tsv_row(
+                        "SELECT status, coalesce(verification_result::text, '') "
+                        f"FROM remediation_executions WHERE execution_id = '{execution_id}'"
+                    )
+                    status, verification_result = _parse_psql_exec_row(raw)
+                    exec_diagnostics.append(
+                        {
+                            "execution_id": execution_id,
+                            "status": status,
+                            "verification_result": verification_result,
+                        }
+                    )
+                except Exception as exc:
+                    exec_diagnostics.append(
+                        {
+                            "execution_id": ex.get("execution_id", "?"),
+                            "lookup_error": str(exc),
+                        }
+                    )
+        assert start and end, _marker_failure_message(by_action, exec_diagnostics)
         t0 = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
         t1 = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
         window = (t1 - t0).total_seconds()

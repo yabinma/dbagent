@@ -3135,3 +3135,176 @@ def test_run_sh_failure_diagnostics_platform_status(tmp_path: Path):
     # Job log must carry the status too — artifacts alone were not enough
     # to diagnose E2/E3/E4 on the failing run.
     assert "enrolling" in combined or "presto-e2e" in combined
+
+
+def test_marker_failure_message_surfaces_remediation_and_execution_diagnostics():
+    """E1 marker assertion must carry remediation_finished.detail and execution rows."""
+    module = _scenarios_module()
+    by_action = {
+        "remediation_finished": [
+            {
+                "detail": {
+                    "ok": False,
+                    "failed_step": 3,
+                    "op": "k8s_patch_configmap",
+                    "error": "configmap conflict",
+                }
+            }
+        ],
+        "remediation_started": [{}],
+        "remediation_proposed": [{}],
+    }
+    execution_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    exec_diagnostics = [
+        {
+            "execution_id": execution_id,
+            "status": "failed",
+            "verification_result": '{"error": "configmap conflict"}',
+        }
+    ]
+
+    # Weak red-before: action names alone omit the fields E1 already had.
+    old_msg = (
+        f"missing remediation/verification audit markers; actions={sorted(by_action)}"
+    )
+    assert "configmap conflict" not in old_msg
+    assert "k8s_patch_configmap" not in old_msg
+    assert execution_id not in old_msg
+
+    msg = module._marker_failure_message(by_action, exec_diagnostics)
+    assert "configmap conflict" in msg
+    assert "failed_step=3" in msg or "failed_step: 3" in msg
+    assert "k8s_patch_configmap" in msg
+    assert execution_id in msg
+    assert "status='failed'" in msg
+    assert "verification_result=" in msg
+    assert '{"error": "configmap conflict"}' in msg
+    assert "playbook failed" in msg.lower()
+
+
+def test_marker_failure_message_omits_detail_when_no_remediation_finished():
+    """No remediation_finished entries must not crash or fabricate detail clauses."""
+    module = _scenarios_module()
+    by_action = {"remediation_started": [{}]}
+    msg = module._marker_failure_message(by_action, [])
+    assert "missing remediation/verification audit markers" in msg
+    assert "remediation_finished.detail=" not in msg
+    assert "playbook failed" not in msg.lower()
+
+
+def test_marker_failure_message_omits_detail_when_none():
+    """detail is None must skip the detail clause without crashing."""
+    module = _scenarios_module()
+    by_action = {"remediation_finished": [{"detail": None}]}
+    msg = module._marker_failure_message(by_action, [])
+    assert "missing remediation/verification audit markers" in msg
+    assert "remediation_finished.detail=" not in msg
+
+
+def test_marker_failure_message_skips_playbook_failed_when_ok_truthy():
+    """detail.ok truthy must not emit playbook-failed diagnostics."""
+    module = _scenarios_module()
+    by_action = {"remediation_finished": [{"detail": {"ok": True}}]}
+    msg = module._marker_failure_message(by_action, [])
+    assert "remediation_finished.detail=" in msg
+    assert "playbook failed" not in msg.lower()
+
+
+def test_marker_failure_message_ok_false_without_error():
+    """ok falsey with error absent must still name playbook failed."""
+    module = _scenarios_module()
+    by_action = {
+        "remediation_finished": [{"detail": {"ok": False, "failed_step": 2}}],
+    }
+    msg = module._marker_failure_message(by_action, [])
+    assert "playbook failed" in msg.lower()
+    assert "error=" not in msg
+    assert "failed_step=2" in msg or "failed_step: 2" in msg
+
+
+def test_marker_failure_message_degrades_on_diagnostic_lookup_failure():
+    """A failed diagnostics lookup must not replace the marker assertion."""
+    module = _scenarios_module()
+    by_action = {
+        "remediation_finished": [{"detail": {"ok": False, "error": "step blew up"}}],
+    }
+    exec_diagnostics = [
+        {
+            "execution_id": "exec-bad",
+            "lookup_error": "connection refused",
+        }
+    ]
+
+    msg = module._marker_failure_message(by_action, exec_diagnostics)
+    assert "missing remediation/verification audit markers" in msg
+    assert "connection refused" in msg
+
+
+def test_marker_failure_message_survives_non_dict_remediation_detail():
+    """A non-dict remediation_finished.detail must not mask the marker assert."""
+    module = _scenarios_module()
+    by_action = {
+        "remediation_finished": [{"detail": "unexpected serialized blob"}],
+    }
+    msg = module._marker_failure_message(by_action, [])
+    assert "missing remediation/verification audit markers" in msg
+    assert "unexpected serialized blob" in msg
+    assert "unexpected type" in msg
+
+
+def test_parse_psql_exec_row_matches_real_psql_tsv_output():
+    """Collection path must parse tab-separated psql -At -F $'\\t' rows."""
+    module = _scenarios_module()
+    # Measured against PostgreSQL 16 psql -At -F $'\t':
+    # SELECT 'failed', '{"error":"boom"}'  ->  failed<TAB>{"error":"boom"}
+    status, vr = module._parse_psql_exec_row('failed\t{"error":"boom"}')
+    assert status == "failed"
+    assert vr == '{"error":"boom"}'
+    # SELECT 'failed', ''  ->  failed<TAB>  (trailing tab; do not strip it)
+    status, vr = module._parse_psql_exec_row("failed\t")
+    assert status == "failed"
+    assert vr == ""
+    # Default psql -At uses '|' — must not be parsed as two columns here.
+    status, vr = module._parse_psql_exec_row('failed|{"error":"boom"}')
+    assert status == 'failed|{"error":"boom"}'
+    assert vr == ""
+    # 0-row SELECT: stdout empty after rstrip -> both columns empty.
+    status, vr = module._parse_psql_exec_row("")
+    assert status == ""
+    assert vr == ""
+    status, vr = module._parse_psql_exec_row("\n")
+    assert status == ""
+    assert vr == ""
+
+
+def test_psql_tsv_separator_constant_is_tab():
+    """Producer and parser must share an explicit tab field separator."""
+    module = _scenarios_module()
+    assert module._PSQL_TSV_SEP == "\t"
+
+
+def test_e1_marker_assertion_and_settle_bounds_not_weakened():
+    """Guard: richer failure messages must not turn E1 green by relaxing the bar."""
+    body = _scenario_source("test_e1_worker_oom_to_resolved")
+    assert "assert start and end" in body
+    assert 'by_action["verification_run"]' in body
+    assert "_marker_failure_message" in body
+    assert "_psql_tsv_row" in body
+    assert "_parse_psql_exec_row" in body
+    assert "window >= 15.0" in body
+    assert "window < 60.0" in body
+    assert 'status") == "RESOLVED"' in body
+    end_assign_lines = [
+        line.strip()
+        for line in body.splitlines()
+        if "end =" in line and "end = None" not in line
+    ]
+    assert len(end_assign_lines) == 1, (
+        f"end must be assigned only from verification_run; found {end_assign_lines!r}"
+    )
+    assert "verification_run" in end_assign_lines[0]
+    diag_block = body.split("if not (start and end):", 1)[1].split(
+        "assert start and end", 1
+    )[0]
+    assert 'ex["execution_id"]' in diag_block
+    assert diag_block.index("try:") < diag_block.index('ex["execution_id"]')
