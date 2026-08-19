@@ -503,18 +503,32 @@ def _fake_worker_pod_list_json(ips: set[str]) -> str:
     )
 
 
+def _stats_nodes(hosts: set[str]) -> list[dict]:
+    """Presto 0.298 HeartbeatFailureDetector.Stats JSON (uri only)."""
+    return [{"uri": f"http://{host}:8080/v1/status"} for host in sorted(hosts)]
+
+
+def _fake_presto_node_get(
+    node_hosts: set[str],
+    failed_hosts: set[str] | None = None,
+):
+    """Route httpx.get to /v1/node and /v1/node/failed fakes."""
+    failed = failed_hosts if failed_hosts is not None else set()
+
+    def fake_get(url: str, **_k):
+        if url.endswith("/v1/node/failed"):
+            return _FakeResponse(_stats_nodes(failed))
+        if url.endswith("/v1/node"):
+            return _FakeResponse(_stats_nodes(node_hosts))
+        raise AssertionError(f"unexpected GET {url!r}")
+
+    return fake_get
+
+
 def test_wait_presto_workers_discovered_accepts_matching_ips(monkeypatch):
-    """Matching /v1/node worker URIs must return success, not only time out."""
+    """Matching live worker URIs must return success, not only time out."""
     mod = _scenarios_module()
     current_ips = {"10.244.0.25", "10.244.0.26"}
-    nodes = [
-        {
-            "nodeId": f"node-{host.replace('.', '-')}",
-            "uri": f"http://{host}:8080",
-            "coordinator": False,
-        }
-        for host in sorted(current_ips)
-    ]
 
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
@@ -523,29 +537,19 @@ def test_wait_presto_workers_discovered_accepts_matching_ips(monkeypatch):
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        lambda *_a, **_k: _FakeResponse(nodes),
+        _fake_presto_node_get(current_ips),
     )
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
 
 
-def test_wait_presto_workers_discovered_rejects_stale_uris(monkeypatch):
-    """Stale /v1/node URIs from the pre-rollout generation must not pass."""
+def test_wait_presto_workers_discovered_ignores_failed_stale_uris(monkeypatch):
+    """CI E1: stale stats in /v1/node but /v1/node/failed must not block."""
     mod = _scenarios_module()
-    current_ips = {"10.244.0.25", "10.244.0.26"}
-    stale_nodes = [
-        {
-            "nodeId": "old-1",
-            "uri": "http://10.244.0.23:8080",
-            "coordinator": False,
-        },
-        {
-            "nodeId": "old-2",
-            "uri": "http://10.244.0.24:8080",
-            "coordinator": False,
-        },
-    ]
+    current_ips = {"10.244.0.27", "10.244.0.28"}
+    stale_ips = {"10.244.0.23", "10.244.0.24"}
+    node_hosts = stale_ips | current_ips
 
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
@@ -554,7 +558,62 @@ def test_wait_presto_workers_discovered_rejects_stale_uris(monkeypatch):
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        lambda *_a, **_k: _FakeResponse(stale_nodes),
+        _fake_presto_node_get(node_hosts, failed_hosts=stale_ips),
+    )
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+
+
+def test_wait_presto_workers_discovered_rejects_warming_workers_in_failed(
+    monkeypatch,
+):
+    """Workers in both /v1/node and /v1/node/failed during warmup must time out."""
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.27", "10.244.0.28"}
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(current_ips, failed_hosts=current_ips),
+    )
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    clock = {"t": 1000.0}
+
+    def fake_time() -> float:
+        clock["t"] += 5.0
+        return clock["t"]
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+
+    with pytest.raises(AssertionError, match=r"(?s)worker discovery.*10\.244\.0\.2[78]"):
+        mod._wait_presto_workers_discovered(
+            "http://presto.example", timeout=10.0
+        )
+
+
+def test_wait_presto_workers_discovered_rejects_still_active_stale_uris(
+    monkeypatch,
+):
+    """Stale hosts still active (not in /v1/node/failed) must time out."""
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.27", "10.244.0.28"}
+    stale_ips = {"10.244.0.23", "10.244.0.24"}
+    node_hosts = stale_ips | current_ips
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(node_hosts, failed_hosts=set()),
     )
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
@@ -600,15 +659,7 @@ def test_wait_presto_workers_discovered_rejects_terminating_pod_ips(monkeypatch)
             ],
         ]
     }
-    node_hosts = [terminating_ip, *sorted(current_ips)]
-    nodes = [
-        {
-            "nodeId": f"node-{host.replace('.', '-')}",
-            "uri": f"http://{host}:8080",
-            "coordinator": False,
-        }
-        for host in node_hosts
-    ]
+    node_hosts = {terminating_ip, *current_ips}
 
     class _FakeProc:
         stdout = json.dumps(kubectl_json)
@@ -617,7 +668,7 @@ def test_wait_presto_workers_discovered_rejects_terminating_pod_ips(monkeypatch)
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        lambda *_a, **_k: _FakeResponse(nodes),
+        _fake_presto_node_get(node_hosts),
     )
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
@@ -643,32 +694,28 @@ def test_wait_presto_workers_discovered_retries_httpx_connection_error(
 
     mod = _scenarios_module()
     current_ips = {"10.244.0.25", "10.244.0.26"}
-    nodes = [
-        {
-            "nodeId": f"node-{host.replace('.', '-')}",
-            "uri": f"http://{host}:8080",
-            "coordinator": False,
-        }
-        for host in sorted(current_ips)
-    ]
 
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
 
     calls = {"n": 0}
+    router = _fake_presto_node_get(current_ips)
 
-    def fake_get(*_a, **_k):
+    def fake_get(url: str, **_k):
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.ConnectError("connection refused")
-        return _FakeResponse(nodes)
+        return router(url)
 
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(mod.httpx, "get", fake_get)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
-    assert calls["n"] == 2, "helper must retry after a transient connect error"
+    assert calls["n"] == 3, (
+        "helper must retry after a transient connect error "
+        "(1 failed + /v1/node + /v1/node/failed)"
+    )
 
 
 def test_e1_memory_error_predicate_rejects_unrelated_limits():

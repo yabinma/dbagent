@@ -412,12 +412,11 @@ def _node_uri_host(uri: str) -> str | None:
 def _wait_presto_workers_discovered(
     presto_url: str, *, timeout: float = 120.0
 ) -> None:
-    """Wait until the coordinator's /v1/node lists the current worker IPs.
+    """Wait until the coordinator will schedule on the current worker IPs.
 
-    Readiness alone does not flush stale discovery entries: after a worker
-    rollout the coordinator may keep scheduling onto dead URIs until the new
-    pods register. E1 must not submit the trip query until /v1/node matches
-    the live worker pod IPs and no stale hosts remain.
+    Presto 0.298 keeps failed nodes in GET /v1/node until expirationGraceInterval
+    (default 10 min). DiscoveryNodeManager excludes GET /v1/node/failed hosts
+    from scheduling. Live workers = /v1/node hosts minus /v1/node/failed hosts.
     """
     base = presto_url.rstrip("/")
     deadline = time.time() + timeout
@@ -430,37 +429,60 @@ def _wait_presto_workers_discovered(
             continue
 
         try:
-            r = httpx.get(f"{base}/v1/node", timeout=30)
+            r_node = httpx.get(f"{base}/v1/node", timeout=30)
+            r_failed = httpx.get(f"{base}/v1/node/failed", timeout=30)
         except httpx.HTTPError as exc:
-            last_detail = f"/v1/node request failed: {exc!r}"
+            last_detail = f"node discovery request failed: {exc!r}"
             time.sleep(2)
             continue
-        if r.status_code != 200:
-            last_detail = f"/v1/node returned status {r.status_code}: {r.text}"
+        if r_node.status_code != 200:
+            last_detail = (
+                f"/v1/node returned status {r_node.status_code}: {r_node.text}"
+            )
             time.sleep(2)
             continue
-        nodes = r.json()
+        if r_failed.status_code != 200:
+            last_detail = (
+                f"/v1/node/failed returned status {r_failed.status_code}: "
+                f"{r_failed.text}"
+            )
+            time.sleep(2)
+            continue
+        nodes = r_node.json()
+        failed_nodes = r_failed.json()
         if not isinstance(nodes, list):
-            last_detail = f"/v1/node returned non-list: {r.text}"
+            last_detail = f"/v1/node returned non-list: {r_node.text}"
+            time.sleep(2)
+            continue
+        if not isinstance(failed_nodes, list):
+            last_detail = f"/v1/node/failed returned non-list: {r_failed.text}"
             time.sleep(2)
             continue
 
-        worker_hosts: set[str] = set()
-        for node in nodes:
-            if not isinstance(node, dict) or node.get("coordinator"):
-                continue
-            host = _node_uri_host(str(node.get("uri") or ""))
-            if host:
-                worker_hosts.add(host)
+        def _hosts_from_stats(entries: list) -> set[str]:
+            hosts: set[str] = set()
+            for node in entries:
+                if not isinstance(node, dict) or node.get("coordinator"):
+                    continue
+                host = _node_uri_host(str(node.get("uri") or ""))
+                if host:
+                    hosts.add(host)
+            return hosts
 
-        stale = sorted(worker_hosts - expected)
-        missing = sorted(expected - worker_hosts)
-        if len(worker_hosts) >= 2 and not stale and not missing:
+        node_hosts = _hosts_from_stats(nodes)
+        failed_hosts = _hosts_from_stats(failed_nodes)
+        live_hosts = node_hosts - failed_hosts
+
+        stale = sorted(live_hosts - expected)
+        missing = sorted(expected - live_hosts)
+        if len(live_hosts) >= 2 and not stale and not missing:
             return
 
         last_detail = (
             f"expected worker IPs {sorted(expected)!r}; "
-            f"/v1/node worker hosts {sorted(worker_hosts)!r}; "
+            f"live worker hosts {sorted(live_hosts)!r}; "
+            f"/v1/node worker hosts {sorted(node_hosts)!r}; "
+            f"/v1/node/failed worker hosts {sorted(failed_hosts)!r}; "
             f"stale={stale!r} missing={missing!r}"
         )
         time.sleep(2)
