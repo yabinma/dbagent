@@ -897,6 +897,77 @@ def _marker_failure_message(by_action: dict, exec_diagnostics: list) -> str:
     return "missing remediation/verification audit markers; " + "; ".join(parts)
 
 
+_PAYLOAD_EXCERPT_MAX = 300
+
+
+def _payload_excerpt(payload: str, max_len: int = _PAYLOAD_EXCERPT_MAX) -> str:
+    if len(payload) <= max_len:
+        return payload
+    return payload[:max_len] + f"... ({len(payload)} bytes total)"
+
+
+_ITER_ROWS_MSG_MAX = 5
+
+
+def _format_iter_rows_for_message(iter_rows: list) -> str:
+    n = len(iter_rows)
+    if n <= _ITER_ROWS_MSG_MAX:
+        return repr(iter_rows)
+    head = ", ".join(repr(row) for row in iter_rows[:_ITER_ROWS_MSG_MAX])
+    return f"[{head}, ...] ({n} rows total)"
+
+
+def _e3_listed_failure_message(refs: list, payload_diagnostics: list) -> str:
+    """Why presto_list_queries evidence yielded no query rows, in one message."""
+    parts = [f"presto_list_queries evidence carried no query rows: refs={refs!r}"]
+    for diag in payload_diagnostics:
+        evidence_id = diag.get("evidence_id", "?")
+        payload_len = diag.get("payload_len", "?")
+        excerpt = diag.get("payload_excerpt", "")
+        iter_rows = diag.get("iter_rows", [])
+        clause = (
+            f"evidence_id={evidence_id!r} payload_len={payload_len} "
+            f"excerpt={excerpt!r} iter_query_rows={_format_iter_rows_for_message(iter_rows)}"
+        )
+        parts.append(clause)
+    return "; ".join(parts)
+
+
+def _e4_resolved_failure_message(detail: dict, audit_entries: list) -> str:
+    """Why the case did not reach RESOLVED, in one message."""
+    parts = [
+        f"status mismatch: got {detail.get('status')!r}, expected 'RESOLVED'"
+    ]
+    for i, ex in enumerate(detail.get("executions") or []):
+        if not isinstance(ex, dict):
+            parts.append(f"execution[{i}] unexpected type: {ex!r}")
+            continue
+        parts.append(
+            f"execution[{i}] playbook_id={ex.get('playbook_id')!r} "
+            f"params={ex.get('params')!r} status={ex.get('status')!r} "
+            f"verification_result={ex.get('verification_result')!r}"
+        )
+    gather_errors = [
+        e.get("_gather_error")
+        for e in audit_entries
+        if isinstance(e, dict) and "_gather_error" in e
+    ]
+    if gather_errors:
+        parts.append(f"audit_entries unavailable: {gather_errors[0]!r}")
+    else:
+        by_action: dict[str, list] = {}
+        for e in audit_entries:
+            if isinstance(e, dict):
+                by_action.setdefault(e.get("action"), []).append(e)
+        for action in ("case_closed", "remediation_finished", "verification_run"):
+            entries = by_action.get(action) or []
+            if entries:
+                detail_val = entries[0].get("detail")
+                if detail_val is not None:
+                    parts.append(f"{action}.detail={detail_val!r}")
+    return "; ".join(parts)
+
+
 WORKER_CONFIGMAP = "presto-worker-config"
 WORKER_WORKLOAD = "deploy/presto-worker"
 COORDINATOR_CONFIGMAP = "presto-coordinator-config"
@@ -1734,13 +1805,34 @@ def _e3_assert_case(
         f"collected={[r.get('tool_name') for r in _evidence_refs(dashboard_url, token, inv_id)]}"
     )
     listed: dict[str, str] = {}
+    payload_diagnostics: list[dict] = []
     for ref in refs:
-        payload = _evidence_payload(dashboard_url, token, ref["evidence_id"])
-        for entry in _iter_query_rows(json.loads(payload)):
+        evidence_id = ref["evidence_id"]
+        payload = _evidence_payload(dashboard_url, token, evidence_id)
+        iter_rows: list[dict] = []
+        parsed = json.loads(payload)
+        for entry in _iter_query_rows(parsed):
+            iter_rows.append(entry)
             qid = str(entry.get("query_id") or entry.get("queryId") or "")
             if qid:
                 listed[qid] = str(entry.get("state") or "").upper()
-    assert listed, f"presto_list_queries evidence carried no query rows: {refs}"
+        payload_diagnostics.append(
+            {
+                "evidence_id": evidence_id,
+                "payload_len": len(payload),
+                "payload_excerpt": _payload_excerpt(payload),
+                "iter_rows": iter_rows,
+            }
+        )
+    failure_msg = ""
+    if not listed:
+        try:
+            failure_msg = _e3_listed_failure_message(refs, payload_diagnostics)
+        except Exception as exc:  # noqa: BLE001
+            failure_msg = (
+                f"presto_list_queries evidence carried no query rows: {exc!r}"
+            )
+    assert listed, failure_msg
     correlated = {qid: listed[qid] for qid in queued if qid in listed}
     assert correlated, (
         "presto_list_queries evidence does not contain any of the queries this "
@@ -1814,7 +1906,18 @@ def test_e4_runaway_query_killed(dashboard_url, ingest_url, presto_url):
             break
         time.sleep(3)
     detail = _case_detail(dashboard_url, token, inv_id)
-    assert detail.get("status") == "RESOLVED", detail.get("status")
+    status = detail.get("status")
+    failure_msg = status
+    if status != "RESOLVED":
+        try:
+            audit_entries = _audit_entries(dashboard_url, token, inv_id)
+            failure_msg = _e4_resolved_failure_message(detail, audit_entries)
+        except Exception as exc:  # noqa: BLE001
+            failure_msg = (
+                f"status mismatch: got {status!r}, expected 'RESOLVED'; "
+                f"diagnostics unavailable: {exc!r}"
+            )
+    assert status == "RESOLVED", failure_msg
 
     # The kill must be *this* query's. Matching the id anywhere in the case
     # surface matched the alert that opened the case, which proves nothing

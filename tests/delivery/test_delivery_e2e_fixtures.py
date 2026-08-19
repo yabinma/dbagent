@@ -18,6 +18,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -3308,3 +3309,572 @@ def test_e1_marker_assertion_and_settle_bounds_not_weakened():
     )[0]
     assert 'ex["execution_id"]' in diag_block
     assert diag_block.index("try:") < diag_block.index('ex["execution_id"]')
+
+
+def test_e4_resolved_failure_message_surfaces_execution_and_audit_diagnostics():
+    """E4 status assertion must carry executions[] and case_closed.reason."""
+    module = _scenarios_module()
+    detail = {
+        "status": "NEEDS_HUMAN",
+        "executions": [
+            {
+                "playbook_id": "presto.kill_query",
+                "params": {"query_id": "q1"},
+                "status": "failed",
+                "verification_result": '{"matched": false}',
+            }
+        ],
+    }
+    audit_entries = [
+        {"action": "case_closed", "detail": {"reason": "verification_failed"}},
+    ]
+
+    old_msg = detail.get("status")
+    assert old_msg == "NEEDS_HUMAN"
+    assert "verification_failed" not in str(old_msg)
+    assert "presto.kill_query" not in str(old_msg)
+    assert "q1" not in str(old_msg)
+
+    msg = module._e4_resolved_failure_message(detail, audit_entries)
+    assert "verification_failed" in msg
+    assert "presto.kill_query" in msg
+    assert "q1" in msg
+    assert "status='failed'" in msg
+    assert '{"matched": false}' in msg
+    assert "RESOLVED" in msg
+
+
+def test_payload_excerpt_truncates_at_300_chars():
+    """W3: long payloads must not dump unbounded bytes into failure messages."""
+    module = _scenarios_module()
+    payload = "x" * 5000
+    excerpt = module._payload_excerpt(payload)
+    assert len(excerpt) == 300 + len(f"... ({len(payload)} bytes total)")
+    assert excerpt.startswith("x" * 300)
+    assert excerpt.endswith(f"... ({len(payload)} bytes total)")
+
+
+_E2E_SCENARIOS_PATH = E2E / "test_e2e_scenarios.py"
+_MANIFESTS_PATH = REPO_ROOT / "tests" / "functional" / "test_manifests.py"
+_mspec = importlib.util.spec_from_file_location(
+    "test_manifests_e2e_guard", _MANIFESTS_PATH
+)
+assert _mspec and _mspec.loader
+_manifests = importlib.util.module_from_spec(_mspec)
+sys.modules[_mspec.name] = _manifests
+_mspec.loader.exec_module(_manifests)
+_build_parent_map = _manifests._build_parent_map
+_in_nested_scope = _manifests._in_nested_scope
+_in_constantly_dead_branch = _manifests._in_constantly_dead_branch
+_ancestor_chain = _manifests._ancestor_chain
+_is_skip_decorator = _manifests._is_skip_decorator
+SUPPRESSOR_CM = _manifests.SUPPRESSOR_CM
+
+
+def _func_def_from_tree(
+    tree: ast.Module, name: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    return None
+
+
+def _func_has_skip_or_xfail_marker(source: str, func_name: str) -> bool:
+    func = _func_def_from_tree(ast.parse(source), func_name)
+    if func is None:
+        return True
+    return any(_is_skip_decorator(dec) for dec in func.decorator_list)
+
+
+def _assert_in_try_or_suppress(node: ast.Assert, func: ast.AST, parents: dict) -> bool:
+    """True when the assert sits inside a Try body or a suppressing with-block."""
+    _TryStar = getattr(ast, "TryStar", ast.Try)
+    for parent, field in _ancestor_chain(node, func, parents):
+        if isinstance(parent, (ast.Try, _TryStar)) and field == "body":
+            return True
+        if isinstance(parent, (ast.With, ast.AsyncWith)) and field == "body":
+            for item in parent.items:
+                expr = item.context_expr
+                if not isinstance(expr, ast.Call):
+                    continue
+                fn = expr.func
+                final = fn.id if isinstance(fn, ast.Name) else (
+                    fn.attr if isinstance(fn, ast.Attribute) else None
+                )
+                if final in SUPPRESSOR_CM:
+                    return True
+    return False
+
+
+def _is_name(node: ast.AST, ident: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == ident
+
+
+def _is_call_to(node: ast.AST, func_name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == func_name
+    )
+
+
+def _is_detail_get_status(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "get"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "detail"
+        and len(node.args) >= 1
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "status"
+    )
+
+
+def _is_resolved_constant(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value == "RESOLVED"
+
+
+def _is_e4_resolved_compare(test: ast.AST) -> bool:
+    if not isinstance(test, ast.Compare):
+        return False
+    if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+        return False
+    if len(test.comparators) != 1:
+        return False
+    left_ok = _is_name(test.left, "status") or _is_detail_get_status(test.left)
+    return left_ok and _is_resolved_constant(test.comparators[0])
+
+
+def _assigns_name_from_call(block: ast.AST, var: str, func_name: str) -> bool:
+    for node in ast.walk(block):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == var:
+                    if _is_call_to(node.value, func_name):
+                        return True
+    return False
+
+
+def _e4_failure_msg_from_helper(func: ast.FunctionDef, assert_node: ast.Assert) -> bool:
+    msg = assert_node.msg
+    if _is_call_to(msg, "_e4_resolved_failure_message"):
+        return True
+    if not isinstance(msg, ast.Name) or msg.id != "failure_msg":
+        return False
+    for node in ast.walk(func):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.NotEq)
+            and _is_name(test.left, "status")
+            and len(test.comparators) == 1
+            and _is_resolved_constant(test.comparators[0])
+        ):
+            continue
+        if _assigns_name_from_call(node, "failure_msg", "_e4_resolved_failure_message"):
+            return True
+    return False
+
+
+def _find_e4_resolved_assert(source: str, func_name: str) -> ast.Assert | None:
+    tree = ast.parse(source)
+    func = _func_def_from_tree(tree, func_name)
+    if func is None:
+        return None
+    parents = _build_parent_map(tree)
+    matches: list[ast.Assert] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assert):
+            continue
+        if _in_nested_scope(node, func, parents):
+            continue
+        if _in_constantly_dead_branch(node, func, parents):
+            continue
+        if _assert_in_try_or_suppress(node, func, parents):
+            continue
+        if isinstance(node.test, ast.BoolOp):
+            continue
+        if not _is_e4_resolved_compare(node.test):
+            continue
+        if not _e4_failure_msg_from_helper(func, node):
+            continue
+        matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _e3_listed_failure_msg_ok(func: ast.FunctionDef, assert_node: ast.Assert) -> bool:
+    msg = assert_node.msg
+    if _is_call_to(msg, "_e3_listed_failure_message"):
+        return True
+    if not isinstance(msg, ast.Name) or msg.id != "failure_msg":
+        return False
+    for node in ast.walk(func):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and _is_name(test.operand, "listed")
+        ):
+            continue
+        if _assigns_name_from_call(node, "failure_msg", "_e3_listed_failure_message"):
+            return True
+    return False
+
+
+def _find_e3_listed_assert(source: str, func_name: str) -> ast.Assert | None:
+    tree = ast.parse(source)
+    func = _func_def_from_tree(tree, func_name)
+    if func is None:
+        return None
+    parents = _build_parent_map(tree)
+    matches: list[ast.Assert] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assert):
+            continue
+        if _in_nested_scope(node, func, parents):
+            continue
+        if _in_constantly_dead_branch(node, func, parents):
+            continue
+        if _assert_in_try_or_suppress(node, func, parents):
+            continue
+        if not isinstance(node.test, ast.Name) or node.test.id != "listed":
+            continue
+        if isinstance(node.test, (ast.BoolOp, ast.UnaryOp, ast.Compare)):
+            continue
+        if not _e3_listed_failure_msg_ok(func, node):
+            continue
+        matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _find_e3_correlated_assert(source: str, func_name: str) -> ast.Assert | None:
+    tree = ast.parse(source)
+    func = _func_def_from_tree(tree, func_name)
+    if func is None:
+        return None
+    parents = _build_parent_map(tree)
+    matches: list[ast.Assert] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assert):
+            continue
+        if _in_nested_scope(node, func, parents):
+            continue
+        if _in_constantly_dead_branch(node, func, parents):
+            continue
+        if _assert_in_try_or_suppress(node, func, parents):
+            continue
+        if not isinstance(node.test, ast.Name) or node.test.id != "correlated":
+            continue
+        matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_e3_queued_any_assert(node: ast.Assert) -> bool:
+    test = node.test
+    if not isinstance(test, ast.Call) or not _is_name(test.func, "any"):
+        return False
+    if len(test.args) != 1 or not isinstance(test.args[0], ast.GeneratorExp):
+        return False
+    elt = test.args[0].elt
+    return (
+        isinstance(elt, ast.Compare)
+        and len(elt.ops) == 1
+        and isinstance(elt.ops[0], ast.Eq)
+        and _is_name(elt.left, "state")
+        and len(elt.comparators) == 1
+        and isinstance(elt.comparators[0], ast.Constant)
+        and elt.comparators[0].value == "QUEUED"
+    )
+
+
+def _find_e3_queued_assert(source: str, func_name: str) -> ast.Assert | None:
+    tree = ast.parse(source)
+    func = _func_def_from_tree(tree, func_name)
+    if func is None:
+        return None
+    parents = _build_parent_map(tree)
+    matches: list[ast.Assert] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assert):
+            continue
+        if _in_nested_scope(node, func, parents):
+            continue
+        if _in_constantly_dead_branch(node, func, parents):
+            continue
+        if _assert_in_try_or_suppress(node, func, parents):
+            continue
+        if not _is_e3_queued_any_assert(node):
+            continue
+        matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _e3_e4_guards_ok(source: str, func_name: str) -> bool:
+    if func_name == "test_e4_runaway_query_killed":
+        if _func_has_skip_or_xfail_marker(source, func_name):
+            return False
+        return _find_e4_resolved_assert(source, func_name) is not None
+    if func_name == "_e3_assert_case":
+        if _func_has_skip_or_xfail_marker(
+            source, "test_e3_queue_saturation_closed_summary"
+        ):
+            return False
+        return (
+            _find_e3_listed_assert(source, func_name) is not None
+            and _find_e3_correlated_assert(source, func_name) is not None
+            and _find_e3_queued_assert(source, func_name) is not None
+        )
+    raise ValueError(func_name)
+
+
+def _mutate_e4_source(src: str, mutation: str) -> str:
+    anchor = '    assert status == "RESOLVED", failure_msg'
+    if mutation == "resolved_assert_deleted":
+        assert anchor in src, "resolved_assert_deleted anchor missing"
+        return src.replace(anchor, "    # mutated: resolved assert deleted", 1)
+    if mutation == "resolved_assert_tautology":
+        assert anchor in src, "resolved_assert_tautology anchor missing"
+        return src.replace(anchor, "    assert True, failure_msg", 1)
+    if mutation == "under_if_false":
+        assert anchor in src, "under_if_false anchor missing"
+        return src.replace(
+            anchor,
+            "    if False:\n        assert status == \"RESOLVED\", failure_msg",
+            1,
+        )
+    if mutation == "resolved_assert_in_try_except":
+        assert anchor in src, "resolved_assert_in_try_except anchor missing"
+        return src.replace(
+            anchor,
+            "    try:\n"
+            "        assert status == \"RESOLVED\", failure_msg\n"
+            "    except AssertionError:\n"
+            "        pass",
+            1,
+        )
+    if mutation == "resolved_assert_in_suppress":
+        assert anchor in src, "resolved_assert_in_suppress anchor missing"
+        return src.replace(
+            anchor,
+            "    with contextlib.suppress(AssertionError):\n"
+            "        assert status == \"RESOLVED\", failure_msg",
+            1,
+        )
+    if mutation == "skip_decorator":
+        old = "@pytest.mark.e2e\ndef test_e4_runaway_query_killed"
+        assert old in src, "skip_decorator anchor missing"
+        return src.replace(
+            old,
+            "@pytest.mark.e2e\n@pytest.mark.skip\ndef test_e4_runaway_query_killed",
+            1,
+        )
+    if mutation == "xfail_decorator":
+        old = "@pytest.mark.e2e\ndef test_e4_runaway_query_killed"
+        assert old in src, "xfail_decorator anchor missing"
+        return src.replace(
+            old,
+            "@pytest.mark.e2e\n@pytest.mark.xfail\ndef test_e4_runaway_query_killed",
+            1,
+        )
+    raise ValueError(mutation)
+
+
+def _mutate_e3_source(src: str, mutation: str) -> str:
+    anchor = "    assert listed, failure_msg"
+    if mutation == "listed_or_true":
+        assert anchor in src, "listed_or_true anchor missing"
+        return src.replace(anchor, "    assert listed or True, failure_msg", 1)
+    if mutation == "listed_assert_deleted":
+        assert anchor in src, "listed_assert_deleted anchor missing"
+        return src.replace(anchor, "    # mutated: listed assert deleted", 1)
+    if mutation == "under_if_false":
+        assert anchor in src, "under_if_false anchor missing"
+        return src.replace(
+            anchor,
+            "    if False:\n        assert listed, failure_msg",
+            1,
+        )
+    if mutation == "correlated_deleted":
+        old = (
+            "    assert correlated, (\n"
+            "        \"presto_list_queries evidence does not contain any of the queries this \"\n"
+            "        f\"scenario established as QUEUED: queued={queued} listed={sorted(listed)[:10]}\"\n"
+            "    )"
+        )
+        assert old in src, "correlated_deleted anchor missing"
+        return src.replace(old, "    # mutated: correlated assert deleted", 1)
+    if mutation == "queued_any_tautology":
+        old = '    assert any(state == "QUEUED" for state in correlated.values()), ('
+        assert old in src, "queued_any_tautology anchor missing"
+        return src.replace(
+            old,
+            "    assert any(state == \"QUEUED\" or True for state in correlated.values()), (",
+            1,
+        )
+    if mutation == "listed_assert_in_try_except":
+        assert anchor in src, "listed_assert_in_try_except anchor missing"
+        return src.replace(
+            anchor,
+            "    try:\n"
+            "        assert listed, failure_msg\n"
+            "    except AssertionError:\n"
+            "        pass",
+            1,
+        )
+    if mutation == "listed_assert_in_suppress":
+        assert anchor in src, "listed_assert_in_suppress anchor missing"
+        return src.replace(
+            anchor,
+            "    with contextlib.suppress(AssertionError):\n"
+            "        assert listed, failure_msg",
+            1,
+        )
+    if mutation == "skip_decorator":
+        old = "@pytest.mark.e2e\ndef test_e3_queue_saturation_closed_summary"
+        assert old in src, "skip_decorator anchor missing"
+        return src.replace(
+            old,
+            "@pytest.mark.e2e\n@pytest.mark.skip\n"
+            "def test_e3_queue_saturation_closed_summary",
+            1,
+        )
+    if mutation == "xfail_decorator":
+        old = "@pytest.mark.e2e\ndef test_e3_queue_saturation_closed_summary"
+        assert old in src, "xfail_decorator anchor missing"
+        return src.replace(
+            old,
+            "@pytest.mark.e2e\n@pytest.mark.xfail\n"
+            "def test_e3_queue_saturation_closed_summary",
+            1,
+        )
+    raise ValueError(mutation)
+
+
+E4_NEGATIVE_MUTATIONS = [
+    "resolved_assert_deleted",
+    "resolved_assert_tautology",
+    "under_if_false",
+    "resolved_assert_in_try_except",
+    "resolved_assert_in_suppress",
+    "skip_decorator",
+    "xfail_decorator",
+]
+
+E3_NEGATIVE_MUTATIONS = [
+    "listed_or_true",
+    "listed_assert_deleted",
+    "under_if_false",
+    "correlated_deleted",
+    "queued_any_tautology",
+    "listed_assert_in_try_except",
+    "listed_assert_in_suppress",
+    "skip_decorator",
+    "xfail_decorator",
+]
+
+
+def test_e3_e4_assertion_conditions_and_helpers_not_weakened():
+    """Anti-goal: richer messages must not turn E3/E4 green by relaxing the bar."""
+    scenarios_src = _E2E_SCENARIOS_PATH.read_text(encoding="utf-8")
+    assert _e3_e4_guards_ok(scenarios_src, "test_e4_runaway_query_killed")
+    assert _e3_e4_guards_ok(scenarios_src, "_e3_assert_case")
+
+    e4_body = _scenario_source("test_e4_runaway_query_killed")
+    assert "_e4_resolved_failure_message" in e4_body
+    diag_block = e4_body.split('if status != "RESOLVED":', 1)[1].split(
+        'assert status == "RESOLVED"', 1
+    )[0]
+    assert "_audit_entries" in diag_block
+    assert diag_block.index("try:") < diag_block.index("_audit_entries")
+    assert "_e4_resolved_failure_message" in diag_block
+
+    e3_body = _scenario_source("_e3_assert_case")
+    assert "_e3_listed_failure_message" in e3_body
+    assert "_payload_excerpt(" in e3_body
+    assert "json.loads(payload)" in e3_body
+    assert "continue" not in e3_body.split("json.loads(payload)", 1)[1].split(
+        "assert listed", 1
+    )[0]
+
+
+@pytest.mark.parametrize("mutation_id", E4_NEGATIVE_MUTATIONS, ids=E4_NEGATIVE_MUTATIONS)
+def test_e4_anti_goal_guard_rejects_mutations(mutation_id: str):
+    """C1: substring bypasses must not satisfy the E4 RESOLVED assertion guard."""
+    src = _E2E_SCENARIOS_PATH.read_text(encoding="utf-8")
+    assert _e3_e4_guards_ok(src, "test_e4_runaway_query_killed")
+    mutated = _mutate_e4_source(src, mutation_id)
+    assert _e3_e4_guards_ok(mutated, "test_e4_runaway_query_killed") is False
+
+
+@pytest.mark.parametrize("mutation_id", E3_NEGATIVE_MUTATIONS, ids=E3_NEGATIVE_MUTATIONS)
+def test_e3_anti_goal_guard_rejects_mutations(mutation_id: str):
+    """C2: tautology/deletion bypasses must not satisfy the E3 listed guard."""
+    src = _E2E_SCENARIOS_PATH.read_text(encoding="utf-8")
+    assert _e3_e4_guards_ok(src, "_e3_assert_case")
+    mutated = _mutate_e3_source(src, mutation_id)
+    assert _e3_e4_guards_ok(mutated, "_e3_assert_case") is False
+
+
+def test_e4_resolved_failure_message_degrades_on_audit_gather_failure():
+    """A failed audit lookup must not replace the status assertion."""
+    module = _scenarios_module()
+    detail = {"status": "NEEDS_HUMAN", "executions": []}
+    audit_entries = [{"_gather_error": "connection refused"}]
+
+    msg = module._e4_resolved_failure_message(detail, audit_entries)
+    assert "NEEDS_HUMAN" in msg
+    assert "RESOLVED" in msg
+    assert "connection refused" in msg
+
+
+def test_e3_listed_failure_message_distinguishes_empty_vs_unwalked_payload():
+    """E3 must distinguish empty payload from unwalked shape in the message."""
+    module = _scenarios_module()
+    refs = [{"evidence_id": "ev-1", "tool_name": "presto_list_queries"}]
+
+    empty_payload = "[]"
+    empty_parsed = json.loads(empty_payload)
+    empty_iter_rows = list(module._iter_query_rows(empty_parsed))
+    assert empty_iter_rows == []
+    empty_diag = [
+        {
+            "evidence_id": "ev-1",
+            "payload_len": len(empty_payload),
+            "payload_excerpt": module._payload_excerpt(empty_payload),
+            "iter_rows": empty_iter_rows,
+        }
+    ]
+    unwalked_payload = '{"meta": {"count": 1}}'
+    unwalked_parsed = json.loads(unwalked_payload)
+    unwalked_iter_rows = list(module._iter_query_rows(unwalked_parsed))
+    assert unwalked_iter_rows == []
+    unwalked_excerpt = module._payload_excerpt(unwalked_payload)
+    unwalked_diag = [
+        {
+            "evidence_id": "ev-2",
+            "payload_len": len(unwalked_payload),
+            "payload_excerpt": unwalked_excerpt,
+            "iter_rows": unwalked_iter_rows,
+        }
+    ]
+
+    msg_empty = module._e3_listed_failure_message(refs, empty_diag)
+    msg_unwalked = module._e3_listed_failure_message(refs, unwalked_diag)
+
+    assert msg_empty != msg_unwalked
+    assert "excerpt='[]'" in msg_empty
+    assert "evidence_id='ev-1'" in msg_empty
+    assert "payload_len=2" in msg_empty
+
+    assert f"excerpt={unwalked_excerpt!r}" in msg_unwalked
+    assert "evidence_id='ev-2'" in msg_unwalked
+    assert f"payload_len={len(unwalked_payload)}" in msg_unwalked
