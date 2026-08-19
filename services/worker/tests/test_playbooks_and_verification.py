@@ -120,8 +120,8 @@ def test_resolve_action_settle_seconds_default_path():
 async def test_verify_union_and_canary():
     probe = FakeProbeGatewayClient(
         {
-            "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
-            "presto_nodes": {"exit_code": 0, "data": {"nodes": [{"nodeId": "n1"}]}},
+            "presto_list_queries": [[]],
+            "presto_nodes": {"active": [{"node_id": "n1"}]},
             "health": {"ok": True, "exit_code": 0},
             "presto_cluster_info": {"exit_code": 0, "data": {}},
         }
@@ -304,8 +304,8 @@ async def test_verification_helpers_pass_and_fail():
 
     probe = FakeProbeGatewayClient(
         {
-            "presto_list_queries": {"exit_code": 0, "data": {"queries": [{"queryId": "gone"}]}},
-            "presto_nodes": {"exit_code": 0, "data": {"nodes": [{"nodeId": "w1"}]}},
+            "presto_list_queries": [[{"query_id": "gone", "state": "RUNNING"}]],
+            "presto_nodes": {"active": [{"node_id": "w1"}]},
             "presto_config": {"exit_code": 0, "data": {"content": "query.max-memory=50GB\n"}},
             "presto_cluster_info": {"exit_code": 0, "data": {}},
             "presto_jmx": {"exit_code": 0, "data": {}},
@@ -316,7 +316,7 @@ async def test_verification_helpers_pass_and_fail():
     r = await check_query_absent(probe, "p", params={"query_id": "gone"})
     assert r["ok"] is False
     # absent
-    probe.script["presto_list_queries"] = {"exit_code": 0, "data": {"queries": []}}
+    probe.script["presto_list_queries"] = [[]]
     r = await check_query_absent(probe, "p", params={"query_id": "gone"})
     assert r["ok"] is True
 
@@ -360,6 +360,152 @@ async def test_verification_helpers_pass_and_fail():
         verification_plan=["presto_cluster_info", {"args": {}}, 123],
     )
     assert "rca:presto_cluster_info" in [c["name"] for c in result["checks"]]
+
+
+@pytest.mark.asyncio
+async def test_workers_active_count_appendix_b_active_key():
+    """Real probe returns {'active': [...]} — not 'nodes' / 'activeWorkers'."""
+    from worker.verification import check_workers_active_count
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_nodes": {"active": [{"node_id": "w1"}]},
+        }
+    )
+    r = await check_workers_active_count(probe, "p", params={"min_workers": 1})
+    assert r["ok"] is True
+    assert r["detail"] == "active=1 min=1"
+
+
+@pytest.mark.asyncio
+async def test_jmx_memory_pool_ok_uses_mbean_arg():
+    """Appendix B presto_jmx requires 'mbean', not 'object'."""
+    from worker.playbooks import PRE_SNAPSHOT_TOOLS
+    from worker.verification import check_jmx_memory_pool_ok
+
+    probe = FakeProbeGatewayClient({"presto_jmx": {"exit_code": 0, "data": {}}})
+    await check_jmx_memory_pool_ok(probe, "p", params={})
+    jmx_calls = [c for c in probe.calls if c["tool"] == "presto_jmx"]
+    assert jmx_calls[-1]["args"] == {"mbean": "heap"}
+
+    jmx = [e for e in PRE_SNAPSHOT_TOOLS["presto.adjust_memory_config"] if e.get("tool") == "presto_jmx"]
+    assert jmx and jmx[0]["args"] == {"mbean": "heap"}
+
+
+@pytest.mark.asyncio
+async def test_query_absent_fails_on_appendix_b_bare_list():
+    """Real probe returns a bare query list, not {'queries': [...]}."""
+    from worker.verification import check_query_absent
+
+    # FakeProbe treats a top-level list as sequential responses; wrap so _next
+    # returns the Appendix B bare list payload the real probe emits.
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_list_queries": [[{"query_id": "q1", "state": "RUNNING"}]],
+        }
+    )
+    r = await check_query_absent(probe, "p", params={"query_id": "q1"})
+    assert r["ok"] is False
+    assert "present=True" in r["detail"]
+
+
+@pytest.mark.asyncio
+async def test_query_absent_passes_on_appendix_b_empty_list():
+    """Appendix B empty query list means the target query is absent."""
+    from worker.verification import check_query_absent
+
+    probe = FakeProbeGatewayClient({"presto_list_queries": [[]]})
+    r = await check_query_absent(probe, "p", params={"query_id": "q1"})
+    assert r["ok"] is True
+    assert "present=False" in r["detail"]
+
+
+@pytest.mark.asyncio
+async def test_node_active_appendix_b_active_key():
+    """Real probe returns {'active': [...]} with node_id — not nodes/nodeId."""
+    from worker.verification import check_node_active
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_nodes": {"active": [{"node_id": "w1"}]},
+        }
+    )
+    r = await check_node_active(probe, "p", params={"worker_id": "w1"})
+    assert r["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_node_active_nodes_key_fallback():
+    """Legacy nodes/nodeId envelope still matches when present."""
+    from worker.verification import check_node_active
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_nodes": {"nodes": [{"nodeId": "w1"}]},
+        }
+    )
+    r = await check_node_active(probe, "p", params={"worker_id": "w1"})
+    assert r["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_workers_active_count_nodes_key_fallback():
+    """Legacy nodes/nodeId envelope still counts workers when present."""
+    from worker.verification import check_workers_active_count
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_nodes": {"nodes": [{"nodeId": "w1"}]},
+        }
+    )
+    r = await check_workers_active_count(probe, "p", params={"min_workers": 1})
+    assert r["ok"] is True
+    assert r["detail"] == "active=1 min=1"
+
+
+@pytest.mark.asyncio
+async def test_workers_active_count_active_workers_int():
+    """Legacy integer activeWorkers count uses the int branch, not len(list)."""
+    from worker.verification import check_workers_active_count
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_nodes": {"active": 3},
+        }
+    )
+    r = await check_workers_active_count(probe, "p", params={"min_workers": 2})
+    assert r["ok"] is True
+    assert r["detail"] == "active=3 min=2"
+
+
+@pytest.mark.asyncio
+async def test_query_absent_queries_key_fallback():
+    """Legacy {queries:[...]} envelope still detects a present query."""
+    from worker.verification import check_query_absent
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_list_queries": {"exit_code": 0, "data": {"queries": [{"query_id": "q1"}]}},
+        }
+    )
+    r = await check_query_absent(probe, "p", params={"query_id": "q1"})
+    assert r["ok"] is False
+    assert "present=True" in r["detail"]
+
+
+@pytest.mark.asyncio
+async def test_query_absent_unwrap_data_inner_list():
+    """FakeProbe nested data:[{...}] unwraps to the bare Appendix B list."""
+    from worker.verification import check_query_absent
+
+    probe = FakeProbeGatewayClient(
+        {
+            "presto_list_queries": {"exit_code": 0, "data": [{"query_id": "q1"}]},
+        }
+    )
+    r = await check_query_absent(probe, "p", params={"query_id": "q1"})
+    assert r["ok"] is False
+    assert "present=True" in r["detail"]
 
 
 def test_playbook_helpers_coverage():

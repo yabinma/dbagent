@@ -12,15 +12,23 @@ from typing import Any, Awaitable, Callable
 CheckFn = Callable[..., Awaitable[dict[str, Any]]]
 
 
-def _unwrap_data(result_data: Any) -> dict[str, Any]:
+def _unwrap_data(result_data: Any) -> Any:
     """Normalize ToolExecutionResult.data shapes from real/fake probes."""
+    if isinstance(result_data, list):
+        return result_data
     if not isinstance(result_data, dict):
         return {}
     # FakeProbe often returns {"exit_code":0,"data":{...}} as the whole data blob.
     inner = result_data.get("data")
     if isinstance(inner, dict) and (
-        "queries" in inner or "nodes" in inner or "content" in inner or "text" in inner
+        "queries" in inner
+        or "nodes" in inner
+        or "active" in inner
+        or "content" in inner
+        or "text" in inner
     ):
+        return inner
+    if isinstance(inner, list):
         return inner
     return result_data
 
@@ -33,8 +41,10 @@ async def check_query_absent(
         platform_key, tool="presto_list_queries", args={"state": "RUNNING"}
     )
     data = _unwrap_data(result.data)
-    # Accept several shapes from fake/real probes.
-    queries = data.get("queries") or data.get("items") or []
+    if isinstance(data, list):
+        queries = data
+    else:
+        queries = data.get("queries") or []
     if isinstance(queries, dict):
         queries = list(queries.values())
     present = False
@@ -58,13 +68,16 @@ async def check_workers_active_count(
 ) -> dict[str, Any]:
     result = await probe.execute_tool(platform_key, tool="presto_nodes", args={})
     data = _unwrap_data(result.data)
-    nodes = data.get("nodes") or data.get("activeWorkers") or []
+    if isinstance(data, dict):
+        nodes = data.get("active") or data.get("nodes") or data.get("activeWorkers") or []
+    else:
+        nodes = []
     if isinstance(nodes, int):
         count = nodes
     elif isinstance(nodes, list):
         count = len(nodes)
     else:
-        count = int(data.get("activeWorkers") or data.get("active_workers") or 0)
+        count = int((data.get("activeWorkers") if isinstance(data, dict) else 0) or 0)
     min_workers = int(params.get("min_workers") or 1)
     ok = result.exit_code == 0 and count >= min_workers
     return {
@@ -93,7 +106,10 @@ async def check_config_key_equals(
         args={"component": "worker", "file": "config"},
     )
     data = _unwrap_data(result.data)
-    content = data.get("content") or data.get("text") or ""
+    if isinstance(data, dict):
+        content = data.get("content") or data.get("text") or ""
+    else:
+        content = ""
     if not content and isinstance(result.data, dict):
         content = result.data.get("content") or result.data.get("text") or result.data.get("data") or ""
     if isinstance(content, dict):
@@ -123,11 +139,23 @@ async def check_node_active(
     worker_id = params.get("worker_id")
     result = await probe.execute_tool(platform_key, tool="presto_nodes", args={})
     data = _unwrap_data(result.data)
-    nodes = data.get("nodes") or []
+    if isinstance(data, list):
+        nodes = data
+    elif isinstance(data, dict):
+        nodes = data.get("active") or data.get("nodes") or data.get("activeWorkers") or []
+    else:
+        nodes = []
     ok = result.exit_code == 0
     if worker_id and isinstance(nodes, list):
         ok = ok and any(
-            (isinstance(n, dict) and (n.get("nodeId") == worker_id or n.get("uri") == worker_id))
+            (
+                isinstance(n, dict)
+                and (
+                    n.get("node_id") == worker_id
+                    or n.get("nodeId") == worker_id
+                    or n.get("uri") == worker_id
+                )
+            )
             or n == worker_id
             for n in nodes
         )
@@ -138,7 +166,7 @@ async def check_jmx_memory_pool_ok(
     probe, platform_key: str, *, params: dict[str, Any], **_: Any
 ) -> dict[str, Any]:
     result = await probe.execute_tool(
-        platform_key, tool="presto_jmx", args={"object": "heap"}
+        platform_key, tool="presto_jmx", args={"mbean": "heap"}
     )
     ok = result.exit_code == 0
     return {"name": "jmx_memory_pool_ok", "ok": ok, "detail": result.error or "ok"}

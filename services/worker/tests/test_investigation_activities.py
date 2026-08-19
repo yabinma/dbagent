@@ -82,8 +82,8 @@ def acts(tmp_path):
     probe = FakeProbeGatewayClient(
         {
             "presto_cluster_info": {"exit_code": 0, "data": {"activeWorkers": 3}},
-            "presto_nodes": {"exit_code": 0, "data": {"nodes": [{"nodeId": "n1"}]}},
-            "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
+            "presto_nodes": {"active": [{"node_id": "n1"}]},
+            "presto_list_queries": [[]],
             "presto_query_detail": {"exit_code": 0, "data": {"queryId": "q"}},
             "health": {"ok": True, "exit_code": 0},
             "write": {"ok": True, "exit_code": 0},

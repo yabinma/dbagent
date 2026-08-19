@@ -406,7 +406,7 @@ PRE_SNAPSHOT_TOOLS: dict[str, list[dict[str, Any]]] = {
     "presto.adjust_memory_config": [
         {"tool": "presto_config", "args": {"component": "worker", "file": "config"}},
         {"tool": "k8s_pods|swarm_tasks", "args": {}},
-        {"tool": "presto_jmx", "args": {"object": "heap"}},
+        {"tool": "presto_jmx", "args": {"mbean": "heap"}},
     ],
     "presto.restart_coordinator": [
         {"tool": "presto_cluster_info", "args": {}},
