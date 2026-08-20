@@ -196,7 +196,7 @@ func mapV1QueryRow(src map[string]any) (map[string]any, error) {
 		if started := getString(stats, "createTime"); started != "" {
 			row["started"] = started
 		}
-		if ended := getString(stats, "endTime"); ended != "" {
+		if ended := getString(stats, "endTime"); ended != "" && !isEpochEndTime(ended) {
 			row["ended"] = ended
 		}
 		if queued := getString(stats, "queuedTime"); queued != "" {
@@ -276,7 +276,30 @@ func parseSinceDuration(s string) (time.Duration, error) {
 	}
 }
 
+func isTerminalQueryState(state string) bool {
+	switch strings.ToUpper(state) {
+	case "FINISHED", "FAILED":
+		return true
+	default:
+		return false
+	}
+}
+
+func isEpochEndTime(s string) bool {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return false
+		}
+	}
+	return t.UTC().Unix() == 0
+}
+
 func passesSinceFilter(row map[string]any, cutoff time.Time) bool {
+	if !isTerminalQueryState(getString(row, "state")) {
+		return true
+	}
 	endedRaw, ok := row["ended"]
 	if !ok {
 		return true

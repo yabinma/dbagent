@@ -722,6 +722,20 @@ def _nested_get(obj: object, path: str) -> object:
     return cur
 
 
+def _is_unix_epoch_timestamp(value: object) -> bool:
+    """True when value is Presto 0.298's unfinished-query endTime sentinel."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return int(dt.timestamp()) == 0
+
+
 def _assert_v1_query_contract(presto_url: str) -> None:
     """FP-AD-7: live 0.298 /v1/query exposes every path the REST mapper consumes."""
     r = httpx.get(f"{presto_url.rstrip('/')}/v1/query", timeout=30)
@@ -730,6 +744,7 @@ def _assert_v1_query_contract(presto_url: str) -> None:
     assert isinstance(body, list) and body, f"/v1/query must return a non-empty array, got {type(body)}"
 
     saw_queued = False
+    saw_queued_epoch_end_time = False
     saw_session_user = False
     saw_query = False
     saw_create_time = False
@@ -782,12 +797,19 @@ def _assert_v1_query_contract(presto_url: str) -> None:
                 assert end_time != "", (
                     f"queryStats.endTime empty on row {item.get('queryId')!r}"
                 )
+                if state == "QUEUED" and _is_unix_epoch_timestamp(end_time):
+                    # 0.298: unfinished queries still carry endTime at Unix epoch.
+                    saw_queued_epoch_end_time = True
 
         if item.get("errorCode") is not None:
             err = item.get("errorCode")
             assert isinstance(err, dict) and err.get("name"), f"errorCode.name missing: {err!r}"
 
     assert saw_queued, "E3 contract check requires at least one QUEUED row while the fault is active"
+    assert saw_queued_epoch_end_time, (
+        "E3 contract check requires a QUEUED row whose queryStats.endTime is Unix epoch "
+        "(Presto 0.298 liveness sentinel — presto_list_queries since filter must not drop it)"
+    )
     assert saw_session_user, (
         "E3 contract check requires session.user on at least one row (REST mapper path)"
     )

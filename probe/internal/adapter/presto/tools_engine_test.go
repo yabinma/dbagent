@@ -400,6 +400,80 @@ func TestExecute_PrestoListQueries_Since(t *testing.T) {
 	}
 }
 
+func TestExecute_PrestoListQueries_SinceKeepsNonTerminalWithEpochEndTime(t *testing.T) {
+	epochEnd := "1970-01-01T00:00:00.000Z"
+	recentCreate := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	oldRealEnd := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	body := []any{
+		map[string]any{
+			"queryId": "q-queued-epoch",
+			"state":   "QUEUED",
+			"query":   "SELECT 1",
+			"session": map[string]any{"user": "analyst"},
+			"queryStats": map[string]any{
+				"createTime": recentCreate,
+				"endTime":    epochEnd,
+			},
+		},
+		map[string]any{
+			"queryId": "q-running-epoch",
+			"state":   "RUNNING",
+			"query":   "SELECT 2",
+			"session": map[string]any{"user": "analyst"},
+			"queryStats": map[string]any{
+				"createTime": recentCreate,
+				"endTime":    epochEnd,
+			},
+		},
+		map[string]any{
+			"queryId": "q-queued-old-end",
+			"state":   "QUEUED",
+			"query":   "SELECT 3",
+			"session": map[string]any{"user": "analyst"},
+			"queryStats": map[string]any{
+				"createTime": recentCreate,
+				"endTime":    oldRealEnd,
+			},
+		},
+	}
+	srv := listQueriesTestServer(t, body, false)
+	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("unexpected result: %+v err=%v", result, err)
+	}
+	rows, ok := result.Data.([]map[string]any)
+	if !ok {
+		t.Fatalf("expected []map rows, got %T", result.Data)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("default since=1h must keep non-terminal rows (epoch and old real endTime), got %d rows: %+v", len(rows), rows)
+	}
+	ids := map[string]bool{}
+	for _, row := range rows {
+		qid := row["query_id"].(string)
+		ids[qid] = true
+		switch qid {
+		case "q-queued-epoch", "q-running-epoch":
+			if _, hasEnded := row["ended"]; hasEnded {
+				t.Fatalf("epoch endTime must not map to ended on row %q: %+v", qid, row)
+			}
+		case "q-queued-old-end":
+			ended, ok := row["ended"].(string)
+			if !ok || ended != oldRealEnd {
+				t.Fatalf("real endTime must map to ended on row %q: %+v", qid, row)
+			}
+		}
+	}
+	if !ids["q-queued-epoch"] || !ids["q-running-epoch"] || !ids["q-queued-old-end"] {
+		t.Fatalf("expected all three non-terminal rows, got ids=%v", keysOfBool(ids))
+	}
+}
+
 func TestExecute_PrestoListQueries_RedactsQueryText(t *testing.T) {
 	secretQuery := "CREATE TABLE t WITH (connection-url = 'jdbc:mysql://svc:hunter2@db:3306/analytics')"
 	body := []any{
