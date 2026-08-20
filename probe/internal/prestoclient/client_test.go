@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGetJSON_Success(t *testing.T) {
@@ -165,6 +166,31 @@ func TestQuery_FollowsNextURIPagination(t *testing.T) {
 	}
 	if len(res.Columns) != 1 || res.Columns[0] != "x" {
 		t.Fatalf("unexpected columns: %+v", res.Columns)
+	}
+}
+
+func TestQuery_InfiniteNextURIRespectsContextDeadline(t *testing.T) {
+	page := "/v1/statement/page"
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"nextUri":"` + srv.URL + page + `"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, srv.Client())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.Query(ctx, "SELECT query_id FROM system.runtime.queries")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected context deadline error")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("Query took %v, expected ~2s deadline", elapsed)
 	}
 }
 

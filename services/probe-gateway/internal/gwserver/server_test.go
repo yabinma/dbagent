@@ -1,6 +1,7 @@
 package gwserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -8,8 +9,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/json"
 	"encoding/pem"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +33,7 @@ import (
 
 	rcaprobev1 "github.com/yabinma/dbagent/gen/go/rcaprobe/v1"
 	"github.com/yabinma/dbagent/internal/bootstrapca"
+	"github.com/yabinma/dbagent/services/probe-gateway/internal/dispatch"
 	"github.com/yabinma/dbagent/services/probe-gateway/internal/registry"
 )
 
@@ -441,6 +446,60 @@ func TestDispatch_ProbeNotConnected(t *testing.T) {
 	}
 }
 
+func TestDispatch_ContextDeadlineReturnsTimeoutEnvelope(t *testing.T) {
+	client, srv, reg := testServer(t)
+	seedPlatform(t, reg, "presto-us1")
+	fp := newFakeProbe(t, client)
+	fp.register("presto-us1")
+	fp.expectAck(2 * time.Second)
+	waitForSession(t, srv, "presto-us1")
+
+	cancelCh := make(chan string, 1)
+	go func() {
+		var errMsg string
+		defer func() { cancelCh <- errMsg }()
+		select {
+		case msg := <-fp.received:
+			task := msg.GetTask()
+			if task == nil {
+				errMsg = "expected TaskRequest"
+				return
+			}
+			select {
+			case cancelMsg := <-fp.received:
+				if cancelMsg.GetCancel() == nil || cancelMsg.GetCancel().GetTaskId() != task.GetTaskId() {
+					errMsg = "expected CancelTask"
+				}
+			case <-time.After(3 * time.Second):
+				errMsg = "timed out waiting for CancelTask"
+			}
+		case <-time.After(2 * time.Second):
+			errMsg = "timed out waiting for TaskRequest"
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, _, err := srv.Dispatch(ctx, "presto-us1", &rcaprobev1.TaskRequest{
+		TaskId: "task-ctx-timeout", TimeoutSeconds: 60,
+		Kind: &rcaprobev1.TaskRequest_Tool{Tool: &rcaprobev1.ToolCall{ToolName: "presto_list_queries"}},
+	})
+	if err != nil {
+		t.Fatalf("expected timeout envelope, got error: %v", err)
+	}
+	if result == nil || result.GetExitCode() != 1 || result.GetError() == "" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	select {
+	case errMsg := <-cancelCh:
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not send CancelTask")
+	}
+}
+
 func TestDispatch_TimesOutWhenProbeDoesNotReply(t *testing.T) {
 	client, srv, reg := testServer(t)
 	seedPlatform(t, reg, "presto-us1")
@@ -449,12 +508,189 @@ func TestDispatch_TimesOutWhenProbeDoesNotReply(t *testing.T) {
 	fp.expectAck(2 * time.Second)
 	waitForSession(t, srv, "presto-us1")
 
-	_, _, err := srv.Dispatch(context.Background(), "presto-us1", &rcaprobev1.TaskRequest{
-		TaskId: "task-timeout", TimeoutSeconds: 1,
-		Kind: &rcaprobev1.TaskRequest_Tool{Tool: &rcaprobev1.ToolCall{ToolName: "x"}},
+	cancelCh := make(chan string, 1)
+	go func() {
+		var errMsg string
+		defer func() { cancelCh <- errMsg }()
+
+		select {
+		case msg := <-fp.received:
+			task := msg.GetTask()
+			if task == nil {
+				errMsg = "expected TaskRequest"
+				return
+			}
+			// Simulate a hanging presto_list_queries poll: never reply until
+			// the gateway sends CancelTask.
+			select {
+			case cancelMsg := <-fp.received:
+				if cancelMsg.GetCancel() == nil || cancelMsg.GetCancel().GetTaskId() != task.GetTaskId() {
+					errMsg = "expected CancelTask for " + task.GetTaskId()
+				}
+			case <-time.After(3 * time.Second):
+				errMsg = "timed out waiting for CancelTask"
+			}
+		case <-time.After(2 * time.Second):
+			errMsg = "timed out waiting for TaskRequest"
+		}
+	}()
+
+	start := time.Now()
+	result, _, err := srv.Dispatch(context.Background(), "presto-us1", &rcaprobev1.TaskRequest{
+		TaskId: "task-timeout", TimeoutSeconds: 2,
+		Kind: &rcaprobev1.TaskRequest_Tool{Tool: &rcaprobev1.ToolCall{ToolName: "presto_list_queries"}},
 	})
-	if err != ErrTaskTimeout {
-		t.Fatalf("expected ErrTaskTimeout, got %v", err)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("expected timeout envelope, got error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected TaskResult")
+	}
+	if result.GetExitCode() != 1 {
+		t.Fatalf("exit_code=%d want 1", result.GetExitCode())
+	}
+	if result.GetError() == "" {
+		t.Fatal("expected timeout error message")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("dispatch took %v, expected ~2s timeout", elapsed)
+	}
+	select {
+	case errMsg := <-cancelCh:
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not send CancelTask")
+	}
+}
+
+// TestHandleExecute_ProbeHangReturnsTimeoutEnvelope exercises the production
+// path: handleExecute wraps ctx with timeout_seconds before calling Dispatch.
+// A hanging probe must yield HTTP 200 with a timeout envelope, not HTTP 502.
+func TestHandleExecute_ProbeHangReturnsTimeoutEnvelope(t *testing.T) {
+	client, srv, reg := testServer(t)
+	seedPlatform(t, reg, "presto-us1")
+	fp := newFakeProbe(t, client)
+	fp.register("presto-us1")
+	fp.expectAck(2 * time.Second)
+	waitForSession(t, srv, "presto-us1")
+
+	// Direct Dispatch with short ctx vs long TimeoutSeconds so only ctx.Done()
+	// fires (HTTP layer copies timeout_seconds onto both deadlines).
+	dispatchCancelCh := make(chan string, 1)
+	go func() {
+		var errMsg string
+		defer func() { dispatchCancelCh <- errMsg }()
+
+		select {
+		case msg := <-fp.received:
+			task := msg.GetTask()
+			if task == nil {
+				errMsg = "expected TaskRequest"
+				return
+			}
+			select {
+			case cancelMsg := <-fp.received:
+				if cancelMsg.GetCancel() == nil || cancelMsg.GetCancel().GetTaskId() != task.GetTaskId() {
+					errMsg = "expected CancelTask for " + task.GetTaskId()
+				}
+			case <-time.After(3 * time.Second):
+				errMsg = "timed out waiting for CancelTask"
+			}
+		case <-time.After(2 * time.Second):
+			errMsg = "timed out waiting for TaskRequest"
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, _, err := srv.Dispatch(ctx, "presto-us1", &rcaprobev1.TaskRequest{
+		TaskId: "task-dispatch-ctx-timeout", TimeoutSeconds: 60,
+		Kind: &rcaprobev1.TaskRequest_Tool{Tool: &rcaprobev1.ToolCall{ToolName: "presto_list_queries"}},
+	})
+	if err != nil {
+		t.Fatalf("expected timeout envelope, got error: %v", err)
+	}
+	if result == nil || result.GetExitCode() != 1 || result.GetError() == "" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	select {
+	case errMsg := <-dispatchCancelCh:
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not send CancelTask")
+	}
+
+	cancelCh := make(chan string, 1)
+	go func() {
+		var errMsg string
+		defer func() { cancelCh <- errMsg }()
+
+		select {
+		case msg := <-fp.received:
+			task := msg.GetTask()
+			if task == nil {
+				errMsg = "expected TaskRequest"
+				return
+			}
+			select {
+			case cancelMsg := <-fp.received:
+				if cancelMsg.GetCancel() == nil || cancelMsg.GetCancel().GetTaskId() != task.GetTaskId() {
+					errMsg = "expected CancelTask for " + task.GetTaskId()
+				}
+			case <-time.After(3 * time.Second):
+				errMsg = "timed out waiting for CancelTask"
+			}
+		case <-time.After(2 * time.Second):
+			errMsg = "timed out waiting for TaskRequest"
+		}
+	}()
+
+	httpSrv := dispatch.New(srv)
+	body := map[string]any{
+		"platform_key":    "presto-us1",
+		"task_id":         "task-http-timeout",
+		"kind":            "tool",
+		"tool":            "presto_list_queries",
+		"timeout_seconds": 2,
+	}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/internal/v1/execute", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+
+	start := time.Now()
+	httpSrv.Handler().ServeHTTP(rr, req)
+	elapsed := time.Since(start)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s want HTTP 200 timeout envelope", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if int(resp["exit_code"].(float64)) != 1 {
+		t.Fatalf("exit_code=%v want 1", resp["exit_code"])
+	}
+	errStr, _ := resp["error"].(string)
+	if errStr == "" {
+		t.Fatal("expected timeout error message")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("request took %v, expected ~2s timeout", elapsed)
+	}
+	select {
+	case errMsg := <-cancelCh:
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not send CancelTask")
 	}
 }
 

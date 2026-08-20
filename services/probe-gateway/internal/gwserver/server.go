@@ -544,9 +544,26 @@ func (s *Server) Dispatch(ctx context.Context, platformKey string, task *rcaprob
 	case <-handle.done:
 		return nil, nil, ErrProbeNotConnected
 	case <-ctx.Done():
+		if err := s.CancelTask(platformKey, task.GetTaskId()); err != nil && !errors.Is(err, ErrProbeNotConnected) {
+			log.Printf("gwserver: CancelTask after context done: %v", err)
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return &rcaprobev1.TaskResult{
+				TaskId:   task.GetTaskId(),
+				ExitCode: 1,
+				Error:    ErrTaskTimeout.Error(),
+			}, nil, nil
+		}
 		return nil, nil, ctx.Err()
 	case <-timer.C:
-		return nil, nil, ErrTaskTimeout
+		if err := s.CancelTask(platformKey, task.GetTaskId()); err != nil && !errors.Is(err, ErrProbeNotConnected) {
+			log.Printf("gwserver: CancelTask after dispatch timeout: %v", err)
+		}
+		return &rcaprobev1.TaskResult{
+			TaskId:   task.GetTaskId(),
+			ExitCode: 1,
+			Error:    ErrTaskTimeout.Error(),
+		}, nil, nil
 	}
 }
 

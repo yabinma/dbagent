@@ -221,6 +221,8 @@ func (c *Client) handleKeyUpdate(ack *rcaprobev1.RegisterAck) {
 	}
 }
 
+const defaultTaskTimeout = 60 * time.Second // Appendix A / gwserver default
+
 func (c *Client) handleTaskRequest(ctx context.Context, task *rcaprobev1.TaskRequest) {
 	defer func() {
 		c.mu.Lock()
@@ -228,11 +230,18 @@ func (c *Client) handleTaskRequest(ctx context.Context, task *rcaprobev1.TaskReq
 		c.mu.Unlock()
 	}()
 
+	timeout := time.Duration(task.GetTimeoutSeconds()) * time.Second
+	if timeout <= 0 {
+		timeout = defaultTaskTimeout
+	}
+	execCtx, cancelTimeout := context.WithTimeout(ctx, timeout)
+	defer cancelTimeout()
+
 	// Snapshot at verification time so the grace window is evaluated now
 	// (§9.6.4), not at install time.
 	ring := c.keys.Ring()
 
-	outcome := HandleTask(ctx, c.Adapter, c.Env, ring, c.WriteEnabled, task)
+	outcome := HandleTask(execCtx, c.Adapter, c.Env, ring, c.WriteEnabled, task)
 	chunks := ChunkPayload(outcome.Payload, DefaultChunkSize)
 
 	for i, chunk := range chunks {

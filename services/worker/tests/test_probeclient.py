@@ -16,6 +16,44 @@ async def test_fake_records_calls():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_http_client_dispatch_timeout_502_returns_error_envelope():
+    respx.post("http://pgw/internal/v1/execute").mock(
+        return_value=httpx.Response(502, text="gwserver: task dispatch timed out")
+    )
+    client = HTTPProbeGatewayClient("http://pgw")
+    r = await client.execute_tool("presto-us1", tool="presto_list_queries", args={})
+    assert r.exit_code == 1
+    assert "task dispatch timed out" in (r.error or "")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_http_client_probe_not_connected_502_raises():
+    respx.post("http://pgw/internal/v1/execute").mock(
+        return_value=httpx.Response(502, text="gwserver: no active session for platform")
+    )
+    client = HTTPProbeGatewayClient("http://pgw")
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.execute_tool("presto-us1", tool="presto_list_queries", args={})
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_http_client_context_deadline_502_returns_error_envelope():
+    respx.post("http://pgw/internal/v1/execute").mock(
+        return_value=httpx.Response(502, text="context deadline exceeded")
+    )
+    client = HTTPProbeGatewayClient("http://pgw")
+    r = await client.execute_tool("presto-us1", tool="presto_list_queries", args={})
+    assert r.exit_code == 1
+    assert "context deadline exceeded" in (r.error or "")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_http_client_execute_tool():
     respx.post("http://pgw/internal/v1/execute").mock(
         return_value=httpx.Response(

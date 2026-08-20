@@ -221,6 +221,19 @@ class HTTPProbeGatewayClient:
             body["custom_query"] = custom_query or ""
             body["wait_seconds"] = wait_seconds or 0
         resp = await self._http().post(f"{self._base_url}/internal/v1/execute", json=body)
+        if resp.status_code == 502 and (
+            "task dispatch timed out" in resp.text
+            or "context deadline exceeded" in resp.text
+        ):
+            return ToolExecutionResult(
+                task_id=tid,
+                exit_code=1,
+                data=None,
+                raw_bytes=resp.content,
+                redacted=False,
+                truncated=False,
+                error=resp.text.strip(),
+            )
         resp.raise_for_status()
         payload = resp.json()
         data = payload.get("data")

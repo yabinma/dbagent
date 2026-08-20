@@ -216,6 +216,54 @@ func TestClient_DispatchesTaskAndSendsChunkedResult(t *testing.T) {
 	}
 }
 
+func TestClient_ToolTaskRespectsTimeoutSeconds(t *testing.T) {
+	srv := newFakeGatewayServer()
+	stream := dialFakeGateway(t, srv)
+
+	blockCh := make(chan struct{})
+	adapter := &blockingAdapter{unblock: blockCh, sawCancel: make(chan struct{}, 1)}
+	client := New(stream, adapter, nil, "presto-us1", "0.1.0", false, writeops.NewKeyStore(writeops.DefaultGraceWindow))
+	client.HeartbeatInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go client.Run(ctx)
+
+	expectFromGateway(t, srv, 2*time.Second) // Register
+	srv.toSend <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Ack{
+		Ack: &rcaprobev1.RegisterAck{ProbeId: "probe-1", Accepted: true},
+	}}
+	srv.toSend <- &rcaprobev1.GatewayMessage{Msg: &rcaprobev1.GatewayMessage_Task{
+		Task: &rcaprobev1.TaskRequest{
+			TaskId: "task-timeout", TimeoutSeconds: 1,
+			Kind: &rcaprobev1.TaskRequest_Tool{Tool: &rcaprobev1.ToolCall{ToolName: "presto_list_queries"}},
+		},
+	}}
+
+	start := time.Now()
+	chunkMsg := expectFromGateway(t, srv, 3*time.Second)
+	if chunkMsg.GetChunk() == nil {
+		t.Fatalf("expected chunk, got %+v", chunkMsg)
+	}
+	resultMsg := expectFromGateway(t, srv, 2*time.Second)
+	elapsed := time.Since(start)
+
+	result := resultMsg.GetResult()
+	if result == nil {
+		t.Fatalf("expected TaskResult, got %+v", resultMsg)
+	}
+	if result.GetExitCode() != 1 {
+		t.Fatalf("exit_code=%d want 1", result.GetExitCode())
+	}
+	if result.GetError() == "" {
+		t.Fatalf("expected timeout error in TaskResult")
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("task took %v, expected ~1s timeout", elapsed)
+	}
+	close(blockCh)
+}
+
 func TestClient_CancelTaskCancelsContext(t *testing.T) {
 	srv := newFakeGatewayServer()
 	stream := dialFakeGateway(t, srv)

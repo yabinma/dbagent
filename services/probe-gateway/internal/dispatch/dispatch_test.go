@@ -271,7 +271,8 @@ func TestHandleExecute_WithTimeoutSeconds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/internal/v1/execute", bytes.NewReader(raw))
 	rr := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr, req)
-	// Dispatch returns ctx.Err() → 502.
+	// fakeDispatcher returns ctx.Err(); handleExecute maps that to HTTP 502.
+	// Production gwserver.Dispatch envelopes DeadlineExceeded instead.
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
