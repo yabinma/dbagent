@@ -137,6 +137,24 @@ def test_toolpack_tools_and_config_keys_are_documented():
         assert key in cfg_doc, f"probe-gateway config key {key} not documented"
 
 
+def test_engine_tools_carry_admission_classification():
+    """FP-AD-5: every engine tool carries exactly one admission marker."""
+    ref = (DOCS / "toolpack-reference.md").read_text(encoding="utf-8")
+    engine_schema = json.loads(
+        (REPO_ROOT / "probe/internal/toolpack/schemas/engine.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    tools = engine_schema.get("tools") or {}
+    for name in tools:
+        independent = f"`{name}` — admission-independent" in ref
+        bound = f"`{name}` — admission-bound" in ref
+        assert independent ^ bound, (
+            f"engine tool {name!r} must carry exactly one admission marker "
+            f"(independent={independent}, bound={bound})"
+        )
+
+
 def test_acceptance_walkthrough_document_structure():
     text = (DOCS / "acceptance/m6-real-cluster-walkthrough.md").read_text(encoding="utf-8")
     assert "status:" in text

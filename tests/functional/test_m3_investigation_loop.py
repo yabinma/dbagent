@@ -218,14 +218,7 @@ def _probe_script(scenario: str) -> dict:
                 "nodes": [{"id": "w1", "state": "failed" if scenario == "worker_network" else "active"}]
             },
         },
-        "presto_list_queries": {
-            "exit_code": 0,
-            "data": {
-                "queries": [
-                    {"queryId": "20260711_q1", "state": "RUNNING", "memory": "huge"}
-                ]
-            },
-        },
+        "presto_list_queries": [[{"query_id": "20260711_q1", "state": "RUNNING"}]],
         "presto_config": {
             "exit_code": 0,
             "redacted": True,

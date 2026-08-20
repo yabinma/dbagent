@@ -250,6 +250,53 @@ class HTTPProbeGatewayClient:
         )
 
 
+_LIST_QUERIES_ROW_KEYS = frozenset({
+    "query_id",
+    "state",
+    "user",
+    "source",
+    "started",
+    "ended",
+    "error_code",
+    "query_text_head",
+    "resource_group",
+    "queued_time",
+    "elapsed_time",
+})
+
+
+def _validate_list_queries_fixture(data: Any) -> None:
+    """Appendix B.1 contract for FakeProbe presto_list_queries script values."""
+    if isinstance(data, dict):
+        if int(data.get("exit_code", 0)) != 0:
+            return
+        raise ValueError(
+            "presto_list_queries fixture must be a bare Appendix B row array "
+            f"or an error envelope; got dict with exit_code=0: {data!r}"
+        )
+    if isinstance(data, list):
+        for row in data:
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"presto_list_queries row must be an object, got {type(row).__name__}"
+                )
+            keys = set(row.keys())
+            unknown = keys - _LIST_QUERIES_ROW_KEYS
+            if unknown:
+                raise ValueError(
+                    f"presto_list_queries row has unknown keys {sorted(unknown)}"
+                )
+            if "query_id" not in row or "state" not in row:
+                raise ValueError(
+                    "presto_list_queries row missing required query_id/state"
+                )
+        return
+    raise ValueError(
+        "presto_list_queries fixture must be a bare Appendix B row array "
+        f"or an error envelope; got {type(data).__name__}"
+    )
+
+
 class FakeProbeGatewayClient:
     """Scripted fake for unit/functional tests (Section 14.1 isolation)."""
 
@@ -285,40 +332,17 @@ class FakeProbeGatewayClient:
         if isinstance(data, Exception):
             raise data
         import json
-        import copy
 
-        if isinstance(data, dict) and tool == "presto_list_queries" and self._killed_queries:
-            data = copy.deepcopy(data)
-            # Filter killed queries from common envelope shapes.
-            for key in ("queries",):
-                if isinstance(data.get(key), list):
-                    data[key] = [
-                        q
-                        for q in data[key]
-                        if not (
-                            isinstance(q, dict)
-                            and (
-                                q.get("queryId") in self._killed_queries
-                                or q.get("query_id") in self._killed_queries
-                                or q.get("id") in self._killed_queries
-                            )
-                        )
-                        and q not in self._killed_queries
-                    ]
-            inner = data.get("data")
-            if isinstance(inner, dict) and isinstance(inner.get("queries"), list):
-                inner["queries"] = [
-                    q
-                    for q in inner["queries"]
+        if tool == "presto_list_queries":
+            _validate_list_queries_fixture(data)
+            if isinstance(data, list) and self._killed_queries:
+                data = [
+                    row
+                    for row in data
                     if not (
-                        isinstance(q, dict)
-                        and (
-                            q.get("queryId") in self._killed_queries
-                            or q.get("query_id") in self._killed_queries
-                            or q.get("id") in self._killed_queries
-                        )
+                        isinstance(row, dict)
+                        and str(row.get("query_id", "")) in self._killed_queries
                     )
-                    and q not in self._killed_queries
                 ]
 
         raw = json.dumps(data).encode()

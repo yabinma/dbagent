@@ -176,7 +176,7 @@ def _acts(tmp_path):
     session.get = MagicMock(side_effect=_get)
     probe = FakeProbeGatewayClient(
         {
-            "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
+            "presto_list_queries": [[]],
             "presto_query_detail": {"exit_code": 0, "data": {"queryId": "q"}},
             "write": {"ok": True, "exit_code": 0},
             "health": {"ok": True, "exit_code": 0},
@@ -304,7 +304,7 @@ async def test_verification_helpers_pass_and_fail():
 
     probe = FakeProbeGatewayClient(
         {
-            "presto_list_queries": [[{"query_id": "gone", "state": "RUNNING"}]],
+            "presto_list_queries": [[{"query_id": "gone", "state": "RUNNING", "resource_group": "global"}]],
             "presto_nodes": {"active": [{"node_id": "w1"}]},
             "presto_config": {"exit_code": 0, "data": {"content": "query.max-memory=50GB\n"}},
             "presto_cluster_info": {"exit_code": 0, "data": {}},
@@ -476,36 +476,6 @@ async def test_workers_active_count_active_workers_int():
     r = await check_workers_active_count(probe, "p", params={"min_workers": 2})
     assert r["ok"] is True
     assert r["detail"] == "active=3 min=2"
-
-
-@pytest.mark.asyncio
-async def test_query_absent_queries_key_fallback():
-    """Legacy {queries:[...]} envelope still detects a present query."""
-    from worker.verification import check_query_absent
-
-    probe = FakeProbeGatewayClient(
-        {
-            "presto_list_queries": {"exit_code": 0, "data": {"queries": [{"query_id": "q1"}]}},
-        }
-    )
-    r = await check_query_absent(probe, "p", params={"query_id": "q1"})
-    assert r["ok"] is False
-    assert "present=True" in r["detail"]
-
-
-@pytest.mark.asyncio
-async def test_query_absent_unwrap_data_inner_list():
-    """FakeProbe nested data:[{...}] unwraps to the bare Appendix B list."""
-    from worker.verification import check_query_absent
-
-    probe = FakeProbeGatewayClient(
-        {
-            "presto_list_queries": {"exit_code": 0, "data": [{"query_id": "q1"}]},
-        }
-    )
-    r = await check_query_absent(probe, "p", params={"query_id": "q1"})
-    assert r["ok"] is False
-    assert "present=True" in r["detail"]
 
 
 def test_playbook_helpers_coverage():

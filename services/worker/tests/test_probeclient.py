@@ -158,3 +158,56 @@ async def test_http_execute_write_posts_kind_write(monkeypatch):
     assert captured["json"]["kind"] == "write"
     assert captured["json"]["op"] == "presto_kill_query"
     assert captured["json"]["control_plane_signature"] == "YWJj"
+
+
+@pytest.mark.asyncio
+async def test_fake_list_queries_kill_strip_on_bare_list():
+    client = FakeProbeGatewayClient(
+        {
+            "presto_list_queries": [
+                [
+                    {"query_id": "2024_q1", "state": "RUNNING"},
+                    {"query_id": "2024_q2", "state": "QUEUED"},
+                ]
+            ],
+            "write:presto_kill_query": {"ok": True, "exit_code": 0},
+        }
+    )
+    await client.execute_write(
+        "pk",
+        playbook_id="presto.kill_query",
+        step_index=0,
+        op="presto_kill_query",
+        params={"query_id": "2024_q1"},
+        execution_id="e1",
+        signature_b64="YWJj",
+    )
+    r = await client.execute_tool("pk", tool="presto_list_queries", args={})
+    assert r.exit_code == 0
+    assert isinstance(r.data, list)
+    ids = {row["query_id"] for row in r.data if isinstance(row, dict)}
+    assert ids == {"2024_q2"}
+
+
+@pytest.mark.asyncio
+async def test_fake_list_queries_rejects_off_contract_fixture():
+    client = FakeProbeGatewayClient({"presto_list_queries": {"queries": []}})
+    with pytest.raises(ValueError, match="bare Appendix B row array"):
+        await client.execute_tool("pk", tool="presto_list_queries", args={})
+
+    client = FakeProbeGatewayClient(
+        {"presto_list_queries": [[{"query_id": "q1", "state": "RUNNING", "memory": "huge"}]]}
+    )
+    with pytest.raises(ValueError, match="unknown keys"):
+        await client.execute_tool("pk", tool="presto_list_queries", args={})
+
+    client = FakeProbeGatewayClient({"presto_list_queries": [[{"query_id": "q1"}]]})
+    with pytest.raises(ValueError, match="missing required query_id/state"):
+        await client.execute_tool("pk", tool="presto_list_queries", args={})
+
+    client = FakeProbeGatewayClient(
+        {"presto_list_queries": {"exit_code": 1, "error": "gwserver: task dispatch timed out"}}
+    )
+    r = await client.execute_tool("pk", tool="presto_list_queries", args={})
+    assert r.exit_code == 1
+    assert "task dispatch timed out" in (r.error or str(r.data))

@@ -385,7 +385,7 @@ async def _run_closed_loop(
     probe_script = {
         "presto_cluster_info": {"exit_code": 0, "data": {"activeWorkers": 3}},
         "presto_nodes": {"exit_code": 0, "data": {"nodes": [{"nodeId": "n1"}]}},
-        "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
+        "presto_list_queries": [[{"query_id": "2024_q1", "state": "RUNNING"}]],
         "presto_query_detail": {"exit_code": 0, "data": {"queryId": "2024_q1"}},
         "presto_config": {"exit_code": 0, "data": {"content": "query.max-memory=50GB\n"}},
         "presto_jmx": {"exit_code": 0, "data": {"heap": "ok"}},

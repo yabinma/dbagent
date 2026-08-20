@@ -695,7 +695,7 @@ async def test_m4_approval_decision_end_to_end(postgres_dsn, temporal_env):
     probe = FakeProbeGatewayClient(
         {
             "presto_cluster_info": {"exit_code": 0, "data": {}},
-            "presto_list_queries": {"exit_code": 0, "data": {"queries": []}},
+            "presto_list_queries": [[]],
             "presto_query_detail": {"exit_code": 0, "data": {}},
             "health": {"ok": True, "exit_code": 0},
             "write": {"ok": True, "exit_code": 0},

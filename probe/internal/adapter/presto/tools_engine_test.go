@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yabinma/dbagent/probe/internal/platform"
 )
@@ -73,55 +75,392 @@ func TestExecute_PrestoNodes_ExcludeFailed(t *testing.T) {
 	}
 }
 
-func TestExecute_PrestoListQueries(t *testing.T) {
+func rewriteV1QueryFixtureTimestamps(t *testing.T, fixture []any) []any {
+	t.Helper()
+	now := time.Now().UTC()
+	out := make([]any, 0, len(fixture))
+	for _, item := range fixture {
+		src, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		row := make(map[string]any, len(src))
+		for k, v := range src {
+			row[k] = v
+		}
+		stats, _ := row["queryStats"].(map[string]any)
+		if stats == nil {
+			stats = map[string]any{}
+			row["queryStats"] = stats
+		} else {
+			statsCopy := make(map[string]any, len(stats))
+			for k, v := range stats {
+				statsCopy[k] = v
+			}
+			stats = statsCopy
+			row["queryStats"] = stats
+		}
+		qid, _ := row["queryId"].(string)
+		switch qid {
+		case "q-finished-recent":
+			stats["createTime"] = now.Add(-30 * time.Minute).Format(time.RFC3339)
+			stats["endTime"] = now.Add(-25 * time.Minute).Format(time.RFC3339)
+		case "q-finished-old":
+			stats["createTime"] = now.Add(-13 * time.Hour).Format(time.RFC3339)
+			stats["endTime"] = now.Add(-12 * time.Hour).Format(time.RFC3339)
+		case "q-runaway-old":
+			stats["createTime"] = now.Add(-3 * time.Hour).Format(time.RFC3339)
+		case "q-bad-ended":
+			stats["createTime"] = now.Add(-2 * time.Hour).Format(time.RFC3339)
+			stats["endTime"] = "not-a-timestamp"
+		default:
+			if create, ok := stats["createTime"].(string); ok && create != "" {
+				stats["createTime"] = now.Add(-10 * time.Minute).Format(time.RFC3339)
+			}
+			if end, ok := stats["endTime"].(string); ok && end != "" && end != "not-a-timestamp" {
+				stats["endTime"] = now.Add(-5 * time.Minute).Format(time.RFC3339)
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func loadV1QueryFixture(t *testing.T) []any {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/v1_query_0298.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var fixture []any
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	return rewriteV1QueryFixtureTimestamps(t, fixture)
+}
+
+func listQueriesTestServer(t *testing.T, v1QueryBody any, statementGuard bool) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
 	})
-	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
-		writeStatementResponse(w,
-			[]string{"query_id", "state", "user", "source", "created", "query"},
-			[][]any{
-				{"q1", "FAILED", "etl_svc", "airflow", "2026-07-09T10:00:00Z", "SELECT 1"},
-				{"q2", "RUNNING", "analyst", "adhoc", "2026-07-09T10:05:00Z", "SELECT 2"},
-			},
-		)
+	if statementGuard {
+		mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("presto_list_queries must not POST /v1/statement")
+		})
+	}
+	mux.HandleFunc("/v1/query", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(v1QueryBody)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestExecute_PrestoListQueries_NeverStatement(t *testing.T) {
+	body := []any{
+		map[string]any{
+			"queryId": "q1",
+			"state":   "RUNNING",
+			"query":   "SELECT 1",
+			"queryStats": map[string]any{
+				"createTime": time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339),
+			},
+		},
+	}
+	srv := listQueriesTestServer(t, body, true)
 	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
 
 	result, err := a.Execute(context.Background(), platform.ToolCall{
-		ToolName: "presto_list_queries", Args: map[string]any{"state": "FAILED"},
+		ToolName: "presto_list_queries", Args: map[string]any{},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("unexpected result: %+v err=%v", result, err)
+	}
+	rows, ok := result.Data.([]map[string]any)
+	if !ok {
+		t.Fatalf("expected []map rows, got %T", result.Data)
+	}
+	if len(rows) != 1 || rows[0]["query_id"] != "q1" {
+		t.Fatalf("unexpected rows: %+v", rows)
+	}
+}
+
+func TestExecute_PrestoListQueries_ContractMapping(t *testing.T) {
+	fixture := loadV1QueryFixture(t)
+	srv := listQueriesTestServer(t, fixture, false)
+	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{"since": "24h", "limit": 200},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("unexpected result: %+v err=%v", result, err)
+	}
+	rows, ok := result.Data.([]map[string]any)
+	if !ok {
+		t.Fatalf("expected []map rows, got %T", result.Data)
+	}
+	byID := map[string]map[string]any{}
+	for _, row := range rows {
+		byID[row["query_id"].(string)] = row
+	}
+
+	full := byID["20260708_101512_00042_abcde"]
+	if full == nil {
+		t.Fatalf("missing full row, got ids=%v", keysOf(byID))
+	}
+	for _, key := range []string{
+		"query_id", "state", "user", "source", "started",
+		"query_text_head", "resource_group", "queued_time", "elapsed_time",
+	} {
+		if _, ok := full[key]; !ok {
+			t.Fatalf("row %s missing %q, got %+v", full["query_id"], key, full)
+		}
+	}
+	if _, ok := full["ended"]; ok {
+		t.Fatalf("QUEUED row must omit ended, got %+v", full)
+	}
+	if full["resource_group"] != "global" {
+		t.Fatalf("resource_group: got %v", full["resource_group"])
+	}
+	if full["queued_time"] != "4.32m" {
+		t.Fatalf("queued_time: got %v", full["queued_time"])
+	}
+	if full["elapsed_time"] != "5.01m" {
+		t.Fatalf("elapsed_time: got %v", full["elapsed_time"])
+	}
+
+	nestedRG := byID["20260708_101512_00043_abcde"]
+	if nestedRG == nil || nestedRG["resource_group"] != "global.adhoc" {
+		t.Fatalf("expected dotted resource_group, got %+v", nestedRG)
+	}
+
+	failed := byID["q-failed"]
+	if failed == nil || failed["error_code"] != "EXCEEDED_LOCAL_MEMORY_LIMIT" {
+		t.Fatalf("expected error_code on FAILED row, got %+v", failed)
+	}
+	if _, ok := failed["ended"]; !ok {
+		t.Fatalf("FAILED row must carry ended, got %+v", failed)
+	}
+
+	minimal := byID["q-minimal"]
+	if minimal == nil {
+		t.Fatalf("missing minimal row")
+	}
+	for _, key := range []string{"user", "source", "started", "ended", "error_code", "query_text_head", "resource_group", "queued_time", "elapsed_time"} {
+		if _, ok := minimal[key]; ok {
+			t.Fatalf("minimal row must omit %q, got %+v", key, minimal)
+		}
+	}
+}
+
+func TestExecute_PrestoListQueries_RequiredFieldMissing(t *testing.T) {
+	for _, tc := range []struct {
+		body    []any
+		wantErr string
+	}{
+		{[]any{map[string]any{"state": "RUNNING"}}, "query_id"},
+		{[]any{map[string]any{"queryId": "q1"}}, "state"},
+	} {
+		srv := listQueriesTestServer(t, tc.body, false)
+		a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+		result, err := a.Execute(context.Background(), platform.ToolCall{
+			ToolName: "presto_list_queries", Args: map[string]any{},
+		})
+		if err != nil {
+			t.Fatalf("unexpected transport error: %v", err)
+		}
+		if result.Error == "" || !strings.Contains(result.Error, tc.wantErr) {
+			t.Fatalf("expected error naming %s, got %q", tc.wantErr, result.Error)
+		}
+	}
+}
+
+func TestExecute_PrestoListQueries_NonArrayBody(t *testing.T) {
+	srv := listQueriesTestServer(t, map[string]any{"queries": []any{}}, false)
+	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries", Args: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "non-array") {
+		t.Fatalf("expected non-array error, got %q", result.Error)
+	}
+}
+
+func TestExecute_PrestoListQueries_NonObjectElement(t *testing.T) {
+	body := []any{
+		map[string]any{"queryId": "q1", "state": "RUNNING"},
+		"not-an-object",
+	}
+	srv := listQueriesTestServer(t, body, false)
+	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries", Args: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "not an object") {
+		t.Fatalf("expected non-object element error, got %q", result.Error)
+	}
+}
+
+func TestExecute_PrestoListQueries_Filters(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	body := []any{
+		map[string]any{
+			"queryId": "q-failed", "state": "FAILED", "query": "SELECT 1",
+			"session":    map[string]any{"user": "etl_svc", "source": "airflow"},
+			"queryStats": map[string]any{"createTime": now, "endTime": now},
+		},
+		map[string]any{
+			"queryId": "q-running", "state": "RUNNING", "query": "SELECT needle",
+			"session":    map[string]any{"user": "analyst", "source": "adhoc"},
+			"queryStats": map[string]any{"createTime": now},
+		},
+	}
+	srv := listQueriesTestServer(t, body, false)
+	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args: map[string]any{
+			"state": "RUNNING", "user": "analyst", "query_substr": "needle", "limit": 1,
+		},
 	})
 	if err != nil || result.Error != "" {
 		t.Fatalf("unexpected result: %+v err=%v", result, err)
 	}
 	rows := result.Data.([]map[string]any)
-	if len(rows) != 1 || rows[0]["query_id"] != "q1" {
+	if len(rows) != 1 || rows[0]["query_id"] != "q-running" {
 		t.Fatalf("unexpected filtered rows: %+v", rows)
 	}
 }
 
-func TestExecute_PrestoListQueries_SQLError(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/info", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
-	})
-	mux.HandleFunc("/v1/statement", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"error":{"message":"catalog unavailable","errorCode":"CATALOG_NOT_FOUND"}}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+func TestExecute_PrestoListQueries_Since(t *testing.T) {
+	fixture := loadV1QueryFixture(t)
+	srv := listQueriesTestServer(t, fixture, false)
 	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
 
-	result, err := a.Execute(context.Background(), platform.ToolCall{ToolName: "presto_list_queries", Args: map[string]any{}})
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{"since": "1h", "limit": 200},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("unexpected result: %+v err=%v", result, err)
+	}
+	rows := result.Data.([]map[string]any)
+	ids := map[string]bool{}
+	for _, row := range rows {
+		ids[row["query_id"].(string)] = true
+	}
+	if !ids["q-finished-recent"] {
+		t.Fatalf("terminal row inside window must be kept, got ids=%v", keysOfBool(ids))
+	}
+	if ids["q-finished-old"] {
+		t.Fatalf("terminal row outside window must be dropped, got ids=%v", keysOfBool(ids))
+	}
+	if !ids["q-runaway-old"] {
+		t.Fatalf("non-terminal old row must be kept (runaway case), got ids=%v", keysOfBool(ids))
+	}
+	if !ids["q-bad-ended"] {
+		t.Fatalf("unparseable ended must be kept, got ids=%v", keysOfBool(ids))
+	}
+
+	// `d` unit parsed.
+	result, err = a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{"since": "1d", "limit": 200},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("since=1d: unexpected result: %+v err=%v", result, err)
+	}
+	rows = result.Data.([]map[string]any)
+	ids = map[string]bool{}
+	for _, row := range rows {
+		ids[row["query_id"].(string)] = true
+	}
+	if !ids["q-finished-old"] {
+		t.Fatalf("1d window must include older terminal row, got ids=%v", keysOfBool(ids))
+	}
+}
+
+func TestExecute_PrestoListQueries_RedactsQueryText(t *testing.T) {
+	secretQuery := "CREATE TABLE t WITH (connection-url = 'jdbc:mysql://svc:hunter2@db:3306/analytics')"
+	body := []any{
+		map[string]any{
+			"queryId": "q-secret", "state": "RUNNING", "query": secretQuery,
+			"queryStats": map[string]any{"createTime": time.Now().UTC().Format(time.RFC3339)},
+		},
+		map[string]any{
+			"queryId": "q-clean", "state": "RUNNING", "query": "SELECT 1",
+			"queryStats": map[string]any{"createTime": time.Now().UTC().Format(time.RFC3339)},
+		},
+	}
+	srv := listQueriesTestServer(t, body, false)
+	a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries", Args: map[string]any{},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("unexpected result: %+v err=%v", result, err)
+	}
+	if !result.Redacted {
+		t.Fatalf("expected redacted=true when query text embeds a credential")
+	}
+	serialized, err := json.Marshal(result.Data)
 	if err != nil {
-		t.Fatalf("unexpected transport error: %v", err)
+		t.Fatalf("marshal: %v", err)
 	}
-	if result.Error == "" {
-		t.Fatalf("expected error envelope for SQL failure")
+	if strings.Contains(string(serialized), "hunter2") {
+		t.Fatalf("secret leaked: %s", serialized)
 	}
+	if !strings.Contains(string(serialized), "***REDACTED***") {
+		t.Fatalf("expected redaction placeholder in query text, got: %s", serialized)
+	}
+
+	result, err = a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{"query_substr": "SELECT 1"},
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("clean row: unexpected result: %+v err=%v", result, err)
+	}
+	if result.Redacted {
+		t.Fatalf("expected redacted=false for clean row set, got %+v", result)
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func keysOfBool(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func TestExecute_PrestoQueryDetail(t *testing.T) {

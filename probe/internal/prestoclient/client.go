@@ -2,7 +2,8 @@
 // read-only account" (design.md Section 8.1) -- a small REST client for
 // the coordinator's `/v1/*` endpoints (design.md Section 8.5 / Appendix
 // B.1) plus the `/v1/statement` client protocol used to run read-only SQL
-// against `system.runtime.*` and the `jmx` catalog. Deliberately returns
+// against `system.runtime.*` and the `jmx` catalog (admission-bound engine
+// tools such as `presto_session_properties` and `presto_jmx`). Deliberately returns
 // loosely-typed JSON (`map[string]any` / raw bytes) for the raw
 // endpoints -- Appendix B's tool-specific `data` shaping happens one
 // layer up in probe/internal/adapter/presto, keeping this client generic
@@ -118,9 +119,9 @@ type statementStats struct {
 }
 
 // Query runs sql via the `/v1/statement` client protocol (POST, then
-// follow `nextUri` until absent), accumulating all rows. Used for
-// `system.runtime.queries` (Appendix B.1 presto_list_queries) and any
-// other `system.runtime.*`/`jmx` catalog read.
+// follow `nextUri` until absent), accumulating all rows. Remaining SQL
+// callers: presto_session_properties, presto_jmx, the §9.2 canary, and
+// the §8.4 connectivity probe.
 func (c *Client) Query(ctx context.Context, sql string) (*QueryResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/statement", bytes.NewBufferString(sql))
 	if err != nil {

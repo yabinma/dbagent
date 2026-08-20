@@ -2,14 +2,14 @@
 
 ## Engine tools
 
-- `presto_cluster_info`
-- `presto_nodes`
-- `presto_list_queries`
-- `presto_query_detail`
-- `presto_query_json_section`
-- `presto_config`
-- `presto_session_properties`
-- `presto_jmx`
+- `presto_cluster_info` — admission-independent
+- `presto_nodes` — admission-independent
+- `presto_list_queries` — admission-independent
+- `presto_query_detail` — admission-independent
+- `presto_query_json_section` — admission-independent
+- `presto_config` — admission-independent
+- `presto_session_properties` — admission-bound
+- `presto_jmx` — admission-bound
 
 ## Runtime tools
 

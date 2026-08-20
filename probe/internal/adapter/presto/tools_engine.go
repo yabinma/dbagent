@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PaesslerAG/jsonpath"
 
@@ -100,50 +101,198 @@ func toolPrestoNodes(ctx context.Context, a *Adapter, args map[string]any) (tool
 
 func toolPrestoListQueries(ctx context.Context, a *Adapter, args map[string]any) (toolResult, error) {
 	state := getStringDefault(args, "state", "ALL")
+	sinceRaw := getStringDefault(args, "since", "1h")
 	limit := getIntDefault(args, "limit", 50)
 	userFilter := getStringDefault(args, "user", "")
 	substrFilter := getStringDefault(args, "query_substr", "")
 
-	sql := "SELECT query_id, state, \"user\", source, created, query FROM system.runtime.queries"
-	res, err := a.presto.Query(ctx, sql)
+	sinceDur, err := parseSinceDuration(sinceRaw)
+	if err != nil {
+		return toolResult{}, fmt.Errorf("presto_list_queries: invalid since %q: %w", sinceRaw, err)
+	}
+	sinceCutoff := time.Now().UTC().Add(-sinceDur)
+
+	raw, err := a.presto.GetJSON(ctx, "/v1/query")
 	if err != nil {
 		return toolResult{}, err
 	}
-	if res.Error != nil {
-		return toolResult{}, fmt.Errorf("presto_list_queries: %s: %s", res.Error.ErrorName, res.Error.Message)
+	items, ok := raw.([]any)
+	if !ok {
+		return toolResult{}, fmt.Errorf("presto_list_queries: /v1/query returned non-array body")
 	}
 
-	col := colIndex(res.Columns)
 	out := []map[string]any{}
-	for _, row := range res.Rows {
-		queryState := colStr(row, col, "state")
+	for _, item := range items {
+		src, ok := item.(map[string]any)
+		if !ok {
+			return toolResult{}, fmt.Errorf("presto_list_queries: /v1/query array element is not an object")
+		}
+		row, err := mapV1QueryRow(src)
+		if err != nil {
+			return toolResult{}, err
+		}
+		if !passesSinceFilter(row, sinceCutoff) {
+			continue
+		}
+		queryState := getString(row, "state")
 		if state != "ALL" && queryState != state {
 			continue
 		}
-		user := colStr(row, col, "user")
+		user := getString(row, "user")
 		if userFilter != "" && user != userFilter {
 			continue
 		}
-		text := colStr(row, col, "query")
+		text := getString(row, "query_text_head")
 		if substrFilter != "" && !strings.Contains(text, substrFilter) {
 			continue
 		}
-		if len(text) > 500 {
-			text = text[:500]
-		}
-		out = append(out, map[string]any{
-			"query_id":        colStr(row, col, "query_id"),
-			"state":           queryState,
-			"user":            user,
-			"source":          colStr(row, col, "source"),
-			"started":         colStr(row, col, "created"),
-			"query_text_head": text,
-		})
+		out = append(out, row)
 		if len(out) >= limit {
 			break
 		}
 	}
-	return toolResult{Data: out}, nil
+
+	wasRedacted := false
+	if len(out) > 0 {
+		redacted, changed := redact.Value(out)
+		if changed {
+			wasRedacted = true
+		}
+		if rows, ok := redacted.([]any); ok {
+			out = make([]map[string]any, 0, len(rows))
+			for _, item := range rows {
+				if m, ok := item.(map[string]any); ok {
+					out = append(out, m)
+				}
+			}
+		}
+	}
+	return toolResult{Data: out, Redacted: wasRedacted}, nil
+}
+
+func mapV1QueryRow(src map[string]any) (map[string]any, error) {
+	queryID := getString(src, "queryId")
+	if queryID == "" {
+		return nil, fmt.Errorf("presto_list_queries: row missing required field query_id")
+	}
+	queryState := getString(src, "state")
+	if queryState == "" {
+		return nil, fmt.Errorf("presto_list_queries: row missing required field state")
+	}
+
+	row := map[string]any{
+		"query_id": queryID,
+		"state":    queryState,
+	}
+	if session, ok := src["session"].(map[string]any); ok {
+		if user := getString(session, "user"); user != "" {
+			row["user"] = user
+		}
+		if source := getString(session, "source"); source != "" {
+			row["source"] = source
+		}
+	}
+	if stats, ok := src["queryStats"].(map[string]any); ok {
+		if started := getString(stats, "createTime"); started != "" {
+			row["started"] = started
+		}
+		if ended := getString(stats, "endTime"); ended != "" {
+			row["ended"] = ended
+		}
+		if queued := getString(stats, "queuedTime"); queued != "" {
+			row["queued_time"] = queued
+		}
+		if elapsed := getString(stats, "elapsedTime"); elapsed != "" {
+			row["elapsed_time"] = elapsed
+		}
+	}
+	if errCode, ok := src["errorCode"].(map[string]any); ok {
+		if name := getString(errCode, "name"); name != "" {
+			row["error_code"] = name
+		}
+	}
+	if query := getString(src, "query"); query != "" {
+		if len(query) > 500 {
+			query = query[:500]
+		}
+		row["query_text_head"] = query
+	}
+	if rg := formatResourceGroup(src["resourceGroupId"]); rg != "" {
+		row["resource_group"] = rg
+	}
+	return row, nil
+}
+
+func formatResourceGroup(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case []any:
+		parts := make([]string, 0, len(t))
+		for _, item := range t {
+			switch s := item.(type) {
+			case string:
+				if s != "" {
+					parts = append(parts, s)
+				}
+			default:
+				if item != nil {
+					parts = append(parts, fmt.Sprintf("%v", item))
+				}
+			}
+		}
+		return strings.Join(parts, ".")
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func parseSinceDuration(s string) (time.Duration, error) {
+	if s == "" {
+		s = "1h"
+	}
+	if len(s) < 2 {
+		return 0, fmt.Errorf("expected ^\\d+[smhd]$")
+	}
+	unit := s[len(s)-1]
+	numStr := s[:len(s)-1]
+	n, err := strconv.ParseInt(numStr, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("expected ^\\d+[smhd]$")
+	}
+	switch unit {
+	case 's':
+		return time.Duration(n) * time.Second, nil
+	case 'm':
+		return time.Duration(n) * time.Minute, nil
+	case 'h':
+		return time.Duration(n) * time.Hour, nil
+	case 'd':
+		return time.Duration(n) * 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("expected ^\\d+[smhd]$")
+	}
+}
+
+func passesSinceFilter(row map[string]any, cutoff time.Time) bool {
+	endedRaw, ok := row["ended"]
+	if !ok {
+		return true
+	}
+	endedStr, ok := endedRaw.(string)
+	if !ok || endedStr == "" {
+		return true
+	}
+	ended, err := time.Parse(time.RFC3339, endedStr)
+	if err != nil {
+		ended, err = time.Parse(time.RFC3339Nano, endedStr)
+		if err != nil {
+			return true
+		}
+	}
+	return !ended.Before(cutoff)
 }
 
 var querySections = map[string]bool{"basic": true, "error": true, "stats": true, "stages": true, "session": true}

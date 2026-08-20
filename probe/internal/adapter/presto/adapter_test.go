@@ -855,26 +855,24 @@ func TestExecute_NonRESTToolsSucceedWhenCoordinatorUnresolvable(t *testing.T) {
 }
 
 func TestExecute_ReResolvesCoordinatorURLAfterRollout(t *testing.T) {
-	var statementServer string
+	var queryServer string
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/info" {
 			w.Write([]byte(`{"nodeVersion":{"version":"0.298"},"coordinator":true}`))
 			return
 		}
-		if r.URL.Path == "/v1/statement" && r.Method == http.MethodPost {
-			statementServer = "A"
+		if r.URL.Path == "/v1/query" && r.Method == http.MethodGet {
+			queryServer = "A"
 			http.NotFound(w, r)
 			return
 		}
 		http.NotFound(w, r)
 	}))
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/statement" && r.Method == http.MethodPost {
-			statementServer = "B"
-			writeStatementResponse(w,
-				[]string{"query_id", "state", "user", "source", "created", "query"},
-				[][]any{{"q1", "RUNNING", "u", "s", "2026-01-01", "SELECT 1"}},
-			)
+		if r.URL.Path == "/v1/query" && r.Method == http.MethodGet {
+			queryServer = "B"
+			w.Write([]byte(`[{"queryId":"q1","state":"RUNNING","session":{"user":"u","source":"s"},
+				"queryStats":{"createTime":"2026-01-01T00:00:00Z"},"query":"SELECT 1"}]`))
 			return
 		}
 		http.NotFound(w, r)
@@ -902,8 +900,8 @@ func TestExecute_ReResolvesCoordinatorURLAfterRollout(t *testing.T) {
 	if result.ExitCode != 0 || result.Error != "" {
 		t.Fatalf("expected success, got exit=%d err=%q", result.ExitCode, result.Error)
 	}
-	if statementServer != "B" {
-		t.Fatalf("presto_list_queries POST landed on server %q, want B (stale Detect-time URL is A)", statementServer)
+	if queryServer != "B" {
+		t.Fatalf("presto_list_queries GET landed on server %q, want B (stale Detect-time URL is A)", queryServer)
 	}
 }
 
