@@ -64,6 +64,37 @@ func New(cfg Config) *Adapter {
 // ToolResult.ProbeID in the envelope (Section 8.5).
 func (a *Adapter) SetProbeID(id string) { a.probeID = id }
 
+// refreshCoordinatorURL re-resolves the coordinator base URL from the
+// runtime env and updates the cached prestoclient. Detect snapshots the
+// pod IP once; K8s rollouts replace the coordinator without re-Detect.
+func (a *Adapter) refreshCoordinatorURL(ctx context.Context) error {
+	if a.env == nil {
+		return fmt.Errorf("runtime env not initialized (Detect not called)")
+	}
+	if a.presto == nil {
+		return fmt.Errorf("presto client not initialized")
+	}
+	baseURL, err := a.env.CoordinatorBaseURL(ctx)
+	if err != nil {
+		return fmt.Errorf("presto: resolve coordinator url: %w", err)
+	}
+	a.presto.BaseURL = baseURL
+	return nil
+}
+
+// usesCoordinatorREST reports whether Execute must refresh a.presto.BaseURL
+// before dispatching the tool (engine tools that call the Presto REST client).
+func usesCoordinatorREST(toolName string) bool {
+	switch toolName {
+	case "presto_cluster_info", "presto_nodes", "presto_list_queries",
+		"presto_query_detail", "presto_query_json_section",
+		"presto_session_properties", "presto_jmx":
+		return true
+	default:
+		return false
+	}
+}
+
 // Detect implements platform.PlatformAdapter (design.md Section 8.3/8.4
 // step 4): environment + auth-scheme detection, and registers the
 // deployment-appropriate tool set.
@@ -262,6 +293,11 @@ func (a *Adapter) Execute(ctx context.Context, call platform.ToolCall) (platform
 		return toolpack.BuildEnvelope(call.ToolName, call.Args, a.Cfg.PlatformKey, a.probeID, 1, nil,
 			fmt.Errorf("tool %q has no implementation", call.ToolName)), nil
 	}
+	if usesCoordinatorREST(call.ToolName) {
+		if err := a.refreshCoordinatorURL(ctx); err != nil {
+			return toolpack.BuildEnvelope(call.ToolName, call.Args, a.Cfg.PlatformKey, a.probeID, 1, nil, err), nil
+		}
+	}
 
 	result, err := fn(ctx, a, call.Args)
 	envelope := toolpack.BuildEnvelope(call.ToolName, call.Args, a.Cfg.PlatformKey, a.probeID, 0, result.Data, err)
@@ -273,6 +309,9 @@ func (a *Adapter) Execute(ctx context.Context, call platform.ToolCall) (platform
 // 9.2: "Canary query: built-in SELECT 1 plus the per-platform configured
 // health_query").
 func (a *Adapter) HealthCheck(ctx context.Context, spec platform.HealthSpec) (platform.HealthResult, error) {
+	if err := a.refreshCoordinatorURL(ctx); err != nil {
+		return platform.HealthResult{}, err
+	}
 	if spec.WaitSeconds > 0 {
 		select {
 		case <-ctx.Done():

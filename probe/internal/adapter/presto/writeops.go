@@ -330,8 +330,8 @@ func (a *Adapter) execSwarmRestartService(ctx context.Context, params map[string
 
 func (a *Adapter) execPrestoKillQuery(ctx context.Context, params map[string]any) (platform.WriteResult, error) {
 	queryID, _ := params["query_id"].(string)
-	if a.presto == nil {
-		return platform.WriteResult{OK: false, Error: "presto client not initialized"}, nil
+	if err := a.refreshCoordinatorURL(ctx); err != nil {
+		return platform.WriteResult{OK: false, Error: err.Error()}, nil
 	}
 	if err := a.presto.DeletePath(ctx, "/v1/query/"+queryID); err != nil {
 		return platform.WriteResult{OK: false, Error: err.Error()}, nil

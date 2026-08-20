@@ -783,6 +783,180 @@ func TestExecuteWrite_AdjustMemorySwarm(t *testing.T) {
 	}
 }
 
+// rollingCoordinatorEnv simulates a K8s coordinator rollout: the first
+// CoordinatorBaseURL call (Detect) returns detectURL; every later call
+// returns postRolloutURL.
+type rollingCoordinatorEnv struct {
+	fakeEnv
+	detectURL      string
+	postRolloutURL string
+	baseURLCalls   int
+}
+
+func (e *rollingCoordinatorEnv) CoordinatorBaseURL(ctx context.Context) (string, error) {
+	e.baseURLCalls++
+	if e.baseURLCalls == 1 {
+		return e.detectURL, e.baseURLErr
+	}
+	return e.postRolloutURL, e.baseURLErr
+}
+
+func TestExecute_NonRESTToolsSucceedWhenCoordinatorUnresolvable(t *testing.T) {
+	srv := newPrestoTestServer(t, nil)
+	env := &fakeEnv{
+		kind:       platform.EnvKindK8s,
+		configText: "http-server.authentication.type=NONE\n",
+		baseURL:    srv.URL,
+		targets:    []platform.TargetInfo{{Name: "presto-coordinator-0", Phase: "Running"}},
+	}
+	a := New(Config{CredentialsMountPath: t.TempDir()})
+	if _, err := a.Detect(context.Background(), env); err != nil {
+		t.Fatalf("detect failed: %v", err)
+	}
+
+	// Simulate coordinator pod gone (no Ready pod) after Detect succeeded.
+	env.baseURLErr = assertErr("no ready coordinator pod")
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "k8s_pods",
+		Args:     map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("k8s_pods transport error: %v", err)
+	}
+	if result.ExitCode != 0 || result.Error != "" {
+		t.Fatalf("k8s_pods should succeed without coordinator URL, got exit=%d err=%q", result.ExitCode, result.Error)
+	}
+
+	result, err = a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_config",
+		Args:     map[string]any{"component": "coordinator", "file": "config"},
+	})
+	if err != nil {
+		t.Fatalf("presto_config transport error: %v", err)
+	}
+	if result.ExitCode != 0 || result.Error != "" {
+		t.Fatalf("presto_config should succeed without coordinator URL, got exit=%d err=%q", result.ExitCode, result.Error)
+	}
+
+	result, err = a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("presto_list_queries transport error: %v", err)
+	}
+	if result.ExitCode == 0 || result.Error == "" {
+		t.Fatalf("presto_list_queries should fail on resolve error, got exit=%d err=%q", result.ExitCode, result.Error)
+	}
+	if !strings.Contains(result.Error, "resolve coordinator url") {
+		t.Fatalf("expected resolve error, got %q", result.Error)
+	}
+}
+
+func TestExecute_ReResolvesCoordinatorURLAfterRollout(t *testing.T) {
+	var statementServer string
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/info" {
+			w.Write([]byte(`{"nodeVersion":{"version":"0.298"},"coordinator":true}`))
+			return
+		}
+		if r.URL.Path == "/v1/statement" && r.Method == http.MethodPost {
+			statementServer = "A"
+			http.NotFound(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/statement" && r.Method == http.MethodPost {
+			statementServer = "B"
+			writeStatementResponse(w,
+				[]string{"query_id", "state", "user", "source", "created", "query"},
+				[][]any{{"q1", "RUNNING", "u", "s", "2026-01-01", "SELECT 1"}},
+			)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srvA.Close)
+	t.Cleanup(srvB.Close)
+
+	env := &rollingCoordinatorEnv{
+		fakeEnv:        fakeEnv{kind: platform.EnvKindK8s, configText: "http-server.authentication.type=NONE\n"},
+		detectURL:      srvA.URL,
+		postRolloutURL: srvB.URL,
+	}
+	a := New(Config{PlatformKey: "presto-us1", CredentialsMountPath: t.TempDir()})
+	if _, err := a.Detect(context.Background(), env); err != nil {
+		t.Fatalf("detect failed: %v", err)
+	}
+
+	result, err := a.Execute(context.Background(), platform.ToolCall{
+		ToolName: "presto_list_queries",
+		Args:     map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.ExitCode != 0 || result.Error != "" {
+		t.Fatalf("expected success, got exit=%d err=%q", result.ExitCode, result.Error)
+	}
+	if statementServer != "B" {
+		t.Fatalf("presto_list_queries POST landed on server %q, want B (stale Detect-time URL is A)", statementServer)
+	}
+}
+
+func TestExecuteWrite_PrestoKillQuery_ReResolvesCoordinatorURLAfterRollout(t *testing.T) {
+	var deleteServer string
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/info" {
+			w.Write([]byte(`{"nodeVersion":{"version":"0.298"},"coordinator":true}`))
+			return
+		}
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/query/") {
+			deleteServer = "A"
+			http.NotFound(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/query/") {
+			deleteServer = "B"
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srvA.Close)
+	t.Cleanup(srvB.Close)
+
+	env := &rollingCoordinatorEnv{
+		fakeEnv:        fakeEnv{kind: platform.EnvKindK8s, configText: "http-server.authentication.type=NONE\n"},
+		detectURL:      srvA.URL,
+		postRolloutURL: srvB.URL,
+	}
+	a := New(Config{WriteEnabled: true, CredentialsMountPath: t.TempDir()})
+	if _, err := a.Detect(context.Background(), env); err != nil {
+		t.Fatalf("detect failed: %v", err)
+	}
+
+	result, err := a.ExecuteWrite(context.Background(), platform.RemediationStep{
+		Op: "presto_kill_query", SignatureOK: true,
+		Params: map[string]any{"query_id": "20260819_211417_00000_w6mpi"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("expected OK, got error=%s", result.Error)
+	}
+	if deleteServer != "B" {
+		t.Fatalf("presto_kill_query DELETE landed on server %q, want B (stale Detect-time URL is A)", deleteServer)
+	}
+}
+
 func TestMergePropertiesHelpers(t *testing.T) {
 	got := mergeProperties("a=1\nb=2\n", map[string]string{"a": "9"})
 	if !strings.Contains(got, "a=9") {
