@@ -1167,6 +1167,60 @@ def test_e4_does_not_accept_a_naturally_finished_query_as_a_kill():
     assert "_audit_entries(" in body
 
 
+def _ast_string_fragments(node: ast.AST) -> list[str]:
+    """Extract literal string fragments from a URL expression (str or f-string)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.JoinedStr):
+        out: list[str] = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                out.append(part.value)
+        return out
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _ast_string_fragments(node.left) + _ast_string_fragments(node.right)
+    return []
+
+
+def _call_is_httpx_post_to_statement(call: ast.Call) -> bool:
+    if not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr != "post":
+        return False
+    if not isinstance(call.func.value, ast.Name) or call.func.value.id != "httpx":
+        return False
+    url_node = call.args[0] if call.args else None
+    for kw in call.keywords:
+        if kw.arg in (None, "url"):
+            url_node = kw.value
+            break
+    if url_node is None:
+        return False
+    return "/v1/statement" in "".join(_ast_string_fragments(url_node))
+
+
+def test_e4_dispatches_runaway_query_via_submit_query():
+    """D3: bare POST /v1/statement only parks a token on 0.298; E4 must follow nextUri."""
+    body = _scenario_source("test_e4_runaway_query_killed")
+    tree = ast.parse(body)
+    saw_submit_query = False
+    raw_statement_post = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "_submit_query":
+                saw_submit_query = True
+            if _call_is_httpx_post_to_statement(node):
+                raw_statement_post = True
+    assert saw_submit_query, (
+        "E4 must submit the runaway query through _submit_query so Presto "
+        "dispatches it before the kill verification"
+    )
+    assert not raw_statement_post, (
+        "E4 must not raw-POST /v1/statement for the fault query; that path never "
+        "follows nextUri and leaves the query invisible to GET /v1/query/{id}"
+    )
+
+
 def test_e2e_admin_password_satisfies_the_apis_own_minimum_length():
     """C2: `run.sh` phase 4 posts this value to /auth/change-password, which
     rejects anything shorter than the API's `password_min_length`."""

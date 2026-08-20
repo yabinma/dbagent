@@ -713,6 +713,101 @@ def _query_states(presto_url: str) -> dict[str, str]:
     }
 
 
+def _nested_get(obj: object, path: str) -> object:
+    cur: object = obj
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _assert_v1_query_contract(presto_url: str) -> None:
+    """FP-AD-7: live 0.298 /v1/query exposes every path the REST mapper consumes."""
+    r = httpx.get(f"{presto_url.rstrip('/')}/v1/query", timeout=30)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body, list) and body, f"/v1/query must return a non-empty array, got {type(body)}"
+
+    saw_queued = False
+    saw_session_user = False
+    saw_query = False
+    saw_create_time = False
+    saw_queued_time = False
+    saw_elapsed_time = False
+    saw_resource_group = False
+    for item in body:
+        assert isinstance(item, dict), f"query row must be an object, got {type(item)}"
+        assert item.get("queryId"), f"row missing queryId: {item!r}"
+        assert item.get("state"), f"row missing state: {item!r}"
+
+        state = str(item.get("state") or "").upper()
+        if state == "QUEUED":
+            saw_queued = True
+
+        user = _nested_get(item, "session.user")
+        if user is not None and user != "":
+            saw_session_user = True
+
+        query_text = _nested_get(item, "query")
+        if query_text is not None and query_text != "":
+            saw_query = True
+
+        create_time = _nested_get(item, "queryStats.createTime")
+        if create_time is not None and create_time != "":
+            saw_create_time = True
+
+        queued_time = _nested_get(item, "queryStats.queuedTime")
+        if queued_time is not None and queued_time != "":
+            saw_queued_time = True
+
+        elapsed_time = _nested_get(item, "queryStats.elapsedTime")
+        if elapsed_time is not None and elapsed_time != "":
+            saw_elapsed_time = True
+
+        rg = item.get("resourceGroupId")
+        if rg is not None and rg != "" and rg != []:
+            saw_resource_group = True
+
+        session = item.get("session")
+        if isinstance(session, dict) and session.get("source") is not None:
+            assert session.get("source") != "", (
+                f"session.source empty on row {item.get('queryId')!r}"
+            )
+
+        stats = item.get("queryStats")
+        if isinstance(stats, dict):
+            end_time = stats.get("endTime")
+            if end_time is not None:
+                assert end_time != "", (
+                    f"queryStats.endTime empty on row {item.get('queryId')!r}"
+                )
+
+        if item.get("errorCode") is not None:
+            err = item.get("errorCode")
+            assert isinstance(err, dict) and err.get("name"), f"errorCode.name missing: {err!r}"
+
+    assert saw_queued, "E3 contract check requires at least one QUEUED row while the fault is active"
+    assert saw_session_user, (
+        "E3 contract check requires session.user on at least one row (REST mapper path)"
+    )
+    assert saw_query, (
+        "E3 contract check requires query on at least one row (REST mapper path)"
+    )
+    assert saw_create_time, (
+        "E3 contract check requires queryStats.createTime on at least one row"
+    )
+    assert saw_queued_time, (
+        "E3 contract check requires queryStats.queuedTime on at least one row"
+    )
+    assert saw_elapsed_time, (
+        "E3 contract check requires queryStats.elapsedTime on at least one row"
+    )
+    assert saw_resource_group, (
+        "E3 contract check requires resourceGroupId on at least one row"
+    )
+
+
 # Object-store URLs the API hands out are presigned for the *cluster-internal*
 # endpoint (http://minio:9000), which does not resolve on the test host, and the
 # control-plane database has no NodePort at all. Both are read through a pod, so
@@ -1733,6 +1828,8 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
             f"QUEUED on the coordinator; submitted={submitted} states={states}"
         )
 
+        _assert_v1_query_contract(presto_url)
+
         opened = _post_alert(
             ingest_url,
             summary=(
@@ -1811,6 +1908,8 @@ def _e3_assert_case(
         payload = _evidence_payload(dashboard_url, token, evidence_id)
         iter_rows: list[dict] = []
         parsed = json.loads(payload)
+        if isinstance(parsed, dict) and "exit_code" in parsed:
+            assert parsed.get("exit_code") == 0, parsed.get("error") or parsed
         for entry in _iter_query_rows(parsed):
             iter_rows.append(entry)
             qid = str(entry.get("query_id") or entry.get("queryId") or "")
@@ -1862,19 +1961,24 @@ def _iter_query_rows(payload: object):
 def test_e4_runaway_query_killed(dashboard_url, ingest_url, presto_url):
     token = _login(dashboard_url)
     # Start a long query on Presto; require a real query_id.
-    r = httpx.post(
-        f"{presto_url.rstrip('/')}/v1/statement",
-        content="SELECT count(*) FROM tpch.sf1.lineitem CROSS JOIN tpch.sf1.lineitem",
-        headers={
-            "X-Presto-User": "e2e",
-            "X-Presto-Catalog": "tpch",
-            "X-Presto-Schema": "sf1",
-        },
-        timeout=10,
+    runaway_sql = (
+        "SELECT count(*) FROM tpch.sf1.lineitem CROSS JOIN tpch.sf1.lineitem"
     )
-    assert r.status_code == 200, r.text
-    query_id = r.json().get("id")
-    assert query_id, r.text
+    query_id = _submit_query(presto_url, runaway_sql)
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        qr = httpx.get(f"{presto_url.rstrip('/')}/v1/query/{query_id}", timeout=10)
+        if qr.status_code == 200:
+            state = (qr.json().get("state") or "").upper()
+            if state not in TERMINAL_QUERY_STATES:
+                break
+        time.sleep(2)
+    else:
+        raise AssertionError(
+            f"runaway query {query_id!r} never reached a non-terminal state "
+            "on the coordinator before the alert was posted"
+        )
 
     # `labels` is the one alert field the ingest normalizer preserves verbatim
     # (gateway/ingest.py), so it is what carries the runaway id into the
