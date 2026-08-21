@@ -1,7 +1,10 @@
-"""FP-IG-33: beyond-ceiling shed is legible and the in-budget population survives."""
+"""FP-IG-33 / FP-IG-36: connection ceiling behaviour and shed-probe witness."""
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -14,6 +17,12 @@ import yaml
 from gateway.main import BACKLOG, build_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_PROFILE_PATH = REPO_ROOT / "services" / "gateway" / "tests" / "b1_reference_profile.py"
+_spec = importlib.util.spec_from_file_location("b1_reference_profile", _PROFILE_PATH)
+assert _spec and _spec.loader
+b1 = importlib.util.module_from_spec(_spec)
+sys.modules["b1_reference_profile"] = b1
+_spec.loader.exec_module(b1)
 
 
 def _free_port() -> int:
@@ -192,3 +201,123 @@ def test_beyond_ceiling_sheds_while_in_budget_connections_serve(gateway_ceiling_
             refused.close()
         for sock in held:
             sock.close()
+
+
+def _start_uvicorn_app(
+    app,
+    *,
+    host: str,
+    port: int,
+    workers: int = 1,
+    limit_concurrency: int | None = 8,
+    keepalive_s: float = 1,
+) -> tuple[uvicorn.Server, threading.Thread]:
+    kwargs: dict = {
+        "workers": workers,
+        "timeout_keep_alive": keepalive_s,
+        "backlog": BACKLOG,
+        "log_level": "warning",
+    }
+    if limit_concurrency is not None:
+        kwargs["limit_concurrency"] = limit_concurrency
+    config = uvicorn.Config(app, host=host, port=port, **kwargs)
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    return server, thread
+
+
+@pytest.fixture
+def gateway_unbounded_server(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.yaml"
+    _write_gateway_config(cfg)
+    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
+
+    host = "127.0.0.1"
+    port = _free_port()
+    app = _build_test_app(str(cfg))
+    server, thread = _start_uvicorn_app(
+        app, host=host, port=port, limit_concurrency=None, keepalive_s=5
+    )
+    health = f"http://{host}:{port}/healthz"
+    _wait_until_healthy(health)
+    yield host, port
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+class _AcceptOnlyServer:
+    """Accepts connections and never responds — accept-backpressure leg."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._host = host
+        self._port = port
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, port))
+        self._sock.listen(2048)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        self._sock.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._sock.accept()
+            except OSError:
+                continue
+            conn.settimeout(None)
+            # Hold without responding.
+
+    def close(self) -> None:
+        self._stop.set()
+        self._sock.close()
+        self._thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_shed_probe_discriminates_enforcement(
+    gateway_ceiling_server, gateway_unbounded_server, monkeypatch
+):
+    """FP-IG-36: fired with ceiling, absent without, timeout on accept-only."""
+    host_c, port_c, ceiling, _keepalive = gateway_ceiling_server
+    probe_workers = 1
+    probe_size = b1.probe_connection_count(
+        workers=probe_workers, ceiling_per_worker=ceiling
+    )
+    assert probe_size == probe_workers * (ceiling - 1) + 1 + b1.PROBE_SLACK
+
+    fired = await b1.run_shed_probe(
+        host_c,
+        port_c,
+        workers=probe_workers,
+        ceiling_per_worker=ceiling,
+    )
+    assert fired == "fired", "live ceiling must shed at least one probe request"
+
+    host_u, port_u = gateway_unbounded_server
+    absent = await b1.run_shed_probe(
+        host_u,
+        port_u,
+        workers=probe_workers,
+        ceiling_per_worker=ceiling,
+    )
+    assert absent == "absent", "unbounded server must answer every probe without 503"
+
+    accept_host = "127.0.0.1"
+    accept_port = _free_port()
+    acceptor = _AcceptOnlyServer(accept_host, accept_port)
+    monkeypatch.setattr(b1, "CLIENT_TIMEOUT", 1.0)
+    try:
+        timeout_outcome = await b1.run_shed_probe(
+            accept_host,
+            accept_port,
+            workers=probe_workers,
+            ceiling_per_worker=ceiling,
+        )
+        assert timeout_outcome == "timeout", (
+            "accept-only server must not be classified as fired or absent"
+        )
+    finally:
+        acceptor.close()

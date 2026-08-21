@@ -31,6 +31,13 @@ INGEST_GATEWAY_WORKERS = 4
 TRACKER_CMDLINE_MARK = "multiprocessing.resource_tracker"
 WORKER_CMDLINE_MARK = "multiprocessing.spawn"
 
+# Post-window shed probe slack (FP-IG-36 / §11.3.3 AK). Absorbs connect losses;
+# never load-bearing — the pigeonhole minimum alone forces a shed.
+PROBE_SLACK = 8
+# Shipped probe size: INGEST_GATEWAY_WORKERS × (ceiling − 1) + 1 + PROBE_SLACK
+# → 4 × 149 + 1 + 8 = 605; pigeonhole minimum 597.
+UNAVAILABLE = "unavailable"
+
 
 class Transport(Protocol):
     async def post(
@@ -111,6 +118,7 @@ class PhaseResult:
     max_in_flight: int
     max_backlog: int
     status_codes: list[int] = field(default_factory=list)
+    peak_established_connections: int | str = UNAVAILABLE
 
     @property
     def p99(self) -> float:
@@ -133,6 +141,204 @@ class PhaseResult:
         if math.isinf(a) or math.isinf(b):
             return float("inf")
         return b - a
+
+
+def serialize_status_histogram(status_codes: list[int]) -> str:
+    """Serialize status_codes as sorted code:count pairs (FP-IG-35)."""
+    counts: dict[int, int] = {}
+    for code in status_codes:
+        counts[code] = counts.get(code, 0) + 1
+    return ";".join(f"{code}:{counts[code]}" for code in sorted(counts))
+
+
+def _remote_port_from_proc_address(address: str) -> int | None:
+    if ":" not in address:
+        return None
+    port_hex = address.rsplit(":", 1)[-1]
+    try:
+        return int(port_hex, 16)
+    except ValueError:
+        return None
+
+
+def count_established_in_proc_content(content: str, serve_port: int) -> int:
+    """Count ESTABLISHED (st 01) rows whose remote port matches serve_port."""
+    total = 0
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("sl"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 4:
+            raise ValueError("malformed proc row")
+        rem_address = parts[2]
+        state = parts[3]
+        if state != "01":
+            continue
+        remote_port = _remote_port_from_proc_address(rem_address)
+        if remote_port == serve_port:
+            total += 1
+    return total
+
+
+def count_established_to_serve_port(
+    serve_port: int,
+    *,
+    tcp_path: Path | None = None,
+    tcp6_path: Path | None = None,
+) -> int | str:
+    """Kernel ESTABLISHED census toward serve_port via /proc file reads (FP-IG-35)."""
+    tcp_path = tcp_path or Path("/proc/net/tcp")
+    tcp6_path = tcp6_path or Path("/proc/net/tcp6")
+    try:
+        tcp_text = tcp_path.read_text(encoding="utf-8")
+        tcp6_text = tcp6_path.read_text(encoding="utf-8")
+    except OSError:
+        return UNAVAILABLE
+    try:
+        return count_established_in_proc_content(
+            tcp_text, serve_port
+        ) + count_established_in_proc_content(tcp6_text, serve_port)
+    except ValueError:
+        return UNAVAILABLE
+
+
+def peak_established_from_samples(samples: list[int | str]) -> int | str:
+    """Peak census sample; unavailable when every sample failed (UT-IG-15)."""
+    numeric = [s for s in samples if isinstance(s, int)]
+    if not numeric:
+        return UNAVAILABLE
+    return max(numeric)
+
+
+def pigeonhole_minimum(*, workers: int, ceiling_per_worker: int) -> int:
+    """Minimum held sockets that force at least one worker to its ceiling."""
+    return workers * (ceiling_per_worker - 1) + 1
+
+
+def probe_connection_count(
+    *,
+    workers: int,
+    ceiling_per_worker: int,
+    slack: int = PROBE_SLACK,
+) -> int:
+    """Probe socket count: pigeonhole minimum + slack (FP-IG-36)."""
+    return pigeonhole_minimum(workers=workers, ceiling_per_worker=ceiling_per_worker) + slack
+
+
+def classify_shed_probe_outcome(
+    socket_results: list[tuple[int | None, bool]],
+    *,
+    established_count: int,
+    pigeonhole_minimum_count: int,
+) -> str:
+    """Classify post-window shed probe results (UT-IG-16 / FP-IG-36)."""
+    if established_count < pigeonhole_minimum_count:
+        return UNAVAILABLE
+    statuses = [code for code, _timed_out in socket_results if code is not None]
+    has_503 = any(code == 503 for code in statuses)
+    if has_503:
+        return "fired"
+    has_timeout = any(timed_out for _code, timed_out in socket_results)
+    if has_timeout:
+        return "timeout"
+    if statuses and len(statuses) == len(socket_results):
+        return "absent"
+    return UNAVAILABLE
+
+
+def _parse_http_status_from_bytes(data: bytes) -> int | None:
+    if not data:
+        return None
+    first = data.split(b"\r\n", 1)[0]
+    parts = first.split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+async def run_shed_probe(
+    host: str,
+    port: int,
+    *,
+    workers: int = INGEST_GATEWAY_WORKERS,
+    ceiling_per_worker: int | None = None,
+    path: str = "/healthz",
+) -> str:
+    """Post-window enforcement witness (FP-IG-36). Raw asyncio sockets only."""
+    from gateway.main import DEFAULT_MAX_CONNECTIONS_PER_WORKER
+
+    if ceiling_per_worker is None:
+        ceiling_per_worker = DEFAULT_MAX_CONNECTIONS_PER_WORKER
+    min_established = pigeonhole_minimum(
+        workers=workers, ceiling_per_worker=ceiling_per_worker
+    )
+    target = probe_connection_count(
+        workers=workers, ceiling_per_worker=ceiling_per_worker
+    )
+
+    readers: list[asyncio.StreamReader] = []
+    writers: list[asyncio.StreamWriter] = []
+    established = 0
+    try:
+        for _ in range(target):
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=CLIENT_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, OSError):
+                continue
+            readers.append(reader)
+            writers.append(writer)
+            established += 1
+
+        if established < min_established:
+            return UNAVAILABLE
+
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        async def _one_probe(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> tuple[int | None, bool]:
+            timed_out = False
+            status: int | None = None
+            try:
+                writer.write(req)
+                await writer.drain()
+                data = await asyncio.wait_for(reader.read(4096), timeout=CLIENT_TIMEOUT)
+                status = _parse_http_status_from_bytes(data)
+            except asyncio.TimeoutError:
+                timed_out = True
+            except OSError:
+                pass
+            return status, timed_out
+
+        results = await asyncio.gather(
+            *(_one_probe(r, w) for r, w in zip(readers, writers))
+        )
+        results_list = list(results)
+
+        return classify_shed_probe_outcome(
+            results_list,
+            established_count=established,
+            pigeonhole_minimum_count=min_established,
+        )
+    finally:
+        for writer in writers:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
 
 def build_httpx_client(*, max_connections: int) -> httpx.AsyncClient:
@@ -168,6 +374,7 @@ async def run_open_loop(
     warmup: tuple[bytes, dict[str, str]] | None = None,
     include_sync_warmup: bool = True,
     on_prologue_complete: Callable[[], None] | None = None,
+    serve_port: int | None = None,
 ) -> PhaseResult:
     """Open-loop generator with due-time latency and unmeasured prologue.
 
@@ -226,12 +433,29 @@ async def run_open_loop(
         if on_prologue_complete is not None:
             on_prologue_complete()
 
+        census_samples: list[int | str] = []
+        census_stop = asyncio.Event()
+
+        async def _census_sampler() -> None:
+            if serve_port is None:
+                return
+            while not census_stop.is_set():
+                census_samples.append(count_established_to_serve_port(serve_port))
+                try:
+                    await asyncio.wait_for(census_stop.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+
+        census_task: asyncio.Task | None = None
+
         # --- measured window ---
         latencies = [0.0] * n
         outcomes: list[str] = [""] * n
         codes: list[int] = [0] * n
         t0 = time.perf_counter()
         due0 = t0
+        if serve_port is not None:
+            census_task = asyncio.create_task(_census_sampler())
         in_flight = 0
         max_if = 0
         max_backlog = 0
@@ -282,6 +506,15 @@ async def run_open_loop(
             for t in done:
                 await _on_done(t)
 
+        if census_task is not None:
+            census_stop.set()
+            await census_task
+        peak_census = (
+            peak_established_from_samples(census_samples)
+            if serve_port is not None
+            else UNAVAILABLE
+        )
+
         served = sum(1 for o in outcomes if o == "served")
         errors = n - served
         return PhaseResult(
@@ -295,6 +528,7 @@ async def run_open_loop(
             max_in_flight=max_if,
             max_backlog=max_backlog,
             status_codes=codes,
+            peak_established_connections=peak_census,
         )
     finally:
         if own_client and client is not None:

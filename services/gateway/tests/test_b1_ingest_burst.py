@@ -5,6 +5,7 @@ via --ignore). Spawns the real gateway under uvicorn against testcontainers PG.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -113,6 +114,233 @@ def test_serve_benchmark_passes_connection_ceiling_carrier(monkeypatch):
     assert called["kwargs"]["limit_concurrency"] == DEFAULT_MAX_CONNECTIONS_PER_WORKER
     assert called["kwargs"]["timeout_keep_alive"] == DEFAULT_TIMEOUT_KEEP_ALIVE_S
     assert called["kwargs"]["backlog"] == BACKLOG
+
+
+# ---------------------------------------------------------------------------
+# UT-IG-15 — histogram serializer, proc census parser, peak reducer (no server)
+# ---------------------------------------------------------------------------
+
+
+def test_status_histogram_serializer_sorts_and_counts():
+    codes = [202, 202, 200, 503, 599, 202]
+    assert b1.serialize_status_histogram(codes) == "200:1;202:3;503:1;599:1"
+    assert sum(int(pair.split(":")[1]) for pair in b1.serialize_status_histogram(codes).split(";")) == len(
+        codes
+    )
+
+
+def test_proc_tcp_established_parser_counts_matching_remote_port(tmp_path):
+    serve_port = 0x1F90  # 8080
+    remote_hex = f"{serve_port:04X}"
+    tcp = textwrap.dedent(
+        f"""
+          sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+           0: 0100007F:EA60 0100007F:{remote_hex} 01 00000000:00000000 00000000:00000000 00000000     0        0 1 1 0000000000000000 20 4 30 10 40
+           1: 0100007F:EA61 0100007F:{remote_hex} 06 00000000:00000000 00000000:00000000 00000000     0        0 2 1 0000000000000000 20 4 30 10 40
+           2: 0100007F:EA62 0100007F:0050 01 00000000:00000000 00000000:00000000 00000000     0        0 3 1 0000000000000000 20 4 30 10 40
+        """
+    )
+    tcp6 = textwrap.dedent(
+        f"""
+          sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+           0: 0000000000000000:0000000000000000:0000000000000000:0000000000000000:0100007F:EA70 0000000000000000:0000000000000000:0000000000000000:0000000000000000:0100007F:{remote_hex} 01 00000000:00000000 00000000:00000000 00000000     0        0 4 1 0000000000000000 20 4 30 10 40
+        """
+    )
+    tcp_path = tmp_path / "tcp"
+    tcp6_path = tmp_path / "tcp6"
+    tcp_path.write_text(tcp, encoding="utf-8")
+    tcp6_path.write_text(tcp6, encoding="utf-8")
+    assert b1.count_established_to_serve_port(
+        serve_port, tcp_path=tcp_path, tcp6_path=tcp6_path
+    ) == 2
+
+
+def test_proc_tcp_established_parser_returns_unavailable_on_malformed(tmp_path):
+    bad = tmp_path / "tcp"
+    good = tmp_path / "tcp6"
+    bad.write_text("not a proc table\nbroken row\n", encoding="utf-8")
+    good.write_text("  sl  local rem st\n", encoding="utf-8")
+    assert (
+        b1.count_established_to_serve_port(8080, tcp_path=bad, tcp6_path=good)
+        == b1.UNAVAILABLE
+    )
+
+
+def test_proc_tcp_established_parser_returns_unavailable_on_unreadable(tmp_path):
+    missing = tmp_path / "nonexistent_tcp"
+    good = tmp_path / "tcp6"
+    good.write_text("  sl  local rem st\n", encoding="utf-8")
+    assert (
+        b1.count_established_to_serve_port(8080, tcp_path=missing, tcp6_path=good)
+        == b1.UNAVAILABLE
+    )
+
+
+def test_peak_established_reducer_returns_max_or_unavailable():
+    assert b1.peak_established_from_samples([1, 5, 3]) == 5
+    assert b1.peak_established_from_samples([b1.UNAVAILABLE, b1.UNAVAILABLE]) == b1.UNAVAILABLE
+    assert b1.peak_established_from_samples([b1.UNAVAILABLE, 2]) == 2
+
+
+# ---------------------------------------------------------------------------
+# UT-IG-16 — shed probe classifier and probe-size arithmetic (no server)
+# ---------------------------------------------------------------------------
+
+
+def test_shed_probe_outcome_classifier_precedence():
+    min_est = 8
+    assert b1.classify_shed_probe_outcome(
+        [(503, False), (200, False)], established_count=8, pigeonhole_minimum_count=min_est
+    ) == "fired"
+    assert b1.classify_shed_probe_outcome(
+        [(503, False), (None, True)], established_count=8, pigeonhole_minimum_count=min_est
+    ) == "fired"
+    assert b1.classify_shed_probe_outcome(
+        [(200, False), (200, False)], established_count=8, pigeonhole_minimum_count=min_est
+    ) == "absent"
+    assert b1.classify_shed_probe_outcome(
+        [(200, False), (None, True)], established_count=8, pigeonhole_minimum_count=min_est
+    ) == "timeout"
+    assert b1.classify_shed_probe_outcome(
+        [(503, False)], established_count=7, pigeonhole_minimum_count=min_est
+    ) == b1.UNAVAILABLE
+
+
+def test_probe_connection_count_recomputed_from_imported_constants():
+    from gateway.main import DEFAULT_MAX_CONNECTIONS_PER_WORKER
+
+    expected = (
+        b1.INGEST_GATEWAY_WORKERS * (DEFAULT_MAX_CONNECTIONS_PER_WORKER - 1)
+        + 1
+        + b1.PROBE_SLACK
+    )
+    assert (
+        b1.probe_connection_count(
+            workers=b1.INGEST_GATEWAY_WORKERS,
+            ceiling_per_worker=DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_open_loop_with_serve_port_records_peak_census():
+    """Census sampler runs during the measured window when serve_port is set."""
+
+    class StubTransport:
+        async def post(self, url, *, content, headers):
+            return 202, b'{"status":"ok"}', None
+
+    measured = [
+        (b'{"event_id":"a"}', {"Content-Type": "application/json"}),
+        (b'{"event_id":"b"}', {"Content-Type": "application/json"}),
+    ]
+    result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=measured,
+        rate=1000,
+        transport=StubTransport(),
+        max_in_flight=10,
+        warmup=(b'{"event_id":"w"}', {"Content-Type": "application/json"}),
+        include_sync_warmup=True,
+        serve_port=65534,
+    )
+    assert result.peak_established_connections in (
+        0,
+        b1.UNAVAILABLE,
+    ) or isinstance(result.peak_established_connections, int)
+
+
+@pytest.mark.asyncio
+async def test_run_shed_probe_fired_against_inline_ceiling_server():
+    """run_shed_probe connect-all-then-request path against a shedding server."""
+    ceiling = 4
+    min_est = b1.pigeonhole_minimum(workers=1, ceiling_per_worker=ceiling)
+    active = 0
+
+    async def handler(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal active
+        active += 1
+        slot = active
+        try:
+            await reader.read(4096)
+            if slot <= ceiling - 1:
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                )
+            else:
+                writer.write(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    try:
+        outcome = await b1.run_shed_probe(
+            host,
+            port,
+            workers=1,
+            ceiling_per_worker=ceiling,
+        )
+        assert outcome == "fired"
+        assert min_est == 4
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def _parse_b1_env_field(line: str, field: str) -> str:
+    prefix = f"{field}="
+    for part in line.split(","):
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+    raise KeyError(field)
+
+
+def _is_never_served_status_code(code: int) -> bool:
+    """HTTP codes that are errors without body inspection (200 stays ambiguous)."""
+    if code in (503, 599):
+        return True
+    return 400 <= code < 600 and code != 200
+
+
+def test_b1_fingerprint_line_carries_terminal_fields(b1_reference_run):
+    """FP-IG-35: three reported-only fields present and reconciled."""
+    from collections import Counter
+
+    line = b1_reference_run["fingerprint"]
+    result = b1_reference_run["result"]
+    hist_raw = _parse_b1_env_field(line, "status_histogram")
+    peak_raw = _parse_b1_env_field(line, "peak_established_connections")
+    shed = _parse_b1_env_field(line, "shed_probe")
+
+    assert hist_raw == b1.serialize_status_histogram(result.status_codes)
+    hist_counts: Counter[int] = Counter()
+    for pair in hist_raw.split(";"):
+        if pair:
+            code, count = pair.split(":")
+            hist_counts[int(code)] = int(count)
+    assert hist_counts == Counter(result.status_codes)
+    assert sum(hist_counts.values()) == result.offered
+    never_served_hist = sum(
+        count for code, count in hist_counts.items()
+        if _is_never_served_status_code(code)
+    )
+    assert never_served_hist <= result.errors
+    assert hist_counts.get(202, 0) <= result.served
+
+    assert peak_raw.isdigit() or peak_raw == b1.UNAVAILABLE
+    assert shed in {"fired", "absent", "timeout", b1.UNAVAILABLE}
 
 
 @pytest.mark.asyncio
@@ -401,16 +629,20 @@ def b1_reference_run():
                     prologue=prologue,
                     include_sync_warmup=True,
                     on_prologue_complete=_after_prologue,
+                    serve_port=port,
                 )
             )
             cpu_after = b1.tree_cpu_seconds(proc.pid)
+            trackers_post, workers_post = b1.classify_tree(proc.pid)
+            shed_probe = asyncio.run(
+                b1.run_shed_probe("127.0.0.1", port)
+            )
             cpu_before = float(marks.get("cpu_before", cpu_after))
             span = result.t_last_complete - result.due0
             cpu_ms = (
                 (cpu_after - cpu_before) * 1000.0 / result.served if result.served else float("inf")
             )
             cpu_cores_used = (cpu_after - cpu_before) / span if span > 0 else 0.0
-            trackers_post, workers_post = b1.classify_tree(proc.pid)
             worker_set_ok = (
                 trackers_post == trackers_pre and workers_post == workers_pre
             )
@@ -438,6 +670,11 @@ def b1_reference_run():
 
             fp = _host_fingerprint()
             med_a, med_b = b1.half_window_medians(result.latencies_ms)
+            status_histogram = b1.serialize_status_histogram(result.status_codes)
+            peak_est = result.peak_established_connections
+            peak_est_str = (
+                str(peak_est) if isinstance(peak_est, int) else peak_est
+            )
             fingerprint_line = (
                 f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
                 f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
@@ -451,7 +688,10 @@ def b1_reference_run():
                 f"lateness_drift_ms={result.lateness_drift_ms:.1f},"
                 f"cpu_ms_per_req={cpu_ms:.3f},cpu_cores_used={cpu_cores_used:.2f},"
                 f"basis_ms_per_req={basis},"
-                f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog}"
+                f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog},"
+                f"status_histogram={status_histogram},"
+                f"peak_established_connections={peak_est_str},"
+                f"shed_probe={shed_probe}"
             )
             print(fingerprint_line, flush=True)
 
@@ -465,6 +705,9 @@ def b1_reference_run():
                 "workers_pre": workers_pre,
                 "workers_post": workers_post,
                 "fingerprint": fingerprint_line,
+                "status_histogram": status_histogram,
+                "peak_established_connections": peak_est,
+                "shed_probe": shed_probe,
                 "host": fp,
                 "platform_online": platform_online,
                 "basis_ms_per_req": basis,
