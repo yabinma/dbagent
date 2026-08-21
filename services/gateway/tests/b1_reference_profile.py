@@ -119,6 +119,9 @@ class PhaseResult:
     max_backlog: int
     status_codes: list[int] = field(default_factory=list)
     peak_established_connections: int | str = UNAVAILABLE
+    peak_pool_connections: int | str = UNAVAILABLE
+    peak_pool_queued: int | str = UNAVAILABLE
+    pool_connections_seen: int | str = UNAVAILABLE
 
     @property
     def p99(self) -> float:
@@ -209,6 +212,39 @@ def peak_established_from_samples(samples: list[int | str]) -> int | str:
     if not numeric:
         return UNAVAILABLE
     return max(numeric)
+
+
+def read_pool_census_sample(
+    client: httpx.AsyncClient,
+) -> tuple[int | str, int | str, set[int] | None]:
+    """Read one client-pool census sample (FP-IG-37 / UT-IG-17).
+
+    Returns (held_connections, queued_requests, connection_identities).
+    Every attribute failure degrades to ``unavailable`` (fail-open recording).
+    """
+    try:
+        pool = client._transport._pool
+        connections = len(pool.connections)
+        queued = sum(1 for req in pool._requests if req.is_queued())
+        seen = {id(c) for c in pool.connections}
+        return connections, queued, seen
+    except (AttributeError, TypeError):
+        return UNAVAILABLE, UNAVAILABLE, None
+
+
+def peak_pool_metric_from_samples(samples: list[int | str]) -> int | str:
+    """Peak of pool census samples; unavailable when every sample failed."""
+    return peak_established_from_samples(samples)
+
+
+def pool_connections_seen_from_identity_sets(identity_sets: list[set[int]]) -> int | str:
+    """Cardinality of the union of connection identities across samples."""
+    if not identity_sets:
+        return UNAVAILABLE
+    union: set[int] = set()
+    for identities in identity_sets:
+        union.update(identities)
+    return len(union)
 
 
 def pigeonhole_minimum(*, workers: int, ceiling_per_worker: int) -> int:
@@ -434,13 +470,21 @@ async def run_open_loop(
             on_prologue_complete()
 
         census_samples: list[int | str] = []
+        pool_conn_samples: list[int | str] = []
+        pool_queued_samples: list[int | str] = []
+        pool_identity_samples: list[set[int]] = []
         census_stop = asyncio.Event()
 
         async def _census_sampler() -> None:
-            if serve_port is None:
-                return
             while not census_stop.is_set():
-                census_samples.append(count_established_to_serve_port(serve_port))
+                if serve_port is not None:
+                    census_samples.append(count_established_to_serve_port(serve_port))
+                if client is not None and transport is None:
+                    conn_n, queued_n, seen = read_pool_census_sample(client)
+                    pool_conn_samples.append(conn_n)
+                    pool_queued_samples.append(queued_n)
+                    if seen is not None:
+                        pool_identity_samples.append(seen)
                 try:
                     await asyncio.wait_for(census_stop.wait(), timeout=0.1)
                 except asyncio.TimeoutError:
@@ -454,7 +498,7 @@ async def run_open_loop(
         codes: list[int] = [0] * n
         t0 = time.perf_counter()
         due0 = t0
-        if serve_port is not None:
+        if serve_port is not None or (client is not None and transport is None):
             census_task = asyncio.create_task(_census_sampler())
         in_flight = 0
         max_if = 0
@@ -490,6 +534,8 @@ async def run_open_loop(
             raw, headers = requests[i]
             task = asyncio.create_task(_one(i, raw, headers))
             pending.add(task)
+            # Dispatch peak: incremented at create_task, before pool/socket
+            # acquisition — an upper bound on on-wire concurrency, not a measure.
             in_flight += 1
             if in_flight > max_if:
                 max_if = in_flight
@@ -514,6 +560,17 @@ async def run_open_loop(
             if serve_port is not None
             else UNAVAILABLE
         )
+        peak_pool_conn = (
+            peak_pool_metric_from_samples(pool_conn_samples)
+            if pool_conn_samples
+            else UNAVAILABLE
+        )
+        peak_pool_q = (
+            peak_pool_metric_from_samples(pool_queued_samples)
+            if pool_queued_samples
+            else UNAVAILABLE
+        )
+        pool_seen = pool_connections_seen_from_identity_sets(pool_identity_samples)
 
         served = sum(1 for o in outcomes if o == "served")
         errors = n - served
@@ -529,6 +586,9 @@ async def run_open_loop(
             max_backlog=max_backlog,
             status_codes=codes,
             peak_established_connections=peak_census,
+            peak_pool_connections=peak_pool_conn,
+            peak_pool_queued=peak_pool_q,
+            pool_connections_seen=pool_seen,
         )
     finally:
         if own_client and client is not None:

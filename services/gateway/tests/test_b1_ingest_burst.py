@@ -343,6 +343,177 @@ def test_b1_fingerprint_line_carries_terminal_fields(b1_reference_run):
     assert shed in {"fired", "absent", "timeout", b1.UNAVAILABLE}
 
 
+def test_b1_fingerprint_line_locates_the_in_flight_population(b1_reference_run):
+    """FP-IG-37: pool census fields present, reconciled, two safe inequalities."""
+    line = b1_reference_run["fingerprint"]
+    result = b1_reference_run["result"]
+
+    peak_pool_conn_raw = _parse_b1_env_field(line, "peak_pool_connections")
+    peak_pool_q_raw = _parse_b1_env_field(line, "peak_pool_queued")
+    pool_seen_raw = _parse_b1_env_field(line, "pool_connections_seen")
+
+    for raw, quantity in (
+        (peak_pool_conn_raw, result.peak_pool_connections),
+        (peak_pool_q_raw, result.peak_pool_queued),
+        (pool_seen_raw, result.pool_connections_seen),
+    ):
+        assert raw.isdigit() or raw == b1.UNAVAILABLE
+        expected = str(quantity) if isinstance(quantity, int) else quantity
+        assert raw == expected
+
+    if isinstance(result.peak_pool_queued, int):
+        assert result.peak_pool_queued <= result.max_in_flight
+    if isinstance(result.pool_connections_seen, int) and isinstance(
+        result.peak_pool_connections, int
+    ):
+        assert result.pool_connections_seen >= result.peak_pool_connections
+
+
+# ---------------------------------------------------------------------------
+# UT-IG-17 — pool census reader (no product server)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pool_census_reader_opposite_directions_and_reducers():
+    """UT-IG-17: sockets vs queued tasks, seen-union, fail-open."""
+    pool_size = 2
+    hold = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.read(65536)
+        hold.set()
+        await release.wait()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    url = f"http://{host}:{port}/"
+    client = b1.build_httpx_client(max_connections=pool_size)
+    try:
+        slow = [
+            asyncio.create_task(client.post(url, content=b"slow"))
+            for _ in range(pool_size)
+        ]
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            conn, queued, _seen = b1.read_pool_census_sample(client)
+            if isinstance(conn, int) and conn >= pool_size:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("pool never reached held-connection plateau")
+
+        conn, queued, seen = b1.read_pool_census_sample(client)
+        assert conn == pool_size
+        assert queued == 0
+        assert seen is not None and len(seen) == pool_size
+
+        extra_dispatch = 3
+        extra = [
+            asyncio.create_task(client.post(url, content=b"extra"))
+            for _ in range(extra_dispatch)
+        ]
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            conn_after, queued_after, _ = b1.read_pool_census_sample(client)
+            if isinstance(queued_after, int) and queued_after == extra_dispatch:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError(
+                f"queued never reached {extra_dispatch} (last={queued_after!r})"
+            )
+        assert conn_after == pool_size
+        assert queued_after == extra_dispatch
+
+        release.set()
+        await asyncio.gather(*slow, *extra, return_exceptions=True)
+        hold.clear()
+        release.clear()
+        await client.aclose()
+
+        close_hold = asyncio.Event()
+        close_release = asyncio.Event()
+
+        async def close_handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            await reader.read(65536)
+            close_hold.set()
+            await close_release.wait()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+        close_server = await asyncio.start_server(close_handler, "127.0.0.1", 0)
+        close_host, close_port = close_server.sockets[0].getsockname()[:2]
+        close_url = f"http://{close_host}:{close_port}/"
+        churn_client = b1.build_httpx_client(max_connections=1)
+        identity_sets: list[set[int]] = []
+        try:
+            for payload in (b"churn-a", b"churn-b"):
+                close_hold.clear()
+                close_release.clear()
+                task = asyncio.create_task(churn_client.post(close_url, content=payload))
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    _c, _q, seen_i = b1.read_pool_census_sample(churn_client)
+                    if seen_i:
+                        identity_sets.append(set(seen_i))
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError("no connection identity sampled")
+                close_release.set()
+                await task
+                await asyncio.sleep(0.05)
+
+            seen_total = b1.pool_connections_seen_from_identity_sets(identity_sets)
+            assert seen_total == 2
+            assert identity_sets[0].isdisjoint(identity_sets[1])
+        finally:
+            close_release.set()
+            await churn_client.aclose()
+            close_server.close()
+            await close_server.wait_closed()
+
+        class _NoPool:
+            _transport = type("T", (), {"_pool": None})()
+
+        bad_conn, bad_q, bad_seen = b1.read_pool_census_sample(_NoPool())  # type: ignore[arg-type]
+        assert bad_conn == b1.UNAVAILABLE
+        assert bad_q == b1.UNAVAILABLE
+        assert bad_seen is None
+
+        class _NoTransport:
+            pass
+
+        bad2 = b1.read_pool_census_sample(_NoTransport())  # type: ignore[arg-type]
+        assert bad2 == (b1.UNAVAILABLE, b1.UNAVAILABLE, None)
+    finally:
+        release.set()
+        if not client.is_closed:
+            await client.aclose()
+        server.close()
+        await server.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_open_loop_rejects_duplicate_event_ids_across_phases():
     """C2: warmup/prologue/measured must be disjoint — a reuse-aware stub fails."""
@@ -675,6 +846,18 @@ def b1_reference_run():
             peak_est_str = (
                 str(peak_est) if isinstance(peak_est, int) else peak_est
             )
+            peak_pool_conn = result.peak_pool_connections
+            peak_pool_conn_str = (
+                str(peak_pool_conn) if isinstance(peak_pool_conn, int) else peak_pool_conn
+            )
+            peak_pool_q = result.peak_pool_queued
+            peak_pool_q_str = (
+                str(peak_pool_q) if isinstance(peak_pool_q, int) else peak_pool_q
+            )
+            pool_seen = result.pool_connections_seen
+            pool_seen_str = (
+                str(pool_seen) if isinstance(pool_seen, int) else pool_seen
+            )
             fingerprint_line = (
                 f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
                 f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
@@ -691,7 +874,10 @@ def b1_reference_run():
                 f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog},"
                 f"status_histogram={status_histogram},"
                 f"peak_established_connections={peak_est_str},"
-                f"shed_probe={shed_probe}"
+                f"shed_probe={shed_probe},"
+                f"peak_pool_connections={peak_pool_conn_str},"
+                f"peak_pool_queued={peak_pool_q_str},"
+                f"pool_connections_seen={pool_seen_str}"
             )
             print(fingerprint_line, flush=True)
 
@@ -707,6 +893,9 @@ def b1_reference_run():
                 "fingerprint": fingerprint_line,
                 "status_histogram": status_histogram,
                 "peak_established_connections": peak_est,
+                "peak_pool_connections": peak_pool_conn,
+                "peak_pool_queued": peak_pool_q,
+                "pool_connections_seen": pool_seen,
                 "shed_probe": shed_probe,
                 "host": fp,
                 "platform_online": platform_online,
