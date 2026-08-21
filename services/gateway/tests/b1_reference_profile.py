@@ -627,6 +627,12 @@ def create_benchmark_app():
 def serve_benchmark(*, host: str, port: int) -> None:
     import uvicorn
 
+    from gateway.main import (
+        BACKLOG,
+        DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+        DEFAULT_TIMEOUT_KEEP_ALIVE_S,
+    )
+
     uvicorn.run(
         "b1_reference_profile:create_benchmark_app",
         factory=True,
@@ -634,6 +640,9 @@ def serve_benchmark(*, host: str, port: int) -> None:
         host=host,
         port=port,
         log_level="warning",
+        limit_concurrency=DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+        timeout_keep_alive=DEFAULT_TIMEOUT_KEEP_ALIVE_S,
+        backlog=BACKLOG,
     )
 
 

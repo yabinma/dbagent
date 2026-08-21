@@ -1008,3 +1008,95 @@ def test_ingest_gateway_worker_count_is_derived_and_identical_in_every_carrier()
             res = dep["spec"]["template"]["spec"]["containers"][0]["resources"]
             assert _parse_memory_mi(res["requests"]["memory"]) == pinned * 128
             assert _parse_memory_mi(res["limits"]["memory"]) == pinned * 512
+
+
+def test_ingest_gateway_connection_ceiling_is_derived_and_identical_in_every_carrier():
+    """FP-IG-34: ceiling carriers agree; interval recomputed from B1 constants."""
+    import importlib.util
+    import sys
+
+    from gateway.main import DEFAULT_MAX_CONNECTIONS_PER_WORKER
+
+    profile_path = REPO_ROOT / "services" / "gateway" / "tests" / "b1_reference_profile.py"
+    spec = importlib.util.spec_from_file_location("b1_reference_profile", profile_path)
+    assert spec and spec.loader
+    b1 = importlib.util.module_from_spec(spec)
+    sys.modules["b1_reference_profile"] = b1
+    spec.loader.exec_module(b1)
+
+    values = yaml.safe_load((DBAGENT / "values.yaml").read_text(encoding="utf-8"))
+    chart_value = values["ingestGateway"]["maxConnectionsPerWorker"]
+    assert chart_value == DEFAULT_MAX_CONNECTIONS_PER_WORKER
+
+    compliant_demand = (
+        b1.BURST_RATE * b1.P99_MS / 1000 + b1.TOTAL_REQUESTS // 100
+    )
+
+    def _overlay_key(values_files):
+        if values_files is None:
+            return "default"
+        joined = " ".join(values_files)
+        if "values-dev.yaml" in joined:
+            return "values-dev"
+        if "values-dbagent.yaml" in joined:
+            return "values-dbagent"
+        return joined
+
+    overlays = [
+        None,
+        [str(DBAGENT / "values-dev.yaml")],
+        [str(REPO_ROOT / "tests" / "e2e" / "values-dbagent.yaml")],
+    ]
+    set_matrices = [
+        None,
+        ["temporal.mode=dev", "postgresql.bundled=true"],
+        ["temporal.mode=external", "temporal.address=temporal.other:7233"],
+        ["temporal.mode=chart", "temporal.chart.enabled=true"],
+    ]
+    checked_overlays: set[str] = set()
+    for values_files in overlays:
+        for set_args in set_matrices:
+            try:
+                out = helm_template(DBAGENT, values=values_files, set_args=set_args)
+            except RuntimeError:
+                continue
+            docs = parse_manifests(out)
+            try:
+                rendered_env = _ingest_env(
+                    docs, "DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER"
+                )
+            except StopIteration:
+                continue
+            if rendered_env is None:
+                continue
+            workers_env = _ingest_env(docs, "DBAGENT_GATEWAY_WORKERS")
+            assert workers_env is not None, (
+                values_files,
+                set_args,
+                "render carries ceiling env but DBAGENT_GATEWAY_WORKERS is absent",
+            )
+            rendered_workers = int(workers_env)
+            assert rendered_env == str(chart_value), (values_files, set_args, rendered_env)
+            assert int(rendered_env) == DEFAULT_MAX_CONNECTIONS_PER_WORKER
+            value = int(rendered_env)
+            assert rendered_workers * (value - 1) >= compliant_demand, (
+                values_files,
+                set_args,
+                rendered_workers,
+                value,
+                compliant_demand,
+            )
+            assert rendered_workers * value < b1.MAX_IN_FLIGHT, (
+                values_files,
+                set_args,
+                rendered_workers,
+                value,
+                b1.MAX_IN_FLIGHT,
+            )
+            checked_overlays.add(_overlay_key(values_files))
+
+    assert "default" in checked_overlays, "default render must exercise FP-IG-34 interval"
+    assert "values-dev" in checked_overlays, "values-dev overlay must exercise FP-IG-34 interval"
+    assert (
+        "values-dbagent" in checked_overlays
+    ), "values-dbagent overlay must exercise FP-IG-34 interval"

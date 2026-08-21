@@ -94,6 +94,27 @@ def test_acceptance_matrix_matches_superseded_formulations():
         assert matrix["form4"] == s4, f"{name} form4={matrix['form4']} want {s4}"
 
 
+def test_serve_benchmark_passes_connection_ceiling_carrier(monkeypatch):
+    """UT-IG-14 harness-side: B1 child passes the same serve carrier as main()."""
+    from gateway.main import (
+        BACKLOG,
+        DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+        DEFAULT_TIMEOUT_KEEP_ALIVE_S,
+    )
+
+    called: dict = {}
+
+    def fake_run(*args, **kwargs):
+        called["args"] = args
+        called["kwargs"] = kwargs
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    b1.serve_benchmark(host="127.0.0.1", port=18080)
+    assert called["kwargs"]["limit_concurrency"] == DEFAULT_MAX_CONNECTIONS_PER_WORKER
+    assert called["kwargs"]["timeout_keep_alive"] == DEFAULT_TIMEOUT_KEEP_ALIVE_S
+    assert called["kwargs"]["backlog"] == BACKLOG
+
+
 @pytest.mark.asyncio
 async def test_open_loop_rejects_duplicate_event_ids_across_phases():
     """C2: warmup/prologue/measured must be disjoint — a reuse-aware stub fails."""

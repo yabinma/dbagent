@@ -36,6 +36,8 @@ spec:
               value: /etc/dbagent/config.yaml
             - name: DBAGENT_GATEWAY_WORKERS
               value: {{ .Values.ingestGateway.workers | quote }}
+            - name: DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER
+              value: {{ .Values.ingestGateway.maxConnectionsPerWorker | quote }}
           volumeMounts:
             - name: config
               mountPath: /etc/dbagent

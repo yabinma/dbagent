@@ -144,6 +144,24 @@ or in the YAML document.
 - `bootstrap_ca_cert_path`, `bootstrap_ca_key_path`, `signing_public_key_path`, `signing_key_grace_window`
 - `gateway_replica`, `heartbeat_timeout`, `heartbeat_check_interval`, `signing_key_poll_interval`, `server_cert_sans`
 
+## Ingest-gateway environment variables
+
+Process-level HTTP serve parameters for `services/gateway` (§11.3.3 AJ). Both
+are read by `gateway.main.main()` with fail-closed validation: absent uses the
+code default; non-integer or `<= 0` refuses to start.
+
+- `DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER` — per-worker open-connection
+  ceiling passed to uvicorn as `limit_concurrency`. Idle keepalive sockets count
+  against the ceiling; uvicorn 0.52.1 sheds at `len(connections) >= limit` with
+  503 and `Connection: close`. Chart default:
+  `ingestGateway.maxConnectionsPerWorker` (150). Operator sizing: choose a value
+  so `workers × (value − 1)` admits every bar-compliant trajectory
+  (`BURST_RATE × P99_MS / 1000 + TOTAL_REQUESTS // 100` at the reference
+  profile constants) and `workers × value < MAX_IN_FLIGHT`.
+- `DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE` — idle keepalive expiry in seconds
+  (`timeout_keep_alive`). Code default: 5. No chart value — override via env
+  only when needed.
+
 ## PostgreSQL connection budget
 
 Every consumer's worst-case ceiling × replicas × engines, plus **RESERVE 13**

@@ -4,7 +4,28 @@ from __future__ import annotations
 import pytest
 
 import gateway.main as main_mod
-from gateway.main import TemporalWorkflowStarter, build_app
+from gateway.main import (
+    BACKLOG,
+    DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+    DEFAULT_TIMEOUT_KEEP_ALIVE_S,
+    TemporalWorkflowStarter,
+    build_app,
+)
+
+
+def _write_min_config(path) -> None:
+    path.write_text("storage:\n  postgres_dsn: 'sqlite:///:memory:'\n")
+
+
+def _patch_uvicorn_run(monkeypatch):
+    called = {}
+
+    def fake_run(app, **kwargs):
+        called["app"] = app
+        called["kwargs"] = kwargs
+
+    monkeypatch.setattr(main_mod.uvicorn, "run", fake_run)
+    return called
 
 
 def test_build_app_loads_config(tmp_path, monkeypatch):
@@ -30,21 +51,64 @@ temporal:
 
 def test_main_invokes_uvicorn_worker_manager(monkeypatch, tmp_path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text("storage:\n  postgres_dsn: 'sqlite:///:memory:'\n")
+    _write_min_config(cfg)
     monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
     monkeypatch.setenv("DBAGENT_GATEWAY_WORKERS", "4")
+    monkeypatch.delenv("DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER", raising=False)
+    monkeypatch.delenv("DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE", raising=False)
 
-    called = {}
-
-    def fake_run(app, **kwargs):
-        called["app"] = app
-        called["kwargs"] = kwargs
-
-    monkeypatch.setattr(main_mod.uvicorn, "run", fake_run)
+    called = _patch_uvicorn_run(monkeypatch)
     main_mod.main()
     assert called["app"] == "gateway.main:create_worker_app"
     assert called["kwargs"]["factory"] is True
     assert called["kwargs"]["workers"] == 4
+    assert called["kwargs"]["limit_concurrency"] == DEFAULT_MAX_CONNECTIONS_PER_WORKER
+    assert called["kwargs"]["timeout_keep_alive"] == DEFAULT_TIMEOUT_KEEP_ALIVE_S
+    assert called["kwargs"]["backlog"] == BACKLOG
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "kwarg"),
+    [
+        ("DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER", "42", "limit_concurrency"),
+        ("DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE", "9", "timeout_keep_alive"),
+    ],
+)
+def test_main_passes_env_overrides_for_serve_carrier(
+    monkeypatch, tmp_path, env_name, env_value, kwarg
+):
+    cfg = tmp_path / "config.yaml"
+    _write_min_config(cfg)
+    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
+    monkeypatch.delenv("DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER", raising=False)
+    monkeypatch.delenv("DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE", raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    called = _patch_uvicorn_run(monkeypatch)
+    main_mod.main()
+    assert called["kwargs"][kwarg] == int(env_value)
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    ["DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER", "DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE"],
+)
+@pytest.mark.parametrize("bad_value", ["0", "-1", "abc"])
+def test_main_refuses_invalid_serve_carrier_env(
+    monkeypatch, tmp_path, env_name, bad_value
+):
+    cfg = tmp_path / "config.yaml"
+    _write_min_config(cfg)
+    monkeypatch.setenv("DBAGENT_GATEWAY_CONFIG", str(cfg))
+    monkeypatch.delenv("DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER", raising=False)
+    monkeypatch.delenv("DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE", raising=False)
+    monkeypatch.setenv(env_name, bad_value)
+    called = _patch_uvicorn_run(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        main_mod.main()
+
+    assert called == {}, "uvicorn.run must not be invoked when carrier env validation fails"
 
 
 @pytest.mark.asyncio

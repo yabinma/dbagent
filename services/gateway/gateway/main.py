@@ -19,6 +19,35 @@ from gateway.ingest import IngestService
 
 logger = logging.getLogger(__name__)
 
+# Serve-parameter carrier (§11.3.3 AJ / FP-IG-32). Per-worker open-connection
+# ceiling; effective aggregate capacity is workers × (ceiling − 1) because
+# uvicorn 0.52.1 refuses at len(connections) >= limit (§11.3.3 AJ).
+# Shipped 150 × 4 workers → 596 effective, inside [450, 1000) from B1's
+# oracle constants (FP-IG-34 recomputes the interval, never this literal).
+DEFAULT_MAX_CONNECTIONS_PER_WORKER = 150
+# Declared explicitly — the parameter whose undeclared 5 s default cost
+# D0.3-c its first run (§11.3.3 AJ).
+DEFAULT_TIMEOUT_KEEP_ALIVE_S = 5
+# Pin documenting uvicorn's compiled default; not an operator knob.
+BACKLOG = 2048
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"ingest-gateway: {name} must be a positive integer (got {raw!r})"
+        )
+    if value <= 0:
+        raise SystemExit(
+            f"ingest-gateway: {name} must be > 0 (got {value})"
+        )
+    return value
+
 
 class TemporalWorkflowStarter:
     def __init__(self, client: Client, task_queue: str = "rca-worker"):
@@ -99,6 +128,14 @@ def main() -> None:
     host = os.environ.get("DBAGENT_GATEWAY_HOST", "0.0.0.0")
     port = int(os.environ.get("DBAGENT_GATEWAY_PORT", "8080"))
     workers = int(os.environ.get("DBAGENT_GATEWAY_WORKERS", "4"))
+    max_connections = _parse_positive_int_env(
+        "DBAGENT_GATEWAY_MAX_CONNECTIONS_PER_WORKER",
+        DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+    )
+    timeout_keep_alive = _parse_positive_int_env(
+        "DBAGENT_GATEWAY_TIMEOUT_KEEP_ALIVE",
+        DEFAULT_TIMEOUT_KEEP_ALIVE_S,
+    )
     uvicorn.run(
         "gateway.main:create_worker_app",
         factory=True,
@@ -106,6 +143,9 @@ def main() -> None:
         host=host,
         port=port,
         log_level="info",
+        limit_concurrency=max_connections,
+        timeout_keep_alive=timeout_keep_alive,
+        backlog=BACKLOG,
     )
 
 

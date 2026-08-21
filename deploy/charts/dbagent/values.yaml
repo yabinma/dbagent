@@ -87,6 +87,11 @@ ingestGateway:
   # = 4). One uvicorn event loop per core inside the single replica; not a
   # uvicorn default and not replicaCount (which stays 1).
   workers: 4
+  # FP-IG-34: per-worker open-connection ceiling (§11.3.3 AJ). Effective
+  # aggregate capacity = workers × (value − 1); must satisfy
+  # workers × (value − 1) ≥ BURST_RATE × P99_MS / 1000 + TOTAL_REQUESTS // 100
+  # and workers × value < MAX_IN_FLIGHT (recomputed by the delivery test).
+  maxConnectionsPerWorker: 150
   service:
     type: ClusterIP
     nodePort: null
