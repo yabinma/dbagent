@@ -369,6 +369,457 @@ def test_b1_fingerprint_line_locates_the_in_flight_population(b1_reference_run):
         assert result.pool_connections_seen >= result.peak_pool_connections
 
 
+def test_b1_fingerprint_line_carries_the_per_worker_census(b1_reference_run):
+    """FP-IG-38: per-worker census fields present and reconciled."""
+    line = b1_reference_run["fingerprint"]
+    result = b1_reference_run["result"]
+    workers_pre = b1_reference_run["workers_pre"]
+
+    peaks_raw = _parse_b1_env_field(line, "worker_established_peaks")
+    peak_worker_raw = _parse_b1_env_field(line, "peak_worker_established")
+
+    expected_peaks_str = b1.serialize_worker_established_peaks(
+        result.worker_established_peaks
+    )
+    expected_peak_worker = (
+        str(result.peak_worker_established)
+        if isinstance(result.peak_worker_established, int)
+        else result.peak_worker_established
+    )
+
+    assert peaks_raw.isdigit() or "+" in peaks_raw or peaks_raw == b1.UNAVAILABLE
+    assert peak_worker_raw.isdigit() or peak_worker_raw == b1.UNAVAILABLE
+    assert peaks_raw == expected_peaks_str
+    assert peak_worker_raw == expected_peak_worker
+
+    if peaks_raw != b1.UNAVAILABLE:
+        peak_parts = [int(x) for x in peaks_raw.split("+")]
+        assert len(peak_parts) == len(workers_pre)
+        assert peak_worker_raw.isdigit()
+        assert int(peak_worker_raw) == max(peak_parts)
+
+
+# ---------------------------------------------------------------------------
+# UT-IG-18 — per-worker established-socket census (no product server)
+# ---------------------------------------------------------------------------
+
+
+def _write_proc_tcp_fixture(
+    tmp_path: Path, *, serve_port: int, rows: list[tuple[int, str, str, str]]
+) -> tuple[Path, Path]:
+    """Build tcp/tcp6 fixture files; each row is (inode, local, remote, state)."""
+    serve_hex = f"{serve_port:04X}"
+    lines = [
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    ]
+    for inode, local, remote, state in rows:
+        lines.append(
+            f"   {inode}: {local} {remote} {state} "
+            "00000000:00000000 00000000:00000000 00000000     0        0 "
+            f"{inode} 1 0000000000000000 20 4 30 10 40"
+        )
+    tcp = tmp_path / "tcp"
+    tcp6 = tmp_path / "tcp6"
+    tcp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tcp6.write_text("  sl  local_address rem_address st\n", encoding="utf-8")
+    return tcp, tcp6
+
+
+def _write_proc_fd_fixture(tmp_path: Path, pid: int, links: dict[str, str]) -> Path:
+    fd_dir = tmp_path / f"proc_{pid}_fd"
+    fd_dir.mkdir()
+    for name, target in links.items():
+        (fd_dir / name).symlink_to(target)
+    return fd_dir
+
+
+def test_per_worker_census_attributes_sockets_to_each_pid(tmp_path):
+    """UT-IG-18: N held sockets on one pid, zero on another — not aggregate for both."""
+    serve_port = 18080
+    serve_hex = f"{serve_port:04X}"
+    inode_a, inode_b = 101, 102
+    tcp = tmp_path / "tcp"
+    tcp6 = tmp_path / "tcp6"
+    tcp.write_text(
+        textwrap.dedent(
+            f"""
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+               0: 0100007F:{serve_hex} 0100007F:EA60 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_a} 1 0000000000000000 20 4 30 10 40
+               1: 0100007F:{serve_hex} 0100007F:EA61 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_b} 1 0000000000000000 20 4 30 10 40
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    tcp6.write_text("  sl  local_address rem_address st\n", encoding="utf-8")
+    pid_with = 10001
+    pid_without = 10002
+    fd_with = _write_proc_fd_fixture(
+        tmp_path,
+        pid_with,
+        {"3": f"socket:[{inode_a}]", "4": f"socket:[{inode_b}]", "5": "pipe:[999]"},
+    )
+    fd_without = _write_proc_fd_fixture(tmp_path, pid_without, {"3": "pipe:[888]"})
+
+    def fd_for_pid(pid: int) -> Path:
+        return fd_with if pid == pid_with else fd_without
+
+    counts = b1.count_per_worker_established_to_serve_port(
+        [pid_with, pid_without],
+        serve_port,
+        tcp_path=tcp,
+        tcp6_path=tcp6,
+        fd_dir_for_pid=fd_for_pid,
+    )
+    assert counts == [2, 0]
+
+
+def test_per_worker_census_reads_proc_tcp_once_per_sample(tmp_path, monkeypatch):
+    """UT-IG-18: one /proc/net/tcp[6] read per count_per_worker invocation, not per pid."""
+    serve_port = 18081
+    serve_hex = f"{serve_port:04X}"
+    inode_a, inode_b = 201, 202
+    tcp = tmp_path / "tcp"
+    tcp6 = tmp_path / "tcp6"
+    tcp.write_text(
+        textwrap.dedent(
+            f"""
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+               0: 0100007F:{serve_hex} 0100007F:EA60 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_a} 1 0000000000000000 20 4 30 10 40
+               1: 0100007F:{serve_hex} 0100007F:EA61 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_b} 1 0000000000000000 20 4 30 10 40
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    tcp6.write_text("  sl  local_address rem_address st\n", encoding="utf-8")
+    pid_with = 10003
+    pid_without = 10004
+    fd_with = _write_proc_fd_fixture(
+        tmp_path,
+        pid_with,
+        {"3": f"socket:[{inode_a}]", "4": f"socket:[{inode_b}]"},
+    )
+    fd_without = _write_proc_fd_fixture(tmp_path, pid_without, {"3": "pipe:[888]"})
+
+    def fd_for_pid(pid: int) -> Path:
+        return fd_with if pid == pid_with else fd_without
+
+    read_calls = 0
+    real_read = b1.read_proc_net_tcp_tables
+
+    def counting_read(**kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        return real_read(**kwargs)
+
+    monkeypatch.setattr(b1, "read_proc_net_tcp_tables", counting_read)
+
+    counts = b1.count_per_worker_established_to_serve_port(
+        [pid_with, pid_without],
+        serve_port,
+        tcp_path=tcp,
+        tcp6_path=tcp6,
+        fd_dir_for_pid=fd_for_pid,
+    )
+    assert counts == [2, 0]
+    assert read_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_census_sampler_reads_proc_tcp_once_per_tick(tmp_path, monkeypatch):
+    """UT-IG-18: production _census_sampler reads /proc/net/tcp[6] once per tick."""
+    serve_port = 18082
+    serve_hex = f"{serve_port:04X}"
+    inode_client, inode_client2, inode_server = 111, 333, 222
+    tcp = tmp_path / "tcp"
+    tcp6 = tmp_path / "tcp6"
+    tcp.write_text(
+        textwrap.dedent(
+            f"""
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+               0: 0100007F:EA60 0100007F:{serve_hex} 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_client} 1 0000000000000000 20 4 30 10 40
+               1: 0100007F:{serve_hex} 0100007F:EA61 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_server} 1 0000000000000000 20 4 30 10 40
+               2: 0100007F:EA62 0100007F:{serve_hex} 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode_client2} 1 0000000000000000 20 4 30 10 40
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    tcp6.write_text("  sl  local_address rem_address st\n", encoding="utf-8")
+
+    tcp_text = tcp.read_text(encoding="utf-8")
+    tcp6_text = tcp6.read_text(encoding="utf-8")
+
+    pid_with = 10005
+    pid_without = 10006
+    fd_with = _write_proc_fd_fixture(
+        tmp_path, pid_with, {"3": f"socket:[{inode_server}]"}
+    )
+    fd_without = _write_proc_fd_fixture(tmp_path, pid_without, {"3": "pipe:[888]"})
+
+    def fd_for_pid(pid: int) -> Path:
+        return fd_with if pid == pid_with else fd_without
+
+    # Same bytes, different measurands: remote-port aggregate vs local-port inode set.
+    # Two client-side rows (remote = serve port) vs one server-side inode {222} — counts
+    # must diverge so a silent merge onto len(inodes) cannot pass.
+    assert b1.count_established_from_proc_tables(tcp_text, tcp6_text, serve_port) == 2
+    assert b1.established_serve_port_inodes_from_proc_tables(
+        tcp_text, tcp6_text, serve_port
+    ) == {inode_server}
+    assert b1.count_per_worker_established_to_serve_port(
+        [pid_with, pid_without],
+        serve_port,
+        tcp_text=tcp_text,
+        tcp6_text=tcp6_text,
+        fd_dir_for_pid=fd_for_pid,
+    ) == [1, 0]
+
+    real_per_worker = b1.count_per_worker_established_to_serve_port
+
+    def per_worker_with_fd(worker_pids, serve_port, **kwargs):
+        kwargs.setdefault("fd_dir_for_pid", fd_for_pid)
+        return real_per_worker(worker_pids, serve_port, **kwargs)
+
+    monkeypatch.setattr(
+        b1, "count_per_worker_established_to_serve_port", per_worker_with_fd
+    )
+
+    read_calls = 0
+    real_read = b1.read_proc_net_tcp_tables
+
+    def counting_read(**kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        kwargs.setdefault("tcp_path", tcp)
+        kwargs.setdefault("tcp6_path", tcp6)
+        return real_read(**kwargs)
+
+    monkeypatch.setattr(b1, "read_proc_net_tcp_tables", counting_read)
+
+    parser_ticks = 0
+    real_aggregate = b1.count_established_to_serve_port
+
+    def counting_aggregate(serve_port, **kwargs):
+        nonlocal parser_ticks
+        if kwargs.get("tcp_text") is not None:
+            parser_ticks += 1
+        return real_aggregate(serve_port, **kwargs)
+
+    monkeypatch.setattr(b1, "count_established_to_serve_port", counting_aggregate)
+
+    class SlowStubTransport:
+        async def post(self, url, *, content, headers):
+            await asyncio.sleep(0.25)
+            return 202, b'{"status":"ok"}', None
+
+    measured = [
+        (b'{"event_id":"a"}', {"Content-Type": "application/json"}),
+        (b'{"event_id":"b"}', {"Content-Type": "application/json"}),
+    ]
+    result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=measured,
+        rate=1000,
+        transport=SlowStubTransport(),
+        max_in_flight=2,
+        include_sync_warmup=False,
+        serve_port=serve_port,
+        worker_pids=[pid_with, pid_without],
+    )
+
+    assert parser_ticks >= 1
+    assert read_calls == parser_ticks
+    assert result.peak_established_connections == 2
+    assert result.worker_established_peaks == [1, 0]
+    assert result.peak_worker_established == 1
+
+
+def test_per_worker_census_skips_non_socket_and_vanished_fd(tmp_path):
+    serve_port = 9000
+    serve_hex = f"{serve_port:04X}"
+    inode = 555
+    tcp, tcp6 = _write_proc_tcp_fixture(
+        tmp_path,
+        serve_port=serve_port,
+        rows=[(0, f"0100007F:{serve_hex}", "0100007F:EA60", "01")],
+    )
+    tcp.write_text(
+        textwrap.dedent(
+            f"""
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+               0: 0100007F:{serve_hex} 0100007F:EA60 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode} 1 0000000000000000 20 4 30 10 40
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    fd_dir = tmp_path / "fd"
+    fd_dir.mkdir()
+    (fd_dir / "3").symlink_to(f"socket:[{inode}]")
+    (fd_dir / "4").symlink_to("anon_inode:[eventfd]")
+    (fd_dir / "5").symlink_to("socket:[99999]")  # foreign inode
+
+    count = b1.count_worker_established_to_serve_port(
+        42, serve_port, tcp_path=tcp, tcp6_path=tcp6, fd_dir=fd_dir
+    )
+    assert count == 1
+
+
+def test_per_worker_census_vanished_fd_is_skipped_not_raised(tmp_path, monkeypatch):
+    serve_port = 9001
+    serve_hex = f"{serve_port:04X}"
+    inode = 777
+    tcp, tcp6 = _write_proc_tcp_fixture(
+        tmp_path,
+        serve_port=serve_port,
+        rows=[(0, f"0100007F:{serve_hex}", "0100007F:EA60", "01")],
+    )
+    tcp.write_text(
+        textwrap.dedent(
+            f"""
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+               0: 0100007F:{serve_hex} 0100007F:EA60 01 00000000:00000000 00000000:00000000 00000000     0        0 {inode} 1 0000000000000000 20 4 30 10 40
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    fd_dir = tmp_path / "fd"
+    fd_dir.mkdir()
+    (fd_dir / "3").symlink_to(f"socket:[{inode}]")
+    ghost = fd_dir / "4"
+    ghost.symlink_to(f"socket:[{inode}]")
+
+    real_readlink = os.readlink
+
+    def flaky_readlink(path):
+        if Path(path).name == "4":
+            raise OSError("vanished")
+        return real_readlink(path)
+
+    monkeypatch.setattr(os, "readlink", flaky_readlink)
+    count = b1.count_worker_established_to_serve_port(
+        42, serve_port, tcp_path=tcp, tcp6_path=tcp6, fd_dir=fd_dir
+    )
+    assert count == 1
+
+
+def test_per_worker_census_returns_unavailable_on_malformed_proc(tmp_path):
+    tcp = tmp_path / "tcp"
+    tcp6 = tmp_path / "tcp6"
+    tcp.write_text("broken\n", encoding="utf-8")
+    tcp6.write_text("  sl  local rem st\n", encoding="utf-8")
+    fd_dir = tmp_path / "fd"
+    fd_dir.mkdir()
+    assert (
+        b1.count_worker_established_to_serve_port(
+            1, 8080, tcp_path=tcp, tcp6_path=tcp6, fd_dir=fd_dir
+        )
+        == b1.UNAVAILABLE
+    )
+
+
+def test_per_worker_census_returns_unavailable_on_unreadable_proc(tmp_path):
+    missing = tmp_path / "nonexistent_tcp"
+    good = tmp_path / "tcp6"
+    good.write_text("  sl  local rem st\n", encoding="utf-8")
+    fd_dir = tmp_path / "fd"
+    fd_dir.mkdir()
+    assert (
+        b1.count_worker_established_to_serve_port(
+            1, 8080, tcp_path=missing, tcp6_path=good, fd_dir=fd_dir
+        )
+        == b1.UNAVAILABLE
+    )
+
+
+def test_serialize_worker_established_peaks_preserves_pid_order():
+    peaks = [3, 1, 7]
+    assert b1.serialize_worker_established_peaks(peaks) == "3+1+7"
+    assert b1.serialize_worker_established_peaks([1, b1.UNAVAILABLE]) == b1.UNAVAILABLE
+
+
+def test_worker_established_peaks_from_sample_matrix():
+    samples = [
+        [1, 4, 2],
+        [3, 4, 5],
+        [2, 6, 5],
+    ]
+    peaks = b1.worker_established_peaks_from_samples(samples)
+    assert peaks == [3, 6, 5]
+    assert b1.peak_worker_established_from_peaks(peaks) == 6
+    assert b1.peak_worker_established_from_peaks([b1.UNAVAILABLE]) == b1.UNAVAILABLE
+    assert (
+        b1.peak_worker_established_from_peaks([1, b1.UNAVAILABLE])
+        == b1.UNAVAILABLE
+    )
+
+
+def test_per_worker_census_discriminating_pair_against_live_sockets():
+    """Two children: one holds N accepted loopback sockets, one holds none."""
+    n_sockets = 3
+    src = textwrap.dedent(
+        """
+        import socket, sys, time
+        port = int(sys.argv[1])
+        role = sys.argv[2]
+        n = int(sys.argv[3])
+        if role == "acceptor":
+            listener = socket.socket()
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen(n)
+            sys.stdout.write("bound\\n")
+            sys.stdout.flush()
+            held = []
+            for _ in range(n):
+                conn, _addr = listener.accept()
+                held.append(conn)
+            sys.stdout.write("ready\\n")
+            sys.stdout.flush()
+            time.sleep(10)
+        else:
+            time.sleep(10)
+        """
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    acceptor = subprocess.Popen(
+        [sys.executable, "-c", src, str(port), "acceptor", str(n_sockets)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    empty = subprocess.Popen(
+        [sys.executable, "-c", src, str(port), "empty", "0"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    clients: list[socket.socket] = []
+    try:
+        assert acceptor.stdout.readline().strip() == "bound"
+        clients = []
+        for _ in range(n_sockets):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(("127.0.0.1", port))
+            clients.append(s)
+        assert acceptor.stdout.readline().strip() == "ready"
+        time.sleep(0.1)
+        holder_count = b1.count_worker_established_to_serve_port(acceptor.pid, port)
+        empty_count = b1.count_worker_established_to_serve_port(empty.pid, port)
+        assert isinstance(holder_count, int) and holder_count == n_sockets, holder_count
+        assert empty_count == 0, empty_count
+    finally:
+        for s in clients:
+            s.close()
+        acceptor.send_signal(signal.SIGTERM)
+        empty.send_signal(signal.SIGTERM)
+        acceptor.wait(timeout=5)
+        empty.wait(timeout=5)
+
+
 # ---------------------------------------------------------------------------
 # UT-IG-17 — pool census reader (no product server)
 # ---------------------------------------------------------------------------
@@ -801,6 +1252,7 @@ def b1_reference_run():
                     include_sync_warmup=True,
                     on_prologue_complete=_after_prologue,
                     serve_port=port,
+                    worker_pids=sorted(workers_pre),
                 )
             )
             cpu_after = b1.tree_cpu_seconds(proc.pid)
@@ -858,6 +1310,14 @@ def b1_reference_run():
             pool_seen_str = (
                 str(pool_seen) if isinstance(pool_seen, int) else pool_seen
             )
+            worker_peaks = result.worker_established_peaks
+            worker_peaks_str = b1.serialize_worker_established_peaks(worker_peaks)
+            peak_worker_est = result.peak_worker_established
+            peak_worker_est_str = (
+                str(peak_worker_est)
+                if isinstance(peak_worker_est, int)
+                else peak_worker_est
+            )
             fingerprint_line = (
                 f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
                 f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
@@ -877,7 +1337,9 @@ def b1_reference_run():
                 f"shed_probe={shed_probe},"
                 f"peak_pool_connections={peak_pool_conn_str},"
                 f"peak_pool_queued={peak_pool_q_str},"
-                f"pool_connections_seen={pool_seen_str}"
+                f"pool_connections_seen={pool_seen_str},"
+                f"worker_established_peaks={worker_peaks_str},"
+                f"peak_worker_established={peak_worker_est_str}"
             )
             print(fingerprint_line, flush=True)
 
@@ -896,6 +1358,8 @@ def b1_reference_run():
                 "peak_pool_connections": peak_pool_conn,
                 "peak_pool_queued": peak_pool_q,
                 "pool_connections_seen": pool_seen,
+                "worker_established_peaks": worker_peaks,
+                "peak_worker_established": peak_worker_est,
                 "shed_probe": shed_probe,
                 "host": fp,
                 "platform_online": platform_online,

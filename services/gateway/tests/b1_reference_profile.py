@@ -122,6 +122,8 @@ class PhaseResult:
     peak_pool_connections: int | str = UNAVAILABLE
     peak_pool_queued: int | str = UNAVAILABLE
     pool_connections_seen: int | str = UNAVAILABLE
+    worker_established_peaks: list[int | str] = field(default_factory=list)
+    peak_worker_established: int | str = UNAVAILABLE
 
     @property
     def p99(self) -> float:
@@ -164,6 +166,206 @@ def _remote_port_from_proc_address(address: str) -> int | None:
         return None
 
 
+def _local_port_from_proc_address(address: str) -> int | None:
+    if ":" not in address:
+        return None
+    port_hex = address.rsplit(":", 1)[-1]
+    try:
+        return int(port_hex, 16)
+    except ValueError:
+        return None
+
+
+def _inode_from_socket_link(target: str) -> int | None:
+    if not target.startswith("socket:[") or not target.endswith("]"):
+        return None
+    inner = target[len("socket:[") : -1]
+    try:
+        return int(inner)
+    except ValueError:
+        return None
+
+
+def established_serve_port_inodes_from_proc_content(
+    content: str, serve_port: int, *, server_side: bool = True
+) -> set[int]:
+    """Inodes of ESTABLISHED rows on serve_port (server-side: local port match)."""
+    inodes: set[int] = set()
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("sl"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 10:
+            raise ValueError("malformed proc row")
+        local_address = parts[1]
+        state = parts[3]
+        if state != "01":
+            continue
+        if server_side:
+            port = _local_port_from_proc_address(local_address)
+        else:
+            port = _remote_port_from_proc_address(parts[2])
+        if port != serve_port:
+            continue
+        try:
+            inodes.add(int(parts[9]))
+        except ValueError as exc:
+            raise ValueError("malformed proc row") from exc
+    return inodes
+
+
+def read_proc_net_tcp_tables(
+    *,
+    tcp_path: Path | None = None,
+    tcp6_path: Path | None = None,
+) -> tuple[str, str] | str:
+    """Read /proc/net/tcp and /proc/net/tcp6 once; unavailable on any OSError."""
+    tcp_path = tcp_path or Path("/proc/net/tcp")
+    tcp6_path = tcp6_path or Path("/proc/net/tcp6")
+    try:
+        return (
+            tcp_path.read_text(encoding="utf-8"),
+            tcp6_path.read_text(encoding="utf-8"),
+        )
+    except OSError:
+        return UNAVAILABLE
+
+
+def established_serve_port_inodes_from_proc_tables(
+    tcp_text: str, tcp6_text: str, serve_port: int
+) -> set[int] | str:
+    """Server-side ESTABLISHED inodes from pre-read /proc/net/tcp[6] content."""
+    try:
+        inodes = established_serve_port_inodes_from_proc_content(
+            tcp_text, serve_port
+        )
+        inodes |= established_serve_port_inodes_from_proc_content(
+            tcp6_text, serve_port
+        )
+        return inodes
+    except ValueError:
+        return UNAVAILABLE
+
+
+def established_serve_port_inodes(
+    serve_port: int,
+    *,
+    tcp_path: Path | None = None,
+    tcp6_path: Path | None = None,
+) -> set[int] | str:
+    """Server-side ESTABLISHED inodes on serve_port from /proc/net/tcp[6]."""
+    tables = read_proc_net_tcp_tables(tcp_path=tcp_path, tcp6_path=tcp6_path)
+    if tables == UNAVAILABLE:
+        return UNAVAILABLE
+    tcp_text, tcp6_text = tables
+    return established_serve_port_inodes_from_proc_tables(
+        tcp_text, tcp6_text, serve_port
+    )
+
+
+def count_worker_established_from_inodes(
+    pid: int,
+    inodes: set[int] | str,
+    *,
+    fd_dir: Path | None = None,
+) -> int | str:
+    """Per-pid fd walk against a pre-built serve-port inode set (FP-IG-38)."""
+    if inodes == UNAVAILABLE:
+        return UNAVAILABLE
+    assert isinstance(inodes, set)
+    proc_fd = fd_dir or Path(f"/proc/{pid}/fd")
+    try:
+        entries = list(proc_fd.iterdir())
+    except OSError:
+        return UNAVAILABLE
+    matched = 0
+    for entry in entries:
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        inode = _inode_from_socket_link(target)
+        if inode is not None and inode in inodes:
+            matched += 1
+    return matched
+
+
+def count_worker_established_to_serve_port(
+    pid: int,
+    serve_port: int,
+    *,
+    tcp_path: Path | None = None,
+    tcp6_path: Path | None = None,
+    fd_dir: Path | None = None,
+) -> int | str:
+    """Per-pid server-side ESTABLISHED census via /proc/<pid>/fd join (FP-IG-38)."""
+    inodes = established_serve_port_inodes(
+        serve_port, tcp_path=tcp_path, tcp6_path=tcp6_path
+    )
+    return count_worker_established_from_inodes(pid, inodes, fd_dir=fd_dir)
+
+
+def count_per_worker_established_to_serve_port(
+    worker_pids: list[int],
+    serve_port: int,
+    *,
+    tcp_path: Path | None = None,
+    tcp6_path: Path | None = None,
+    tcp_text: str | None = None,
+    tcp6_text: str | None = None,
+    fd_dir_for_pid: Callable[[int], Path] | None = None,
+) -> list[int | str]:
+    """One census sample per worker pid, in the given pid order."""
+    if tcp_text is not None and tcp6_text is not None:
+        inodes = established_serve_port_inodes_from_proc_tables(
+            tcp_text, tcp6_text, serve_port
+        )
+    else:
+        inodes = established_serve_port_inodes(
+            serve_port, tcp_path=tcp_path, tcp6_path=tcp6_path
+        )
+    out: list[int | str] = []
+    for pid in worker_pids:
+        fd_dir = fd_dir_for_pid(pid) if fd_dir_for_pid is not None else None
+        out.append(
+            count_worker_established_from_inodes(pid, inodes, fd_dir=fd_dir)
+        )
+    return out
+
+
+def serialize_worker_established_peaks(peaks: list[int | str]) -> str:
+    """Plus-join per-worker peaks; unavailable if any entry is unavailable."""
+    if not peaks:
+        return UNAVAILABLE
+    if any(not isinstance(p, int) for p in peaks):
+        return UNAVAILABLE
+    return "+".join(str(p) for p in peaks)
+
+
+def peak_worker_established_from_peaks(peaks: list[int | str]) -> int | str:
+    """Maximum of per-worker peaks; unavailable when any peak failed (FP-IG-38)."""
+    if not peaks:
+        return UNAVAILABLE
+    if any(not isinstance(p, int) for p in peaks):
+        return UNAVAILABLE
+    return max(peaks)
+
+
+def worker_established_peaks_from_samples(
+    samples: list[list[int | str]],
+) -> list[int | str]:
+    """Per-worker peak across census ticks."""
+    if not samples:
+        return []
+    n_workers = len(samples[0])
+    peaks: list[int | str] = []
+    for idx in range(n_workers):
+        worker_samples = [row[idx] for row in samples if len(row) > idx]
+        peaks.append(peak_established_from_samples(worker_samples))
+    return peaks
+
+
 def count_established_in_proc_content(content: str, serve_port: int) -> int:
     """Count ESTABLISHED (st 01) rows whose remote port matches serve_port."""
     total = 0
@@ -184,26 +386,34 @@ def count_established_in_proc_content(content: str, serve_port: int) -> int:
     return total
 
 
-def count_established_to_serve_port(
-    serve_port: int,
-    *,
-    tcp_path: Path | None = None,
-    tcp6_path: Path | None = None,
+def count_established_from_proc_tables(
+    tcp_text: str, tcp6_text: str, serve_port: int
 ) -> int | str:
-    """Kernel ESTABLISHED census toward serve_port via /proc file reads (FP-IG-35)."""
-    tcp_path = tcp_path or Path("/proc/net/tcp")
-    tcp6_path = tcp6_path or Path("/proc/net/tcp6")
-    try:
-        tcp_text = tcp_path.read_text(encoding="utf-8")
-        tcp6_text = tcp6_path.read_text(encoding="utf-8")
-    except OSError:
-        return UNAVAILABLE
+    """Aggregate ESTABLISHED census from pre-read /proc/net/tcp[6] content."""
     try:
         return count_established_in_proc_content(
             tcp_text, serve_port
         ) + count_established_in_proc_content(tcp6_text, serve_port)
     except ValueError:
         return UNAVAILABLE
+
+
+def count_established_to_serve_port(
+    serve_port: int,
+    *,
+    tcp_path: Path | None = None,
+    tcp6_path: Path | None = None,
+    tcp_text: str | None = None,
+    tcp6_text: str | None = None,
+) -> int | str:
+    """Kernel ESTABLISHED census toward serve_port via /proc file reads (FP-IG-35)."""
+    if tcp_text is not None and tcp6_text is not None:
+        return count_established_from_proc_tables(tcp_text, tcp6_text, serve_port)
+    tables = read_proc_net_tcp_tables(tcp_path=tcp_path, tcp6_path=tcp6_path)
+    if tables == UNAVAILABLE:
+        return UNAVAILABLE
+    tcp_text, tcp6_text = tables
+    return count_established_from_proc_tables(tcp_text, tcp6_text, serve_port)
 
 
 def peak_established_from_samples(samples: list[int | str]) -> int | str:
@@ -411,6 +621,7 @@ async def run_open_loop(
     include_sync_warmup: bool = True,
     on_prologue_complete: Callable[[], None] | None = None,
     serve_port: int | None = None,
+    worker_pids: list[int] | None = None,
 ) -> PhaseResult:
     """Open-loop generator with due-time latency and unmeasured prologue.
 
@@ -473,12 +684,37 @@ async def run_open_loop(
         pool_conn_samples: list[int | str] = []
         pool_queued_samples: list[int | str] = []
         pool_identity_samples: list[set[int]] = []
+        worker_census_samples: list[list[int | str]] = []
         census_stop = asyncio.Event()
 
         async def _census_sampler() -> None:
             while not census_stop.is_set():
                 if serve_port is not None:
-                    census_samples.append(count_established_to_serve_port(serve_port))
+                    tables = read_proc_net_tcp_tables()
+                    if tables == UNAVAILABLE:
+                        census_samples.append(UNAVAILABLE)
+                        if worker_pids:
+                            worker_census_samples.append(
+                                [UNAVAILABLE] * len(worker_pids)
+                            )
+                    else:
+                        tcp_text, tcp6_text = tables
+                        census_samples.append(
+                            count_established_to_serve_port(
+                                serve_port,
+                                tcp_text=tcp_text,
+                                tcp6_text=tcp6_text,
+                            )
+                        )
+                        if worker_pids:
+                            worker_census_samples.append(
+                                count_per_worker_established_to_serve_port(
+                                    worker_pids,
+                                    serve_port,
+                                    tcp_text=tcp_text,
+                                    tcp6_text=tcp6_text,
+                                )
+                            )
                 if client is not None and transport is None:
                     conn_n, queued_n, seen = read_pool_census_sample(client)
                     pool_conn_samples.append(conn_n)
@@ -571,6 +807,16 @@ async def run_open_loop(
             else UNAVAILABLE
         )
         pool_seen = pool_connections_seen_from_identity_sets(pool_identity_samples)
+        worker_peaks = (
+            worker_established_peaks_from_samples(worker_census_samples)
+            if worker_pids
+            else []
+        )
+        peak_worker_est = (
+            peak_worker_established_from_peaks(worker_peaks)
+            if worker_peaks
+            else UNAVAILABLE
+        )
 
         served = sum(1 for o in outcomes if o == "served")
         errors = n - served
@@ -589,6 +835,8 @@ async def run_open_loop(
             peak_pool_connections=peak_pool_conn,
             peak_pool_queued=peak_pool_q,
             pool_connections_seen=pool_seen,
+            worker_established_peaks=worker_peaks,
+            peak_worker_established=peak_worker_est,
         )
     finally:
         if own_client and client is not None:
