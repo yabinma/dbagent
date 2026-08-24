@@ -5,10 +5,12 @@ via --ignore). Spawns the real gateway under uvicorn against testcontainers PG.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import signal
 import socket
@@ -397,6 +399,424 @@ def test_b1_fingerprint_line_carries_the_per_worker_census(b1_reference_run):
         assert len(peak_parts) == len(workers_pre)
         assert peak_worker_raw.isdigit()
         assert int(peak_worker_raw) == max(peak_parts)
+
+
+def _parse_leg_triple(raw: str) -> tuple[float, float, float]:
+    parts = raw.split("/")
+    assert len(parts) == 3, raw
+    return float(parts[0]), float(parts[1]), float(parts[2])
+
+
+def test_b1_fingerprint_line_decomposes_the_headline_lateness(b1_reference_run):
+    """FP-IG-39: both leg fields present, numeric, wired to this run."""
+    line = b1_reference_run["fingerprint"]
+    result = b1_reference_run["result"]
+
+    split_raw = _parse_b1_env_field(line, "p99_leg_split")
+    p99s_raw = _parse_b1_env_field(line, "leg_p99s")
+    p99_ms_raw = _parse_b1_env_field(line, "p99_ms")
+
+    peak_at = line.index("peak_worker_established=")
+    split_at = line.index("p99_leg_split=")
+    p99s_at = line.index("leg_p99s=")
+    assert peak_at < split_at < p99s_at
+
+    assert "/" in split_raw and split_raw != b1.UNAVAILABLE
+    assert "/" in p99s_raw and p99s_raw != b1.UNAVAILABLE
+    split_vals = _parse_leg_triple(split_raw)
+    p99s_vals = _parse_leg_triple(p99s_raw)
+    assert all(math.isfinite(v) for v in split_vals + p99s_vals)
+
+    assert split_raw == b1.serialize_leg_triple(result.p99_leg_split)
+    assert p99s_raw == b1.serialize_leg_triple(result.leg_p99s)
+
+    for vec in (
+        result.pre_dispatch_slip_ms,
+        result.start_lag_ms,
+        result.attempt_duration_ms,
+    ):
+        assert len(vec) == result.offered
+        assert all(v >= -b1.LEG_SUM_TOLERANCE_MS for v in vec)
+
+    idx = result.p99_index
+    assert idx is not None
+    raw_triple = (
+        result.pre_dispatch_slip_ms[idx],
+        result.start_lag_ms[idx],
+        result.attempt_duration_ms[idx],
+    )
+    assert abs(sum(raw_triple) - result.p99) <= b1.LEG_SUM_TOLERANCE_MS
+    parsed_p99 = float(p99_ms_raw)
+    assert abs(sum(split_vals) - parsed_p99) <= b1.LEG_LINE_TOLERANCE_MS
+
+
+# ---------------------------------------------------------------------------
+# UT-IG-19 — per-request station decomposition (no product server)
+# ---------------------------------------------------------------------------
+
+
+def _stub_payload(event_id: str) -> tuple[bytes, dict[str, str]]:
+    return (
+        json.dumps({"event_id": event_id}).encode(),
+        {"Content-Type": "application/json"},
+    )
+
+
+class _QuantumTransport:
+    """Stub that awaits a pinned quantum, then returns the served class."""
+
+    def __init__(self, quantum_s: float):
+        self.quantum_s = quantum_s
+
+    async def post(self, url, *, content, headers):
+        await asyncio.sleep(self.quantum_s)
+        return 202, b'{"status":"ok"}', None
+
+
+class _HoldThenQuantumTransport:
+    """Attempts 0 and 1 wait on ``release`` then S; later attempts take S."""
+
+    def __init__(self, quantum_s: float, release: asyncio.Event):
+        self.quantum_s = quantum_s
+        self.release = release
+        self._arrivals = 0
+        self.second_arrival = asyncio.Event()
+
+    async def post(self, url, *, content, headers):
+        self._arrivals += 1
+        n = self._arrivals
+        if n <= 2:
+            if n == 2:
+                self.second_arrival.set()
+            await self.release.wait()
+            await asyncio.sleep(self.quantum_s)
+        else:
+            await asyncio.sleep(self.quantum_s)
+        return 202, b'{"status":"ok"}', None
+
+
+@pytest.mark.asyncio
+async def test_leg_derivation_runs_after_window_complete(monkeypatch):
+    """C1 [live path]: CPU-window hook fires before named O(N) derivation."""
+    order: list[str] = []
+    real_derive = b1.derive_leg_vectors
+
+    def _wrapped(*args, **kwargs):
+        order.append("derive")
+        return real_derive(*args, **kwargs)
+
+    monkeypatch.setattr(b1, "derive_leg_vectors", _wrapped)
+    n = 4
+    measured = [_stub_payload(f"w{i}") for i in range(n)]
+    result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=measured,
+        rate=50,
+        transport=_QuantumTransport(1.0 / 50),
+        max_in_flight=n,
+        include_sync_warmup=False,
+        on_window_complete=lambda: order.append("window"),
+    )
+    assert order == ["window", "derive"], order
+    assert len(result.pre_dispatch_slip_ms) == n
+
+
+def test_window_complete_precedes_derivation_in_source():
+    """C1 [live path]: hook call site is before the named derive call."""
+    src = _PROFILE_PATH.read_text(encoding="utf-8")
+    hook_at = src.index("on_window_complete()")
+    derive_at = src.index("= derive_leg_vectors(")
+    assert hook_at < derive_at
+
+
+def test_b1_fixture_samples_cpu_after_on_window_complete():
+    """C1 [consumer path]: cpu_after is the hook sample, not a post-return read."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    hook = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_after_window":
+            hook = node
+    assert hook is not None
+    hook_src = ast.get_source_segment(src, hook)
+    assert hook_src is not None
+    assert "tree_cpu_seconds" in hook_src
+    assert "cpu_after" in hook_src
+
+    hooked = False
+    cpu_after_from_marks = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if (
+                    kw.arg == "on_window_complete"
+                    and isinstance(kw.value, ast.Name)
+                    and kw.value.id == "_after_window"
+                ):
+                    hooked = True
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "cpu_after"
+        ):
+            seg = ast.get_source_segment(src, node)
+            assert seg is not None
+            assert "tree_cpu_seconds" not in seg
+            assert "marks" in seg
+            cpu_after_from_marks = True
+    assert hooked
+    assert cpu_after_from_marks
+
+
+@pytest.mark.asyncio
+async def test_ut_ig19_leg_reconciliation():
+    """UT-IG-19 (1) [live path]: per-request sum identity against a quantum stub."""
+    rate = 50
+    delta_s = 1.0 / rate
+    quantum_s = 2 * delta_s
+    n = 8
+    measured = [_stub_payload(f"m{i}") for i in range(n)]
+    result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=measured,
+        rate=rate,
+        transport=_QuantumTransport(quantum_s),
+        max_in_flight=n,
+        include_sync_warmup=False,
+    )
+    quantum_ms = quantum_s * 1000.0
+    assert len(result.pre_dispatch_slip_ms) == n
+    for i in range(n):
+        total = (
+            result.pre_dispatch_slip_ms[i]
+            + result.start_lag_ms[i]
+            + result.attempt_duration_ms[i]
+        )
+        assert abs(total - result.latencies_ms[i]) <= b1.LEG_SUM_TOLERANCE_MS
+        assert result.attempt_duration_ms[i] >= quantum_ms
+        assert result.pre_dispatch_slip_ms[i] >= -b1.LEG_SUM_TOLERANCE_MS
+
+
+@pytest.mark.asyncio
+async def test_ut_ig19_gate_placement():
+    """UT-IG-19 (2) [live path]: d_i is after the gate; hold-run is sync-based."""
+    delta_s = 20 * (10**-3)
+    rate = int(round(1.0 / delta_s))
+    assert abs(1.0 / rate - delta_s) < 1e-12
+    k = 10
+    quantum_s = k * delta_s
+    n = 8
+    measured = [_stub_payload(f"g{i}") for i in range(n)]
+    result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=measured,
+        rate=rate,
+        transport=_QuantumTransport(quantum_s),
+        max_in_flight=2,
+        include_sync_warmup=False,
+    )
+    for i in range(2, n):
+        bound = (math.floor(i / 2) * quantum_s - i * delta_s) * 1000.0
+        if bound > 0:
+            assert result.pre_dispatch_slip_ms[i] >= bound - b1.LEG_SUM_TOLERANCE_MS
+
+    release = asyncio.Event()
+    hold = _HoldThenQuantumTransport(quantum_s, release)
+    hold_n = 4
+    hold_measured = [_stub_payload(f"h{i}") for i in range(hold_n)]
+
+    async def _release_after_second_arrival() -> None:
+        await hold.second_arrival.wait()
+        await asyncio.sleep(2 * delta_s)
+        release.set()
+
+    releaser = asyncio.create_task(_release_after_second_arrival())
+    hold_result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=hold_measured,
+        rate=rate,
+        transport=hold,
+        max_in_flight=2,
+        include_sync_warmup=False,
+    )
+    await releaser
+    lower = min(
+        hold_result.latencies_ms[0] - 2 * delta_s * 1000.0,
+        hold_result.latencies_ms[1] - delta_s * 1000.0,
+    )
+    assert hold_result.pre_dispatch_slip_ms[2] >= lower - b1.LEG_SUM_TOLERANCE_MS
+
+
+def test_ut_ig19_summary_evaluator():
+    """UT-IG-19 (3) [evaluator]: identity split ≠ per-leg p99s; tie → smallest index."""
+    n = 100
+    slip = [0.5] * n
+    lag = [0.3] * n
+    attempt = [0.2] * n
+    latencies = [1.0] * n
+    # Three-way tie at the p99 rank (sorted[98] = 100.0); smallest index wins.
+    latencies[10] = latencies[50] = latencies[80] = 100.0
+    slip[10], lag[10], attempt[10] = 11.0, 22.0, 67.0
+    slip[50], lag[50], attempt[50] = 6.0, 8.0, 86.0
+    slip[80], lag[80], attempt[80] = 7.0, 9.0, 84.0
+    expected = {
+        "p99_index": 10,
+        "split": (11.0, 22.0, 67.0),
+        "leg_p99s": (7.0, 9.0, 84.0),
+    }
+    values = (
+        expected["split"] + expected["leg_p99s"] + (float(expected["p99_index"]),)
+    )
+    assert len(set(values)) == 7
+
+    idx = b1.p99_index_of(latencies)
+    split = b1.p99_leg_split_of(latencies, slip, lag, attempt)
+    per_leg = b1.leg_p99s_of(slip, lag, attempt)
+    assert idx == expected["p99_index"]
+    assert split == expected["split"]
+    assert per_leg == expected["leg_p99s"]
+    assert split != per_leg
+
+
+def _is_idx_range_guard(node: ast.AST) -> bool:
+    """True iff ``node`` is the compare ``0 <= idx < n``."""
+    if not isinstance(node, ast.Compare) or len(node.ops) != 2:
+        return False
+    return (
+        isinstance(node.left, ast.Constant)
+        and node.left.value == 0
+        and isinstance(node.ops[0], ast.LtE)
+        and isinstance(node.ops[1], ast.Lt)
+        and isinstance(node.comparators[0], ast.Name)
+        and node.comparators[0].id == "idx"
+        and isinstance(node.comparators[1], ast.Name)
+        and node.comparators[1].id == "n"
+    )
+
+
+def _is_attempt_at_idx_store(node: ast.AST) -> bool:
+    """True iff ``node`` assigns to ``attempt_at[idx]``."""
+    if not isinstance(node, ast.Assign):
+        return False
+    for target in node.targets:
+        if (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "attempt_at"
+            and isinstance(target.slice, ast.Name)
+            and target.slice.id == "idx"
+        ):
+            return True
+    return False
+
+
+def _one_records_c_i_behind_idx_guard(src: str) -> bool:
+    """True iff nested ``_one`` stores ``attempt_at[idx]`` only under ``0 <= idx < n``.
+
+    Every matching assignment must sit inside that guard's body; a matching
+    compare anywhere in ``_one`` is not enough, and an unguarded store fails.
+    """
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef) or node.name != "_one":
+            continue
+        stores: list[ast.Assign] = []
+        guards: list[ast.If] = []
+        for child in ast.walk(node):
+            if _is_attempt_at_idx_store(child):
+                stores.append(child)
+            if isinstance(child, ast.If) and _is_idx_range_guard(child.test):
+                guards.append(child)
+        if not stores:
+            return False
+        guarded_ids: set[int] = set()
+        for guard in guards:
+            for stmt in guard.body:
+                for inner in ast.walk(stmt):
+                    guarded_ids.add(id(inner))
+        return all(id(store) in guarded_ids for store in stores)
+    return False
+
+
+def test_ut_ig19_idx_guard_rejects_assignment_outside_compare():
+    """W2: a matching ``0 <= idx < n`` anywhere in ``_one`` is not enough."""
+    unguarded = textwrap.dedent(
+        """
+        async def _one(idx, raw, headers):
+            if 0 <= idx < n:
+                pass
+            attempt_at[idx] = time.perf_counter()
+        """
+    )
+    guarded = textwrap.dedent(
+        """
+        async def _one(idx, raw, headers):
+            if 0 <= idx < n:
+                attempt_at[idx] = time.perf_counter()
+        """
+    )
+    assert _one_records_c_i_behind_idx_guard(unguarded) is False
+    assert _one_records_c_i_behind_idx_guard(guarded) is True
+
+
+@pytest.mark.asyncio
+async def test_ut_ig19_negative_index_guard():
+    """UT-IG-19 (4) [live path]: warmup/prologue never write a measured slot."""
+    src = _PROFILE_PATH.read_text(encoding="utf-8")
+    assert _one_records_c_i_behind_idx_guard(src)
+    assert "complete_at" not in src
+    rate = 50
+    n = 3
+    measured = [_stub_payload(f"n{i}") for i in range(n)]
+    warmup = _stub_payload("warm")
+    prologue = [_stub_payload("p0"), _stub_payload("p1")]
+    result = await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=measured,
+        rate=rate,
+        transport=_QuantumTransport(1.0 / rate),
+        max_in_flight=n,
+        warmup=warmup,
+        prologue=prologue,
+        include_sync_warmup=True,
+    )
+    assert len(result.pre_dispatch_slip_ms) == n
+    assert len(result.start_lag_ms) == n
+    assert len(result.attempt_duration_ms) == n
+    assert len(result.latencies_ms) == n
+    for i in range(n):
+        due_i = result.due0 + i / rate
+        d_i = due_i + result.pre_dispatch_slip_ms[i] / 1000.0
+        c_i = d_i + result.start_lag_ms[i] / 1000.0
+        assert c_i >= d_i - 1e-12
+        assert d_i >= result.t0 - 1e-12
+
+
+def test_ut_ig19_serializer_round_trip():
+    """UT-IG-19 (5) [consumer path]: :.3f width and the two-tolerance boundary."""
+    assert b1.LEG_SUM_TOLERANCE_MS == 1e-6
+    assert b1.LEG_LINE_TOLERANCE_MS == (
+        3 * (10**-3) / 2 + (10**-1) / 2 + b1.LEG_SUM_TOLERANCE_MS
+    )
+    triple = (1.234567, 2.345678, 3.456789)
+    rendered = b1.serialize_leg_triple(triple)
+    assert rendered == f"{triple[0]:.3f}/{triple[1]:.3f}/{triple[2]:.3f}"
+    parts = rendered.split("/")
+    assert all(len(p.split(".")[1]) == 3 for p in parts)
+    parsed = _parse_leg_triple(rendered)
+    assert parsed == (float(f"{triple[0]:.3f}"), float(f"{triple[1]:.3f}"), float(f"{triple[2]:.3f}"))
+
+    # Each raw leg sits just above the :.3f half-ulp so format rounds upward.
+    raw_legs = (1.0005001, 2.0005001, 3.0005001)
+    assert all(float(f"{leg:.3f}") > leg for leg in raw_legs)
+    line_split = b1.serialize_leg_triple(raw_legs)
+    parsed_split = _parse_leg_triple(line_split)
+    raw_p99 = sum(raw_legs)
+    parsed_p99 = float(f"{raw_p99:.1f}")
+    parsed_sum = sum(parsed_split)
+    assert abs(parsed_sum - parsed_p99) <= b1.LEG_LINE_TOLERANCE_MS
+    assert abs(parsed_sum - parsed_p99) > b1.LEG_SUM_TOLERANCE_MS
 
 
 # ---------------------------------------------------------------------------
@@ -1241,6 +1661,12 @@ def b1_reference_run():
                     )
                 engine_p.dispose()
 
+            def _after_window() -> None:
+                # Close the gateway CPU interval at drain/census stop, before
+                # O(N) leg derivation. Meaning of cpu_after is unchanged: end
+                # of the measured window, not end of post-window arithmetic.
+                marks["cpu_after"] = b1.tree_cpu_seconds(proc.pid)
+
             result = asyncio.run(
                 b1.run_open_loop(
                     endpoint=endpoint,
@@ -1251,11 +1677,12 @@ def b1_reference_run():
                     prologue=prologue,
                     include_sync_warmup=True,
                     on_prologue_complete=_after_prologue,
+                    on_window_complete=_after_window,
                     serve_port=port,
                     worker_pids=sorted(workers_pre),
                 )
             )
-            cpu_after = b1.tree_cpu_seconds(proc.pid)
+            cpu_after = float(marks["cpu_after"])
             trackers_post, workers_post = b1.classify_tree(proc.pid)
             shed_probe = asyncio.run(
                 b1.run_shed_probe("127.0.0.1", port)
@@ -1318,6 +1745,8 @@ def b1_reference_run():
                 if isinstance(peak_worker_est, int)
                 else peak_worker_est
             )
+            p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
+            leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
             fingerprint_line = (
                 f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
                 f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
@@ -1339,7 +1768,9 @@ def b1_reference_run():
                 f"peak_pool_queued={peak_pool_q_str},"
                 f"pool_connections_seen={pool_seen_str},"
                 f"worker_established_peaks={worker_peaks_str},"
-                f"peak_worker_established={peak_worker_est_str}"
+                f"peak_worker_established={peak_worker_est_str},"
+                f"p99_leg_split={p99_leg_split_str},"
+                f"leg_p99s={leg_p99s_str}"
             )
             print(fingerprint_line, flush=True)
 
@@ -1360,6 +1791,8 @@ def b1_reference_run():
                 "pool_connections_seen": pool_seen,
                 "worker_established_peaks": worker_peaks,
                 "peak_worker_established": peak_worker_est,
+                "p99_leg_split": result.p99_leg_split,
+                "leg_p99s": result.leg_p99s,
                 "shed_probe": shed_probe,
                 "host": fp,
                 "platform_online": platform_online,

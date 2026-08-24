@@ -38,6 +38,19 @@ PROBE_SLACK = 8
 # → 4 × 149 + 1 + 8 = 605; pigeonhole minimum 597.
 UNAVAILABLE = "unavailable"
 
+# Float-identity tolerance from double-precision ulps at the magnitudes
+# involved, never a behavioural allowance. Binds PhaseResult's own vectors
+# and LV-1's full-precision JSON; never values parsed back from the
+# fingerprint line.
+LEG_SUM_TOLERANCE_MS = 1e-6
+# Formatting-quantization bound, never a behavioural allowance: the two
+# pinned format widths' half-ulps plus the raw-vector tolerance. Three
+# :.3f legs contribute 3*(10**-3)/2; the :.1f p99_ms contributes
+# (10**-1)/2. An expression over the widths, never a re-typed literal.
+LEG_LINE_TOLERANCE_MS = (
+    3 * (10**-3) / 2 + (10**-1) / 2 + LEG_SUM_TOLERANCE_MS
+)
+
 
 class Transport(Protocol):
     async def post(
@@ -90,6 +103,83 @@ def nearest_rank_p99(samples: list[float]) -> float:
     return ordered[min(idx, len(ordered) - 1)]
 
 
+def p99_index_of(latencies: list[float]) -> int | None:
+    """Smallest request index whose lateness equals the nearest-rank p99."""
+    if not latencies:
+        return None
+    target = nearest_rank_p99(latencies)
+    for i, value in enumerate(latencies):
+        if value == target:
+            return i
+    return None
+
+
+def p99_leg_split_of(
+    latencies: list[float],
+    pre_dispatch_slip_ms: list[float],
+    start_lag_ms: list[float],
+    attempt_duration_ms: list[float],
+) -> tuple[float, float, float]:
+    """Identity-aligned triple of the p99-index request (FP-IG-39)."""
+    idx = p99_index_of(latencies)
+    if (
+        idx is None
+        or idx >= len(pre_dispatch_slip_ms)
+        or idx >= len(start_lag_ms)
+        or idx >= len(attempt_duration_ms)
+    ):
+        inf = float("inf")
+        return (inf, inf, inf)
+    return (
+        pre_dispatch_slip_ms[idx],
+        start_lag_ms[idx],
+        attempt_duration_ms[idx],
+    )
+
+
+def leg_p99s_of(
+    pre_dispatch_slip_ms: list[float],
+    start_lag_ms: list[float],
+    attempt_duration_ms: list[float],
+) -> tuple[float, float, float]:
+    """Three separate nearest-rank p99s; never a decomposition."""
+    return (
+        nearest_rank_p99(pre_dispatch_slip_ms),
+        nearest_rank_p99(start_lag_ms),
+        nearest_rank_p99(attempt_duration_ms),
+    )
+
+
+def serialize_leg_triple(values: tuple[float, float, float]) -> str:
+    """Pinned :.3f triple for p99_leg_split / leg_p99s (FP-IG-39)."""
+    a, b, c = values
+    return f"{a:.3f}/{b:.3f}/{c:.3f}"
+
+
+def derive_leg_vectors(
+    latencies_ms: list[float],
+    dispatch_at: list[float],
+    attempt_at: list[float],
+    *,
+    due0: float,
+    rate: float,
+) -> tuple[list[float], list[float], list[float]]:
+    """Post-window three-leg derivation (FP-IG-39). Called only after the
+    measurement window is closed — never inside a recorded CPU interval.
+    """
+    n = len(latencies_ms)
+    pre_dispatch_slip_ms = [0.0] * n
+    start_lag_ms = [0.0] * n
+    attempt_duration_ms = [0.0] * n
+    for i in range(n):
+        due_i = due0 + i / rate
+        pre_dispatch_slip_ms[i] = (dispatch_at[i] - due_i) * 1000.0
+        start_lag_ms[i] = (attempt_at[i] - dispatch_at[i]) * 1000.0
+        # t_resp lives in latencies[i] = (t_resp - due_i) * 1000; no third store.
+        attempt_duration_ms[i] = latencies_ms[i] - (attempt_at[i] - due_i) * 1000.0
+    return pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms
+
+
 def half_window_medians(latencies: list[float]) -> tuple[float, float]:
     n = len(latencies)
     if n == 0:
@@ -124,10 +214,34 @@ class PhaseResult:
     pool_connections_seen: int | str = UNAVAILABLE
     worker_established_peaks: list[int | str] = field(default_factory=list)
     peak_worker_established: int | str = UNAVAILABLE
+    pre_dispatch_slip_ms: list[float] = field(default_factory=list)
+    start_lag_ms: list[float] = field(default_factory=list)
+    attempt_duration_ms: list[float] = field(default_factory=list)
 
     @property
     def p99(self) -> float:
         return nearest_rank_p99(self.latencies_ms)
+
+    @property
+    def p99_index(self) -> int | None:
+        return p99_index_of(self.latencies_ms)
+
+    @property
+    def p99_leg_split(self) -> tuple[float, float, float]:
+        return p99_leg_split_of(
+            self.latencies_ms,
+            self.pre_dispatch_slip_ms,
+            self.start_lag_ms,
+            self.attempt_duration_ms,
+        )
+
+    @property
+    def leg_p99s(self) -> tuple[float, float, float]:
+        return leg_p99s_of(
+            self.pre_dispatch_slip_ms,
+            self.start_lag_ms,
+            self.attempt_duration_ms,
+        )
 
     @property
     def served_rate(self) -> float:
@@ -620,6 +734,7 @@ async def run_open_loop(
     warmup: tuple[bytes, dict[str, str]] | None = None,
     include_sync_warmup: bool = True,
     on_prologue_complete: Callable[[], None] | None = None,
+    on_window_complete: Callable[[], None] | None = None,
     serve_port: int | None = None,
     worker_pids: list[int] | None = None,
 ) -> PhaseResult:
@@ -640,10 +755,19 @@ async def run_open_loop(
     if own_client:
         client = build_httpx_client(max_connections=max_in_flight)
 
+    # Per-request stations (FP-IG-39). Preallocated length-n; stores guarded
+    # so warmup (idx = -1) and prologue (idx <= -2) never write a measured slot.
+    # AW licenses two timestamp reads and two list stores; t_resp is already
+    # represented by latencies[idx], so the third leg is derived after drain.
+    dispatch_at = [0.0] * n
+    attempt_at = [0.0] * n
+
     async def _one(
         idx: int, raw: bytes, headers: dict[str, str]
     ) -> tuple[int, int | None, bytes | None, BaseException | None, float]:
         try:
+            if 0 <= idx < n:
+                attempt_at[idx] = time.perf_counter()
             if transport is not None:
                 code, body, err = await transport.post(
                     endpoint, content=raw, headers=headers
@@ -768,6 +892,8 @@ async def run_open_loop(
                 for t in done:
                     await _on_done(t)
             raw, headers = requests[i]
+            if 0 <= i < n:
+                dispatch_at[i] = time.perf_counter()
             task = asyncio.create_task(_one(i, raw, headers))
             pending.add(task)
             # Dispatch peak: incremented at create_task, before pool/socket
@@ -791,6 +917,10 @@ async def run_open_loop(
         if census_task is not None:
             census_stop.set()
             await census_task
+        # Window is closed. Any recorded quantity of the measured interval
+        # (CPU included) must be sampled here, before O(N) leg arithmetic.
+        if on_window_complete is not None:
+            on_window_complete()
         peak_census = (
             peak_established_from_samples(census_samples)
             if serve_port is not None
@@ -820,6 +950,13 @@ async def run_open_loop(
 
         served = sum(1 for o in outcomes if o == "served")
         errors = n - served
+        pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(
+            latencies,
+            dispatch_at,
+            attempt_at,
+            due0=due0,
+            rate=rate,
+        )
         return PhaseResult(
             offered=n,
             served=served,
@@ -837,6 +974,9 @@ async def run_open_loop(
             pool_connections_seen=pool_seen,
             worker_established_peaks=worker_peaks,
             peak_worker_established=peak_worker_est,
+            pre_dispatch_slip_ms=pre_dispatch_slip_ms,
+            start_lag_ms=start_lag_ms,
+            attempt_duration_ms=attempt_duration_ms,
         )
     finally:
         if own_client and client is not None:
