@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -397,6 +398,104 @@ func TestExecute_PrestoListQueries_Since(t *testing.T) {
 	}
 	if !ids["q-finished-old"] {
 		t.Fatalf("1d window must include older terminal row, got ids=%v", keysOfBool(ids))
+	}
+}
+
+func TestParseSinceDuration_Representability(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{value: "9223372035s", want: 9223372035 * time.Second},
+		{value: "9223372036s", want: 9223372036 * time.Second},
+		{value: "9223372037s", wantErr: true},
+		{value: "153722866m", want: 153722866 * time.Minute},
+		{value: "153722867m", want: 153722867 * time.Minute},
+		{value: "153722868m", wantErr: true},
+		{value: "2562046h", want: 2562046 * time.Hour},
+		{value: "2562047h", want: 2562047 * time.Hour},
+		{value: "2562048h", wantErr: true},
+		{value: "106750d", want: 106750 * 24 * time.Hour},
+		{value: "106751d", want: 106751 * 24 * time.Hour},
+		{value: "106752d", wantErr: true},
+		{value: "200000d", wantErr: true},
+		{value: "213504d", wantErr: true},
+		{value: "9223372036854775807s", wantErr: true},
+		{value: "9223372036854775808d", wantErr: true},
+		{value: "0s", want: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.value, func(t *testing.T) {
+			got, err := parseSinceDuration(tc.value)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "representable range") {
+					t.Fatalf("parseSinceDuration(%q) error=%v, want representable-range error", tc.value, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("parseSinceDuration(%q)=(%v, %v), want (%v, nil)", tc.value, got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecute_PrestoListQueries_SinceRepresentability(t *testing.T) {
+	for _, tc := range []struct {
+		value    string
+		accepted bool
+	}{
+		{value: "9223372035s", accepted: true},
+		{value: "9223372036s", accepted: true},
+		{value: "9223372037s"},
+		{value: "153722866m", accepted: true},
+		{value: "153722867m", accepted: true},
+		{value: "153722868m"},
+		{value: "2562046h", accepted: true},
+		{value: "2562047h", accepted: true},
+		{value: "2562048h"},
+		{value: "106750d", accepted: true},
+		{value: "106751d", accepted: true},
+		{value: "106752d"},
+		{value: "200000d"},
+		{value: "213504d"},
+		{value: "9223372036854775807s"},
+		{value: "9223372036854775808d"},
+		{value: "0s", accepted: true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			var requests atomic.Int32
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/info", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"nodeVersion":{"version":"0.298"}}`))
+			})
+			mux.HandleFunc("/v1/query", func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				_, _ = w.Write([]byte(`[]`))
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			a, _ := detectedAdapter(t, srv, platform.EnvKindK8s)
+
+			result, err := a.Execute(context.Background(), platform.ToolCall{
+				ToolName: "presto_list_queries",
+				Args:     map[string]any{"since": tc.value},
+			})
+			if err != nil {
+				t.Fatalf("Execute returned transport error: %v", err)
+			}
+			if tc.accepted {
+				if result.ExitCode != 0 || result.Error != "" || result.Data == nil || requests.Load() != 1 {
+					t.Fatalf("accepted input returned %+v with %d requests", result, requests.Load())
+				}
+				return
+			}
+			if result.ExitCode != 1 || result.Data != nil || requests.Load() != 0 ||
+				!strings.Contains(result.Error, "representable range") {
+				t.Fatalf("rejected input returned %+v with %d requests", result, requests.Load())
+			}
+		})
 	}
 }
 

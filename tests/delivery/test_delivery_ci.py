@@ -1,6 +1,8 @@
 """FP-M6-18a/18b: CI on: block and images/e2e jobs."""
 from __future__ import annotations
 
+import ast
+import builtins
 import copy
 import posixpath
 import re
@@ -11,6 +13,17 @@ import pytest
 import yaml
 
 from delivery_helpers import CI_YML, REPO_ROOT
+
+
+_TEMPORAL_TEST_ROOTS = {
+    "services/worker/tests",
+    "services/gateway/tests",
+    "services/dashboard-api/tests",
+    "libs/py/rca_common/tests",
+    "tests/functional",
+    "tests/benchmark",
+    "tests/delivery",
+}
 
 
 def _load():
@@ -380,6 +393,99 @@ def _pytest_invocations(run: str) -> list[tuple[list[str], list[str]]]:
             out.append((roots, ignores))
             i = j
     return out
+
+
+def test_temporal_workflow_environment_starters_are_enumerated():
+    workflow = _load()
+    roots: set[str] = set()
+    for job_name, job in (workflow.get("jobs") or {}).items():
+        if not (
+            job_name.startswith("unit-")
+            or job_name in {"functional", "benchmark"}
+        ):
+            continue
+        for step in job.get("steps") or []:
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            workdir = _step_working_directory(job, step)
+            for positional, _ignores in _pytest_invocations(run):
+                for root in positional:
+                    resolved = _resolve_against_workdir(root, workdir)
+                    if resolved == "tests/mocks/llm":
+                        continue
+                    if resolved.endswith(".py"):
+                        resolved = posixpath.dirname(resolved)
+                    roots.add(resolved.rstrip("/"))
+
+    assert roots == _TEMPORAL_TEST_ROOTS
+
+    starters: set[str] = set()
+    for rel_root in sorted(roots):
+        for path in sorted((REPO_ROOT / rel_root).rglob("*.py")):
+            if ".venv" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr.startswith("start_")
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "WorkflowEnvironment"
+                ):
+                    starters.add(func.attr)
+
+    assert starters == {"start_local", "start_time_skipping"}
+
+
+def test_dashboard_api_pg_fixture_fails_closed_without_testcontainers(
+    monkeypatch,
+):
+    fixture_path = REPO_ROOT / "services" / "dashboard-api" / "tests" / "conftest.py"
+    source = fixture_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(fixture_path))
+    fixture = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "pg_dsn"
+    )
+
+    skip_calls = [
+        node
+        for node in ast.walk(fixture)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "skip"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pytest"
+    ]
+    assert not skip_calls, (
+        "dashboard-api pg_dsn must not skip when testcontainers is absent"
+    )
+
+    executable = copy.deepcopy(fixture)
+    executable.decorator_list = []
+    module = ast.fix_missing_locations(ast.Module(body=[executable], type_ignores=[]))
+    namespace = {"pytest": pytest}
+    exec(compile(module, str(fixture_path), "exec"), namespace)
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "testcontainers.postgres":
+            raise ImportError("blocked by delivery guard")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    with pytest.raises(
+        pytest.fail.Exception,
+        match="testcontainers is required for dashboard-api acceptance tests",
+    ):
+        next(namespace["pg_dsn"]())
 
 
 def _jobs_collecting(
@@ -889,4 +995,3 @@ def test_pytest_invocations_does_not_split_on_quoted_separator():
     )
     assert semicolon == [(["tests/delivery"], [])]
     assert ampersand == [(["tests/delivery"], [])]
-

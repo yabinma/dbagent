@@ -1,8 +1,8 @@
-"""Unit-test fixtures for dashboard-api (ephemeral PG when available, else skip).
+"""Acceptance-test fixtures for dashboard-api (ephemeral PG is required).
 
-Most unit tests use an in-process SQLite-incompatible path: real Postgres via
-testcontainers when Docker is available; otherwise a lightweight mock session
-is used for pure auth/JWT tests.
+The database-backed tests use real Postgres via testcontainers. Pure auth/JWT
+tests may use lightweight mock sessions, but this fixture fails closed when its
+required integration dependency is unavailable.
 """
 from __future__ import annotations
 
@@ -57,7 +57,10 @@ def pg_dsn():
     try:
         from testcontainers.postgres import PostgresContainer
     except Exception:
-        pytest.skip("testcontainers not available")
+        pytest.fail(
+            "testcontainers is required for dashboard-api acceptance tests",
+            pytrace=False,
+        )
     with PostgresContainer(
         "postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent"
     ) as pg:
@@ -133,5 +136,4 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
-
 

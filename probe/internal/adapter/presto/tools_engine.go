@@ -2,7 +2,9 @@ package presto
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -259,21 +261,32 @@ func parseSinceDuration(s string) (time.Duration, error) {
 	unit := s[len(s)-1]
 	numStr := s[:len(s)-1]
 	n, err := strconv.ParseInt(numStr, 10, 64)
-	if err != nil || n < 0 {
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("duration exceeds representable range")
+		}
 		return 0, fmt.Errorf("expected ^\\d+[smhd]$")
 	}
+	if n < 0 {
+		return 0, fmt.Errorf("expected ^\\d+[smhd]$")
+	}
+	var durationUnit time.Duration
 	switch unit {
 	case 's':
-		return time.Duration(n) * time.Second, nil
+		durationUnit = time.Second
 	case 'm':
-		return time.Duration(n) * time.Minute, nil
+		durationUnit = time.Minute
 	case 'h':
-		return time.Duration(n) * time.Hour, nil
+		durationUnit = time.Hour
 	case 'd':
-		return time.Duration(n) * 24 * time.Hour, nil
+		durationUnit = 24 * time.Hour
 	default:
 		return 0, fmt.Errorf("expected ^\\d+[smhd]$")
 	}
+	if n > math.MaxInt64/int64(durationUnit) {
+		return 0, fmt.Errorf("duration exceeds representable range")
+	}
+	return time.Duration(n) * durationUnit, nil
 }
 
 func isTerminalQueryState(state string) bool {
