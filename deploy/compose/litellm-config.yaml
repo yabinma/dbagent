@@ -1,0 +1,27 @@
+# Example LiteLLM Proxy config for local dev (design.md Section 7 / Appendix
+# E `models`). Points at whatever local/dev backend you have available;
+# adjust before real use. Not exercised by any automated test (the M1
+# functional test targets `LiteLLMHTTPBackend` at the mock LLM server
+# directly -- see tests/functional/test_m1_foundation.py's module
+# docstring for why). `os.environ/VAR_NAME` is LiteLLM's own documented
+# syntax for pulling a value from the process environment at proxy
+# start-up (https://docs.litellm.ai/docs/proxy/configs) -- set the
+# corresponding env vars (or edit the values below directly) before
+# running `docker compose -f deploy/compose/control-plane.yml up`.
+model_list:
+  - model_name: ollama/qwen2.5:14b
+    litellm_params:
+      model: ollama/qwen2.5:14b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  - model_name: mock/demo-model
+    litellm_params:
+      model: openai/mock-demo-model
+      api_base: os.environ/MOCK_LLM_URL
+      api_key: os.environ/MOCK_LLM_API_KEY
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -1,0 +1,14 @@
+{
+  "proposed_actions": [
+    {
+      "kind": "playbook",
+      "playbook_id": "presto.kill_query",
+      "playbook_params": {
+        "query_id": "${query_id}"
+      },
+      "risk_level": "R2",
+      "description": "kill the runaway query"
+    }
+  ],
+  "rca_compact": "kill runaway"
+}

@@ -1,0 +1,15 @@
+postgres_dsn: ${PG_DSN}
+max_db_conns: 10
+session_listen_addr: ":8443"
+bootstrap_listen_addr: ":8444"
+internal_listen_addr: ":8080"
+signing_public_key_path: /etc/dbagent/signing/ed25519.key.pub
+bootstrap_ca_cert_path: /etc/dbagent/probe-gateway-ca/bootstrap-ca.crt
+bootstrap_ca_key_path: /etc/dbagent/probe-gateway-ca/bootstrap-ca.key
+server_cert_sans:
+  - probe-gateway
+  - localhost
+gateway_replica: probe-gateway-0
+heartbeat_timeout: 60s
+heartbeat_check_interval: 15s
+signing_key_poll_interval: 30s

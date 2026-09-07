@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: presto-coordinator
+  labels: { app: presto, role: coordinator }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: presto, role: coordinator }
+  template:
+    metadata:
+      labels: { app: presto, role: coordinator }
+    spec:
+      containers:
+        - name: presto
+          image: prestodb/presto:0.298
+          ports:
+            - containerPort: 8080
+          # Sized for -Xmx1G heap + off-heap/native headroom. Without
+          # resources the pod is BestEffort QoS and is first starved under
+          # node pressure on a 4-vCPU CI runner. No limits.cpu so the JVM
+          # can still burst free cores during startup (rollout timeouts).
+          resources:
+            requests: { cpu: 100m, memory: 1536Mi }
+            limits: { memory: 2Gi }
+          volumeMounts:
+            - name: config
+              mountPath: /opt/presto-server/etc/config.properties
+              subPath: config.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/jvm.config
+              subPath: jvm.config
+            - name: config
+              mountPath: /opt/presto-server/etc/node.properties
+              subPath: node.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/log.properties
+              subPath: log.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/catalog/tpch.properties
+              subPath: catalog_tpch.properties
+            # E3 (Section 13.5) constrains concurrency by switching to the file
+            # resource-group manager, which reads this file. Mounted
+            # unconditionally; inert until selected.
+            - name: config
+              mountPath: /opt/presto-server/etc/resource-groups.json
+              subPath: resource_groups.json
+            # resource-groups.properties is NOT mounted by default. Presto 0.298
+            # hard-fails if the file exists without
+            # resource-groups.configuration-manager. E3 adds the mount when it
+            # injects the fault (see test_e2e_scenarios.py).
+          readinessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            # D2: require consecutive successes so a crashlooping coordinator
+            # cannot pass the Ready gate during the brief window where /v1/info
+            # serves before the config check kills the process.
+            successThreshold: 3
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+      volumes:
+        - name: config
+          configMap:
+            name: presto-coordinator-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: presto-coordinator
+spec:
+  selector: { app: presto, role: coordinator }
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30880
+  type: NodePort

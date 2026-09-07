@@ -1,0 +1,12 @@
+platformKey: presto-e2e
+gatewayAddress: dbagent-probe-gateway:8443
+bootstrapAddress: dbagent-probe-gateway:8444
+# Overridden at install time by run.sh via --set bootstrapToken=<issued token>.
+bootstrapToken: ""
+writeEnabled: true
+coordinatorLocator: app=presto,role=coordinator
+namespace: dbagent
+image:
+  registry: ghcr.io/yabinma/dbagent
+  name: probe
+  tag: "0.1.0"

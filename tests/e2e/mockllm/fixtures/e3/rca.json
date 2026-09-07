@@ -1,0 +1,1 @@
+{"status":"concluded","confidence":0.88,"root_cause":{"category":"capacity","summary":"query queue saturation; raise query.max-concurrent-queries"},"rca_compact":"capacity: queued backlog","recommendation":"increase query.max-concurrent-queries"}

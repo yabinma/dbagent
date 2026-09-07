@@ -1,0 +1,18 @@
+{
+  "proposed_actions": [
+    {
+      "kind": "playbook",
+      "playbook_id": "presto.adjust_memory_config",
+      "playbook_params": {
+        "name": "presto-worker-config",
+        "namespace": "dbagent",
+        "patches": [
+          {"key": "query.max-memory-per-node", "value": "128MB"}
+        ]
+      },
+      "risk_level": "R2",
+      "description": "restore per-node query memory to 128MB (JVM -Xmx1G, query.max-total-memory-per-node=256MB)"
+    }
+  ],
+  "rca_compact": "raise memory"
+}

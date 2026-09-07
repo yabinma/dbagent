@@ -1,0 +1,1 @@
+{"tool_calls":[{"tool":"presto_cluster_info","args":{},"purpose":"state"},{"tool":"presto_list_queries","args":{},"purpose":"queries"},{"tool":"resource_usage","args":{},"purpose":"mem"}],"unresolvable":[]}

@@ -1,0 +1,23 @@
+{
+  "$id": "tools.presto.host",
+  "$comment": "Machine-readable copy of Appendix B.3 Host/JVM Tools' params schemas.",
+  "tools": {
+    "jvm_thread_dump": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "jvm_heap_histo": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {"type": "string"},
+        "top": {"type": "integer", "minimum": 1, "default": 50}
+      },
+      "additionalProperties": false
+    }
+  }
+}

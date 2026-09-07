@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dbagent.fullname" . }}-probe-gateway-config
+  labels:
+    {{- include "dbagent.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    postgres_dsn: "${PG_DSN}"
+    max_db_conns: {{ int .Values.probeGateway.maxDbConns }}
+    session_listen_addr: ":8443"
+    bootstrap_listen_addr: ":8444"
+    internal_listen_addr: ":8080"
+    signing_public_key_path: /etc/dbagent/signing/ed25519.key.pub
+    bootstrap_ca_cert_path: /etc/dbagent/probe-gateway-ca/bootstrap-ca.crt
+    bootstrap_ca_key_path: /etc/dbagent/probe-gateway-ca/bootstrap-ca.key
+    server_cert_sans:
+      - {{ printf "%s-probe-gateway" (include "dbagent.fullname" .) | quote }}
+      - {{ printf "%s-probe-gateway.%s" (include "dbagent.fullname" .) .Release.Namespace | quote }}
+      - {{ printf "%s-probe-gateway.%s.svc" (include "dbagent.fullname" .) .Release.Namespace | quote }}
+      - {{ printf "%s-probe-gateway.%s.svc.cluster.local" (include "dbagent.fullname" .) .Release.Namespace | quote }}
+      {{- range .Values.probeGateway.extraSANs }}
+      - {{ . | quote }}
+      {{- end }}
+    gateway_replica: "${POD_NAME}"
+    heartbeat_timeout: {{ .Values.probeGateway.heartbeatTimeout | quote }}
+    heartbeat_check_interval: {{ .Values.probeGateway.heartbeatCheckInterval | quote }}
+    signing_key_poll_interval: {{ .Values.probeGateway.signingKeyPollInterval | quote }}

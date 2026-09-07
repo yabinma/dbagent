@@ -1,0 +1,322 @@
+# dbagent umbrella chart defaults (design.md §11.1.3)
+
+global:
+  imageRegistry: ghcr.io/yabinma/dbagent
+  imagePullPolicy: IfNotPresent
+  appVersion: "0.1.0"
+
+images:
+  ingestGateway: ingest-gateway
+  temporalWorker: temporal-worker
+  probeGateway: probe-gateway
+  dashboardApi: dashboard-api
+  dashboardWeb: dashboard-web
+
+config:
+  # Appendix E role routes. When modelGateway.bundled=true the ConfigMap
+  # rewrites every role's model to `mock` (the only name the bundled
+  # gateway serves).
+  models:
+    planner:     {model: "ollama/qwen2.5:14b",               max_tokens: 2000}
+    collector:   {model: "ollama/qwen2.5:14b",               max_tokens: 2000}
+    rca:         {model: "bedrock/anthropic.claude-fable-5", max_tokens: 8000}
+    remediation: {model: "bedrock/anthropic.claude-fable-5", max_tokens: 4000}
+  temporal:
+    # When temporal.mode=dev the ConfigMap rewrites this to {{Release}}-temporal:7233.
+    # For mode=external, set temporal.address (or this field) to the operator endpoint.
+    address: "temporal:7233"
+    namespace: dbagent
+    task_queue: rca-worker
+  storage:
+    postgres_dsn: "${PG_DSN}"
+    # Appendix E nested shape (storage.s3.*). When minio.bundled=true the
+    # ConfigMap rewrites endpoint to http://{{Release.Name}}-minio:9000.
+    # For external MinIO, set the full URL here (or leave bundled=false).
+    # No s3.region: Appendix E and rca_common have no home for it.
+    s3:
+      endpoint: "http://minio:9000"
+      bucket: dbagent
+      access_key: "${S3_ACCESS_KEY}"
+      secret_key: "${S3_SECRET_KEY}"
+  model_gateway:
+    # Same rewrite rule as storage.s3.endpoint when modelGateway.bundled=true.
+    url: "http://model-gateway:4000"
+    master_key: "${LITELLM_MASTER_KEY}"
+  # Always rendered by this chart as {{Release.Name}}-probe-gateway. The ConfigMap
+  # fills the release-qualified URL when this block is omitted or still bare.
+  # Override url for an external probe-gateway.
+  probe_gateway:
+    url: "http://probe-gateway:8080"
+  signing:
+    key_path: /etc/dbagent/signing/ed25519.key
+    rotation_grace_seconds: 600
+  dashboard:
+    jwt_secret: "${DASHBOARD_JWT_SECRET}"
+    cors_origins: []
+    bootstrap_ca_cert_path: ""
+  notifications:
+    outbound_webhooks: []
+  ingest:
+    sources: []
+  budget_defaults:
+    max_rounds: 15
+    max_cost_usd: 10.0
+    max_wall_seconds: 1800
+  agents: {}
+  tracing:
+    backend: builtin
+
+secrets:
+  create: true
+  existingSecret: ""
+  data:
+    # External default host; when postgresql.bundled=true, secret-app uses dbagent.pgDsn.
+    PG_DSN: "postgresql://dbagent:dbagent@postgresql:5432/dbagent"
+    S3_ACCESS_KEY: "minioadmin"
+    S3_SECRET_KEY: "minioadmin"
+    LITELLM_MASTER_KEY: "sk-local"
+    DASHBOARD_JWT_SECRET: "change-me-in-production"
+    GRAFANA_WEBHOOK_SECRET: ""
+    SLACK_WEBHOOK_URL: ""
+    ADMIN_USERNAME: "admin"
+    ADMIN_INITIAL_PASSWORD: "admin-change-me"
+
+ingestGateway:
+  replicaCount: 1
+  # FP-IG-20: worker count is the reference environment's core count (§14.4
+  # = 4). One uvicorn event loop per core inside the single replica; not a
+  # uvicorn default and not replicaCount (which stays 1).
+  workers: 4
+  # FP-IG-34: per-worker open-connection ceiling (§11.3.3 AJ). Effective
+  # aggregate capacity = workers × (value − 1); must satisfy
+  # workers × (value − 1) ≥ BURST_RATE × P99_MS / 1000 + TOTAL_REQUESTS // 100
+  # and workers × value < MAX_IN_FLIGHT (recomputed by the delivery test).
+  maxConnectionsPerWorker: 150
+  service:
+    type: ClusterIP
+    nodePort: null
+  # FP-IG-1/2: every probe parameter explicit; sourced from one place.
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
+  # FP-IG-4: sizingBasis is the per-request CPU cost (ms) measured by
+  # FP-IG-7's reference-tier benchmark. requests.cpu = ceil(basis × 200) m;
+  # limits.cpu ≥ 5 × requests.cpu. Basis = max+(max−min) over five consecutive
+  # runs after C2 (disjoint warmup/prologue). Recorded 2026-08-12:
+  #   run1: 2.031 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run2: 1.983 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run3: 2.205 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run4: 2.102 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  #   run5: 2.096 ms  cpus=16 cpu_model="11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz" image=os-release:01af466feb100306
+  # basis = 2.205 + (2.205 − 1.983) = 2.427 ms/req. VOID as provenance
+  # (FP-IG-23/Z): every recorded run failed B1 clauses, reached MAX_IN_FLIGHT,
+  # and carried cpus=16 (not §14.4's reference 4). observations stays empty
+  # until five valid CI benchmark-job runs at this change's head are recorded
+  # — do not fabricate runIds. signature.cpus/workers name the required
+  # collection identity; they do not re-certify the void 2.427 figure.
+  sizingBasis:
+    cpuMsPerRequest: 2.427
+    signature:
+      cpus: 4
+      cpuModel: ""
+      image: ""
+      workers: 4
+    observations: []
+  resources:
+    # ceil(2.427 × 200) = 486m; limits = 5 × requests (CPU still from the
+    # void basis until five valid runs are recorded). Memory is W × the
+    # shipped per-process 128Mi / 512Mi (copied, not derived — §11.3.3 X).
+    requests: { cpu: 486m, memory: 512Mi }
+    limits: { cpu: 2430m, memory: 2Gi }
+
+temporalWorker:
+  replicaCount: 1
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 30
+      failureThreshold: 4
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 15
+      failureThreshold: 3
+      successThreshold: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+probeGateway:
+  replicaCount: 1
+  # FP-IG-30(a): finite database/sql pool. Rendered as a bare unquoted int
+  # into the probe-gateway ConfigMap (`max_db_conns`); required at the serve
+  # path (absent / <= 0 refuses to start). No ${} — envexpand re-tags
+  # placeholder scalars !!str and yaml.v3 cannot decode !!str into int.
+  maxDbConns: 10
+  service:
+    type: ClusterIP
+    # NodePort for the internal (:8080) health/admin port when type=NodePort.
+    nodePort: null
+  extraSANs: []
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  bootstrapCA:
+    persistence:
+      enabled: true
+      size: 64Mi
+      storageClass: ""
+    existingSecret: ""
+  heartbeatTimeout: 60s
+  heartbeatCheckInterval: 15s
+  signingKeyPollInterval: 30s
+
+dashboardApi:
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    nodePort: null
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+dashboardWeb:
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    nodePort: null
+  probes:
+    liveness:
+      timeoutSeconds: 5
+      periodSeconds: 15
+      failureThreshold: 7
+      successThreshold: 1
+    readiness:
+      timeoutSeconds: 3
+      periodSeconds: 10
+      failureThreshold: 3
+      successThreshold: 1
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+  apiBaseUrl: /api/v1
+
+ingress:
+  enabled: false
+  className: ""
+  hosts: []
+  tls: []
+
+networkPolicy:
+  enabled: false
+
+# temporal.mode: dev | chart | external
+# Default external: operator-managed Temporal (pair with postgresql.bundled: false).
+# For self-contained dev/e2e use -f values-dev.yaml (or tests/e2e/values-dbagent.yaml).
+# When mode=chart, set chart.enabled=true so the vendored subchart renders.
+temporal:
+  mode: external
+  chart:
+    enabled: false
+  address: ""
+  # Official Temporal subchart value overrides (only when chart.enabled=true).
+  # v1.6+ uses server.config.persistence.datastores (no top-level cassandra/es).
+  server:
+    replicaCount: 1
+    config:
+      persistence:
+        defaultStore: default
+        visibilityStore: visibility
+        numHistoryShards: 512
+        datastores:
+          default:
+            sql:
+              pluginName: postgres12
+              driverName: postgres12
+              databaseName: temporal
+              connectAddr: "postgresql:5432"
+              connectProtocol: "tcp"
+              user: dbagent
+              password: dbagent
+          visibility:
+            sql:
+              pluginName: postgres12
+              driverName: postgres12
+              databaseName: temporal_visibility
+              connectAddr: "postgresql:5432"
+              connectProtocol: "tcp"
+              user: dbagent
+              password: dbagent
+# Bundled PostgreSQL is dev/e2e only (emptyDir, default password). Production must
+# set bundled: false and supply an external DSN via secrets.
+postgresql:
+  bundled: false
+  # FP-IG-29: connection supply for bundled PG only. Derived from AH's demand
+  # table (145 at the shipped topology) + RESERVE 13 (3 superuser_reserved
+  # + 10 transient) = 158, rounded up to 160 as one-direction slack. Slack
+  # can only widen supply; FP-IG-31 asserts the recomputed inequality, so
+  # the slack buys no laxity on demand. Edited only when AH's demand table
+  # changes, in the same commit.
+  maxConnections: 160
+  image: postgres:16-alpine
+  auth:
+    database: dbagent
+    username: dbagent
+    password: dbagent
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 1Gi }
+
+minio:
+  bundled: false
+  image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+  mcImage: minio/mc:RELEASE.2025-08-13T08-35-41Z
+  rootUser: minioadmin
+  rootPassword: minioadmin
+  bucket: dbagent
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+modelGateway:
+  bundled: false
+  image: ghcr.io/berriai/litellm:main-v1.55.8
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+temporalDev:
+  image: temporalio/auto-setup:1.24.2
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
