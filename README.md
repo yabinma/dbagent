@@ -1,5 +1,7 @@
 # dbagent
 
+> We recognize AI's capabilities and firmly believe it can greatly enhance human productivity. Yet throughout the production process, humans always bear unshirkable responsibility. Therefore, when designing AI systems, we uphold one core principle: **Trust, but verify.**
+
 **Self-hosted, open-source root-cause-analysis and remediation agent for data
 platforms.**
 
