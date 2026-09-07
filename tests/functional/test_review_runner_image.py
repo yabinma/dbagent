@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -88,11 +89,36 @@ def _assert_live_declaration() -> None:
     assert fallbacks == [FALLBACK_PACKAGES]
 
 
-def _docker(*args: str, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess:
+def _docker(*args: str, check: bool = True, timeout: float = 120) -> subprocess.CompletedProcess:
     result = subprocess.run(["docker", *args], capture_output=True, timeout=timeout)
     if check:
         assert result.returncode == 0, result.stdout.decode() + result.stderr.decode()
     return result
+
+
+def _wait_for_removal(kind: str, name: str, *, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    output = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"Timed out waiting for {kind} {name} removal: {output}")
+        try:
+            result = _docker(kind, "inspect", name, check=False,
+                             timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail(
+                f"Timed out waiting for {kind} {name} removal: "
+                + (exc.stdout or b"").decode(errors="replace")
+                + "\n"
+                + (exc.stderr or b"").decode(errors="replace")
+            )
+        if result.returncode != 0:
+            return
+        output = result.stdout.decode(errors="replace") + "\n" + result.stderr.decode(errors="replace")
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.25, remaining))
 
 
 def _image_run(image: str, argv: list[str], *, env: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
@@ -107,7 +133,7 @@ def _image_run(image: str, argv: list[str], *, env: tuple[str, ...] = ()) -> sub
         # Also contain a timed-out or otherwise failed invocation to this fixture.
         if _docker("container", "inspect", name, check=False).returncode == 0:
             _docker("rm", "-f", "-v", name)
-        assert _docker("container", "inspect", name, check=False).returncode != 0
+        _wait_for_removal("container", name)
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +147,77 @@ def review_runner_image():
     finally:
         if _docker("image", "inspect", image, check=False).returncode == 0:
             _docker("image", "rm", image)
-        assert _docker("image", "inspect", image, check=False).returncode != 0
+        _wait_for_removal("image", image)
+
+
+@pytest.mark.parametrize("kind", ("container", "volume", "image"))
+def test_review_runner_removal_timeout(monkeypatch, kind):
+    now = [0.0]
+    calls = []
+
+    def docker(*args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, b"still present", b"daemon detail")
+
+    monkeypatch.setitem(globals(), "_docker", docker)
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
+    with pytest.raises(AssertionError, match=f"Timed out waiting for {kind} stuck removal: still present\ndaemon detail"):
+        _wait_for_removal(kind, "stuck", timeout=0.5)
+    assert now[0] == 0.5
+    assert calls == [(kind, "inspect", "stuck")] * 2
+
+
+def test_review_runner_removal_inspect_timeout(monkeypatch):
+    def docker(*args, **kwargs):
+        assert 0 < kwargs["timeout"] <= 30
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=b"partial inspect", stderr=b"daemon stuck")
+
+    monkeypatch.setitem(globals(), "_docker", docker)
+    with pytest.raises(pytest.fail.Exception, match="Timed out waiting for container stuck removal: partial inspect\ndaemon stuck"):
+        _wait_for_removal("container", "stuck")
+
+
+def test_review_runner_image_delayed_removal(monkeypatch):
+    inspections = iter((0, 0, 1))
+
+    def docker(*args, **kwargs):
+        code = next(inspections) if args[:2] == ("image", "inspect") else 0
+        return subprocess.CompletedProcess(args, code, b"still removing", b"")
+
+    monkeypatch.setitem(globals(), "_docker", docker)
+    fixture = review_runner_image.__wrapped__()
+    next(fixture)
+    with pytest.raises(StopIteration):
+        next(fixture)
+    assert list(inspections) == []
+
+
+def test_review_runner_mount_delayed_removal(monkeypatch, tmp_path):
+    mounts = [{"Type": "volume", "Name": f"volume-{index}", "Destination": path}
+              for index, path in enumerate(VENV_PATHS)]
+    remaining = {"container": 1, **{mount["Name"]: 1 for mount in mounts}}
+    stopped = False
+
+    def docker(*args, **kwargs):
+        nonlocal stopped
+        if args[0] == "stop":
+            stopped = True
+        if args[:2] == ("container", "inspect") and not stopped:
+            return subprocess.CompletedProcess(args, 0, json.dumps([{"Mounts": mounts}]).encode(), b"")
+        if args[1:2] == ("inspect",):
+            key = "container" if args[0] == "container" else args[2]
+            code = 0 if remaining[key] else 1
+            remaining[key] = 0
+            return subprocess.CompletedProcess(args, code, b"still removing", b"")
+        assert args[0] != "rm" and args[:2] != ("volume", "rm"), "must await --rm cleanup"
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setitem(globals(), "_docker", docker)
+    monkeypatch.setitem(globals(), "_assert_probe", lambda *args: None)
+    monkeypatch.setattr(shutil, "copytree", lambda *args, **kwargs: None)
+    _assert_mounted_python("image", tmp_path, False)
+    assert stopped and not any(remaining.values())
 
 
 def _assert_mounted_python(image: str, workspace: Path, existing_venvs: bool) -> None:
@@ -175,18 +271,18 @@ def _assert_mounted_python(image: str, workspace: Path, existing_venvs: bool) ->
                               _docker("exec", name, python, "-c", script, check=False))
         # --rm must remove the anonymous volumes as part of normal container removal.
         _docker("stop", "--time", "1", name)
-        assert _docker("container", "inspect", name, check=False).returncode != 0
+        _wait_for_removal("container", name)
         for volume in volumes:
-            assert _docker("volume", "inspect", volume, check=False).returncode != 0
+            _wait_for_removal("volume", volume)
     finally:
         if _docker("container", "inspect", name, check=False).returncode == 0:
             _docker("rm", "-f", "-v", name)
         for volume in volumes:
             if _docker("volume", "inspect", volume, check=False).returncode == 0:
                 _docker("volume", "rm", volume)
-        assert _docker("container", "inspect", name, check=False).returncode != 0
+        _wait_for_removal("container", name)
         for volume in volumes:
-            assert _docker("volume", "inspect", volume, check=False).returncode != 0
+            _wait_for_removal("volume", volume)
     for path, content in sentinels.items():
         assert path.read_bytes() == content
     if not existing_venvs:
