@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+import httpcore
 import httpx
 
 # Profile constants — each bound exactly once at module scope (FP-IG-13).
@@ -210,6 +211,7 @@ class PhaseResult:
     status_codes: list[int] = field(default_factory=list)
     peak_established_connections: int | str = UNAVAILABLE
     peak_pool_connections: int | str = UNAVAILABLE
+    peak_pool_requests: int | str = UNAVAILABLE
     peak_pool_queued: int | str = UNAVAILABLE
     pool_connections_seen: int | str = UNAVAILABLE
     worker_established_peaks: list[int | str] = field(default_factory=list)
@@ -540,20 +542,21 @@ def peak_established_from_samples(samples: list[int | str]) -> int | str:
 
 def read_pool_census_sample(
     client: httpx.AsyncClient,
-) -> tuple[int | str, int | str, set[int] | None]:
+) -> tuple[int | str, int | str, set[int] | None, int | str]:
     """Read one client-pool census sample (FP-IG-37 / UT-IG-17).
 
-    Returns (held_connections, queued_requests, connection_identities).
+    Returns (held_connections, queued_requests, connection_identities, requests).
     Every attribute failure degrades to ``unavailable`` (fail-open recording).
     """
     try:
         pool = client._transport._pool
-        connections = len(pool.connections)
-        queued = sum(1 for req in pool._requests if req.is_queued())
-        seen = {id(c) for c in pool.connections}
-        return connections, queued, seen
+        connections = list(pool.connections)
+        requests = list(pool._requests)
+        queued = sum(1 for req in requests if req.is_queued())
+        seen = {id(c) for c in connections}
+        return len(connections), queued, seen, len(requests)
     except (AttributeError, TypeError):
-        return UNAVAILABLE, UNAVAILABLE, None
+        return UNAVAILABLE, UNAVAILABLE, None, UNAVAILABLE
 
 
 def peak_pool_metric_from_samples(samples: list[int | str]) -> int | str:
@@ -701,9 +704,107 @@ async def run_shed_probe(
                 pass
 
 
+class B1ReservationPool(httpcore.AsyncConnectionPool):
+    """HTTP/1.1 assignment reservations live exactly as long as pool requests.
+
+    Version-coupled to httpcore 1.0.9. Stream close, errors and retries retain
+    their upstream lifecycle; only the synchronous assignment pass differs.
+    """
+
+    def _assign_requests_to_connections(self):
+        reserved = {
+            id(request.connection) for request in self._requests
+            if request.connection is not None
+        }
+        closing = []
+        retained = []
+        held = len(self._connections)
+        for connection in self._connections:
+            if id(connection) in reserved:
+                retained.append(connection)
+            elif connection.is_closed():
+                held -= 1
+            elif connection.has_expired() or (
+                connection.is_idle() and held > self._max_keepalive_connections
+            ):
+                held -= 1
+                closing.append(connection)
+            else:
+                retained.append(connection)
+        self._connections = retained
+
+        for request in self._requests:
+            if not request.is_queued():
+                continue
+            origin = request.request.url.origin
+            available = next((
+                c for c in self._connections
+                if id(c) not in reserved
+                and c.can_handle_request(origin) and c.is_available()
+            ), None)
+            if available is not None:
+                connection = available
+            elif len(self._connections) < self._max_connections:
+                connection = self.create_connection(origin)
+                self._connections.append(connection)
+            else:
+                idle = next((
+                    c for c in self._connections
+                    if id(c) not in reserved and c.is_idle()
+                ), None)
+                if idle is None:
+                    continue
+                self._connections.remove(idle)
+                closing.append(idle)
+                connection = self.create_connection(origin)
+                self._connections.append(connection)
+            # The helper also wakes an already parked pool waiter.
+            request.assign_to_connection(connection)
+            reserved.add(id(connection))
+        return closing
+
+
+class B1ReservationTransport(httpx.AsyncHTTPTransport):
+    """Retain HTTPX conversion and its default SSL context, with BD's pool."""
+
+    def __init__(self, *, limits, trust_env, http1, http2, retries):
+        super().__init__(
+            limits=limits, trust_env=trust_env, http1=http1,
+            http2=http2, retries=retries,
+        )
+        # Newly constructed and unused: no requests, connections or network I/O.
+        pool = self._pool
+        self._pool = B1ReservationPool(
+            ssl_context=pool._ssl_context,
+            max_connections=pool._max_connections,
+            max_keepalive_connections=pool._max_keepalive_connections,
+            keepalive_expiry=pool._keepalive_expiry,
+            http1=pool._http1,
+            http2=pool._http2,
+            retries=pool._retries,
+        )
+
+
 def build_httpx_client(*, max_connections: int) -> httpx.AsyncClient:
     """Pinned HTTPX client (FP-IG-13 / §11.3.3 H)."""
+    if (
+        isinstance(max_connections, bool)
+        or not isinstance(max_connections, int)
+        or max_connections <= 0
+    ):
+        raise ValueError("max_connections must be a positive integer")
     return httpx.AsyncClient(
+        transport=B1ReservationTransport(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+                keepalive_expiry=KEEPALIVE_EXPIRY,
+            ),
+            trust_env=False,
+            http1=True,
+            http2=False,
+            retries=0,
+        ),
         limits=httpx.Limits(
             max_connections=max_connections,
             max_keepalive_connections=max_connections,
@@ -807,6 +908,7 @@ async def run_open_loop(
         census_samples: list[int | str] = []
         pool_conn_samples: list[int | str] = []
         pool_queued_samples: list[int | str] = []
+        pool_request_samples: list[int | str] = []
         pool_identity_samples: list[set[int]] = []
         worker_census_samples: list[list[int | str]] = []
         census_stop = asyncio.Event()
@@ -840,8 +942,9 @@ async def run_open_loop(
                                 )
                             )
                 if client is not None and transport is None:
-                    conn_n, queued_n, seen = read_pool_census_sample(client)
+                    conn_n, queued_n, seen, requests_n = read_pool_census_sample(client)
                     pool_conn_samples.append(conn_n)
+                    pool_request_samples.append(requests_n)
                     pool_queued_samples.append(queued_n)
                     if seen is not None:
                         pool_identity_samples.append(seen)
@@ -970,6 +1073,7 @@ async def run_open_loop(
             status_codes=codes,
             peak_established_connections=peak_census,
             peak_pool_connections=peak_pool_conn,
+            peak_pool_requests=peak_pool_metric_from_samples(pool_request_samples),
             peak_pool_queued=peak_pool_q,
             pool_connections_seen=pool_seen,
             worker_established_peaks=worker_peaks,

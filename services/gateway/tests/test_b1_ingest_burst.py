@@ -12,8 +12,10 @@ import hmac
 import json
 import math
 import os
+import re
 import signal
 import socket
+import select
 import subprocess
 import sys
 import tempfile
@@ -21,8 +23,10 @@ import textwrap
 import time
 import uuid
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
+import httpcore
 import httpx
 import pytest
 import yaml
@@ -351,11 +355,14 @@ def test_b1_fingerprint_line_locates_the_in_flight_population(b1_reference_run):
     result = b1_reference_run["result"]
 
     peak_pool_conn_raw = _parse_b1_env_field(line, "peak_pool_connections")
+    peak_pool_requests_raw = _parse_b1_env_field(line, "peak_pool_requests")
+    assert line.index("peak_pool_connections=") < line.index("peak_pool_requests=") < line.index("peak_pool_queued=")
     peak_pool_q_raw = _parse_b1_env_field(line, "peak_pool_queued")
     pool_seen_raw = _parse_b1_env_field(line, "pool_connections_seen")
 
     for raw, quantity in (
         (peak_pool_conn_raw, result.peak_pool_connections),
+        (peak_pool_requests_raw, result.peak_pool_requests),
         (peak_pool_q_raw, result.peak_pool_queued),
         (pool_seen_raw, result.pool_connections_seen),
     ):
@@ -1277,15 +1284,16 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
         ]
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            conn, queued, _seen = b1.read_pool_census_sample(client)
+            conn, queued, _seen, _requests = b1.read_pool_census_sample(client)
             if isinstance(conn, int) and conn >= pool_size:
                 break
             await asyncio.sleep(0.01)
         else:
             raise AssertionError("pool never reached held-connection plateau")
 
-        conn, queued, seen = b1.read_pool_census_sample(client)
+        conn, queued, seen, requests_n = b1.read_pool_census_sample(client)
         assert conn == pool_size
+        assert requests_n == pool_size
         assert queued == 0
         assert seen is not None and len(seen) == pool_size
 
@@ -1296,7 +1304,7 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
         ]
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            conn_after, queued_after, _ = b1.read_pool_census_sample(client)
+            conn_after, queued_after, _, requests_after = b1.read_pool_census_sample(client)
             if isinstance(queued_after, int) and queued_after == extra_dispatch:
                 break
             await asyncio.sleep(0.01)
@@ -1306,6 +1314,7 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
             )
         assert conn_after == pool_size
         assert queued_after == extra_dispatch
+        assert requests_after == pool_size + extra_dispatch
 
         release.set()
         await asyncio.gather(*slow, *extra, return_exceptions=True)
@@ -1344,7 +1353,7 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
                 task = asyncio.create_task(churn_client.post(close_url, content=payload))
                 deadline = time.time() + 5.0
                 while time.time() < deadline:
-                    _c, _q, seen_i = b1.read_pool_census_sample(churn_client)
+                    _c, _q, seen_i, _r = b1.read_pool_census_sample(churn_client)
                     if seen_i:
                         identity_sets.append(set(seen_i))
                         break
@@ -1367,16 +1376,17 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
         class _NoPool:
             _transport = type("T", (), {"_pool": None})()
 
-        bad_conn, bad_q, bad_seen = b1.read_pool_census_sample(_NoPool())  # type: ignore[arg-type]
+        bad_conn, bad_q, bad_seen, bad_requests = b1.read_pool_census_sample(_NoPool())  # type: ignore[arg-type]
         assert bad_conn == b1.UNAVAILABLE
         assert bad_q == b1.UNAVAILABLE
         assert bad_seen is None
+        assert bad_requests == b1.UNAVAILABLE
 
         class _NoTransport:
             pass
 
         bad2 = b1.read_pool_census_sample(_NoTransport())  # type: ignore[arg-type]
-        assert bad2 == (b1.UNAVAILABLE, b1.UNAVAILABLE, None)
+        assert bad2 == (b1.UNAVAILABLE, b1.UNAVAILABLE, None, b1.UNAVAILABLE)
     finally:
         release.set()
         if not client.is_closed:
@@ -1495,8 +1505,91 @@ def _host_fingerprint() -> dict[str, str | int]:
     return {"cpus": cpus, "cpu_model": model, "image": image}
 
 
+def _b1_gateway_warning_count(log_path: Path, prefix_bytes: int) -> int:
+    """Count complete warning lines only in the saved spawn-to-window prefix."""
+    count = 0
+    pending = b""
+    with log_path.open("rb") as reader:
+        remaining = prefix_bytes
+        while remaining:
+            chunk = reader.read(min(65536, remaining))
+            if not chunk:
+                raise RuntimeError(f"gateway log shortened before snapshot read: {log_path}")
+            remaining -= len(chunk)
+            lines = (pending + chunk).split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                if re.fullmatch(r"WARNING:\s+Exceeded concurrency limit\.",
+                                line.decode("utf-8", errors="replace").rstrip("\r\n")):
+                    count += 1
+    return count
+
+
+def _b1_gateway_log_tail(log_path: Path) -> str:
+    tail = ""
+    with log_path.open(encoding="utf-8", errors="replace", newline="") as reader:
+        while chunk := reader.read(65536):
+            tail = (tail + chunk)[-2000:]
+    return tail
+
+
+def _b1_gateway_group_alive(pgid: int) -> bool:
+    """Linux reference harness: zombies have exited and cannot retain the sink."""
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except FileNotFoundError:
+            continue  # Process exited during enumeration.
+        if int(fields[2]) == pgid and fields[0] not in {"Z", "X"}:
+            return True
+    return False
+
+
+def _b1_gateway_signal_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+@contextmanager
+def _b1_gateway_process(argv, *, env, log_path: Path):
+    """Own the regular-file sink and the entire isolated gateway process group."""
+    with log_path.open("xb") as writer:
+        proc = subprocess.Popen(
+            argv, env=env, stdout=writer, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            try:
+                yield proc
+            finally:
+                if proc.poll() is None or _b1_gateway_group_alive(proc.pid):
+                    _b1_gateway_signal_group(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _b1_gateway_signal_group(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=10)
+                # A supervisor may exit while an inherited-output worker survives.
+                if _b1_gateway_group_alive(proc.pid):
+                    _b1_gateway_signal_group(proc.pid, signal.SIGKILL)
+                    deadline = time.monotonic() + 10
+                    while _b1_gateway_group_alive(proc.pid):
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(f"gateway process group {proc.pid} survived teardown")
+                        time.sleep(0.01)
+                if proc.poll() is None:
+                    raise RuntimeError(f"gateway child {proc.pid} was not reaped")
+        except Exception as exc:
+            tail = _b1_gateway_log_tail(log_path)
+            raise RuntimeError(f"{exc}; gateway log={log_path}; tail:\n{tail}") from exc
+
+
 @pytest.fixture(scope="module")
-def b1_reference_run():
+def b1_reference_run(tmp_path_factory):
     """Session-scoped single 30 s burst shared by FP-IG-7 and FP-IG-18.
 
     Hard-fails when the measurement-of-record dependencies are unavailable —
@@ -1601,56 +1694,112 @@ def b1_reference_run():
                 str(REPO_ROOT / "libs" / "py" / "rca_common"),
             ]
         )
-        proc = subprocess.Popen(
-            [sys.executable, str(_PROFILE_PATH), "--host", "127.0.0.1", "--port", str(port)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        log_path = tmp_path_factory.mktemp("b1-gateway") / "gateway.log"
+        print(f"B1 gateway log={log_path}", flush=True)
         endpoint = f"http://127.0.0.1:{port}/api/v1/events"
         health = f"http://127.0.0.1:{port}/healthz"
         try:
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if proc.poll() is not None:
-                    out = proc.stdout.read().decode() if proc.stdout else ""
-                    raise RuntimeError(f"gateway exited early: {out[-2000:]}")
-                try:
-                    r = httpx.get(health, timeout=1.0)
-                    if r.status_code == 200:
-                        break
-                except Exception:
-                    time.sleep(0.2)
-            else:
-                raise RuntimeError("gateway never became healthy")
+            with _b1_gateway_process(
+                [sys.executable, str(_PROFILE_PATH), "--host", "127.0.0.1", "--port", str(port)],
+                env=env, log_path=log_path,
+            ) as proc:
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    if proc.poll() is not None:
+                        raise RuntimeError("gateway exited early")
+                    try:
+                        r = httpx.get(health, timeout=1.0)
+                        if r.status_code == 200:
+                            break
+                    except Exception:
+                        time.sleep(0.2)
+                else:
+                    raise RuntimeError("gateway never became healthy")
 
-            # ONLINE precondition — platform row is online; health proves reachability.
-            assert httpx.get(health, timeout=5).status_code == 200
-            platform_online = True
+                # ONLINE precondition — platform row is online; health proves reachability.
+                assert httpx.get(health, timeout=5).status_code == 200
+                platform_online = True
 
-            # FP-IG-22: wait for the classified serving tree before any CPU read.
-            workers_pre: set[int]
-            trackers_pre: set[int]
-            trackers_pre, workers_pre = b1.wait_for_classified_workers(
-                proc.pid, workers=b1.INGEST_GATEWAY_WORKERS
-            )
+                # FP-IG-22: wait for the classified serving tree before any CPU read.
+                workers_pre: set[int]
+                trackers_pre: set[int]
+                trackers_pre, workers_pre = b1.wait_for_classified_workers(
+                    proc.pid, workers=b1.INGEST_GATEWAY_WORKERS
+                )
 
-            warmup = _build_requests(1)[0]
-            prologue = _build_requests(b1.PROLOGUE_REQUESTS)
-            measured = _build_requests(b1.TOTAL_REQUESTS)
-            import asyncio
+                warmup = _build_requests(1)[0]
+                prologue = _build_requests(b1.PROLOGUE_REQUESTS)
+                measured = _build_requests(b1.TOTAL_REQUESTS)
+                import asyncio
 
-            marks: dict = {}
+                marks: dict = {}
 
-            def _after_prologue() -> None:
-                # Snapshot AFTER unmeasured prologue so CPU/audit exclude it (C2).
-                marks["cpu_before"] = b1.tree_cpu_seconds(proc.pid)
-                engine_p = make_engine(dsn)
-                sf_p = make_session_factory(engine_p)
-                with sf_p() as session:
+                def _after_prologue() -> None:
+                    # Snapshot AFTER unmeasured prologue so CPU/audit exclude it (C2).
+                    marks["cpu_before"] = b1.tree_cpu_seconds(proc.pid)
+                    engine_p = make_engine(dsn)
+                    sf_p = make_session_factory(engine_p)
+                    with sf_p() as session:
+                        from sqlalchemy import text
+
+                        marks["committed_before"] = int(
+                            session.execute(
+                                text(
+                                    "SELECT count(*) FROM audit_log "
+                                    "WHERE action IN ('event_received','event_merged')"
+                                )
+                            ).scalar()
+                            or 0
+                        )
+                    engine_p.dispose()
+
+                def _after_window() -> None:
+                    # Close the gateway CPU interval at drain/census stop, before
+                    # O(N) leg derivation. Meaning of cpu_after is unchanged: end
+                    # of the measured window, not end of post-window arithmetic.
+                    marks["cpu_after"] = b1.tree_cpu_seconds(proc.pid)
+                    marks["log_prefix_bytes"] = log_path.stat().st_size
+
+                result = asyncio.run(
+                    b1.run_open_loop(
+                        endpoint=endpoint,
+                        requests=measured,
+                        rate=b1.BURST_RATE,
+                        max_in_flight=b1.MAX_IN_FLIGHT,
+                        warmup=warmup,
+                        prologue=prologue,
+                        include_sync_warmup=True,
+                        on_prologue_complete=_after_prologue,
+                        on_window_complete=_after_window,
+                        serve_port=port,
+                        worker_pids=sorted(workers_pre),
+                    )
+                )
+                concurrency_limit_warnings = _b1_gateway_warning_count(
+                    log_path, marks["log_prefix_bytes"]
+                )
+                cpu_after = float(marks["cpu_after"])
+                trackers_post, workers_post = b1.classify_tree(proc.pid)
+                shed_probe = asyncio.run(
+                    b1.run_shed_probe("127.0.0.1", port)
+                )
+                cpu_before = float(marks.get("cpu_before", cpu_after))
+                span = result.t_last_complete - result.due0
+                cpu_ms = (
+                    (cpu_after - cpu_before) * 1000.0 / result.served if result.served else float("inf")
+                )
+                cpu_cores_used = (cpu_after - cpu_before) / span if span > 0 else 0.0
+                worker_set_ok = (
+                    trackers_post == trackers_pre and workers_post == workers_pre
+                )
+
+                # committed count of the measured window only
+                engine = make_engine(dsn)
+                sf = make_session_factory(engine)
+                with sf() as session:
                     from sqlalchemy import text
 
-                    marks["committed_before"] = int(
+                    committed_total = int(
                         session.execute(
                             text(
                                 "SELECT count(*) FROM audit_log "
@@ -1659,152 +1808,97 @@ def b1_reference_run():
                         ).scalar()
                         or 0
                     )
-                engine_p.dispose()
+                engine.dispose()
+                committed = committed_total - int(marks.get("committed_before", 0))
 
-            def _after_window() -> None:
-                # Close the gateway CPU interval at drain/census stop, before
-                # O(N) leg derivation. Meaning of cpu_after is unchanged: end
-                # of the measured window, not end of post-window arithmetic.
-                marks["cpu_after"] = b1.tree_cpu_seconds(proc.pid)
+                values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
+                basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
 
-            result = asyncio.run(
-                b1.run_open_loop(
-                    endpoint=endpoint,
-                    requests=measured,
-                    rate=b1.BURST_RATE,
-                    max_in_flight=b1.MAX_IN_FLIGHT,
-                    warmup=warmup,
-                    prologue=prologue,
-                    include_sync_warmup=True,
-                    on_prologue_complete=_after_prologue,
-                    on_window_complete=_after_window,
-                    serve_port=port,
-                    worker_pids=sorted(workers_pre),
+                fp = _host_fingerprint()
+                med_a, med_b = b1.half_window_medians(result.latencies_ms)
+                status_histogram = b1.serialize_status_histogram(result.status_codes)
+                peak_est = result.peak_established_connections
+                peak_est_str = (
+                    str(peak_est) if isinstance(peak_est, int) else peak_est
                 )
-            )
-            cpu_after = float(marks["cpu_after"])
-            trackers_post, workers_post = b1.classify_tree(proc.pid)
-            shed_probe = asyncio.run(
-                b1.run_shed_probe("127.0.0.1", port)
-            )
-            cpu_before = float(marks.get("cpu_before", cpu_after))
-            span = result.t_last_complete - result.due0
-            cpu_ms = (
-                (cpu_after - cpu_before) * 1000.0 / result.served if result.served else float("inf")
-            )
-            cpu_cores_used = (cpu_after - cpu_before) / span if span > 0 else 0.0
-            worker_set_ok = (
-                trackers_post == trackers_pre and workers_post == workers_pre
-            )
-
-            # committed count of the measured window only
-            engine = make_engine(dsn)
-            sf = make_session_factory(engine)
-            with sf() as session:
-                from sqlalchemy import text
-
-                committed_total = int(
-                    session.execute(
-                        text(
-                            "SELECT count(*) FROM audit_log "
-                            "WHERE action IN ('event_received','event_merged')"
-                        )
-                    ).scalar()
-                    or 0
+                peak_pool_conn = result.peak_pool_connections
+                peak_pool_conn_str = (
+                    str(peak_pool_conn) if isinstance(peak_pool_conn, int) else peak_pool_conn
                 )
-            engine.dispose()
-            committed = committed_total - int(marks.get("committed_before", 0))
+                peak_pool_q = result.peak_pool_queued
+                peak_pool_q_str = (
+                    str(peak_pool_q) if isinstance(peak_pool_q, int) else peak_pool_q
+                )
+                pool_seen = result.pool_connections_seen
+                pool_seen_str = (
+                    str(pool_seen) if isinstance(pool_seen, int) else pool_seen
+                )
+                worker_peaks = result.worker_established_peaks
+                worker_peaks_str = b1.serialize_worker_established_peaks(worker_peaks)
+                peak_worker_est = result.peak_worker_established
+                peak_worker_est_str = (
+                    str(peak_worker_est)
+                    if isinstance(peak_worker_est, int)
+                    else peak_worker_est
+                )
+                p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
+                leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
+                fingerprint_line = (
+                    f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
+                    f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
+                    f"max_lateness_ms={result.max_lateness_ms:.1f},"
+                    f"p99_ms={result.p99:.1f},served_rate={result.served_rate:.1f},"
+                    f"served={result.served},errors={result.errors},committed={int(committed)},"
+                    f"platform_online={1 if platform_online else 0},"
+                    f"workers_pre={b1.format_pid_list(workers_pre)},"
+                    f"workers_post={b1.format_pid_list(workers_post)},"
+                    f"median_lateness_a_ms={med_a:.1f},median_lateness_b_ms={med_b:.1f},"
+                    f"lateness_drift_ms={result.lateness_drift_ms:.1f},"
+                    f"cpu_ms_per_req={cpu_ms:.3f},cpu_cores_used={cpu_cores_used:.2f},"
+                    f"basis_ms_per_req={basis},"
+                    f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog},"
+                    f"status_histogram={status_histogram},"
+                    f"concurrency_limit_warnings={concurrency_limit_warnings},"
+                    f"peak_established_connections={peak_est_str},"
+                    f"shed_probe={shed_probe},"
+                    f"peak_pool_connections={peak_pool_conn_str},"
+                    f"peak_pool_requests={result.peak_pool_requests},"
+                    f"peak_pool_queued={peak_pool_q_str},"
+                    f"pool_connections_seen={pool_seen_str},"
+                    f"worker_established_peaks={worker_peaks_str},"
+                    f"peak_worker_established={peak_worker_est_str},"
+                    f"p99_leg_split={p99_leg_split_str},"
+                    f"leg_p99s={leg_p99s_str}"
+                )
+                print(fingerprint_line, flush=True)
 
-            values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
-            basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
-
-            fp = _host_fingerprint()
-            med_a, med_b = b1.half_window_medians(result.latencies_ms)
-            status_histogram = b1.serialize_status_histogram(result.status_codes)
-            peak_est = result.peak_established_connections
-            peak_est_str = (
-                str(peak_est) if isinstance(peak_est, int) else peak_est
-            )
-            peak_pool_conn = result.peak_pool_connections
-            peak_pool_conn_str = (
-                str(peak_pool_conn) if isinstance(peak_pool_conn, int) else peak_pool_conn
-            )
-            peak_pool_q = result.peak_pool_queued
-            peak_pool_q_str = (
-                str(peak_pool_q) if isinstance(peak_pool_q, int) else peak_pool_q
-            )
-            pool_seen = result.pool_connections_seen
-            pool_seen_str = (
-                str(pool_seen) if isinstance(pool_seen, int) else pool_seen
-            )
-            worker_peaks = result.worker_established_peaks
-            worker_peaks_str = b1.serialize_worker_established_peaks(worker_peaks)
-            peak_worker_est = result.peak_worker_established
-            peak_worker_est_str = (
-                str(peak_worker_est)
-                if isinstance(peak_worker_est, int)
-                else peak_worker_est
-            )
-            p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
-            leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
-            fingerprint_line = (
-                f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
-                f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
-                f"max_lateness_ms={result.max_lateness_ms:.1f},"
-                f"p99_ms={result.p99:.1f},served_rate={result.served_rate:.1f},"
-                f"served={result.served},errors={result.errors},committed={int(committed)},"
-                f"platform_online={1 if platform_online else 0},"
-                f"workers_pre={b1.format_pid_list(workers_pre)},"
-                f"workers_post={b1.format_pid_list(workers_post)},"
-                f"median_lateness_a_ms={med_a:.1f},median_lateness_b_ms={med_b:.1f},"
-                f"lateness_drift_ms={result.lateness_drift_ms:.1f},"
-                f"cpu_ms_per_req={cpu_ms:.3f},cpu_cores_used={cpu_cores_used:.2f},"
-                f"basis_ms_per_req={basis},"
-                f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog},"
-                f"status_histogram={status_histogram},"
-                f"peak_established_connections={peak_est_str},"
-                f"shed_probe={shed_probe},"
-                f"peak_pool_connections={peak_pool_conn_str},"
-                f"peak_pool_queued={peak_pool_q_str},"
-                f"pool_connections_seen={pool_seen_str},"
-                f"worker_established_peaks={worker_peaks_str},"
-                f"peak_worker_established={peak_worker_est_str},"
-                f"p99_leg_split={p99_leg_split_str},"
-                f"leg_p99s={leg_p99s_str}"
-            )
-            print(fingerprint_line, flush=True)
-
-            yield {
-                "result": result,
-                "committed": int(committed),
-                "cpu_ms_per_request": cpu_ms,
-                "cpu_cores_used": cpu_cores_used,
-                "alive": proc.poll() is None,
-                "worker_set_ok": worker_set_ok,
-                "workers_pre": workers_pre,
-                "workers_post": workers_post,
-                "fingerprint": fingerprint_line,
-                "status_histogram": status_histogram,
-                "peak_established_connections": peak_est,
-                "peak_pool_connections": peak_pool_conn,
-                "peak_pool_queued": peak_pool_q,
-                "pool_connections_seen": pool_seen,
-                "worker_established_peaks": worker_peaks,
-                "peak_worker_established": peak_worker_est,
-                "p99_leg_split": result.p99_leg_split,
-                "leg_p99s": result.leg_p99s,
-                "shed_probe": shed_probe,
-                "host": fp,
-                "platform_online": platform_online,
-                "basis_ms_per_req": basis,
-            }
+                yield {
+                    "result": result,
+                    "committed": int(committed),
+                    "cpu_ms_per_request": cpu_ms,
+                    "cpu_cores_used": cpu_cores_used,
+                    "alive": proc.poll() is None,
+                    "worker_set_ok": worker_set_ok,
+                    "workers_pre": workers_pre,
+                    "workers_post": workers_post,
+                    "fingerprint": fingerprint_line,
+                    "status_histogram": status_histogram,
+                    "concurrency_limit_warnings": concurrency_limit_warnings,
+                    "gateway_log_path": log_path,
+                    "peak_established_connections": peak_est,
+                    "peak_pool_connections": peak_pool_conn,
+                    "peak_pool_queued": peak_pool_q,
+                    "pool_connections_seen": pool_seen,
+                    "worker_established_peaks": worker_peaks,
+                    "peak_worker_established": peak_worker_est,
+                    "p99_leg_split": result.p99_leg_split,
+                    "leg_p99s": result.leg_p99s,
+                    "shed_probe": shed_probe,
+                    "host": fp,
+                    "platform_online": platform_online,
+                    "basis_ms_per_req": basis,
+                }
         finally:
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
             Path(cfg_path).unlink(missing_ok=True)
 
 
@@ -2057,3 +2151,855 @@ def test_classification_rejects_tracker_shaped_helper_in_worker_count():
     finally:
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=5)
+
+
+# BD: the instant acceptor runs outside the driver's event loop/process.
+
+_E2E_PROFILE_PATH = REPO_ROOT / "tests/e2e/b1_e2e_profile.py"
+_e2e_spec = importlib.util.spec_from_file_location("bd_e2e_profile", _E2E_PROFILE_PATH)
+assert _e2e_spec and _e2e_spec.loader
+bd_e2e = importlib.util.module_from_spec(_e2e_spec)
+_sys.modules[_e2e_spec.name] = bd_e2e
+_e2e_spec.loader.exec_module(bd_e2e)
+
+_BD_SERVER = r'''
+import asyncio, sys
+async def main():
+    stop = asyncio.Event()
+    writers = set()
+    tasks = set()
+    async def handle(reader, writer):
+        writers.add(writer)
+        tasks.add(asyncio.current_task())
+        try:
+            while True:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                length = next((int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n") if line.lower().startswith(b"content-length:")), 0)
+                await reader.readexactly(length)
+                body = b'{"investigation_id":"bd"}'
+                writer.write(b"HTTP/1.1 202 Accepted\r\nContent-Length: " + str(len(body)).encode() + b"\r\nContent-Type: application/json\r\n\r\n" + body)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writers.discard(writer)
+            tasks.discard(asyncio.current_task())
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=2048)
+    print(server.sockets[0].getsockname()[1], flush=True)
+    asyncio.get_running_loop().add_reader(sys.stdin.fileno(), stop.set)
+    await stop.wait()
+    server.close()
+    await server.wait_closed()
+    for writer in list(writers):
+        writer.close()
+    for task in list(tasks):
+        task.cancel()
+    await asyncio.gather(*list(tasks), return_exceptions=True)
+asyncio.run(main())
+'''
+
+
+@contextmanager
+def _bd_instant_server():
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", _BD_SERVER],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert select.select([proc.stdout], [], [], 10)[0], "BD server readiness timeout"
+        port = int(proc.stdout.readline())
+        yield f"http://127.0.0.1:{port}/"
+    finally:
+        try:
+            proc.communicate("stop\n", timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=3)
+        assert proc.poll() is not None, "BD server was not reaped"
+
+
+def _bd_pool_settings(pool):
+    return dict(
+        ssl_context=pool._ssl_context,
+        max_connections=pool._max_connections,
+        max_keepalive_connections=pool._max_keepalive_connections,
+        keepalive_expiry=pool._keepalive_expiry,
+        http1=pool._http1, http2=pool._http2, retries=pool._retries,
+    )
+
+
+def _bd_requests(n):
+    return [(json.dumps({"event_id": f"bd-{i}"}).encode(), {}) for i in range(n)]
+
+
+async def _bd_offer(driver, client, endpoint, n, *, rate=1000):
+    run = driver.run_open_loop if driver is b1 else driver.run_open_loop_baseline
+    return await run(
+        endpoint=endpoint, requests=_bd_requests(n), rate=rate,
+        max_in_flight=1000, client=client, include_sync_warmup=False, warmup=None,
+    )
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_b1_pool_reserves_before_http11_activation(driver):
+    arrived = asyncio.Event()
+    release = asyncio.Event()
+
+    class BarrierPool(driver.B1ReservationPool):
+        armed = False
+        arrivals = 0
+
+        async def _close_connections(self, closing):
+            await super()._close_connections(closing)
+            if self.armed and self.arrivals < 128:
+                self.arrivals += 1
+                if self.arrivals == 128:
+                    arrived.set()
+                await release.wait()
+
+    with _bd_instant_server() as endpoint:
+        async with driver.build_httpx_client(max_connections=1000) as client:
+            original = client._transport._pool
+            assert not original.connections and not original._requests
+            pool = BarrierPool(**_bd_pool_settings(original))
+            client._transport._pool = pool
+            response = await client.post(endpoint, content=b"warm")
+            assert response.status_code == 202
+            assert len(pool.connections) == 1 and pool.connections[0].is_idle()
+            pool.armed = True
+            task = asyncio.create_task(_bd_offer(driver, client, endpoint, 128))
+            try:
+                await asyncio.wait_for(arrived.wait(), 10)
+                c, q, ids, r = b1.read_pool_census_sample(client)
+                assigned = [id(req.connection) for req in pool._requests if req.connection is not None]
+                print(f"BD barrier {driver.__name__}: R={r} Q={q} C={c} unique={len(set(assigned))}")
+                assert (r, q, c) == (128, 0, 128)
+                assert len(set(assigned)) == 128
+                assert set(assigned) == ids
+            finally:
+                release.set()
+                result = await asyncio.wait_for(task, 10)
+            assert result.served == 128 and result.errors == 0
+            assert not pool._requests
+
+
+async def _bd_instant_measurement(driver, endpoint, n, *, rate=1000):
+    async with driver.build_httpx_client(max_connections=1000) as client:
+        samples = []
+        task = asyncio.create_task(_bd_offer(driver, client, endpoint, n, rate=rate))
+        try:
+            while not task.done():
+                sample = b1.read_pool_census_sample(client)
+                c, q, _, r = sample
+                assert isinstance(c, int) and isinstance(q, int) and isinstance(r, int)
+                assert r - q <= c
+                assigned = [id(req.connection) for req in client._transport._pool._requests if req.connection is not None]
+                assert len(assigned) == len(set(assigned))
+                samples.append(sample)
+                await asyncio.sleep(0.01)
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        print(json.dumps({
+            "driver": driver.__name__, "offered": n, "served": result.served,
+            "errors": result.errors, "served_rate": result.served_rate,
+            "elapsed_drain": result.t_last_complete - result.due0,
+            "p99": result.p99, "max_in_flight": result.max_in_flight,
+            "peak_requests": max(s[3] for s in samples),
+            "peak_connections": max(s[0] for s in samples),
+            "peak_queued": max(s[1] for s in samples),
+        }), flush=True)
+        assert result.served == n and result.errors == 0
+        assert result.max_in_flight < 1000
+        assert not client._transport._pool._requests
+        return result
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_b1_instant_server_clears_open_loop_offer(driver):
+    with _bd_instant_server() as endpoint:
+        await _bd_instant_measurement(driver, endpoint, 2000)
+
+
+def characterize_b1_instant_server():
+    """Explicit supporting benchmark; never invoked during collection/import."""
+    async def run():
+        with _bd_instant_server() as endpoint:
+            for driver in (b1, bd_e2e):
+                await _bd_instant_measurement(driver, endpoint, 30000, rate=1000)
+    asyncio.run(run())
+
+
+@asynccontextmanager
+async def _bd_held_body_server():
+    release = asyncio.Event()
+    writers = set()
+    tasks = set()
+
+    async def handler(reader, writer):
+        writers.add(writer)
+        tasks.add(asyncio.current_task())
+        try:
+            while True:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                length = next((int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n") if line.lower().startswith(b"content-length:")), 0)
+                await reader.readexactly(length)
+                writer.write(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n")
+                await writer.drain()
+                await release.wait()
+                writer.write(b"{}")
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writers.discard(writer)
+            tasks.discard(asyncio.current_task())
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0, backlog=2048)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/", release
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+        for writer in list(writers):
+            writer.close()
+        remaining = list(tasks)
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+
+
+async def _bd_wait_census(client, expected):
+    async with asyncio.timeout(10):
+        while True:
+            c, q, _, r = b1.read_pool_census_sample(client)
+            if (r, q, c) == expected:
+                return
+            await asyncio.sleep(0.001)
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_b1_reservation_lifecycle(driver):
+    async with _bd_held_body_server() as (endpoint, release):
+        client = driver.build_httpx_client(max_connections=2)
+        pool = client._transport._pool
+        pending = []
+        responses = []
+        async def headers():
+            response = await client.send(client.build_request("POST", endpoint, content=b"body"), stream=True)
+            responses.append(response)
+            return response
+        try:
+            first, second = await asyncio.gather(headers(), headers())
+            await _bd_wait_census(client, (2, 0, 2))
+            third = asyncio.create_task(headers())
+            pending.append(third)
+            await _bd_wait_census(client, (3, 1, 2))
+            assert not third.done()
+            await first.aclose()
+            await asyncio.wait_for(third, 10)  # assign_to_connection must wake it.
+            assert not pool._requests[0].is_queued()
+            queued = asyncio.create_task(headers())
+            pending.append(queued)
+            await _bd_wait_census(client, (3, 1, 2))
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            await _bd_wait_census(client, (2, 0, 2))
+            with pytest.raises(httpx.PoolTimeout):
+                await client.post(endpoint, timeout=httpx.Timeout(1, pool=0.02))
+            assert len(pool._requests) == 2
+            await second.aclose()
+            await third.result().aclose()
+            assert not pool._requests
+
+            at_body = asyncio.Event()
+            async def assigned():
+                async with client.stream("POST", endpoint, content=b"cancel") as response:
+                    assert response.status_code == 202
+                    at_body.set()
+                    await response.aread()
+            task = asyncio.create_task(assigned())
+            pending.append(task)
+            await asyncio.wait_for(at_body.wait(), 10)
+            assert len(pool._requests) == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not pool._requests
+            release.set()
+            assert (await client.post(endpoint)).status_code == 202
+            assert not pool._requests
+        finally:
+            release.set()
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for response in responses:
+                await response.aclose()
+            await client.aclose()
+        assert not pool.connections and not pool._requests
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.parametrize("capacity", [2, 1000])
+@pytest.mark.asyncio
+async def test_bd_capacity_boundaries(driver, capacity):
+    async with _bd_held_body_server() as (endpoint, release):
+        async with driver.build_httpx_client(max_connections=capacity) as client:
+            responses = []
+            tasks = []
+            async def headers():
+                response = await client.send(client.build_request("POST", endpoint), stream=True)
+                responses.append(response)
+                return response
+            try:
+                tasks = [asyncio.create_task(headers()) for _ in range(capacity - 1)]
+                await asyncio.wait_for(asyncio.gather(*tasks), 10)
+                await _bd_wait_census(client, (capacity - 1, 0, capacity - 1))
+                tasks.append(asyncio.create_task(headers()))
+                await asyncio.wait_for(tasks[-1], 10)
+                await _bd_wait_census(client, (capacity, 0, capacity))
+                tasks.append(asyncio.create_task(headers()))
+                await _bd_wait_census(client, (capacity + 1, 1, capacity))
+                await responses[0].aclose()
+                await asyncio.wait_for(tasks[-1], 10)
+            finally:
+                release.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for response in responses:
+                    await response.aclose()
+            assert not client._transport._pool._requests
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.parametrize("capacity", [None, True, False, float("nan"), 0, -1, 1.5, "2"])
+def test_bd_invalid_capacity_precedes_transport(driver, capacity, monkeypatch):
+    def forbidden(**kwargs):
+        pytest.fail("transport constructed before validation")
+    monkeypatch.setattr(driver, "B1ReservationTransport", forbidden)
+    with pytest.raises(ValueError, match="positive integer"):
+        driver.build_httpx_client(max_connections=capacity)
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.parametrize("failure,exception", [("connect", httpx.ConnectError), ("read", httpx.ReadError), ("unavailable", None)])
+@pytest.mark.asyncio
+async def test_bd_inherited_failures_release_reservations(driver, failure, exception):
+    class ReadFailure(httpcore.AsyncMockStream):
+        async def read(self, max_bytes, timeout=None):
+            raise httpcore.ReadError("injected read failure")
+
+    class Backend(httpcore.AsyncMockBackend):
+        first = True
+        async def connect_tcp(self, *args, **kwargs):
+            if self.first:
+                self.first = False
+                if failure == "connect":
+                    raise httpcore.ConnectError("injected connect failure")
+                if failure == "read":
+                    return ReadFailure([])
+            return await super().connect_tcp(*args, **kwargs)
+
+    class UnavailableConnection(httpcore.AsyncHTTPConnection):
+        async def handle_async_request(self, request):
+            self._connect_failed = True
+            raise httpcore.ConnectionNotAvailable()
+
+    class FaultPool(driver.B1ReservationPool):
+        first = True
+        def create_connection(self, origin):
+            if failure == "unavailable" and self.first:
+                self.first = False
+                return UnavailableConnection(origin)
+            return super().create_connection(origin)
+
+    async with driver.build_httpx_client(max_connections=1) as client:
+        pool = FaultPool(
+            **_bd_pool_settings(client._transport._pool),
+            network_backend=Backend([b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"]),
+        )
+        client._transport._pool = pool
+        if exception is not None:
+            with pytest.raises(exception):
+                await client.post("http://bd.invalid/")
+        else:
+            assert (await client.post("http://bd.invalid/")).status_code == 202
+        assert not pool._requests
+        assert (await client.post("http://bd.invalid/")).status_code == 202
+        assert not pool._requests
+    assert not pool.connections
+
+
+def test_bd_assignment_and_census_parity():
+    """Same ledger fixture, exact assignment/census outcomes in both copies."""
+    from httpcore._async.connection_pool import AsyncPoolRequest
+    from types import SimpleNamespace
+
+    class Connection:
+        def __init__(self, origin, *, closed=False, expired=False, idle=True):
+            self.origin, self.closed, self.expired, self.idle = origin, closed, expired, idle
+        def is_closed(self):
+            return self.closed
+        def has_expired(self):
+            return self.expired
+        def is_idle(self):
+            return self.idle
+        def is_available(self):
+            return self.idle and not self.closed
+        def can_handle_request(self, origin):
+            return self.origin == origin
+
+    def exercise(driver):
+        class Pool(driver.B1ReservationPool):
+            def create_connection(self, origin):
+                return Connection(origin)
+        origin = httpcore.URL("http://first/").origin
+        pool = Pool(max_connections=2, max_keepalive_connections=2)
+        a, b = Connection(origin), Connection(origin)
+        pool._connections = [a, b]
+        requests = [AsyncPoolRequest(httpcore.Request("GET", "http://first/")) for _ in range(3)]
+        pool._requests = requests
+        assert pool._assign_requests_to_connections() == []
+        assert [r.connection for r in requests] == [a, b, None]
+        client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
+        c, q, ids, r = b1.read_pool_census_sample(client)
+        assert (c, q, r) == (2, 1, 3) and ids == {id(a), id(b)}
+        # A second-origin waiter must not evict reserved idle-looking objects.
+        other = AsyncPoolRequest(httpcore.Request("GET", "http://second/"))
+        pool._requests = [requests[0], requests[1], other]
+        assert pool._assign_requests_to_connections() == []
+        assert other.connection is None and pool.connections == [a, b]
+        # Removing one owner permits idle eviction for the other origin.
+        pool._requests.remove(requests[0])
+        assert pool._assign_requests_to_connections() == [a]
+        assert other.connection.origin == other.request.url.origin
+        # Closed/expired/surplus objects cannot be cleaned while reserved.
+        b.closed = True
+        other.connection.expired = True
+        pool._max_keepalive_connections = 0
+        assert pool._assign_requests_to_connections() == []
+        assert len(pool.connections) == 2
+        pool._requests.clear()
+        assert pool._assign_requests_to_connections() == [other.connection]
+        assert not pool.connections
+        # Explicit unreserved expired and surplus-idle cleanup paths.
+        expired, idle, active = Connection(origin, expired=True), Connection(origin), Connection(origin, idle=False)
+        pool._connections = [expired, idle, active]
+        assert pool._assign_requests_to_connections() == [expired, idle]
+        assert pool.connections == [active]
+        # A cleared assignment is freshly derived, never sticky ownership.
+        pool._connections = [a := Connection(origin)]
+        request = AsyncPoolRequest(httpcore.Request("GET", "http://first/"))
+        request.assign_to_connection(a)
+        pool._requests = [request]
+        pool._max_keepalive_connections = 2
+        request.clear_connection()
+        assert pool._assign_requests_to_connections() == []
+        assert request.connection is a
+        return c, q, r, len(ids)
+    assert exercise(b1) == exercise(bd_e2e) == (2, 1, 3, 2)
+
+
+def test_bd_census_empty_malformed_and_same_sample_arithmetic():
+    from types import SimpleNamespace
+    from httpcore._async.connection_pool import AsyncPoolRequest
+    def client(pool):
+        return SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
+    empty = SimpleNamespace(connections=[], _requests=[])
+    assert b1.read_pool_census_sample(client(empty)) == (0, 0, set(), 0)
+    for pool in (None, SimpleNamespace(connections=[]), SimpleNamespace(connections=[], _requests=None)):
+        assert b1.read_pool_census_sample(client(pool)) == (b1.UNAVAILABLE, b1.UNAVAILABLE, None, b1.UNAVAILABLE)
+    connections = [object(), object()]
+    requests = [AsyncPoolRequest(httpcore.Request("GET", "http://first/")) for _ in range(3)]
+    for request, connection in zip(requests, connections):
+        request.assign_to_connection(connection)
+    samples = []
+    for ledger in (requests[:2], requests):
+        sample = b1.read_pool_census_sample(client(SimpleNamespace(connections=connections, _requests=ledger)))
+        c, q, _, r = sample
+        assert r - q <= c
+        samples.append((c, q, r))
+    assert samples == [(2, 0, 2), (2, 1, 3)]
+    assert b1.peak_pool_metric_from_samples([b1.UNAVAILABLE, 3]) == 3
+    assert b1.peak_pool_metric_from_samples([b1.UNAVAILABLE]) == b1.UNAVAILABLE
+
+
+@pytest.mark.parametrize("values,expected", [([b1.UNAVAILABLE, 3], 3), ([b1.UNAVAILABLE], b1.UNAVAILABLE)])
+@pytest.mark.asyncio
+async def test_bd_request_peak_uses_sampler(values, expected, monkeypatch):
+    samples = iter(values)
+    def sample(client):
+        value = next(samples, values[-1])
+        return 0, 0, set(), value
+    monkeypatch.setattr(b1, "read_pool_census_sample", sample)
+    with _bd_instant_server() as endpoint:
+        async with b1.build_httpx_client(max_connections=1000) as client:
+            result = await _bd_offer(b1, client, endpoint, 250)
+    assert result.peak_pool_requests == expected
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_bd_transport_effective_settings(driver):
+    async with driver.build_httpx_client(max_connections=17) as client:
+        assert type(client._transport) is driver.B1ReservationTransport
+        pool = client._transport._pool
+        assert type(pool) is driver.B1ReservationPool
+        assert (pool._max_connections, pool._max_keepalive_connections, pool._keepalive_expiry) == (17, 17, 30.0)
+        assert pool._http1 is True and pool._http2 is False and pool._retries == 0
+        assert client.timeout.as_dict() == dict(connect=30.0, read=30.0, write=30.0, pool=30.0)
+        assert not client.trust_env and not client.follow_redirects
+        assert not pool.connections and not pool._requests
+
+
+@pytest.mark.parametrize("quantity", [0, 3, b1.UNAVAILABLE])
+def test_bd_fingerprint_request_field_renders_phase_value(quantity):
+    """Execute the sole fingerprint template, then its named FP-IG-37 check."""
+    tree = ast.parse(Path(__file__).read_text())
+    template = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "fingerprint_line" for t in n.targets))
+    result = b1.PhaseResult(0, 0, 0, [], 0.0, 1.0, 0.0, 5, 0,
+                            peak_pool_connections=quantity,
+                            peak_pool_requests=quantity,
+                            peak_pool_queued=quantity,
+                            pool_connections_seen=quantity)
+    names = {n.id for n in ast.walk(template) if isinstance(n, ast.Name)}
+    env = dict.fromkeys(names, 0)
+    env.update(b1=b1, result=result, int=int, fp=dict(cpus=4, cpu_model="fixture", image="fixture"),
+               workers_pre=[], workers_post=[], peak_pool_conn_str=str(quantity),
+               peak_pool_q_str=str(quantity), pool_seen_str=str(quantity))
+    line = eval(compile(ast.Expression(template), str(__file__), "eval"), env)
+    assert f",peak_pool_connections={quantity},peak_pool_requests={quantity},peak_pool_queued={quantity}," in line
+    test_b1_fingerprint_line_locates_the_in_flight_population({"fingerprint": line, "result": result})
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_bd_expired_idle_connection_is_replaced(driver):
+    with _bd_instant_server() as endpoint:
+        async with driver.build_httpx_client(max_connections=1) as client:
+            settings = _bd_pool_settings(client._transport._pool)
+            settings["keepalive_expiry"] = 0
+            pool = driver.B1ReservationPool(**settings)
+            client._transport._pool = pool
+            response = await client.send(client.build_request("POST", endpoint), stream=True)
+            connection = pool.connections[0]
+            await response.aread()
+            # Inherited stream close reassigns and expires the now-unowned idle object.
+            assert connection.is_closed() and not pool._requests
+            assert (await client.post(endpoint)).status_code == 202
+            assert not pool._requests
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--characterize-b1-client"]:
+        raise SystemExit("usage: test_b1_ingest_burst.py --characterize-b1-client")
+    characterize_b1_instant_server()
+
+
+@pytest.mark.parametrize("payload_length", [65535, 65536, 65537, 2097152])
+def test_b1_gateway_output_is_retained_without_pipe_backpressure(tmp_path, payload_length):
+    log_path = tmp_path / "gateway.log"
+    sentinel = tmp_path / "complete"
+    marker = b"\nSTDERR-TAIL\n"
+    script = (
+        "import pathlib,sys; "
+        f"sys.stdout.buffer.write(b'x'*{payload_length}); sys.stdout.flush(); "
+        f"sys.stderr.buffer.write({marker!r}); sys.stderr.flush(); "
+        f"pathlib.Path({str(sentinel)!r}).touch()"
+    )
+    with _b1_gateway_process([sys.executable, "-c", script],
+                             env=os.environ.copy(), log_path=log_path) as proc:
+        try:
+            proc.wait(timeout=10)
+            assert sentinel.exists()
+            assert proc.returncode == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+    assert log_path.read_bytes() == b"x" * payload_length + marker
+
+
+def test_b1_gateway_log_prefix_count_and_diagnostic_tail(tmp_path):
+    log_path = tmp_path / "gateway.log"
+    warning = b"WARNING:  Exceeded concurrency limit.\n"
+    with _b1_gateway_process([sys.executable, "-c", "pass"],
+                             env=os.environ.copy(), log_path=log_path) as proc:
+        proc.wait(timeout=10)
+        assert _b1_gateway_warning_count(log_path, 0) == 0
+        assert _b1_gateway_log_tail(log_path) == ""
+        # Independent append descriptor models the child's shared writer offset.
+        with log_path.open("ab", buffering=0) as child_writer:
+            child_writer.write(b"INITIAL\n" + warning)
+            assert _b1_gateway_warning_count(log_path, log_path.stat().st_size) == 1
+            child_writer.write(warning + b"unrelated Exceeded concurrency limit.\n" + warning[:-1])
+            prefix = log_path.stat().st_size
+            assert _b1_gateway_warning_count(log_path, prefix) == 2
+            before = log_path.read_bytes()
+            offset = child_writer.tell()
+            _b1_gateway_log_tail(log_path)
+            assert child_writer.tell() == offset
+            child_writer.write(b"\n" + warning + b"\xffTAIL")
+            assert _b1_gateway_warning_count(log_path, prefix) == 2
+            assert _b1_gateway_warning_count(log_path, log_path.stat().st_size) == 4
+            assert log_path.read_bytes().startswith(before)
+            assert "\ufffdTAIL" in _b1_gateway_log_tail(log_path)
+    for length in (1999, 2000, 2001):
+        path = tmp_path / str(length)
+        payload = "\u00e9" * length
+        path.write_text(payload)
+        assert _b1_gateway_log_tail(path) == payload[-2000:]
+        assert path.read_text() == payload
+    with pytest.raises(OSError):
+        _b1_gateway_warning_count(tmp_path / "missing", 0)
+    with pytest.raises(OSError):
+        _b1_gateway_warning_count(tmp_path, 0)
+    with pytest.raises(RuntimeError, match="shortened"):
+        _b1_gateway_warning_count(log_path, log_path.stat().st_size + 1)
+
+    # Keep the child's non-O_APPEND writer alive across the diagnostic read.
+    # Seeking that shared descriptor would overwrite the initial output.
+    live_log = tmp_path / "live.log"
+    ready, resume = tmp_path / "ready", tmp_path / "resume"
+    initial = b"INITIAL-MARKER\n" + b"x" * 70000 + b"\xff\n" + warning
+    script = textwrap.dedent(f"""
+        import pathlib, sys, time
+        sys.stdout.buffer.write({initial!r})
+        sys.stdout.flush()
+        pathlib.Path({str(ready)!r}).touch()
+        while not pathlib.Path({str(resume)!r}).exists(): time.sleep(0.01)
+        sys.stdout.buffer.write(b'APPENDED-TAIL')
+        sys.stdout.flush()
+    """)
+    with _b1_gateway_process([sys.executable, "-c", script],
+                             env=os.environ.copy(), log_path=live_log) as proc:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert _b1_gateway_log_tail(live_log) == initial.decode(errors="replace")[-2000:]
+        assert _b1_gateway_warning_count(live_log, live_log.stat().st_size) == 1
+        resume.touch()
+        proc.wait(timeout=10)
+        assert proc.returncode == 0
+    assert live_log.read_bytes() == initial + b"APPENDED-TAIL"
+
+    boundary_log = tmp_path / "chunk-boundaries.log"
+    # A UTF-8 whitespace character and warning straddle the parser's chunk boundary.
+    boundary_log.write_bytes(b"x" * 65525 + b"\nWARNING:\xc2\xa0Exceeded concurrency limit.\r\n")
+    assert _b1_gateway_warning_count(boundary_log, boundary_log.stat().st_size) == 1
+
+
+@pytest.mark.parametrize("branch", [
+    "normal", "early", "startup_timeout", "assertion", "stubborn", "constructor",
+    "fake_kill", "fake_orphan", "fake_survivor", "fake_unreapable",
+])
+def test_b1_gateway_process_reaps_on_failure(tmp_path, monkeypatch, branch):
+    log_path = tmp_path / "gateway.log"
+    writers = []
+    original_popen = subprocess.Popen
+
+    def spawn(*args, **kwargs):
+        writers.append(kwargs["stdout"])
+        if branch == "constructor":
+            raise OSError("constructor failure")
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    if branch == "constructor":
+        with pytest.raises(OSError, match="constructor failure"):
+            with _b1_gateway_process([], env={}, log_path=log_path):
+                pytest.fail("constructor unexpectedly succeeded")
+        assert writers[0].closed
+        assert log_path.exists()
+        return
+    if branch.startswith("fake_"):
+        class LifecycleFake:
+            pid = 987654321
+            returncode = None
+            waits = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout):
+                self.waits += 1
+                if branch == "fake_unreapable" or (branch == "fake_kill" and self.waits == 1):
+                    raise subprocess.TimeoutExpired("fake", timeout)
+                self.returncode = -9
+                return self.returncode
+
+        fake = LifecycleFake()
+        def fake_spawn(*args, **kwargs):
+            writers.append(kwargs["stdout"])
+            return fake
+        signals = []
+        monkeypatch.setattr(subprocess, "Popen", fake_spawn)
+        def send(pid, sig):
+            signals.append((pid, sig))
+        monkeypatch.setattr(os, "killpg", send)
+        if branch in {"fake_orphan", "fake_survivor"}:
+            monkeypatch.setitem(globals(), "_b1_gateway_group_alive", lambda pid: (
+                branch == "fake_survivor" or (pid, signal.SIGKILL) not in signals
+            ))
+        if branch == "fake_survivor":
+            from types import SimpleNamespace
+            ticks = iter((0, 11))
+            monkeypatch.setitem(globals(), "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+        if branch in {"fake_survivor", "fake_unreapable"}:
+            with pytest.raises(RuntimeError, match="gateway log="):
+                with _b1_gateway_process([], env={}, log_path=log_path):
+                    pass
+            assert writers[0].closed
+            assert signals[-1] == (fake.pid, signal.SIGKILL)
+            return
+        with _b1_gateway_process([], env={}, log_path=log_path):
+            pass
+        if branch == "fake_orphan":
+            assert fake.waits == 1 and fake.poll() == -9
+            assert signals[-1] == (fake.pid, signal.SIGKILL)
+            assert writers[0].closed
+            return
+        assert fake.waits == 2 and fake.poll() == -9
+        assert signals == [(fake.pid, signal.SIGTERM), (fake.pid, signal.SIGKILL)]
+        assert writers[0].closed
+        return
+
+    ready = tmp_path / "ready"
+    script = "import sys; print('RETAINED-TAIL', flush=True); sys.exit(7)"
+    if branch in {"startup_timeout", "assertion"}:
+        script = f"import time,pathlib; print('RETAINED-TAIL',flush=True); pathlib.Path({str(ready)!r}).touch(); time.sleep(60)"
+    elif branch == "stubborn":
+        script = textwrap.dedent(f"""
+            import os, signal, time, pathlib
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            child = os.fork()
+            if child == 0:
+                while True: time.sleep(1)
+            print('RETAINED-TAIL', flush=True)
+            pathlib.Path({str(ready)!r}).write_text(str(child))
+            while True: time.sleep(1)
+        """)
+    elif branch == "normal":
+        script = "print('RETAINED-TAIL', flush=True)"
+
+    def exercise():
+        with _b1_gateway_process([sys.executable, "-c", script],
+                                 env=os.environ.copy(), log_path=log_path) as proc:
+            processes.append(proc)
+            if branch in {"normal", "early"}:
+                proc.wait(timeout=10)
+                if branch == "early":
+                    raise RuntimeError("gateway exited early")
+            else:
+                deadline = time.monotonic() + 10
+                while not ready.exists():
+                    assert time.monotonic() < deadline, "child did not become ready"
+                    time.sleep(0.01)
+                assert _b1_gateway_group_alive(proc.pid)
+                if branch == "startup_timeout":
+                    raise RuntimeError("gateway never became healthy")
+                if branch == "assertion":
+                    raise AssertionError("fixture assertion")
+    processes = []
+    try:
+        if branch in {"early", "startup_timeout", "assertion"}:
+            with pytest.raises(RuntimeError, match="RETAINED-TAIL") as error:
+                exercise()
+            assert str(log_path) in str(error.value)
+            assert isinstance(error.value.__cause__, (RuntimeError, AssertionError))
+        else:
+            exercise()
+        assert processes[0].poll() is not None
+        assert not _b1_gateway_group_alive(processes[0].pid)
+        assert writers[0].closed
+        assert b"RETAINED-TAIL" in log_path.read_bytes()
+    finally:
+        for proc in processes:
+            _b1_gateway_signal_group(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while any(_b1_gateway_group_alive(p.pid) for p in processes):
+            assert time.monotonic() < deadline, "test left live group members"
+            time.sleep(0.01)
+
+
+def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monkeypatch):
+    """Execute the fixture's actual callback, serialization and yielded mapping."""
+    from types import SimpleNamespace
+
+    tree = ast.parse(Path(__file__).read_text())
+    fixture = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "b1_reference_run")
+    callback = next(n for n in ast.walk(fixture) if isinstance(n, ast.FunctionDef) and n.name == "_after_window")
+    warning = b"WARNING:  Exceeded concurrency limit.\n"
+    log_path = tmp_path / "gateway.log"
+    log_path.write_bytes(warning * 2)
+    marks = {}
+    def cpu(pid):
+        assert "log_prefix_bytes" not in marks
+        return 1.0
+    monkeypatch.setattr(b1, "tree_cpu_seconds", cpu)
+    namespace = {"b1": b1, "marks": marks, "proc": SimpleNamespace(pid=1, poll=lambda: None), "log_path": log_path}
+    exec(compile(ast.Module(body=[callback], type_ignores=[]), "fixture-callback", "exec"), namespace)
+    namespace["_after_window"]()
+    assert marks["cpu_after"] == 1.0
+    with log_path.open("ab") as output:
+        output.write(warning * 2)  # Later shed-probe phase must not enter the prefix.
+    count_assignment = next(n for n in ast.walk(fixture) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "concurrency_limit_warnings" for t in n.targets))
+    namespace["_b1_gateway_warning_count"] = _b1_gateway_warning_count
+    exec(compile(ast.Module(body=[count_assignment], type_ignores=[]), "fixture-count", "exec"), namespace)
+    assert namespace["concurrency_limit_warnings"] == 2
+    assert _b1_gateway_warning_count(log_path, log_path.stat().st_size) == 4
+    assignment = next(n for n in ast.walk(fixture) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "fingerprint_line" for t in n.targets))
+    mapping = next(n.value for n in ast.walk(fixture) if isinstance(n, ast.Yield))
+    # Supply unrelated fixture observations; execute its unchanged consumer expressions.
+    names = {n.id for root in (assignment, mapping) for n in ast.walk(root) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    for name in names - namespace.keys() - {"int", "float", "str"}:
+        namespace[name] = 1
+    namespace.update(fp={"cpus": 1, "cpu_model": "test", "image": "test"},
+                     workers_pre={1}, workers_post={1}, status_histogram="200:3;503:1")
+    attrs = {n.attr for root in (assignment, mapping) for n in ast.walk(root) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "result"}
+    namespace["result"] = SimpleNamespace(**dict.fromkeys(attrs, 1))
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), "fixture-line", "exec"), namespace)
+    yielded = eval(compile(ast.Expression(mapping), "fixture-mapping", "eval"), namespace)
+    assert "status_histogram=200:3;503:1,concurrency_limit_warnings=2," in yielded["fingerprint"]
+    assert yielded["concurrency_limit_warnings"] == 2
+    assert yielded["gateway_log_path"] == log_path
+    # Pin the real callback registration and its ordering before the probe.
+    calls = [n for n in ast.walk(fixture) if isinstance(n, ast.Call)]
+    run = next(n for n in calls if isinstance(n.func, ast.Attribute) and n.func.attr == "run_open_loop")
+    assert any(k.arg == "on_window_complete" and isinstance(k.value, ast.Name) and k.value.id == "_after_window" for k in run.keywords)
+    probe = next(n for n in calls if isinstance(n.func, ast.Attribute) and n.func.attr == "run_shed_probe")
+    assert run.lineno < count_assignment.lineno < probe.lineno
+    # A failed snapshot cannot yield a zero-valued count/fingerprint.
+    log_path.unlink()
+    marks.clear()
+    with pytest.raises(OSError):
+        namespace["_after_window"]()
+    assert "log_prefix_bytes" not in marks

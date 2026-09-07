@@ -232,6 +232,37 @@ def _assert_httpx_fully_pinned(path: Path, src: str) -> None:
         f"{path.name}: max_keepalive_connections must be the capacity parameter, got {mk}"
     )
 
+    assert "transport" in kwargs, f"{path.name}: missing transport="
+    transport = _nested_call_kwargs(
+        kwargs["transport"], expected_names={"B1ReservationTransport"}
+    )
+    assert set(transport) == {"limits", "trust_env", "http1", "http2", "retries"}
+    assert ast.dump(transport["limits"]) == ast.dump(kwargs["limits"])
+    for key, expected in {"trust_env": False, "http1": True, "http2": False, "retries": 0}.items():
+        assert isinstance(transport[key], ast.Constant)
+        assert transport[key].value is expected
+    tree = ast.parse(src)
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    pool_class = classes["B1ReservationPool"]
+    transport_class = classes["B1ReservationTransport"]
+    assert [ast.unparse(b) for b in pool_class.bases] == ["httpcore.AsyncConnectionPool"]
+    assert [ast.unparse(b) for b in transport_class.bases] == ["httpx.AsyncHTTPTransport"]
+    assert [n.name for n in pool_class.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))] == ["_assign_requests_to_connections"]
+    init = next(n for n in transport_class.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    expected_init = ast.parse("""
+def __init__(self, *, limits, trust_env, http1, http2, retries):
+    super().__init__(limits=limits, trust_env=trust_env, http1=http1, http2=http2, retries=retries)
+    pool = self._pool
+    self._pool = B1ReservationPool(
+        ssl_context=pool._ssl_context,
+        max_connections=pool._max_connections,
+        max_keepalive_connections=pool._max_keepalive_connections,
+        keepalive_expiry=pool._keepalive_expiry,
+        http1=pool._http1, http2=pool._http2, retries=pool._retries,
+    )
+""").body[0]
+    assert ast.dump(init) == ast.dump(expected_init), f"{path.name}: transport/pool construction drift"
+
     timeout = _nested_call_kwargs(kwargs["timeout"], expected_names={"Timeout"})
     for key in _TIMEOUT_KEYS:
         assert key in timeout, f"{path.name}: Timeout missing {key}="
@@ -1243,3 +1274,145 @@ def test_unhealthy_events_oracle_filters_and_fails_closed():
     # Retired field names must not appear as fingerprint keys.
     assert "cgroup_cpu_s=" not in src
     assert "nr_throttled_delta=" not in src
+
+
+_BD_CONSTRUCTION_MUTATIONS = [
+    ("plain_transport", "transport=B1ReservationTransport(", "transport=httpx.AsyncHTTPTransport("),
+    ("plain_pool", "self._pool = B1ReservationPool(", "self._pool = httpcore.AsyncConnectionPool("),
+    ("unequal_inner_limits", "                max_connections=max_connections,", "                max_connections=1,"),
+    ("transport_environment", "            trust_env=False,", "            trust_env=True,"),
+    ("transport_http2", "            http2=False,", "            http2=True,"),
+] + [
+    ("pool_" + key, key + "=pool._" + key + ",", key + "=" + value + ",")
+    for key, value in (
+        ("max_connections", "1"), ("max_keepalive_connections", "1"),
+        ("keepalive_expiry", "0.001"), ("http1", "False"),
+        ("http2", "True"), ("retries", "1"),
+    )
+] + [
+    ("pool_ssl_context_" + name, "ssl_context=pool._ssl_context,", "ssl_context=" + value + ",")
+    for name, value in (
+        ("none", "None"), ("new", "ssl.SSLContext()"),
+        ("unrelated", "other._ssl_context"),
+    )
+]
+
+
+@pytest.mark.parametrize("path", [REF_PATH, E2E_PATH], ids=["reference", "e2e"])
+@pytest.mark.parametrize("name,old,new", _BD_CONSTRUCTION_MUTATIONS, ids=[m[0] for m in _BD_CONSTRUCTION_MUTATIONS])
+def test_bd_construction_mutations(path, name, old, new):
+    source = path.read_text()
+    assert old in source, name
+    with pytest.raises(AssertionError):
+        _assert_httpx_fully_pinned(path, source.replace(old, new, 1))
+
+
+@pytest.mark.parametrize("path", [REF_PATH, E2E_PATH])
+def test_bd_omitted_transport(path):
+    tree = ast.parse(path.read_text())
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_func_name(n) == "AsyncClient")
+    call.keywords = [k for k in call.keywords if k.arg != "transport"]
+    with pytest.raises(AssertionError):
+        _assert_httpx_fully_pinned(path, ast.unparse(tree))
+
+
+def test_bd_import_does_not_construct_client_or_start_server():
+    import subprocess
+    import sys
+    script = """
+import importlib.util, subprocess, sys, httpx
+from pathlib import Path
+def forbidden(*args, **kwargs):
+    raise AssertionError("module import started a client or server")
+subprocess.Popen = forbidden
+httpx.AsyncClient = forbidden
+path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("bd_import_only", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert callable(module.characterize_b1_instant_server)
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(REF_TEST)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert not result.stdout
+
+
+def _assert_b1_output_capture_ownership(reference_source, e2e_sources):
+    tree = ast.parse(reference_source)
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_b1_gateway_process")
+    fixture = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "b1_reference_run")
+    launches = [n for n in ast.walk(helper) if isinstance(n, ast.Call) and _call_func_name(n) == "Popen"]
+    assert len(launches) == 1
+    launch = launches[0]
+    kwargs = {k.arg: ast.unparse(k.value) for k in launch.keywords}
+    assert kwargs["stdout"] == "writer"
+    assert kwargs["stderr"] == "subprocess.STDOUT"
+    assert kwargs["start_new_session"] == "True"
+    writer_scope = next(n for n in ast.walk(helper) if isinstance(n, ast.With) and any(isinstance(i.optional_vars, ast.Name) and i.optional_vars.id == "writer" for i in n.items))
+    assert ast.unparse(writer_scope.items[0].context_expr) == "log_path.open('xb')"
+    assert launch in list(ast.walk(writer_scope))
+    owned = [n for n in ast.walk(fixture) if isinstance(n, ast.With) and any(isinstance(i.context_expr, ast.Call) and _call_func_name(i.context_expr) == "_b1_gateway_process" and isinstance(i.optional_vars, ast.Name) and i.optional_vars.id == "proc" for i in n.items)]
+    assert len(owned) == 1
+    call = owned[0].items[0].context_expr
+    assert {k.arg: ast.unparse(k.value) for k in call.keywords} == {"env": "env", "log_path": "log_path"}
+    assert "_PROFILE_PATH" in ast.unparse(call.args[0])
+    assert not any(isinstance(n, ast.Call) and _call_func_name(n) == "Popen" for n in ast.walk(fixture))
+    assert any(isinstance(n, ast.Call) and _call_func_name(n) == "run_open_loop" for n in ast.walk(owned[0]))
+    assert any(isinstance(n, ast.Call) and _call_func_name(n) == "get" for n in ast.walk(owned[0]))
+    for source in e2e_sources:
+        assert not any(isinstance(n, ast.Call) and _call_func_name(n) == "Popen" for n in ast.walk(ast.parse(source)))
+    load_tree = ast.parse(e2e_sources[1])
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and ast.unparse(n.func) == "subprocess.run" for n in ast.walk(load_tree))
+    events = next(n for n in load_tree.body if isinstance(n, ast.FunctionDef) and n.name == "_unhealthy_events_since")
+    assert any(isinstance(n, ast.Assign) and ast.unparse(n.value) == "kubectl_runner or subprocess.run" for n in ast.walk(events))
+
+
+def test_b1_output_capture_ownership():
+    source = REF_TEST.read_text()
+    e2e_sources = [p.read_text() for p in (E2E_PATH, E2E_TEST, E2E_TEST.parent / "conftest.py")]
+    _assert_b1_output_capture_ownership(source, e2e_sources)
+    for mutant in (
+        source.replace("stdout=writer", "stdout=subprocess.PIPE", 1),
+        source.replace("with _b1_gateway_process(", "with subprocess.Popen(", 1),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_b1_output_capture_ownership(mutant, e2e_sources)
+    for index in range(3):
+        mutants = e2e_sources.copy()
+        mutants[index] += "\nproc = subprocess.Popen(['gateway'], stdout=subprocess.PIPE)\n"
+        with pytest.raises(AssertionError):
+            _assert_b1_output_capture_ownership(source, mutants)
+
+
+def test_b1_e2e_finite_capture_drains_large_output():
+    import signal
+    import subprocess
+    import sys
+    from datetime import datetime, timezone
+
+    module = _load(E2E_TEST, "be_e2e_finite_capture")
+    captures = []
+    marker = "FINITE-STDERR-MARKER"
+    def runner(argv, **kwargs):
+        assert argv[0] == "kubectl"
+        assert kwargs == {"capture_output": True, "text": True, "check": False}
+        result = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.stdout.write(' '*2097152 + '{\"items\": []}'); sys.stderr.write('FINITE-STDERR-MARKER')"],
+            **kwargs, timeout=9,
+        )
+        captures.append(result)
+        return result
+    def watchdog(signum, frame):
+        raise TimeoutError("finite capture exceeded outer 10-second watchdog")
+    previous = signal.signal(signal.SIGALRM, watchdog)
+    signal.setitimer(signal.ITIMER_REAL, 10)
+    try:
+        assert module._unhealthy_events_since(datetime.now(timezone.utc), pod_name="gateway", kubectl_runner=runner) == []
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert len(captures) == 1
+    assert captures[0].returncode == 0
+    assert captures[0].stdout == " " * 2097152 + '{"items": []}'
+    assert captures[0].stderr == marker

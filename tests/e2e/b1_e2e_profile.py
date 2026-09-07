@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
+import httpcore
 import httpx
 
 # Profile constants — each bound exactly once at module scope (FP-IG-13).
@@ -129,8 +130,106 @@ class PhaseResult:
         return b - a
 
 
+class B1ReservationPool(httpcore.AsyncConnectionPool):
+    """HTTP/1.1 assignment reservations live exactly as long as pool requests.
+
+    Version-coupled to httpcore 1.0.9. Stream close, errors and retries retain
+    their upstream lifecycle; only the synchronous assignment pass differs.
+    """
+
+    def _assign_requests_to_connections(self):
+        reserved = {
+            id(request.connection) for request in self._requests
+            if request.connection is not None
+        }
+        closing = []
+        retained = []
+        held = len(self._connections)
+        for connection in self._connections:
+            if id(connection) in reserved:
+                retained.append(connection)
+            elif connection.is_closed():
+                held -= 1
+            elif connection.has_expired() or (
+                connection.is_idle() and held > self._max_keepalive_connections
+            ):
+                held -= 1
+                closing.append(connection)
+            else:
+                retained.append(connection)
+        self._connections = retained
+
+        for request in self._requests:
+            if not request.is_queued():
+                continue
+            origin = request.request.url.origin
+            available = next((
+                c for c in self._connections
+                if id(c) not in reserved
+                and c.can_handle_request(origin) and c.is_available()
+            ), None)
+            if available is not None:
+                connection = available
+            elif len(self._connections) < self._max_connections:
+                connection = self.create_connection(origin)
+                self._connections.append(connection)
+            else:
+                idle = next((
+                    c for c in self._connections
+                    if id(c) not in reserved and c.is_idle()
+                ), None)
+                if idle is None:
+                    continue
+                self._connections.remove(idle)
+                closing.append(idle)
+                connection = self.create_connection(origin)
+                self._connections.append(connection)
+            # The helper also wakes an already parked pool waiter.
+            request.assign_to_connection(connection)
+            reserved.add(id(connection))
+        return closing
+
+
+class B1ReservationTransport(httpx.AsyncHTTPTransport):
+    """Retain HTTPX conversion and its default SSL context, with BD's pool."""
+
+    def __init__(self, *, limits, trust_env, http1, http2, retries):
+        super().__init__(
+            limits=limits, trust_env=trust_env, http1=http1,
+            http2=http2, retries=retries,
+        )
+        # Newly constructed and unused: no requests, connections or network I/O.
+        pool = self._pool
+        self._pool = B1ReservationPool(
+            ssl_context=pool._ssl_context,
+            max_connections=pool._max_connections,
+            max_keepalive_connections=pool._max_keepalive_connections,
+            keepalive_expiry=pool._keepalive_expiry,
+            http1=pool._http1,
+            http2=pool._http2,
+            retries=pool._retries,
+        )
+
+
 def build_httpx_client(*, max_connections: int) -> httpx.AsyncClient:
+    if (
+        isinstance(max_connections, bool)
+        or not isinstance(max_connections, int)
+        or max_connections <= 0
+    ):
+        raise ValueError("max_connections must be a positive integer")
     return httpx.AsyncClient(
+        transport=B1ReservationTransport(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+                keepalive_expiry=KEEPALIVE_EXPIRY,
+            ),
+            trust_env=False,
+            http1=True,
+            http2=False,
+            retries=0,
+        ),
         limits=httpx.Limits(
             max_connections=max_connections,
             max_keepalive_connections=max_connections,
