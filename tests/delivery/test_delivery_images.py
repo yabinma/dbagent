@@ -434,6 +434,50 @@ def test_versions_env_is_the_only_pin_source():
                 assert default == vers[arg] or default in vers.values(), (name, arg, default)
 
 
+def test_minio_pins_are_registry_qualified_and_repeated_by_every_manifest():
+    """The MinIO pins name their registry, and no consumer names another.
+
+    An unqualified ``minio/minio`` or ``minio/mc`` resolves to Docker Hub,
+    where both repositories were removed; every pull then fails with
+    ImageNotFound at the functional fixture, the e2e pre-pull, Helm and
+    compose alike. The same releases are served by MinIO's own registry,
+    so each reference carries the registry that serves it.
+    """
+    from delivery_helpers import CHARTS, COMPOSE
+
+    import yaml
+
+    vers = load_versions()
+    for key in ("MINIO_IMAGE", "MINIO_MC_IMAGE"):
+        ref = vers[key]
+        assert ref.startswith("quay.io/minio/"), (
+            f"{key}={ref!r} is not registry-qualified: an unqualified "
+            f"minio/... reference resolves to Docker Hub, where the "
+            f"repository no longer exists"
+        )
+
+    # Manifests repeat versions.env byte-for-byte, so the Docker Hub
+    # default cannot return through a manifest the pin does not reach.
+    chart = yaml.safe_load((CHARTS / "dbagent/values.yaml").read_text(encoding="utf-8"))
+    assert chart["minio"]["image"] == vers["MINIO_IMAGE"]
+    assert chart["minio"]["mcImage"] == vers["MINIO_MC_IMAGE"]
+
+    compose = yaml.safe_load((COMPOSE / "control-plane.yml").read_text(encoding="utf-8"))
+    assert compose["services"]["minio"]["image"] == vers["MINIO_IMAGE"]
+    assert compose["services"]["minio-init"]["image"] == vers["MINIO_MC_IMAGE"]
+
+    # The functional fixture pins its own tag but never its own registry:
+    # it is the site that failed in CI, and versions.env does not reach it.
+    fixture = (REPO_ROOT / "tests/functional/conftest.py").read_text(encoding="utf-8")
+    unqualified = re.findall(r"""["'](minio/(?:minio|mc):[^"']+)["']""", fixture)
+    assert not unqualified, (
+        f"tests/functional/conftest.py names Docker Hub: {unqualified}"
+    )
+    assert re.search(r"""["']quay\.io/minio/minio:[^"']+["']""", fixture), (
+        "tests/functional/conftest.py no longer pulls MinIO from quay.io"
+    )
+
+
 def test_dashboard_web_nginx_config_and_runtime_config_js():
     conf = (DOCKER_DIR / "nginx/default.conf.template").read_text(encoding="utf-8")
     assert "try_files $uri /index.html" in conf

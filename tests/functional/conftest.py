@@ -69,7 +69,7 @@ def minio_endpoint() -> str:
     access_key = "minioadmin"
     secret_key = "minioadmin"
     container = (
-        DockerContainer("minio/minio:latest")
+        DockerContainer("quay.io/minio/minio:latest")
         .with_exposed_ports(9000)
         .with_env("MINIO_ROOT_USER", access_key)
         .with_env("MINIO_ROOT_PASSWORD", secret_key)
