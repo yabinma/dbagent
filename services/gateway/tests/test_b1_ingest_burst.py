@@ -2304,6 +2304,7 @@ async def _bd_instant_measurement(driver, endpoint, n, *, rate=1000):
                 c, q, _, r = sample
                 assert isinstance(c, int) and isinstance(q, int) and isinstance(r, int)
                 assert r - q <= c
+                assert q == 0
                 assigned = [id(req.connection) for req in client._transport._pool._requests if req.connection is not None]
                 assert len(assigned) == len(set(assigned))
                 samples.append(sample)
@@ -2321,9 +2322,10 @@ async def _bd_instant_measurement(driver, endpoint, n, *, rate=1000):
             "peak_requests": max(s[3] for s in samples),
             "peak_connections": max(s[0] for s in samples),
             "peak_queued": max(s[1] for s in samples),
+            "samples": len(samples),
         }), flush=True)
+        assert any(s[3] >= 1 for s in samples)
         assert result.served == n and result.errors == 0
-        assert result.max_in_flight < 1000
         assert not client._transport._pool._requests
         return result
 
@@ -2342,6 +2344,160 @@ def characterize_b1_instant_server():
             for driver in (b1, bd_e2e):
                 await _bd_instant_measurement(driver, endpoint, 30000, rate=1000)
     asyncio.run(run())
+
+
+@pytest.fixture
+def bf_instant_script(monkeypatch):
+    """Script test collaborators; the real measurement owns every policy check."""
+    from types import SimpleNamespace
+
+    @asynccontextmanager
+    async def scripted(driver, ticks, *, residual=False, **result_fields):
+        result = SimpleNamespace(
+            served=2000, errors=0, max_in_flight=1000,
+            served_rate=211.61444797304955, due0=0,
+            t_last_complete=9.451150519999999, p99=7314.775114000042,
+        )
+        vars(result).update(result_fields)
+        pool = SimpleNamespace(_requests=[])
+        client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
+        state = SimpleNamespace(consumed=0, finished=False, closed=False)
+        consumed = asyncio.Event()
+        # The real helper always samples before its newly created task runs.
+        script = [(0, 0, 0, ())] + list(ticks)
+
+        @asynccontextmanager
+        async def build_client(*, max_connections):
+            assert max_connections == 1000
+            try:
+                yield client
+            finally:
+                state.closed = True
+
+        def census(sampled_client):
+            assert sampled_client is client
+            c, q, r, assignments = script[state.consumed]
+            identities = {key: object() for key in assignments if key is not None}
+            pool._requests = [
+                SimpleNamespace(connection=identities[key] if key is not None else None)
+                for key in assignments
+            ]
+            state.consumed += 1
+            if state.consumed == len(script):
+                consumed.set()
+            return c, q, {id(conn) for conn in identities.values()}, r
+
+        async def offer(offered_driver, offered_client, endpoint, n, *, rate):
+            try:
+                assert offered_driver is driver and offered_client is client
+                assert n == 2000 and rate == 1000
+                await consumed.wait()
+                pool._requests = [SimpleNamespace(connection=object())] if residual else []
+                return result
+            finally:
+                state.finished = True
+
+        with monkeypatch.context() as patch:
+            patch.setattr(driver, "build_httpx_client", build_client)
+            patch.setattr(b1, "read_pool_census_sample", census)
+            patch.setattr(sys.modules[__name__], "_bd_offer", offer)
+            try:
+                yield state
+            finally:
+                assert state.finished, "fake offer was not reaped"
+                assert state.closed, "fake client was not closed"
+
+    return scripted
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_b1_instant_server_sample_from_ci_34146724801(driver, bf_instant_script, capsys):
+    # Synthetic simultaneous census compatible with the CI summary, not raw CI ticks.
+    ticks = [(1000, 0, 894, tuple(range(894))), (0, 0, 0, ())]
+    async with bf_instant_script(driver, ticks) as state:
+        await _bd_instant_measurement(driver, "unused", 2000)
+    record = json.loads(capsys.readouterr().out)
+    assert record == {
+        "driver": driver.__name__, "offered": 2000, "served": 2000, "errors": 0,
+        "max_in_flight": 1000, "served_rate": 211.61444797304955,
+        # Synthetic timestamp operands preserve the recorded drain interval.
+        "elapsed_drain": 9.451150519999999 - 0, "p99": 7314.775114000042,
+        "peak_requests": 894, "peak_connections": 1000, "peak_queued": 0,
+        "samples": state.consumed,
+    }
+    assert state.consumed == 3
+
+
+@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
+@pytest.mark.parametrize("ticks,fields,failure", [
+    pytest.param([(1000, 0, 894, tuple(range(894)))], {"max_in_flight": peak}, None,
+                 id=f"recorded-peak-{peak}") for peak in (999, 1000, 1001)
+] + [
+    pytest.param([(1000, 0, 894, tuple(range(894)))], {"served_rate": rate}, None,
+                 id=f"recorded-rate-{rate}") for rate in (199.9, 200.0, 200.1)
+] + [
+    pytest.param([(2, 0, 2, (0, 1))], {"served": served},
+                 None if served == 2000 else "assert result.served == n and result.errors == 0",
+                 id=f"served-{served}") for served in (1999, 2000, 2001)
+] + [
+    pytest.param([(2, 0, 2, (0, 1))], {"errors": 1},
+                 "assert result.served == n and result.errors == 0", id="errors"),
+    pytest.param([(2, 0, 2, (0, 1))], {}, None, id="distinct-equality"),
+    pytest.param([(2, 0, 3, (0, 1, 2))], {}, "assert r - q <= c", id="inequality"),
+    pytest.param([(2, 0, 2, (0, 0))], {},
+                 "assert len(assigned) == len(set(assigned))", id="duplicate"),
+    pytest.param([(2, 1, 3, (0, 1, None))], {}, "assert q == 0", id="queued"),
+    pytest.param([(2, 0, 2, (0, 1))], {"residual": True},
+                 "assert not client._transport._pool._requests", id="residual"),
+    pytest.param([(0, 0, 0, ()), (0, 0, 0, ())], {},
+                 "assert any(s[3] >= 1 for s in samples)", id="all-empty"),
+    pytest.param([("unavailable", 0, 2, (0, 1))], {}, "assert isinstance(c, int)", id="unavailable-c"),
+    pytest.param([(2, "unavailable", 2, (0, 1))], {}, "assert isinstance(c, int)", id="unavailable-q"),
+    pytest.param([(2, 0, "unavailable", (0, 1))], {}, "assert isinstance(c, int)", id="unavailable-r"),
+    pytest.param([("unavailable", 0, 2, (0, 1))], {"served": 1999},
+                 "assert isinstance(c, int)", id="validity-before-completion"),
+    pytest.param([(1, 0, 1, (0,))], {}, None, id="empty-then-one"),
+    pytest.param([(0, 0, 0, ()), (2, 0, 2, (0, 1))], {}, None, id="empty-then-valid"),
+    pytest.param([(2, 0, 2, (0, 1)), (2, 0, 3, (0, 1, 2)), (4, 0, 4, (0, 1, 2, 3))], {},
+                 "assert r - q <= c", id="invalid-middle"),
+])
+@pytest.mark.asyncio
+async def test_b1_instant_server_correctness_rejects_corrupt_samples(
+    driver, ticks, fields, failure, bf_instant_script, capsys,
+):
+    async with bf_instant_script(driver, ticks, **fields) as state:
+        if failure is None:
+            await _bd_instant_measurement(driver, "unused", 2000)
+        else:
+            with pytest.raises(AssertionError) as exc:
+                await _bd_instant_measurement(driver, "unused", 2000)
+            frame = exc.traceback[-1]
+            assert frame.name == "_bd_instant_measurement"
+            assert str(frame.statement).strip().startswith(failure)
+    output = capsys.readouterr().out
+    if failure is None or failure == "assert any(s[3] >= 1 for s in samples)":
+        record = json.loads(output)
+        assert record["samples"] == state.consumed == len(ticks) + 1
+        assert record["max_in_flight"] == fields.get("max_in_flight", 1000)
+        assert record["served_rate"] == fields.get("served_rate", 211.61444797304955)
+        if failure is not None:
+            assert record["peak_requests"] == 0
+            # Prove that readable-sample count alone accepts this vacuous witness.
+            import inspect
+
+            source = inspect.getsource(_bd_instant_measurement)
+            populated = "assert any(s[3] >= 1 for s in samples)"
+            assert source.count(populated) == 1
+            namespace = dict(globals())
+            exec(compile(source.replace(populated, "assert len(samples) > 0"),
+                         "<BF count-only mutant>", "exec"), namespace)
+            async with bf_instant_script(driver, ticks, **fields) as mutant_state:
+                namespace["_bd_offer"] = _bd_offer
+                await namespace["_bd_instant_measurement"](driver, "unused", 2000)
+            mutant_record = json.loads(capsys.readouterr().out)
+            assert mutant_record["samples"] == mutant_state.consumed == len(ticks) + 1
+            assert mutant_record["peak_requests"] == 0
 
 
 @asynccontextmanager
