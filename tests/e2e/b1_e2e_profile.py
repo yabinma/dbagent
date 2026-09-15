@@ -9,11 +9,10 @@ import asyncio
 import json
 import math
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
-
-import httpcore
-import httpx
+from urllib.parse import urlsplit
 
 # Profile constants — each bound exactly once at module scope (FP-IG-13).
 BURST_RATE = 1000
@@ -130,122 +129,542 @@ class PhaseResult:
         return b - a
 
 
-class B1ReservationPool(httpcore.AsyncConnectionPool):
-    """HTTP/1.1 assignment reservations live exactly as long as pool requests.
+# B1-RAW-CLIENT:BEGIN
+# FP-B1DF-1/2/3 — B1's own HTTP/1.1 client. Every connection-ownership
+# transition is O(1) in the connection/request population: no request-path
+# helper iterates the held, idle, request or waiter collections. Work scales
+# with payload bytes, never with MAX_IN_FLIGHT. The bytes between these two
+# markers are identical in both driver copies — edit both, never one.
+_B1_HEADER_NAME_FORBIDDEN = frozenset(' \t"(),/:;<=>?@[\\]{}\r\n\x00')
+_B1_HEADER_VALUE_FORBIDDEN = frozenset("\r\n\x00")
+# Framing is the client's own: a caller may not restate or contradict it.
+_B1_RESERVED_HEADERS = frozenset(
+    ("host", "content-length", "transfer-encoding", "connection")
+)
+_B1_TARGET_FORBIDDEN = frozenset(" \r\n\x00")
+_B1_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+_B1_BODYLESS_STATUS = frozenset((204, 304))
 
-    Version-coupled to httpcore 1.0.9. Stream close, errors and retries retain
-    their upstream lifecycle; only the synchronous assignment pass differs.
+
+@dataclass(frozen=True)
+class B1HttpResponse:
+    """The only response surface the B1 generators consume (FP-IG-8)."""
+
+    status_code: int
+    content: bytes
+
+
+class B1ProtocolError(RuntimeError):
+    """Malformed, conflicting or indeterminate HTTP/1.1 response framing."""
+
+
+@dataclass(frozen=True)
+class B1PoolSnapshot:
+    """One coherent event-loop observation of the client's own ledgers."""
+
+    held_connections: int
+    queued_requests: int
+    connection_identities: frozenset[int]
+    assigned_connection_identities: tuple[int, ...]
+    requests: int
+
+
+class _B1Connection:
+    """One reserved connection record, addressed by a stable connection id.
+
+    A record exists from the moment its reservation is granted, so a record
+    whose socket open is still in progress is already held and already owned.
     """
 
-    def _assign_requests_to_connections(self):
-        reserved = {
-            id(request.connection) for request in self._requests
-            if request.connection is not None
-        }
-        closing = []
-        retained = []
-        held = len(self._connections)
-        for connection in self._connections:
-            if id(connection) in reserved:
-                retained.append(connection)
-            elif connection.is_closed():
-                held -= 1
-            elif connection.has_expired() or (
-                connection.is_idle() and held > self._max_keepalive_connections
-            ):
-                held -= 1
-                closing.append(connection)
-            else:
-                retained.append(connection)
-        self._connections = retained
+    __slots__ = ("cid", "reader", "writer", "idle_token", "expiry_handle")
 
-        for request in self._requests:
-            if not request.is_queued():
+    def __init__(self, cid: int) -> None:
+        self.cid = cid
+        self.reader = None
+        self.writer = None
+        self.idle_token = 0
+        self.expiry_handle = None
+
+
+def _b1_check_header_field(name: str, value: str) -> None:
+    """Reject caller headers that could make the request framing ambiguous."""
+    if not isinstance(name, str) or not isinstance(value, str):
+        raise ValueError("header names and values must be str")
+    if not name or _B1_HEADER_NAME_FORBIDDEN.intersection(name):
+        raise ValueError(f"not a header name token: {name!r}")
+    if name.lower() in _B1_RESERVED_HEADERS:
+        raise ValueError(f"header {name!r} is framing the client owns")
+    if _B1_HEADER_VALUE_FORBIDDEN.intersection(value):
+        raise ValueError(f"header {name!r} value carries CR, LF or NUL")
+
+
+def _b1_parse_head(head: bytes) -> tuple[bytes, int, list[tuple[bytes, bytes]]]:
+    """Parse one response head into (version, status, lowercased headers)."""
+    lines = head[:-4].split(b"\r\n")
+    parts = lines[0].split(b" ", 2)
+    if len(parts) < 2:
+        raise B1ProtocolError(f"malformed status line: {lines[0]!r}")
+    version = parts[0]
+    if version not in (b"HTTP/1.1", b"HTTP/1.0"):
+        raise B1ProtocolError(f"unsupported HTTP version: {version!r}")
+    if not parts[1].isdigit():
+        raise B1ProtocolError(f"malformed status code: {lines[0]!r}")
+    status_code = int(parts[1])
+    if not 100 <= status_code <= 599:
+        raise B1ProtocolError(f"status code out of range: {status_code}")
+    headers: list[tuple[bytes, bytes]] = []
+    for line in lines[1:]:
+        if not line:
+            raise B1ProtocolError("empty header line before the head terminator")
+        if line[:1] in (b" ", b"\t"):
+            raise B1ProtocolError(f"obsolete header line folding: {line!r}")
+        name, sep, value = line.partition(b":")
+        if not sep or not name or name.strip() != name:
+            raise B1ProtocolError(f"malformed header line: {line!r}")
+        headers.append((name.lower(), value.strip()))
+    return version, status_code, headers
+
+
+def _b1_response_framing(
+    version: bytes, status_code: int, headers: list[tuple[bytes, bytes]]
+) -> tuple[str, int, bool]:
+    """Decide (body mode, length, reusable) for one response head.
+
+    Ambiguity is never resolved by preference: conflicting lengths, transfer
+    coding beside a length, an unsupported coding and an unbounded body with
+    no close signal are all protocol errors.
+    """
+    lengths: set[int] = set()
+    codings: list[bytes] = []
+    close = False
+    keep_alive = False
+    for name, value in headers:
+        if name == b"content-length":
+            if not value.isdigit():
+                raise B1ProtocolError(f"malformed content-length: {value!r}")
+            lengths.add(int(value))
+        elif name == b"transfer-encoding":
+            codings.extend(token.strip().lower() for token in value.split(b","))
+        elif name == b"connection":
+            for token in value.split(b","):
+                token = token.strip().lower()
+                if token == b"close":
+                    close = True
+                elif token == b"keep-alive":
+                    keep_alive = True
+    if len(lengths) > 1:
+        raise B1ProtocolError(f"conflicting content-length values: {sorted(lengths)}")
+    if codings and lengths:
+        raise B1ProtocolError("transfer-encoding beside content-length is ambiguous")
+    if codings and codings != [b"chunked"]:
+        raise B1ProtocolError(f"unsupported transfer coding: {codings!r}")
+    reusable = not close and (version == b"HTTP/1.1" or keep_alive)
+    if status_code in _B1_BODYLESS_STATUS:
+        return "empty", 0, reusable
+    if codings:
+        return "chunked", 0, reusable
+    if lengths:
+        return "length", lengths.pop(), reusable
+    if close or version == b"HTTP/1.0":
+        return "eof", 0, False
+    raise B1ProtocolError("indeterminate response body boundary")
+
+
+class B1RawHttp11Client:
+    """Single-origin HTTP/1.1 client, one reserved connection per request.
+
+    Deliberately not thread-safe: every caller is an asyncio phase inside one
+    driver process, so the four ledgers are plain event-loop state and every
+    ownership transition is a single dictionary operation.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_connections: int,
+        timeout: float,
+        keepalive_expiry: float,
+        http_version: str,
+        retries: int,
+        follow_redirects: bool,
+        trust_env: bool,
+    ) -> None:
+        if (
+            isinstance(max_connections, bool)
+            or not isinstance(max_connections, int)
+            or max_connections <= 0
+        ):
+            raise ValueError("max_connections must be a positive integer")
+        if http_version != "HTTP/1.1":
+            raise ValueError("only HTTP/1.1 is supported")
+        if retries != 0:
+            raise ValueError("retries must be 0: a B1 request is never retried")
+        if follow_redirects:
+            raise ValueError("redirects are never followed")
+        if trust_env:
+            raise ValueError("the client reads no environment configuration")
+        self._max_connections = max_connections
+        self._timeout = float(timeout)
+        self._keepalive_expiry = float(keepalive_expiry)
+        self._origin: tuple[str, str, int] | None = None
+        self._host_header: str | None = None
+        self._closed = False
+        self._next_request_id = 0
+        self._next_connection_id = 0
+        # The four populations. No request-path helper iterates any of them.
+        self._connections: dict[int, _B1Connection] = {}
+        self._idle: OrderedDict[int, _B1Connection] = OrderedDict()
+        self._requests: dict[int, int | None] = {}
+        self._waiters: OrderedDict[int, asyncio.Future] = OrderedDict()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    async def __aenter__(self) -> "B1RawHttp11Client":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
+    # -- public request path -------------------------------------------------
+
+    async def post(
+        self, url: str, *, content: bytes, headers: dict[str, str]
+    ) -> B1HttpResponse:
+        """One POST on one reserved connection. Never retried, never redirected."""
+        if self._closed:
+            raise RuntimeError("client is closed")
+        target = self._bind_origin(url)
+        head = self._render_head(target, content, headers)
+        request_id, conn = await self._checkout()
+        try:
+            if conn.writer is None:
+                await self._open(conn)
+            await self._send(conn, head, content)
+            status_code, body, reusable = await self._receive(conn)
+        except BaseException:
+            # One reservation, one retirement: every failure path frees exactly
+            # this connection and exactly this ledger entry, and hands the
+            # freed capacity to at most one waiter.
+            self._retire(conn)
+            self._requests.pop(request_id, None)
+            raise
+        self._requests.pop(request_id, None)
+        if reusable:
+            self._recycle(conn)
+        else:
+            self._retire(conn)
+        return B1HttpResponse(status_code, body)
+
+    def pool_snapshot(self) -> B1PoolSnapshot:
+        """One coherent diagnostic observation (FP-IG-37 / FP-B1DF-5).
+
+        Deliberately O(C + R) and deliberately off the request path: it is
+        taken by the 100 ms census sampler, never by checkout or release.
+        """
+        assigned = tuple(cid for cid in self._requests.values() if cid is not None)
+        return B1PoolSnapshot(
+            held_connections=len(self._connections),
+            queued_requests=len(self._requests) - len(assigned),
+            connection_identities=frozenset(self._connections),
+            assigned_connection_identities=assigned,
+            requests=len(self._requests),
+        )
+
+    async def aclose(self) -> None:
+        """Shutdown is once per phase, so O(C + Q) here is deliberate."""
+        self._closed = True
+        while self._waiters:
+            request_id, waiter = self._waiters.popitem(last=False)
+            self._requests.pop(request_id, None)
+            if not waiter.done():
+                waiter.set_exception(RuntimeError("client is closing"))
+                waiter.exception()
+        writers = []
+        while self._connections:
+            _cid, conn = self._connections.popitem()
+            writer = self._detach(conn)
+            if writer is not None:
+                writers.append(writer)
+        self._idle.clear()
+        self._requests.clear()
+        if writers:
+            # Bounded and concurrent: shutdown must terminate even when a peer
+            # has stopped reading a half-written request, and must leave the
+            # four snapshot counts at zero either way.
+            try:
+                async with asyncio.timeout(self._timeout):
+                    await asyncio.gather(
+                        *(writer.wait_closed() for writer in writers),
+                        return_exceptions=True,
+                    )
+            except TimeoutError:
+                pass
+
+    # -- origin and request serialization ------------------------------------
+
+    def _bind_origin(self, url: str) -> str:
+        """Bind (or re-check) the single origin and return the request target.
+
+        Runs before any reservation exists, so invalid input never occupies
+        capacity, and a single origin means release never scans for a victim.
+        """
+        parts = urlsplit(url)
+        if parts.scheme != "http":
+            raise ValueError(f"only http:// is supported: {url!r}")
+        if parts.fragment:
+            raise ValueError(f"a fragment is not a request target: {url!r}")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError(f"userinfo is not accepted: {url!r}")
+        host = parts.hostname
+        if not host:
+            raise ValueError(f"missing host: {url!r}")
+        origin = (parts.scheme, host, parts.port or 80)
+        if self._origin is None:
+            self._origin = origin
+            self._host_header = parts.netloc
+        elif origin != self._origin:
+            raise ValueError(f"client is bound to {self._origin}, got {origin}")
+        target = parts.path or "/"
+        if parts.query:
+            target = f"{target}?{parts.query}"
+        if _B1_TARGET_FORBIDDEN.intersection(target):
+            raise ValueError(f"not a request target: {target!r}")
+        return target
+
+    def _render_head(
+        self, target: str, content: bytes, headers: dict[str, str]
+    ) -> bytes:
+        """Serialize the request head. O(header bytes), never O(population)."""
+        if not isinstance(content, (bytes, bytearray)):
+            raise ValueError("content must be bytes")
+        lines = [
+            f"POST {target} HTTP/1.1",
+            f"Host: {self._host_header}",
+            f"Content-Length: {len(content)}",
+            "Connection: keep-alive",
+        ]
+        for name, value in (headers or {}).items():
+            _b1_check_header_field(name, value)
+            lines.append(f"{name}: {value}")
+        try:
+            return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"header bytes are not latin-1: {exc}") from exc
+
+    # -- constant-time connection ownership (FP-B1DF-1) ----------------------
+
+    async def _checkout(self) -> tuple[int, _B1Connection]:
+        """Reserve exactly one connection for one request, in constant time."""
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        if self._idle:
+            _cid, conn = self._idle.popitem(last=False)
+            self._disarm(conn)
+            if conn.writer.is_closing() or conn.reader.at_eof():
+                # The peer retired it while parked. Replacing an unused socket
+                # is not a retry: no request byte was ever written to it.
+                self._drop(conn)
+                conn = self._new_connection()
+            self._requests[request_id] = conn.cid
+            return request_id, conn
+        if len(self._connections) < self._max_connections:
+            conn = self._new_connection()
+            self._requests[request_id] = conn.cid
+            return request_id, conn
+        waiter = asyncio.get_running_loop().create_future()
+        self._requests[request_id] = None
+        self._waiters[request_id] = waiter
+        try:
+            async with asyncio.timeout(self._timeout):
+                conn = await waiter
+        except BaseException:
+            self._waiters.pop(request_id, None)
+            if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
+                # Handed a connection in the same tick the wait ended: return
+                # it rather than leaking one unit of capacity.
+                self._retire(waiter.result())
+            self._requests.pop(request_id, None)
+            raise
+        return request_id, conn
+
+    def _new_connection(self) -> _B1Connection:
+        """Allocate one held record, in `opening` state, with a stable id."""
+        cid = self._next_connection_id
+        self._next_connection_id += 1
+        conn = _B1Connection(cid)
+        self._connections[cid] = conn
+        return conn
+
+    def _disarm(self, conn: _B1Connection) -> None:
+        """Cancel this record's keep-alive timer and void its idle generation."""
+        handle = conn.expiry_handle
+        if handle is not None:
+            handle.cancel()
+            conn.expiry_handle = None
+        conn.idle_token += 1
+
+    def _detach(self, conn: _B1Connection):
+        """Unparent one record's socket and return its writer, if any."""
+        self._disarm(conn)
+        writer = conn.writer
+        conn.writer = None
+        conn.reader = None
+        if writer is not None:
+            try:
+                writer.close()
+            except OSError:
+                pass
+        return writer
+
+    def _drop(self, conn: _B1Connection) -> None:
+        """Remove and close exactly this connection. No ledger is scanned."""
+        self._connections.pop(conn.cid, None)
+        self._idle.pop(conn.cid, None)
+        self._detach(conn)
+
+    def _retire(self, conn: _B1Connection) -> None:
+        """Close one connection and pass its freed capacity to one waiter."""
+        self._drop(conn)
+        if not self._closed:
+            self._give_to_waiter(None)
+
+    def _recycle(self, conn: _B1Connection) -> None:
+        """Hand one reusable connection on, or park it with its own timer."""
+        if self._closed:
+            self._drop(conn)
+            return
+        if self._give_to_waiter(conn):
+            return
+        self._idle[conn.cid] = conn
+        conn.idle_token += 1
+        conn.expiry_handle = asyncio.get_running_loop().call_later(
+            self._keepalive_expiry, self._expire_idle, conn.cid, conn.idle_token
+        )
+
+    def _give_to_waiter(self, conn: _B1Connection | None) -> bool:
+        """Transfer one connection, or one unit of capacity, to the oldest waiter.
+
+        The loop only discards waiters that are already dead, and each turn
+        removes one entry permanently: the cost is amortized O(1) per request
+        and no live waiter, request or connection is ever scanned.
+        """
+        while self._waiters:
+            request_id, waiter = self._waiters.popitem(last=False)
+            if waiter.done():
+                self._requests.pop(request_id, None)
                 continue
-            origin = request.request.url.origin
-            available = next((
-                c for c in self._connections
-                if id(c) not in reserved
-                and c.can_handle_request(origin) and c.is_available()
-            ), None)
-            if available is not None:
-                connection = available
-            elif len(self._connections) < self._max_connections:
-                connection = self.create_connection(origin)
-                self._connections.append(connection)
-            else:
-                idle = next((
-                    c for c in self._connections
-                    if id(c) not in reserved and c.is_idle()
-                ), None)
-                if idle is None:
-                    continue
-                self._connections.remove(idle)
-                closing.append(idle)
-                connection = self.create_connection(origin)
-                self._connections.append(connection)
-            # The helper also wakes an already parked pool waiter.
-            request.assign_to_connection(connection)
-            reserved.add(id(connection))
-        return closing
+            if conn is None:
+                conn = self._new_connection()
+            self._requests[request_id] = conn.cid
+            waiter.set_result(conn)
+            return True
+        return False
 
+    def _expire_idle(self, cid: int, token: int) -> None:
+        """Keep-alive expiry for exactly one id and one idle generation."""
+        conn = self._idle.get(cid)
+        if conn is None or conn.idle_token != token:
+            return
+        conn.expiry_handle = None
+        self._drop(conn)
 
-class B1ReservationTransport(httpx.AsyncHTTPTransport):
-    """Retain HTTPX conversion and its default SSL context, with BD's pool."""
+    # -- HTTP/1.1 exchange ---------------------------------------------------
 
-    def __init__(self, *, limits, trust_env, http1, http2, retries):
-        super().__init__(
-            limits=limits, trust_env=trust_env, http1=http1,
-            http2=http2, retries=retries,
+    async def _open(self, conn: _B1Connection) -> None:
+        _scheme, host, port = self._origin
+        async with asyncio.timeout(self._timeout):
+            conn.reader, conn.writer = await asyncio.open_connection(host, port)
+
+    async def _send(self, conn: _B1Connection, head: bytes, content: bytes) -> None:
+        conn.writer.write(head)
+        if content:
+            conn.writer.write(content)
+        async with asyncio.timeout(self._timeout):
+            await conn.writer.drain()
+
+    async def _receive(self, conn: _B1Connection) -> tuple[int, bytes, bool]:
+        version, status_code, headers = _b1_parse_head(
+            await self._read_until(conn, b"\r\n\r\n")
         )
-        # Newly constructed and unused: no requests, connections or network I/O.
-        pool = self._pool
-        self._pool = B1ReservationPool(
-            ssl_context=pool._ssl_context,
-            max_connections=pool._max_connections,
-            max_keepalive_connections=pool._max_keepalive_connections,
-            keepalive_expiry=pool._keepalive_expiry,
-            http1=pool._http1,
-            http2=pool._http2,
-            retries=pool._retries,
-        )
+        if status_code < 200:
+            raise B1ProtocolError(
+                f"unexpected informational response: {status_code}"
+            )
+        mode, length, reusable = _b1_response_framing(version, status_code, headers)
+        if mode == "length":
+            body = await self._read_exactly(conn, length) if length else b""
+        elif mode == "chunked":
+            body = await self._read_chunked(conn)
+        elif mode == "eof":
+            body = await self._read_to_eof(conn)
+        else:
+            body = b""
+        return status_code, body, reusable
+
+    async def _read_until(self, conn: _B1Connection, separator: bytes) -> bytes:
+        try:
+            async with asyncio.timeout(self._timeout):
+                return await conn.reader.readuntil(separator)
+        except asyncio.IncompleteReadError as exc:
+            raise B1ProtocolError("response truncated before its framing") from exc
+        except asyncio.LimitOverrunError as exc:
+            raise B1ProtocolError("response framing exceeds the stream limit") from exc
+
+    async def _read_exactly(self, conn: _B1Connection, count: int) -> bytes:
+        try:
+            async with asyncio.timeout(self._timeout):
+                return await conn.reader.readexactly(count)
+        except asyncio.IncompleteReadError as exc:
+            raise B1ProtocolError("response body truncated") from exc
+
+    async def _read_to_eof(self, conn: _B1Connection) -> bytes:
+        async with asyncio.timeout(self._timeout):
+            return await conn.reader.read()
+
+    async def _read_chunked(self, conn: _B1Connection) -> bytes:
+        pieces = []
+        while True:
+            line = await self._read_until(conn, b"\r\n")
+            size_field = line[:-2].split(b";", 1)[0].strip()
+            if not size_field or not set(size_field).issubset(_B1_HEX_DIGITS):
+                raise B1ProtocolError(f"malformed chunk size: {line!r}")
+            size = int(size_field, 16)
+            if size == 0:
+                break
+            piece = await self._read_exactly(conn, size + 2)
+            if piece[-2:] != b"\r\n":
+                raise B1ProtocolError("chunk not terminated by CRLF")
+            pieces.append(piece[:-2])
+        while await self._read_until(conn, b"\r\n") != b"\r\n":
+            pass
+        return b"".join(pieces)
 
 
-def build_httpx_client(*, max_connections: int) -> httpx.AsyncClient:
+def build_httpx_client(*, max_connections: int) -> B1RawHttp11Client:
+    """Pinned B1 HTTP/1.1 client (FP-B1DF-2/3; compatibility factory name).
+
+    The name is retained for its callers; the returned object is B1's own raw
+    client. Capacity is validated before any state is allocated, and nothing
+    here reads the environment, a proxy, a certificate or a socket option.
+    """
     if (
         isinstance(max_connections, bool)
         or not isinstance(max_connections, int)
         or max_connections <= 0
     ):
         raise ValueError("max_connections must be a positive integer")
-    return httpx.AsyncClient(
-        transport=B1ReservationTransport(
-            limits=httpx.Limits(
-                max_connections=max_connections,
-                max_keepalive_connections=max_connections,
-                keepalive_expiry=KEEPALIVE_EXPIRY,
-            ),
-            trust_env=False,
-            http1=True,
-            http2=False,
-            retries=0,
-        ),
-        limits=httpx.Limits(
-            max_connections=max_connections,
-            max_keepalive_connections=max_connections,
-            keepalive_expiry=KEEPALIVE_EXPIRY,
-        ),
-        timeout=httpx.Timeout(
-            connect=CLIENT_TIMEOUT,
-            read=CLIENT_TIMEOUT,
-            write=CLIENT_TIMEOUT,
-            pool=CLIENT_TIMEOUT,
-        ),
-        trust_env=False,
-        http2=False,
-        http1=True,
+    return B1RawHttp11Client(
+        max_connections=max_connections,
+        timeout=CLIENT_TIMEOUT,
+        keepalive_expiry=KEEPALIVE_EXPIRY,
+        http_version="HTTP/1.1",
+        retries=0,
         follow_redirects=False,
+        trust_env=False,
     )
+# B1-RAW-CLIENT:END
 
 
 async def run_open_loop_baseline(
@@ -253,7 +672,7 @@ async def run_open_loop_baseline(
     endpoint: str,
     requests: list[tuple[bytes, dict[str, str]]],
     transport: Transport | None = None,
-    client: httpx.AsyncClient | None = None,
+    client: B1RawHttp11Client | None = None,
     rate: int = BASE_RATE,
     prologue: list[tuple[bytes, dict[str, str]]] | None = None,
     warmup: tuple[bytes, dict[str, str]] | None = None,
@@ -388,7 +807,7 @@ async def run_closed_loop_saturation(
     clients: int = SATURATION_CLIENTS,
     duration_s: float = BURST_SECONDS,
     transport: Transport | None = None,
-    client: httpx.AsyncClient | None = None,
+    client: B1RawHttp11Client | None = None,
 ) -> PhaseResult:
     """Closed-loop saturation: clients issue back-to-back for duration_s.
 

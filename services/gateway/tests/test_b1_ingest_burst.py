@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
-import httpcore
 import httpx
 import pytest
 import yaml
@@ -1254,7 +1253,7 @@ def test_per_worker_census_discriminating_pair_against_live_sockets():
 
 @pytest.mark.asyncio
 async def test_pool_census_reader_opposite_directions_and_reducers():
-    """UT-IG-17: sockets vs queued tasks, seen-union, fail-open."""
+    """UT-IG-17 / FP-B1DF-5: sockets vs queued tasks, seen-union, fail-open."""
     pool_size = 2
     hold = asyncio.Event()
     release = asyncio.Event()
@@ -1278,8 +1277,11 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
     url = f"http://{host}:{port}/"
     client = b1.build_httpx_client(max_connections=pool_size)
     try:
+        # A readable empty pool is numeric zero, never unavailable.
+        assert b1.read_pool_census_sample(client) == (0, 0, set(), 0)
+
         slow = [
-            asyncio.create_task(client.post(url, content=b"slow"))
+            asyncio.create_task(client.post(url, content=b"slow", headers={}))
             for _ in range(pool_size)
         ]
         deadline = time.time() + 5.0
@@ -1296,10 +1298,11 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
         assert requests_n == pool_size
         assert queued == 0
         assert seen is not None and len(seen) == pool_size
+        assert requests_n - queued <= conn
 
         extra_dispatch = 3
         extra = [
-            asyncio.create_task(client.post(url, content=b"extra"))
+            asyncio.create_task(client.post(url, content=b"extra", headers={}))
             for _ in range(extra_dispatch)
         ]
         deadline = time.time() + 5.0
@@ -1312,9 +1315,12 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
             raise AssertionError(
                 f"queued never reached {extra_dispatch} (last={queued_after!r})"
             )
+        # Held sockets and queued tasks move in opposite directions on the
+        # same tick: connections stay at the cap while the ledger grows.
         assert conn_after == pool_size
         assert queued_after == extra_dispatch
         assert requests_after == pool_size + extra_dispatch
+        assert requests_after - queued_after <= conn_after
 
         release.set()
         await asyncio.gather(*slow, *extra, return_exceptions=True)
@@ -1350,7 +1356,9 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
             for payload in (b"churn-a", b"churn-b"):
                 close_hold.clear()
                 close_release.clear()
-                task = asyncio.create_task(churn_client.post(close_url, content=payload))
+                task = asyncio.create_task(
+                    churn_client.post(close_url, content=payload, headers={})
+                )
                 deadline = time.time() + 5.0
                 while time.time() < deadline:
                     _c, _q, seen_i, _r = b1.read_pool_census_sample(churn_client)
@@ -1366,6 +1374,8 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
 
             seen_total = b1.pool_connections_seen_from_identity_sets(identity_sets)
             assert seen_total == 2
+            # Stable monotonic ids: the union cannot be deceived by an object
+            # address that a later connection happens to reuse.
             assert identity_sets[0].isdisjoint(identity_sets[1])
         finally:
             close_release.set()
@@ -1373,20 +1383,53 @@ async def test_pool_census_reader_opposite_directions_and_reducers():
             close_server.close()
             await close_server.wait_closed()
 
-        class _NoPool:
-            _transport = type("T", (), {"_pool": None})()
+        # Fail-open: a client with no snapshot support, a snapshot object that
+        # is missing fields, and a snapshot call that raises all degrade to
+        # unavailable rather than fabricating zeros.
+        unavailable = (b1.UNAVAILABLE, b1.UNAVAILABLE, None, b1.UNAVAILABLE)
 
-        bad_conn, bad_q, bad_seen, bad_requests = b1.read_pool_census_sample(_NoPool())  # type: ignore[arg-type]
-        assert bad_conn == b1.UNAVAILABLE
-        assert bad_q == b1.UNAVAILABLE
-        assert bad_seen is None
-        assert bad_requests == b1.UNAVAILABLE
-
-        class _NoTransport:
+        class _NoSnapshot:
             pass
 
-        bad2 = b1.read_pool_census_sample(_NoTransport())  # type: ignore[arg-type]
-        assert bad2 == (b1.UNAVAILABLE, b1.UNAVAILABLE, None, b1.UNAVAILABLE)
+        class _MalformedSnapshot:
+            def pool_snapshot(self):
+                return object()
+
+        class _RaisingSnapshot:
+            def pool_snapshot(self):
+                raise TypeError("no snapshot support")
+
+        for broken in (_NoSnapshot(), _MalformedSnapshot(), _RaisingSnapshot()):
+            assert b1.read_pool_census_sample(broken) == unavailable
+        assert b1.pool_census_from_snapshot(None) == unavailable
+        assert b1.pool_census_from_snapshot(object()) == unavailable
+
+        # Same-sample arithmetic: one snapshot yields both the four-tuple and
+        # the assigned-identity list, so R - Q <= C is read on one tick.
+        from types import SimpleNamespace
+
+        def snapshot(c, q, r, assigned):
+            return SimpleNamespace(
+                held_connections=c, queued_requests=q, requests=r,
+                connection_identities=frozenset(assigned),
+                assigned_connection_identities=tuple(assigned),
+            )
+
+        samples = []
+        for held, queued_n, requests_c, assigned in (
+            (2, 0, 2, (7, 9)),
+            (2, 1, 3, (7, 9)),
+        ):
+            c, q, ids, r = b1.pool_census_from_snapshot(
+                snapshot(held, queued_n, requests_c, assigned)
+            )
+            assert r - q <= c
+            assert ids == set(assigned)
+            samples.append((c, q, r))
+        assert samples == [(2, 0, 2), (2, 1, 3)]
+        assert b1.peak_pool_metric_from_samples([b1.UNAVAILABLE, 3]) == 3
+        assert b1.peak_pool_metric_from_samples([b1.UNAVAILABLE]) == b1.UNAVAILABLE
+        assert b1.pool_connections_seen_from_identity_sets([]) == b1.UNAVAILABLE
     finally:
         release.set()
         if not client.is_closed:
@@ -2228,16 +2271,6 @@ def _bd_instant_server():
         assert proc.poll() is not None, "BD server was not reaped"
 
 
-def _bd_pool_settings(pool):
-    return dict(
-        ssl_context=pool._ssl_context,
-        max_connections=pool._max_connections,
-        max_keepalive_connections=pool._max_keepalive_connections,
-        keepalive_expiry=pool._keepalive_expiry,
-        http1=pool._http1, http2=pool._http2, retries=pool._retries,
-    )
-
-
 def _bd_requests(n):
     return [(json.dumps({"event_id": f"bd-{i}"}).encode(), {}) for i in range(n)]
 
@@ -2246,66 +2279,32 @@ async def _bd_offer(driver, client, endpoint, n, *, rate=1000):
     run = driver.run_open_loop if driver is b1 else driver.run_open_loop_baseline
     return await run(
         endpoint=endpoint, requests=_bd_requests(n), rate=rate,
-        max_in_flight=1000, client=client, include_sync_warmup=False, warmup=None,
+        max_in_flight=driver.MAX_IN_FLIGHT, client=client,
+        include_sync_warmup=False, warmup=None,
     )
 
 
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.asyncio
-async def test_b1_pool_reserves_before_http11_activation(driver):
-    arrived = asyncio.Event()
-    release = asyncio.Event()
-
-    class BarrierPool(driver.B1ReservationPool):
-        armed = False
-        arrivals = 0
-
-        async def _close_connections(self, closing):
-            await super()._close_connections(closing)
-            if self.armed and self.arrivals < 128:
-                self.arrivals += 1
-                if self.arrivals == 128:
-                    arrived.set()
-                await release.wait()
-
-    with _bd_instant_server() as endpoint:
-        async with driver.build_httpx_client(max_connections=1000) as client:
-            original = client._transport._pool
-            assert not original.connections and not original._requests
-            pool = BarrierPool(**_bd_pool_settings(original))
-            client._transport._pool = pool
-            response = await client.post(endpoint, content=b"warm")
-            assert response.status_code == 202
-            assert len(pool.connections) == 1 and pool.connections[0].is_idle()
-            pool.armed = True
-            task = asyncio.create_task(_bd_offer(driver, client, endpoint, 128))
-            try:
-                await asyncio.wait_for(arrived.wait(), 10)
-                c, q, ids, r = b1.read_pool_census_sample(client)
-                assigned = [id(req.connection) for req in pool._requests if req.connection is not None]
-                print(f"BD barrier {driver.__name__}: R={r} Q={q} C={c} unique={len(set(assigned))}")
-                assert (r, q, c) == (128, 0, 128)
-                assert len(set(assigned)) == 128
-                assert set(assigned) == ids
-            finally:
-                release.set()
-                result = await asyncio.wait_for(task, 10)
-            assert result.served == 128 and result.errors == 0
-            assert not pool._requests
-
-
 async def _bd_instant_measurement(driver, endpoint, n, *, rate=1000):
-    async with driver.build_httpx_client(max_connections=1000) as client:
+    """Drive one offer through the driver's generator and judge the outer gate.
+
+    Every tick reads ONE snapshot and derives both the census four-tuple and
+    the assigned-connection list from it, so two checks can never compare
+    different ticks (FP-B1DF-5 / FP-B1DF-6).
+    """
+    async with driver.build_httpx_client(
+        max_connections=driver.MAX_IN_FLIGHT
+    ) as client:
         samples = []
         task = asyncio.create_task(_bd_offer(driver, client, endpoint, n, rate=rate))
         try:
             while not task.done():
-                sample = b1.read_pool_census_sample(client)
+                snapshot = client.pool_snapshot()
+                sample = b1.pool_census_from_snapshot(snapshot)
                 c, q, _, r = sample
                 assert isinstance(c, int) and isinstance(q, int) and isinstance(r, int)
                 assert r - q <= c
                 assert q == 0
-                assigned = [id(req.connection) for req in client._transport._pool._requests if req.connection is not None]
+                assigned = list(snapshot.assigned_connection_identities)
                 assert len(assigned) == len(set(assigned))
                 samples.append(sample)
                 await asyncio.sleep(0.01)
@@ -2323,18 +2322,43 @@ async def _bd_instant_measurement(driver, endpoint, n, *, rate=1000):
             "peak_connections": max(s[0] for s in samples),
             "peak_queued": max(s[1] for s in samples),
             "samples": len(samples),
+            "outer_gate_nonbinding": (
+                "met" if result.max_in_flight < driver.MAX_IN_FLIGHT else "not_met"
+            ),
         }), flush=True)
         assert any(s[3] >= 1 for s in samples)
         assert result.served == n and result.errors == 0
-        assert not client._transport._pool._requests
+        assert client.pool_snapshot().requests == 0
+        # Internal accounting first: a peak above the cap is the generator's
+        # own arithmetic failing, not a measurement verdict.
+        assert result.max_in_flight <= driver.MAX_IN_FLIGHT
+        # Then the outer-gate predicate. Strict, because equality means the
+        # gate became the scheduler and later due requests were paced by
+        # completions rather than by the schedule.
+        assert result.max_in_flight < driver.MAX_IN_FLIGHT
         return result
 
 
 @pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
 @pytest.mark.asyncio
 async def test_b1_instant_server_clears_open_loop_offer(driver):
+    """FP-B1DF-6: over B1's own offer window the outer in-flight gate never binds.
+
+    The full window is required: a linear-cost generator can stay below the
+    cap during a short transient and still reach it over B1's real window.
+    This proves only that the gate did not bind — pre-dispatch slip,
+    max_backlog, served rate, elapsed drain and p99 stay recorded-only, so
+    the witness does not certify schedule adherence. A slow or contended host
+    fails it closed, which invalidates B1 as a gateway measurement on that
+    host and is never a gateway result.
+    """
     with _bd_instant_server() as endpoint:
-        await _bd_instant_measurement(driver, endpoint, 2000)
+        await _bd_instant_measurement(
+            driver,
+            endpoint,
+            driver.BURST_RATE * driver.BURST_SECONDS,
+            rate=driver.BURST_RATE,
+        )
 
 
 def characterize_b1_instant_server():
@@ -2342,7 +2366,12 @@ def characterize_b1_instant_server():
     async def run():
         with _bd_instant_server() as endpoint:
             for driver in (b1, bd_e2e):
-                await _bd_instant_measurement(driver, endpoint, 30000, rate=1000)
+                await _bd_instant_measurement(
+                    driver,
+                    endpoint,
+                    driver.BURST_RATE * driver.BURST_SECONDS,
+                    rate=driver.BURST_RATE,
+                )
     asyncio.run(run())
 
 
@@ -2351,55 +2380,61 @@ def bf_instant_script(monkeypatch):
     """Script test collaborators; the real measurement owns every policy check."""
     from types import SimpleNamespace
 
+    def _snapshot(c, q, r, assignments):
+        assigned = tuple(key for key in assignments if key is not None)
+        return SimpleNamespace(
+            held_connections=c,
+            queued_requests=q,
+            requests=r,
+            connection_identities=frozenset(assigned),
+            assigned_connection_identities=assigned,
+        )
+
     @asynccontextmanager
     async def scripted(driver, ticks, *, residual=False, **result_fields):
         result = SimpleNamespace(
-            served=2000, errors=0, max_in_flight=1000,
+            served=2000, errors=0, max_in_flight=999,
             served_rate=211.61444797304955, due0=0,
             t_last_complete=9.451150519999999, p99=7314.775114000042,
         )
         vars(result).update(result_fields)
-        pool = SimpleNamespace(_requests=[])
-        client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
         state = SimpleNamespace(consumed=0, finished=False, closed=False)
         consumed = asyncio.Event()
         # The real helper always samples before its newly created task runs.
         script = [(0, 0, 0, ())] + list(ticks)
 
+        class ScriptedClient:
+            def pool_snapshot(self):
+                if state.finished:
+                    # The drained-ledger read, after the offer returned.
+                    return _snapshot(0, 0, 1 if residual else 0, (0,) if residual else ())
+                c, q, r, assignments = script[state.consumed]
+                state.consumed += 1
+                if state.consumed == len(script):
+                    consumed.set()
+                return _snapshot(c, q, r, assignments)
+
+        client = ScriptedClient()
+
         @asynccontextmanager
         async def build_client(*, max_connections):
-            assert max_connections == 1000
+            assert max_connections == driver.MAX_IN_FLIGHT
             try:
                 yield client
             finally:
                 state.closed = True
-
-        def census(sampled_client):
-            assert sampled_client is client
-            c, q, r, assignments = script[state.consumed]
-            identities = {key: object() for key in assignments if key is not None}
-            pool._requests = [
-                SimpleNamespace(connection=identities[key] if key is not None else None)
-                for key in assignments
-            ]
-            state.consumed += 1
-            if state.consumed == len(script):
-                consumed.set()
-            return c, q, {id(conn) for conn in identities.values()}, r
 
         async def offer(offered_driver, offered_client, endpoint, n, *, rate):
             try:
                 assert offered_driver is driver and offered_client is client
                 assert n == 2000 and rate == 1000
                 await consumed.wait()
-                pool._requests = [SimpleNamespace(connection=object())] if residual else []
                 return result
             finally:
                 state.finished = True
 
         with monkeypatch.context() as patch:
             patch.setattr(driver, "build_httpx_client", build_client)
-            patch.setattr(b1, "read_pool_census_sample", census)
             patch.setattr(sys.modules[__name__], "_bd_offer", offer)
             try:
                 yield state
@@ -2413,10 +2448,17 @@ def bf_instant_script(monkeypatch):
 @pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
 @pytest.mark.asyncio
 async def test_b1_instant_server_sample_from_ci_34146724801(driver, bf_instant_script, capsys):
+    """The recorded CI sample is now a named outer-gate rejection (FP-B1DF-6)."""
     # Synthetic simultaneous census compatible with the CI summary, not raw CI ticks.
     ticks = [(1000, 0, 894, tuple(range(894))), (0, 0, 0, ())]
-    async with bf_instant_script(driver, ticks) as state:
-        await _bd_instant_measurement(driver, "unused", 2000)
+    async with bf_instant_script(driver, ticks, max_in_flight=1000) as state:
+        with pytest.raises(AssertionError) as exc:
+            await _bd_instant_measurement(driver, "unused", 2000)
+        frame = exc.traceback[-1]
+        assert frame.name == "_bd_instant_measurement"
+        assert str(frame.statement).strip().startswith(
+            "assert result.max_in_flight < driver.MAX_IN_FLIGHT"
+        )
     record = json.loads(capsys.readouterr().out)
     assert record == {
         "driver": driver.__name__, "offered": 2000, "served": 2000, "errors": 0,
@@ -2424,17 +2466,26 @@ async def test_b1_instant_server_sample_from_ci_34146724801(driver, bf_instant_s
         # Synthetic timestamp operands preserve the recorded drain interval.
         "elapsed_drain": 9.451150519999999 - 0, "p99": 7314.775114000042,
         "peak_requests": 894, "peak_connections": 1000, "peak_queued": 0,
-        "samples": state.consumed,
+        "samples": state.consumed, "outer_gate_nonbinding": "not_met",
     }
     assert state.consumed == 3
 
 
 @pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
 @pytest.mark.parametrize("ticks,fields,failure", [
-    pytest.param([(1000, 0, 894, tuple(range(894)))], {"max_in_flight": peak}, None,
-                 id=f"recorded-peak-{peak}") for peak in (999, 1000, 1001)
+    pytest.param([(1000, 0, 894, tuple(range(894)))], {"max_in_flight": 999}, None,
+                 id="recorded-peak-999"),
+    pytest.param([(1000, 0, 894, tuple(range(894)))], {"max_in_flight": 1000},
+                 "assert result.max_in_flight < driver.MAX_IN_FLIGHT",
+                 id="recorded-peak-1000"),
+    pytest.param([(1000, 0, 894, tuple(range(894)))], {"max_in_flight": 1001},
+                 "assert result.max_in_flight <= driver.MAX_IN_FLIGHT",
+                 id="recorded-peak-1001"),
 ] + [
-    pytest.param([(1000, 0, 894, tuple(range(894)))], {"served_rate": rate}, None,
+    # No throughput floor leaked back in with the outer-gate predicate: the
+    # verdict is identical at 199.9, 200.0 and 200.1 when the peak is 999.
+    pytest.param([(1000, 0, 894, tuple(range(894)))],
+                 {"served_rate": rate, "max_in_flight": 999}, None,
                  id=f"recorded-rate-{rate}") for rate in (199.9, 200.0, 200.1)
 ] + [
     pytest.param([(2, 0, 2, (0, 1))], {"served": served},
@@ -2449,7 +2500,7 @@ async def test_b1_instant_server_sample_from_ci_34146724801(driver, bf_instant_s
                  "assert len(assigned) == len(set(assigned))", id="duplicate"),
     pytest.param([(2, 1, 3, (0, 1, None))], {}, "assert q == 0", id="queued"),
     pytest.param([(2, 0, 2, (0, 1))], {"residual": True},
-                 "assert not client._transport._pool._requests", id="residual"),
+                 "assert client.pool_snapshot().requests == 0", id="residual"),
     pytest.param([(0, 0, 0, ()), (0, 0, 0, ())], {},
                  "assert any(s[3] >= 1 for s in samples)", id="all-empty"),
     pytest.param([("unavailable", 0, 2, (0, 1))], {}, "assert isinstance(c, int)", id="unavailable-c"),
@@ -2479,8 +2530,9 @@ async def test_b1_instant_server_correctness_rejects_corrupt_samples(
     if failure is None or failure == "assert any(s[3] >= 1 for s in samples)":
         record = json.loads(output)
         assert record["samples"] == state.consumed == len(ticks) + 1
-        assert record["max_in_flight"] == fields.get("max_in_flight", 1000)
+        assert record["max_in_flight"] == fields.get("max_in_flight", 999)
         assert record["served_rate"] == fields.get("served_rate", 211.61444797304955)
+        assert record["outer_gate_nonbinding"] == "met"
         if failure is not None:
             assert record["peak_requests"] == 0
             # Prove that readable-sample count alone accepts this vacuous witness.
@@ -2500,26 +2552,117 @@ async def test_b1_instant_server_correctness_rejects_corrupt_samples(
             assert mutant_record["peak_requests"] == 0
 
 
+# ---------------------------------------------------------------------------
+# FP-B1DF-1 / FP-B1DF-2 — B1's own raw HTTP/1.1 client. Both driver copies are
+# exercised: byte equality is pinned in tests/delivery, behaviour is pinned
+# here, once per copy.
+# ---------------------------------------------------------------------------
+
+_RAW_DRIVERS = [b1, bd_e2e]
+_RAW_OK_BODY = b'{"status":"merged"}'
+_RAW_BAD_CAPACITIES = [None, True, False, float("nan"), 0, -1, 1.5, "2"]
+# The four ledgers FP-B1DF-1 forbids the request path to scan.
+_RAW_POPULATION_ATTRS = ("_connections", "_idle", "_requests", "_waiters")
+_RAW_SCAN_BUILTINS = frozenset(
+    {
+        "any", "all", "next", "sorted", "min", "max", "sum", "list", "tuple",
+        "set", "frozenset", "filter", "map", "reversed", "enumerate", "zip",
+        "iter",
+    }
+)
+# Off the request path by construction: shutdown and the diagnostic snapshot
+# are once per phase and once per census tick, never per request.
+_RAW_OFF_REQUEST_PATH = frozenset(
+    {"pool_snapshot", "aclose", "__init__", "__aenter__", "__aexit__"}
+)
+
+
+def _raw_client(driver, capacity, *, timeout=None, keepalive_expiry=None):
+    """The driver's own client, with the pinned values unless a case moves one."""
+    return driver.B1RawHttp11Client(
+        max_connections=capacity,
+        timeout=driver.CLIENT_TIMEOUT if timeout is None else timeout,
+        keepalive_expiry=(
+            driver.KEEPALIVE_EXPIRY if keepalive_expiry is None else keepalive_expiry
+        ),
+        http_version="HTTP/1.1",
+        retries=0,
+        follow_redirects=False,
+        trust_env=False,
+    )
+
+
+def _raw_counts(client):
+    snapshot = client.pool_snapshot()
+    return (
+        snapshot.held_connections,
+        snapshot.queued_requests,
+        snapshot.requests,
+    )
+
+
+def _assert_raw_client_drained(client):
+    """No reservation, no connection and no waiter survives the case."""
+    snapshot = client.pool_snapshot()
+    assert (
+        snapshot.held_connections,
+        snapshot.queued_requests,
+        snapshot.requests,
+        snapshot.connection_identities,
+        snapshot.assigned_connection_identities,
+    ) == (0, 0, 0, frozenset(), ())
+
+
+async def _raw_wait_counts(client, expected, *, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        observed = _raw_counts(client)
+        if observed == expected:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"census never reached {expected}; last={_raw_counts(client)}")
+
+
 @asynccontextmanager
-async def _bd_held_body_server():
-    release = asyncio.Event()
+async def _raw_server(responder, *, read_requests=True, rcvbuf=None):
+    """A scripted HTTP/1.1 peer: one responder call per request it reads."""
+    import inspect
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(requests=0, connections=0)
     writers = set()
     tasks = set()
 
-    async def handler(reader, writer):
+    async def handle(reader, writer):
+        state.connections += 1
         writers.add(writer)
         tasks.add(asyncio.current_task())
         try:
+            if not read_requests:
+                await asyncio.Event().wait()
             while True:
-                headers = await reader.readuntil(b"\r\n\r\n")
-                length = next((int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n") if line.lower().startswith(b"content-length:")), 0)
-                await reader.readexactly(length)
-                writer.write(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n")
-                await writer.drain()
-                await release.wait()
-                writer.write(b"{}")
-                await writer.drain()
-        except (asyncio.IncompleteReadError, ConnectionError):
+                head = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    (
+                        int(line.split(b":", 1)[1])
+                        for line in head.split(b"\r\n")
+                        if line.lower().startswith(b"content-length:")
+                    ),
+                    0,
+                )
+                if length:
+                    await reader.readexactly(length)
+                state.requests += 1
+                reply = responder(state)
+                if inspect.isawaitable(reply):
+                    reply = await reply
+                payload, close = reply
+                if payload:
+                    writer.write(payload)
+                    await writer.drain()
+                if close:
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
         finally:
             writers.discard(writer)
@@ -2527,283 +2670,985 @@ async def _bd_held_body_server():
             writer.close()
             try:
                 await writer.wait_closed()
-            except ConnectionError:
+            except (OSError, ConnectionError):
                 pass
 
-    server = await asyncio.start_server(handler, "127.0.0.1", 0, backlog=2048)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if rcvbuf is not None:
+        # A small receive window makes a write to a peer that never reads
+        # block deterministically, without depending on autotuned buffers.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(2048)
+    sock.setblocking(False)
+    port = sock.getsockname()[1]
+    server = await asyncio.start_server(handle, sock=sock)
     try:
-        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/", release
+        yield f"http://127.0.0.1:{port}/events", state
     finally:
-        release.set()
         server.close()
-        await server.wait_closed()
         for writer in list(writers):
             writer.close()
         remaining = list(tasks)
         for task in remaining:
             task.cancel()
         await asyncio.gather(*remaining, return_exceptions=True)
+        # Only now: 3.12's Server.wait_closed() also waits for every handler.
+        await server.wait_closed()
 
 
-async def _bd_wait_census(client, expected):
-    async with asyncio.timeout(10):
-        while True:
-            c, q, _, r = b1.read_pool_census_sample(client)
-            if (r, q, c) == expected:
-                return
-            await asyncio.sleep(0.001)
+def _raw_fixed(payload, *, close=False):
+    return lambda state: (payload, close)
 
 
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.asyncio
-async def test_b1_reservation_lifecycle(driver):
-    async with _bd_held_body_server() as (endpoint, release):
-        client = driver.build_httpx_client(max_connections=2)
-        pool = client._transport._pool
-        pending = []
-        responses = []
-        async def headers():
-            response = await client.send(client.build_request("POST", endpoint, content=b"body"), stream=True)
-            responses.append(response)
-            return response
+def _raw_silent(state):
+    return None, False
+
+
+_RAW_KEEPALIVE_200 = b"HTTP/1.1 200 OK\r\ncontent-length: 19\r\n\r\n" + _RAW_OK_BODY
+
+# (response bytes, close after responding, expectation)
+# expectation: ("served", status, body, held_after) | ("error", type name,
+# message fragment, held_after)
+_RAW_FRAMING_CASES: dict[str, tuple] = {
+    "framing-content-length": (
+        _RAW_KEEPALIVE_200,
+        False,
+        ("served", 200, _RAW_OK_BODY, 1),
+    ),
+    "framing-chunked": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"5;ext=a\r\nhello\r\n3\r\n-hi\r\n0\r\nX-Trailer: v\r\n\r\n",
+        False,
+        ("served", 200, b"hello-hi", 1),
+    ),
+    "framing-bodyless": (
+        b"HTTP/1.1 204 No Content\r\n\r\n",
+        False,
+        ("served", 204, b"", 1),
+    ),
+    "framing-close": (
+        b"HTTP/1.1 200 OK\r\nConnection: Close\r\n\r\nclosed-body",
+        True,
+        ("served", 200, b"closed-body", 0),
+    ),
+    "framing-duplicate-identical-length": (
+        b"HTTP/1.1 202 Accepted\r\nContent-Length: 19\r\nCONTENT-LENGTH: 19\r\n\r\n"
+        + _RAW_OK_BODY,
+        False,
+        ("served", 202, _RAW_OK_BODY, 1),
+    ),
+    "framing-conflicting-length": (
+        b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\nContent-Length: 5\r\n\r\n"
+        + _RAW_OK_BODY,
+        False,
+        ("error", "B1ProtocolError", "conflicting content-length", 0),
+    ),
+    "framing-te-plus-length": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "beside content-length", 0),
+    ),
+    "framing-malformed-status": (
+        b"HTTP/1.1 twenty OK\r\nContent-Length: 0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "malformed status code", 0),
+    ),
+    "framing-malformed-header": (
+        b"HTTP/1.1 200 OK\r\nNoColonHere\r\nContent-Length: 0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "malformed header line", 0),
+    ),
+    "framing-malformed-chunk": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nnope\r\n",
+        False,
+        ("error", "B1ProtocolError", "malformed chunk size", 0),
+    ),
+    "framing-truncated": (
+        b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\nshort",
+        True,
+        ("error", "B1ProtocolError", "truncated", 0),
+    ),
+    "framing-indeterminate-eof": (
+        b"HTTP/1.1 200 OK\r\n\r\nno-boundary",
+        True,
+        ("error", "B1ProtocolError", "indeterminate response body boundary", 0),
+    ),
+    "framing-unsupported-coding": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "unsupported transfer coding", 0),
+    ),
+    "framing-malformed-length": (
+        b"HTTP/1.1 200 OK\r\nContent-Length: twelve\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "malformed content-length", 0),
+    ),
+    "framing-short-status-line": (
+        b"HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "malformed status line", 0),
+    ),
+    "framing-status-out-of-range": (
+        b"HTTP/1.1 999999 Nope\r\nContent-Length: 0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "status code out of range", 0),
+    ),
+    "framing-oversized-head": (
+        b"HTTP/1.1 200 OK\r\nX-Pad: " + b"p" * 70000 + b"\r\nContent-Length: 0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "exceeds the stream limit", 0),
+    ),
+    "framing-chunk-without-crlf": (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "chunk not terminated by CRLF", 0),
+    ),
+    "framing-http10-keepalive": (
+        b"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 19\r\n\r\n"
+        + _RAW_OK_BODY,
+        False,
+        ("served", 200, _RAW_OK_BODY, 1),
+    ),
+    "framing-http10-eof": (
+        b"HTTP/1.0 200 OK\r\n\r\nten-oh-body",
+        True,
+        ("served", 200, b"ten-oh-body", 0),
+    ),
+    "outcome-200": (_RAW_KEEPALIVE_200, False, ("served", 200, _RAW_OK_BODY, 1)),
+    "outcome-202": (
+        b"HTTP/1.1 202 Accepted\r\nContent-Length: 24\r\n\r\n"
+        b'{"investigation_id":"x"}',
+        False,
+        ("served", 202, b'{"investigation_id":"x"}', 1),
+    ),
+    "outcome-4xx": (
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}",
+        False,
+        ("served", 401, b"{}", 1),
+    ),
+    "outcome-5xx": (
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\n{}",
+        False,
+        ("served", 503, b"{}", 1),
+    ),
+    "outcome-protocol-error": (
+        b"NOT-HTTP 200 OK\r\nContent-Length: 0\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "unsupported HTTP version", 0),
+    ),
+    "outcome-informational": (
+        b"HTTP/1.1 100 Continue\r\n\r\n",
+        False,
+        ("error", "B1ProtocolError", "unexpected informational response", 0),
+    ),
+}
+
+
+async def _raw_framing_case(driver, case_id):
+    response, close, expectation = _RAW_FRAMING_CASES[case_id]
+    async with _raw_server(_raw_fixed(response, close=close)) as (endpoint, _state):
+        client = _raw_client(driver, 2)
         try:
-            first, second = await asyncio.gather(headers(), headers())
-            await _bd_wait_census(client, (2, 0, 2))
-            third = asyncio.create_task(headers())
-            pending.append(third)
-            await _bd_wait_census(client, (3, 1, 2))
-            assert not third.done()
-            await first.aclose()
-            await asyncio.wait_for(third, 10)  # assign_to_connection must wake it.
-            assert not pool._requests[0].is_queued()
-            queued = asyncio.create_task(headers())
-            pending.append(queued)
-            await _bd_wait_census(client, (3, 1, 2))
+            if expectation[0] == "served":
+                _kind, status, body, held = expectation
+                reply = await client.post(
+                    endpoint, content=b'{"event_id":"a"}', headers={}
+                )
+                assert (reply.status_code, reply.content) == (status, body)
+            else:
+                _kind, exc_name, fragment, held = expectation
+                with pytest.raises(getattr(driver, exc_name)) as exc:
+                    await client.post(
+                        endpoint, content=b'{"event_id":"a"}', headers={}
+                    )
+                assert fragment in str(exc.value), exc.value
+            assert _raw_counts(client) == (held, 0, 0)
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_request_target_preserved(driver):
+    """The path and query reach the wire as the request target, unrewritten."""
+    seen = []
+
+    def responder(state):
+        return _RAW_KEEPALIVE_200, False
+
+    async with _raw_server(responder) as (endpoint, state):
+        client = _raw_client(driver, 2)
+        base = endpoint.rsplit("/", 1)[0]
+        try:
+            reply = await client.post(
+                f"{base}/api/v1/events?tier=b1&n=2",
+                content=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            assert reply.status_code == 200
+            assert state.requests == 1
+            reply = await client.post(base + "/", content=b"{}", headers={})
+            assert reply.status_code == 200
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_stale_idle_replacement(driver):
+    """A peer that retires a parked connection costs a socket, never a retry."""
+    async with _raw_server(_raw_fixed(_RAW_KEEPALIVE_200, close=True)) as (
+        endpoint,
+        state,
+    ):
+        client = _raw_client(driver, 2)
+        try:
+            assert (
+                await client.post(endpoint, content=b"{}", headers={})
+            ).status_code == 200
+            # Keep-alive framing parks it; the peer's FIN arrives afterwards.
+            first = client.pool_snapshot().connection_identities
+            assert len(first) == 1
+            deadline = time.time() + 5.0
+            while time.time() < deadline and client.pool_snapshot().held_connections:
+                await asyncio.sleep(0.01)
+                if state.connections >= 1:
+                    break
+            await asyncio.sleep(0.05)
+            assert (
+                await client.post(endpoint, content=b"{}", headers={})
+            ).status_code == 200
+            second = client.pool_snapshot().connection_identities
+            assert len(second) == 1 and second.isdisjoint(first)
+            assert state.requests == 2 and state.connections == 2
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_outcome_oserror(driver):
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    client = _raw_client(driver, 2, timeout=5.0)
+    try:
+        with pytest.raises(OSError):
+            await client.post(
+                f"http://127.0.0.1:{port}/events", content=b"{}", headers={}
+            )
+        assert _raw_counts(client) == (0, 0, 0)
+    finally:
+        await client.aclose()
+    _assert_raw_client_drained(client)
+
+
+async def _raw_case_outcome_no_retry(driver):
+    """A failed attempt is never re-sent: one request, one connection, one error."""
+    async with _raw_server(lambda state: (None, True)) as (endpoint, state):
+        client = _raw_client(driver, 4, timeout=5.0)
+        try:
+            with pytest.raises(driver.B1ProtocolError):
+                await client.post(endpoint, content=b"{}", headers={})
+            assert (state.requests, state.connections) == (1, 1)
+            assert _raw_counts(client) == (0, 0, 0)
+        finally:
+            await client.aclose()
+        assert (state.requests, state.connections) == (1, 1)
+    _assert_raw_client_drained(client)
+
+
+async def _raw_case_timeout_pool(driver):
+    client = _raw_client(driver, 1, timeout=0.3)
+    # Occupy the only reservation with no I/O at all, so the second request
+    # can expire at the waiter-acquisition stage and nowhere else: the four
+    # stage timeouts share one value, so a live holder would expire first.
+    request_id, held = await client._checkout()
+    try:
+        assert _raw_counts(client) == (1, 0, 1)
+        started = time.perf_counter()
+        with pytest.raises(TimeoutError):
+            await client.post("http://127.0.0.1:9/events", content=b"{}", headers={})
+        assert time.perf_counter() - started >= 0.3
+        # The queued request removed its own waiter and its own entry.
+        assert _raw_counts(client) == (1, 0, 1)
+    finally:
+        client._requests.pop(request_id, None)
+        client._retire(held)
+        await client.aclose()
+    _assert_raw_client_drained(client)
+
+
+async def _raw_case_timeout_connect(driver, monkeypatch):
+    real_open = asyncio.open_connection
+
+    async def never_connects(*args, **kwargs):
+        await asyncio.sleep(30)
+        return await real_open(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "open_connection", never_connects)
+    client = _raw_client(driver, 2, timeout=0.3)
+    try:
+        with pytest.raises(TimeoutError):
+            await client.post("http://127.0.0.1:9/events", content=b"{}", headers={})
+        assert _raw_counts(client) == (0, 0, 0)
+    finally:
+        await client.aclose()
+    _assert_raw_client_drained(client)
+
+
+async def _raw_case_timeout_write(driver):
+    async with _raw_server(_raw_silent, read_requests=False, rcvbuf=1024) as (
+        endpoint,
+        _state,
+    ):
+        client = _raw_client(driver, 2, timeout=0.3)
+        try:
+            with pytest.raises(TimeoutError):
+                await client.post(
+                    endpoint, content=b"x" * (1 << 20), headers={}
+                )
+            assert _raw_counts(client) == (0, 0, 0)
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_timeout_read(driver):
+    async with _raw_server(_raw_silent) as (endpoint, state):
+        client = _raw_client(driver, 2, timeout=0.3)
+        try:
+            with pytest.raises(TimeoutError):
+                await client.post(endpoint, content=b"{}", headers={})
+            assert state.requests == 1
+            assert _raw_counts(client) == (0, 0, 0)
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_cancel_queued(driver):
+    async with _raw_server(_raw_silent) as (endpoint, _state):
+        client = _raw_client(driver, 1)
+        held = asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+        await _raw_wait_counts(client, (1, 0, 1))
+        queued = asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+        try:
+            await _raw_wait_counts(client, (1, 1, 2))
             queued.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await queued
-            await _bd_wait_census(client, (2, 0, 2))
-            with pytest.raises(httpx.PoolTimeout):
-                await client.post(endpoint, timeout=httpx.Timeout(1, pool=0.02))
-            assert len(pool._requests) == 2
-            await second.aclose()
-            await third.result().aclose()
-            assert not pool._requests
+            assert _raw_counts(client) == (1, 0, 1)
+        finally:
+            held.cancel()
+            await asyncio.gather(held, queued, return_exceptions=True)
+            await client.aclose()
+        _assert_raw_client_drained(client)
 
-            at_body = asyncio.Event()
-            async def assigned():
-                async with client.stream("POST", endpoint, content=b"cancel") as response:
-                    assert response.status_code == 202
-                    at_body.set()
-                    await response.aread()
-            task = asyncio.create_task(assigned())
-            pending.append(task)
-            await asyncio.wait_for(at_body.wait(), 10)
-            assert len(pool._requests) == 1
+
+async def _raw_case_cancel_opening(driver, monkeypatch):
+    opening = asyncio.Event()
+    real_open = asyncio.open_connection
+
+    async def slow_open(*args, **kwargs):
+        opening.set()
+        await asyncio.sleep(30)
+        return await real_open(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "open_connection", slow_open)
+    client = _raw_client(driver, 2)
+    task = asyncio.create_task(
+        client.post("http://127.0.0.1:9/events", content=b"{}", headers={})
+    )
+    try:
+        await asyncio.wait_for(opening.wait(), 10)
+        # The reservation exists while the socket open is still in progress.
+        assert _raw_counts(client) == (1, 0, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert _raw_counts(client) == (0, 0, 0)
+    finally:
+        await asyncio.gather(task, return_exceptions=True)
+        await client.aclose()
+    _assert_raw_client_drained(client)
+
+
+async def _raw_case_cancel_writing(driver):
+    async with _raw_server(_raw_silent, read_requests=False, rcvbuf=1024) as (
+        endpoint,
+        _state,
+    ):
+        client = _raw_client(driver, 2)
+        task = asyncio.create_task(
+            client.post(endpoint, content=b"x" * (1 << 20), headers={})
+        )
+        try:
+            await _raw_wait_counts(client, (1, 0, 1))
+            await asyncio.sleep(0.25)
+            assert not task.done(), "the peer that never reads let the write finish"
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert not pool._requests
+            assert _raw_counts(client) == (0, 0, 0)
+        finally:
+            await asyncio.gather(task, return_exceptions=True)
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_cancel_reading(driver):
+    async with _raw_server(_raw_silent) as (endpoint, state):
+        client = _raw_client(driver, 2)
+        task = asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+        try:
+            deadline = time.time() + 10
+            while state.requests < 1 and time.time() < deadline:
+                await asyncio.sleep(0.005)
+            assert state.requests == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert _raw_counts(client) == (0, 0, 0)
+        finally:
+            await asyncio.gather(task, return_exceptions=True)
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_validation_capacity(driver, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("a socket was opened before capacity validation")
+
+    monkeypatch.setattr(asyncio, "open_connection", forbidden)
+    for capacity in _RAW_BAD_CAPACITIES:
+        with pytest.raises(ValueError, match="positive integer"):
+            driver.build_httpx_client(max_connections=capacity)
+        with pytest.raises(ValueError, match="positive integer"):
+            _raw_client(driver, capacity)
+    for pin, value in (
+        ("http_version", "HTTP/1.0"),
+        ("retries", 1),
+        ("follow_redirects", True),
+        ("trust_env", True),
+    ):
+        kwargs = dict(
+            max_connections=1,
+            timeout=driver.CLIENT_TIMEOUT,
+            keepalive_expiry=driver.KEEPALIVE_EXPIRY,
+            http_version="HTTP/1.1",
+            retries=0,
+            follow_redirects=False,
+            trust_env=False,
+        )
+        kwargs[pin] = value
+        with pytest.raises(ValueError):
+            driver.B1RawHttp11Client(**kwargs)
+
+
+async def _raw_case_validation_origin(driver):
+    async with _raw_server(_raw_fixed(_RAW_KEEPALIVE_200)) as (endpoint, _state):
+        client = _raw_client(driver, 2)
+        try:
+            assert (
+                await client.post(endpoint, content=b"{}", headers={})
+            ).status_code == 200
+            port = endpoint.rsplit(":", 1)[1].split("/")[0]
+            for bad in (
+                endpoint.replace("http://", "https://"),
+                f"http://user:pw@127.0.0.1:{port}/events",
+                f"http://127.0.0.1:{port}/events#fragment",
+                "http:///events",
+                "http://127.0.0.2:1/events",
+                f"http://127.0.0.1:{int(port) + 1}/events",
+                f"http://127.0.0.1:{port}/ev ents",
+            ):
+                with pytest.raises(ValueError):
+                    await client.post(bad, content=b"{}", headers={})
+            # One idle connection from the accepted request; no stray reservation.
+            assert _raw_counts(client) == (1, 0, 0)
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_validation_header(driver):
+    async with _raw_server(_raw_fixed(_RAW_KEEPALIVE_200)) as (endpoint, state):
+        client = _raw_client(driver, 2)
+        try:
+            for headers in (
+                {"Host": "elsewhere"},
+                {"Content-Length": "3"},
+                {"Transfer-Encoding": "chunked"},
+                {"Connection": "close"},
+                {"X-Signature": "a\r\nInjected: 1"},
+                {"X-Sig\nnature": "a"},
+                {"Bad Name": "a"},
+                {"": "a"},
+                {"X-Signature": "sn\u2603wman"},
+                {b"X-Bytes": "a"},
+                {"X-Signature": 7},
+            ):
+                with pytest.raises(ValueError):
+                    await client.post(endpoint, content=b"{}", headers=headers)
+            with pytest.raises(ValueError):
+                await client.post(endpoint, content="not-bytes", headers={})
+            assert state.requests == 0
+            assert _raw_counts(client) == (0, 0, 0)
+            reply = await client.post(
+                endpoint,
+                content=b"{}",
+                headers={"Content-Type": "application/json", "X-Signature": "ab"},
+            )
+            assert reply.status_code == 200
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_closed_client(driver):
+    async with _raw_server(_raw_fixed(_RAW_KEEPALIVE_200)) as (endpoint, _state):
+        client = _raw_client(driver, 2)
+        assert (await client.post(endpoint, content=b"{}", headers={})).status_code == 200
+        assert not client.is_closed
+        await client.aclose()
+        assert client.is_closed
+        with pytest.raises(RuntimeError, match="closed"):
+            await client.post(endpoint, content=b"{}", headers={})
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_keepalive_expiry_replacement(driver):
+    async with _raw_server(_raw_fixed(_RAW_KEEPALIVE_200)) as (endpoint, _state):
+        client = _raw_client(driver, 2, keepalive_expiry=0.05)
+        try:
+            await client.post(endpoint, content=b"{}", headers={})
+            first = client.pool_snapshot().connection_identities
+            assert len(first) == 1
+            await _raw_wait_counts(client, (0, 0, 0))
+            await client.post(endpoint, content=b"{}", headers={})
+            second = client.pool_snapshot().connection_identities
+            assert len(second) == 1 and second.isdisjoint(first)
+        finally:
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+
+async def _raw_case_shutdown_waiters(driver):
+    async with _raw_server(_raw_silent) as (endpoint, _state):
+        client = _raw_client(driver, 1)
+        held = asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+        await _raw_wait_counts(client, (1, 0, 1))
+        queued = asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+        await _raw_wait_counts(client, (1, 1, 2))
+        await client.aclose()
+        results = await asyncio.gather(held, queued, return_exceptions=True)
+        assert isinstance(results[1], RuntimeError), results
+        assert isinstance(results[0], BaseException), results
+        _assert_raw_client_drained(client)
+
+
+_RAW_LIFECYCLE_CASES = sorted(_RAW_FRAMING_CASES) + [
+    "request-target-preserved",
+    "stale-idle-replacement",
+    "outcome-oserror",
+    "outcome-no-retry",
+    "timeout-pool",
+    "timeout-connect",
+    "timeout-write",
+    "timeout-read",
+    "cancel-queued",
+    "cancel-opening",
+    "cancel-writing",
+    "cancel-reading",
+    "validation-capacity",
+    "validation-origin",
+    "validation-header",
+    "closed-client",
+    "keepalive-expiry-replacement",
+    "shutdown-waiters",
+]
+_RAW_MONKEYPATCHED_CASES = frozenset(
+    {"timeout-connect", "cancel-opening", "validation-capacity"}
+)
+
+
+@pytest.mark.parametrize("driver", _RAW_DRIVERS, ids=["reference", "e2e"])
+@pytest.mark.parametrize("case", _RAW_LIFECYCLE_CASES)
+@pytest.mark.asyncio
+async def test_b1_raw_http11_client_lifecycle_and_response_framing(
+    driver, case, monkeypatch
+):
+    """FP-B1DF-2: framing, outcomes, timeout roles, cancellation, shutdown."""
+    if case in _RAW_FRAMING_CASES:
+        await _raw_framing_case(driver, case)
+        return
+    handler = globals()["_raw_case_" + case.replace("-", "_")]
+    if case in _RAW_MONKEYPATCHED_CASES:
+        await handler(driver, monkeypatch)
+    else:
+        await handler(driver)
+
+
+@pytest.mark.parametrize("driver", _RAW_DRIVERS, ids=["reference", "e2e"])
+@pytest.mark.parametrize("capacity", [1, 2])
+@pytest.mark.asyncio
+async def test_b1_raw_client_capacity_boundaries(driver, capacity, monkeypatch):
+    """FP-B1DF-1/2: C-1/C/C+1, reservation before the socket, FIFO, failed open."""
+    # A — invalid capacity is refused before any socket work is attempted.
+    def forbidden(*args, **kwargs):
+        pytest.fail("a socket was opened before capacity validation")
+
+    monkeypatch.setattr(asyncio, "open_connection", forbidden)
+    for bad in _RAW_BAD_CAPACITIES:
+        with pytest.raises(ValueError, match="positive integer"):
+            driver.build_httpx_client(max_connections=bad)
+    monkeypatch.undo()
+
+    # B — the reservation lives in an `opening` record before open_connection.
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    real_open = asyncio.open_connection
+
+    async def gated_open(*args, **kwargs):
+        entered.set()
+        await gate.wait()
+        return await real_open(*args, **kwargs)
+
+    async with _raw_server(_raw_fixed(_RAW_KEEPALIVE_200)) as (endpoint, state):
+        client = _raw_client(driver, capacity)
+        monkeypatch.setattr(asyncio, "open_connection", gated_open)
+        task = asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            snapshot = client.pool_snapshot()
+            assert (
+                snapshot.held_connections,
+                snapshot.queued_requests,
+                snapshot.requests,
+            ) == (1, 0, 1)
+            assert len(snapshot.assigned_connection_identities) == 1
+            assert set(snapshot.assigned_connection_identities) <= set(
+                snapshot.connection_identities
+            )
+            assert state.connections == 0, "the socket preceded the reservation"
+            gate.set()
+            assert (await asyncio.wait_for(task, 10)).status_code == 200
+        finally:
+            monkeypatch.undo()
+            await asyncio.gather(task, return_exceptions=True)
+            await client.aclose()
+        _assert_raw_client_drained(client)
+
+    # C — C-1, C and C+1 concurrent requests against a peer that holds replies.
+    release = asyncio.Event()
+
+    async def holding(state):
+        await release.wait()
+        return _RAW_KEEPALIVE_200, False
+
+    async with _raw_server(holding) as (endpoint, _state):
+        client = _raw_client(driver, capacity)
+        tasks = []
+        try:
+            assert _raw_counts(client) == (0, 0, 0)
+            for offered in range(1, capacity + 2):
+                tasks.append(
+                    asyncio.create_task(
+                        client.post(endpoint, content=b"{}", headers={})
+                    )
+                )
+                await _raw_wait_counts(
+                    client,
+                    (min(offered, capacity), max(0, offered - capacity), offered),
+                )
             release.set()
-            assert (await client.post(endpoint)).status_code == 202
-            assert not pool._requests
+            replies = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            assert [reply.status_code for reply in replies] == [200] * (capacity + 1)
+            await _raw_wait_counts(client, (capacity, 0, 0))
         finally:
             release.set()
-            for task in pending:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for response in responses:
-                await response.aclose()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await client.aclose()
-        assert not pool.connections and not pool._requests
+        _assert_raw_client_drained(client)
+
+    # D — FIFO handoff and failed-open replacement: every reply retires its
+    # connection, so each completion hands one unit of capacity to the oldest
+    # waiter, and the open that fails hands it straight on to the next.
+    opens = [0]
+    fails_at = capacity + 1
+
+    async def flaky_open(*args, **kwargs):
+        opens[0] += 1
+        if opens[0] == fails_at:
+            raise ConnectionResetError("injected open failure")
+        return await real_open(*args, **kwargs)
+
+    closing = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 19\r\n\r\n" + (
+        _RAW_OK_BODY
+    )
+    async with _raw_server(_raw_fixed(closing, close=True)) as (endpoint, _state):
+        client = _raw_client(driver, capacity, timeout=10.0)
+        monkeypatch.setattr(asyncio, "open_connection", flaky_open)
+        tasks = [
+            asyncio.create_task(client.post(endpoint, content=b"{}", headers={}))
+            for _ in range(capacity + 2)
+        ]
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), 20
+            )
+            failed = [i for i, r in enumerate(results) if isinstance(r, OSError)]
+            assert failed == [capacity], results
+            assert all(
+                r.status_code == 200
+                for i, r in enumerate(results)
+                if i not in failed
+            ), results
+            assert opens[0] == capacity + 2
+        finally:
+            monkeypatch.undo()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await client.aclose()
+        _assert_raw_client_drained(client)
 
 
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.parametrize("capacity", [2, 1000])
-@pytest.mark.asyncio
-async def test_bd_capacity_boundaries(driver, capacity):
-    async with _bd_held_body_server() as (endpoint, release):
-        async with driver.build_httpx_client(max_connections=capacity) as client:
-            responses = []
-            tasks = []
-            async def headers():
-                response = await client.send(client.build_request("POST", endpoint), stream=True)
-                responses.append(response)
-                return response
-            try:
-                tasks = [asyncio.create_task(headers()) for _ in range(capacity - 1)]
-                await asyncio.wait_for(asyncio.gather(*tasks), 10)
-                await _bd_wait_census(client, (capacity - 1, 0, capacity - 1))
-                tasks.append(asyncio.create_task(headers()))
-                await asyncio.wait_for(tasks[-1], 10)
-                await _bd_wait_census(client, (capacity, 0, capacity))
-                tasks.append(asyncio.create_task(headers()))
-                await _bd_wait_census(client, (capacity + 1, 1, capacity))
-                await responses[0].aclose()
-                await asyncio.wait_for(tasks[-1], 10)
-            finally:
-                release.set()
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                for response in responses:
-                    await response.aclose()
-            assert not client._transport._pool._requests
+# ---------------------------------------------------------------------------
+# FP-B1DF-1 — the deterministic O(1)-bookkeeping regression. Red against rev
+# 2.60 at B1ReservationPool._assign_requests_to_connections (source leg) and
+# against any renamed full-pool sweep (runtime leg).
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.parametrize("capacity", [None, True, False, float("nan"), 0, -1, 1.5, "2"])
-def test_bd_invalid_capacity_precedes_transport(driver, capacity, monkeypatch):
-    def forbidden(**kwargs):
-        pytest.fail("transport constructed before validation")
-    monkeypatch.setattr(driver, "B1ReservationTransport", forbidden)
-    with pytest.raises(ValueError, match="positive integer"):
-        driver.build_httpx_client(max_connections=capacity)
+def _raw_touches_population(node) -> str | None:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in _RAW_POPULATION_ATTRS:
+            return sub.attr
+    return None
 
 
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.parametrize("failure,exception", [("connect", httpx.ConnectError), ("read", httpx.ReadError), ("unavailable", None)])
-@pytest.mark.asyncio
-async def test_bd_inherited_failures_release_reservations(driver, failure, exception):
-    class ReadFailure(httpcore.AsyncMockStream):
-        async def read(self, max_bytes, timeout=None):
-            raise httpcore.ReadError("injected read failure")
+def _raw_is_drain_step(stmt, attr) -> bool:
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        return False
+    value = stmt.value
+    if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+        return False
+    if value.func.attr not in ("pop", "popitem"):
+        return False
+    target = value.func.value
+    return isinstance(target, ast.Attribute) and target.attr == attr
 
-    class Backend(httpcore.AsyncMockBackend):
-        first = True
-        async def connect_tcp(self, *args, **kwargs):
-            if self.first:
-                self.first = False
-                if failure == "connect":
-                    raise httpcore.ConnectError("injected connect failure")
-                if failure == "read":
-                    return ReadFailure([])
-            return await super().connect_tcp(*args, **kwargs)
 
-    class UnavailableConnection(httpcore.AsyncHTTPConnection):
-        async def handle_async_request(self, request):
-            self._connect_failed = True
-            raise httpcore.ConnectionNotAvailable()
+def _raw_population_scan(source: str, where: str) -> str | None:
+    """Name the first ledger scan in one function's source, or None."""
+    tree = ast.parse(textwrap.dedent(source))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.For):
+            attr = _raw_touches_population(node.iter)
+            if attr is not None:
+                return f"{where} iterates self.{attr} (for loop)"
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for generator in node.generators:
+                attr = _raw_touches_population(generator.iter)
+                if attr is not None:
+                    return f"{where} iterates self.{attr} (comprehension)"
+        elif isinstance(node, ast.While):
+            attr = _raw_touches_population(node.test)
+            if attr is not None and not (
+                node.body and _raw_is_drain_step(node.body[0], attr)
+            ):
+                return f"{where} loops over self.{attr} without draining it"
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _RAW_SCAN_BUILTINS:
+                attr = _raw_touches_population(node)
+                if attr is not None:
+                    return f"{where} passes self.{attr} to {func.id}()"
+            if isinstance(func, ast.Attribute) and func.attr in ("values", "items", "keys"):
+                attr = _raw_touches_population(func.value)
+                if attr is not None:
+                    return f"{where} takes a view of self.{attr}"
+    return None
 
-    class FaultPool(driver.B1ReservationPool):
-        first = True
-        def create_connection(self, origin):
-            if failure == "unavailable" and self.first:
-                self.first = False
-                return UnavailableConnection(origin)
-            return super().create_connection(origin)
 
-    async with driver.build_httpx_client(max_connections=1) as client:
-        pool = FaultPool(
-            **_bd_pool_settings(client._transport._pool),
-            network_backend=Backend([b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"]),
+def _raw_reachable_driver_classes(client, driver, *, depth=4, budget=4000):
+    """Every class defined by the driver module that the built client owns."""
+    found: dict[str, type] = {}
+    seen: set[int] = set()
+    frontier = [(client, 0)]
+    while frontier and len(seen) < budget:
+        obj, level = frontier.pop()
+        if level > depth or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        cls = type(obj)
+        if getattr(cls, "__module__", None) == driver.__name__:
+            found.setdefault(cls.__name__, cls)
+        children = []
+        state = getattr(obj, "__dict__", None)
+        if isinstance(state, dict):
+            children.extend(state.values())
+        for slot in getattr(cls, "__slots__", ()) or ():
+            children.append(getattr(obj, slot, None))
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            children.extend(obj)
+        elif isinstance(obj, dict):
+            children.extend(obj.values())
+        for child in children:
+            frontier.append((child, level + 1))
+    return found
+
+
+def _raw_request_path_methods(cls) -> set[str]:
+    """Transitive closure of post() over self-method calls on one class."""
+    import inspect
+
+    members = {
+        name: member
+        for name, member in vars(cls).items()
+        if inspect.isfunction(member)
+    }
+    resolved: set[str] = set()
+    pending = ["post"] if "post" in members else []
+    while pending:
+        name = pending.pop()
+        if name in resolved:
+            continue
+        resolved.add(name)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(members[name])))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr in members
+            ):
+                pending.append(node.func.attr)
+    return resolved
+
+
+class _RawAliveReader:
+    def at_eof(self):
+        return False
+
+
+class _RawAliveWriter:
+    def is_closing(self):
+        return False
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+
+class _RawCountingConnection:
+    """A reusable connection record that records every object inspection."""
+
+    def __init__(self, cid):
+        object.__setattr__(
+            self,
+            "_state",
+            {
+                "cid": cid,
+                "reader": _RawAliveReader(),
+                "writer": _RawAliveWriter(),
+                "idle_token": 0,
+                "expiry_handle": None,
+            },
         )
-        client._transport._pool = pool
-        if exception is not None:
-            with pytest.raises(exception):
-                await client.post("http://bd.invalid/")
-        else:
-            assert (await client.post("http://bd.invalid/")).status_code == 202
-        assert not pool._requests
-        assert (await client.post("http://bd.invalid/")).status_code == 202
-        assert not pool._requests
-    assert not pool.connections
+        object.__setattr__(self, "touches", 0)
+
+    def __getattribute__(self, name):
+        state = object.__getattribute__(self, "_state")
+        if name in state:
+            object.__setattr__(
+                self, "touches", object.__getattribute__(self, "touches") + 1
+            )
+            return state[name]
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        state = object.__getattribute__(self, "_state")
+        if name in state:
+            object.__setattr__(
+                self, "touches", object.__getattribute__(self, "touches") + 1
+            )
+            state[name] = value
+            return
+        object.__setattr__(self, name, value)
 
 
-def test_bd_assignment_and_census_parity():
-    """Same ledger fixture, exact assignment/census outcomes in both copies."""
-    from httpcore._async.connection_pool import AsyncPoolRequest
-    from types import SimpleNamespace
+@pytest.mark.parametrize("driver", _RAW_DRIVERS, ids=["reference", "e2e"])
+@pytest.mark.asyncio
+async def test_b1_client_bookkeeping_does_not_scale_with_capacity(driver):
+    """FP-B1DF-1 benchmark: existing connections inspected per acquire/release.
 
-    class Connection:
-        def __init__(self, origin, *, closed=False, expired=False, idle=True):
-            self.origin, self.closed, self.expired, self.idle = origin, closed, expired, idle
-        def is_closed(self):
-            return self.closed
-        def has_expired(self):
-            return self.expired
-        def is_idle(self):
-            return self.idle
-        def is_available(self):
-            return self.idle and not self.closed
-        def can_handle_request(self, origin):
-            return self.origin == origin
+    Metric: how many already-held connection objects one acquire/complete/
+    release touches. Bar: the same number at populations 8 and 1,000, and at
+    most one. Deterministic, no socket I/O and no elapsed-time threshold.
+    """
+    import inspect
 
-    def exercise(driver):
-        class Pool(driver.B1ReservationPool):
-            def create_connection(self, origin):
-                return Connection(origin)
-        origin = httpcore.URL("http://first/").origin
-        pool = Pool(max_connections=2, max_keepalive_connections=2)
-        a, b = Connection(origin), Connection(origin)
-        pool._connections = [a, b]
-        requests = [AsyncPoolRequest(httpcore.Request("GET", "http://first/")) for _ in range(3)]
-        pool._requests = requests
-        assert pool._assign_requests_to_connections() == []
-        assert [r.connection for r in requests] == [a, b, None]
-        client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
-        c, q, ids, r = b1.read_pool_census_sample(client)
-        assert (c, q, r) == (2, 1, 3) and ids == {id(a), id(b)}
-        # A second-origin waiter must not evict reserved idle-looking objects.
-        other = AsyncPoolRequest(httpcore.Request("GET", "http://second/"))
-        pool._requests = [requests[0], requests[1], other]
-        assert pool._assign_requests_to_connections() == []
-        assert other.connection is None and pool.connections == [a, b]
-        # Removing one owner permits idle eviction for the other origin.
-        pool._requests.remove(requests[0])
-        assert pool._assign_requests_to_connections() == [a]
-        assert other.connection.origin == other.request.url.origin
-        # Closed/expired/surplus objects cannot be cleaned while reserved.
-        b.closed = True
-        other.connection.expired = True
-        pool._max_keepalive_connections = 0
-        assert pool._assign_requests_to_connections() == []
-        assert len(pool.connections) == 2
-        pool._requests.clear()
-        assert pool._assign_requests_to_connections() == [other.connection]
-        assert not pool.connections
-        # Explicit unreserved expired and surplus-idle cleanup paths.
-        expired, idle, active = Connection(origin, expired=True), Connection(origin), Connection(origin, idle=False)
-        pool._connections = [expired, idle, active]
-        assert pool._assign_requests_to_connections() == [expired, idle]
-        assert pool.connections == [active]
-        # A cleared assignment is freshly derived, never sticky ownership.
-        pool._connections = [a := Connection(origin)]
-        request = AsyncPoolRequest(httpcore.Request("GET", "http://first/"))
-        request.assign_to_connection(a)
-        pool._requests = [request]
-        pool._max_keepalive_connections = 2
-        request.clear_connection()
-        assert pool._assign_requests_to_connections() == []
-        assert request.connection is a
-        return c, q, r, len(ids)
-    assert exercise(b1) == exercise(bd_e2e) == (2, 1, 3, 2)
+    # --- leg 1: the source of the client the factory actually returns -------
+    client = driver.build_httpx_client(max_connections=driver.MAX_IN_FLIGHT)
+    try:
+        classes = _raw_reachable_driver_classes(client, driver)
+        assert classes, "no driver-defined class is reachable from the built client"
+        offences = []
+        for cls_name, cls in sorted(classes.items()):
+            for name, member in sorted(vars(cls).items()):
+                if name in _RAW_OFF_REQUEST_PATH or not inspect.isfunction(member):
+                    continue
+                found = _raw_population_scan(
+                    inspect.getsource(member), f"{cls_name}.{name}"
+                )
+                if found is not None:
+                    offences.append(found)
+        assert not offences, "per-request ledger scan: " + "; ".join(offences)
+        assert type(client).__module__ == driver.__name__, (
+            f"the factory returns {type(client)!r}, not the driver's own client"
+        )
+        # The O(C + R) diagnostic snapshot must stay off the request path.
+        assert "pool_snapshot" not in _raw_request_path_methods(type(client))
+    finally:
+        await client.aclose()
 
+    # --- leg 2: the same transitions at two populations ---------------------
+    touched = {}
+    seeded = {}
+    for population in (8, 1000):
+        client = _raw_client(driver, population + 1)
+        probes = [_RawCountingConnection(cid) for cid in range(population)]
+        for probe in probes:
+            client._connections[probe.cid] = probe
+            client._idle[probe.cid] = probe
+        client._next_connection_id = population
+        for probe in probes:
+            probe.touches = 0
 
-def test_bd_census_empty_malformed_and_same_sample_arithmetic():
-    from types import SimpleNamespace
-    from httpcore._async.connection_pool import AsyncPoolRequest
-    def client(pool):
-        return SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
-    empty = SimpleNamespace(connections=[], _requests=[])
-    assert b1.read_pool_census_sample(client(empty)) == (0, 0, set(), 0)
-    for pool in (None, SimpleNamespace(connections=[]), SimpleNamespace(connections=[], _requests=None)):
-        assert b1.read_pool_census_sample(client(pool)) == (b1.UNAVAILABLE, b1.UNAVAILABLE, None, b1.UNAVAILABLE)
-    connections = [object(), object()]
-    requests = [AsyncPoolRequest(httpcore.Request("GET", "http://first/")) for _ in range(3)]
-    for request, connection in zip(requests, connections):
-        request.assign_to_connection(connection)
-    samples = []
-    for ledger in (requests[:2], requests):
-        sample = b1.read_pool_census_sample(client(SimpleNamespace(connections=connections, _requests=ledger)))
-        c, q, _, r = sample
-        assert r - q <= c
-        samples.append((c, q, r))
-    assert samples == [(2, 0, 2), (2, 1, 3)]
-    assert b1.peak_pool_metric_from_samples([b1.UNAVAILABLE, 3]) == 3
-    assert b1.peak_pool_metric_from_samples([b1.UNAVAILABLE]) == b1.UNAVAILABLE
+        request_id, conn = await client._checkout()
+        client._requests.pop(request_id, None)
+        client._recycle(conn)
+
+        touched[population] = sum(1 for probe in probes if probe.touches)
+        seeded[population] = probes
+        await client.aclose()
+
+    assert touched[8] == touched[1000] <= 1, touched
+
+    # The probe discriminates: an explicit sweep of the same seeded pools is
+    # counted as 8 and 1,000, so equality above is not equality-by-blindness.
+    control = {}
+    for population, probes in seeded.items():
+        for probe in probes:
+            probe.touches = 0
+        for probe in probes:
+            probe.cid
+        control[population] = sum(1 for probe in probes if probe.touches)
+    assert control == {8: 8, 1000: 1000}
 
 
 @pytest.mark.parametrize("values,expected", [([b1.UNAVAILABLE, 3], 3), ([b1.UNAVAILABLE], b1.UNAVAILABLE)])
@@ -2818,20 +3663,6 @@ async def test_bd_request_peak_uses_sampler(values, expected, monkeypatch):
         async with b1.build_httpx_client(max_connections=1000) as client:
             result = await _bd_offer(b1, client, endpoint, 250)
     assert result.peak_pool_requests == expected
-
-
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.asyncio
-async def test_bd_transport_effective_settings(driver):
-    async with driver.build_httpx_client(max_connections=17) as client:
-        assert type(client._transport) is driver.B1ReservationTransport
-        pool = client._transport._pool
-        assert type(pool) is driver.B1ReservationPool
-        assert (pool._max_connections, pool._max_keepalive_connections, pool._keepalive_expiry) == (17, 17, 30.0)
-        assert pool._http1 is True and pool._http2 is False and pool._retries == 0
-        assert client.timeout.as_dict() == dict(connect=30.0, read=30.0, write=30.0, pool=30.0)
-        assert not client.trust_env and not client.follow_redirects
-        assert not pool.connections and not pool._requests
 
 
 @pytest.mark.parametrize("quantity", [0, 3, b1.UNAVAILABLE])
@@ -2852,24 +3683,6 @@ def test_bd_fingerprint_request_field_renders_phase_value(quantity):
     line = eval(compile(ast.Expression(template), str(__file__), "eval"), env)
     assert f",peak_pool_connections={quantity},peak_pool_requests={quantity},peak_pool_queued={quantity}," in line
     test_b1_fingerprint_line_locates_the_in_flight_population({"fingerprint": line, "result": result})
-
-
-@pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
-@pytest.mark.asyncio
-async def test_bd_expired_idle_connection_is_replaced(driver):
-    with _bd_instant_server() as endpoint:
-        async with driver.build_httpx_client(max_connections=1) as client:
-            settings = _bd_pool_settings(client._transport._pool)
-            settings["keepalive_expiry"] = 0
-            pool = driver.B1ReservationPool(**settings)
-            client._transport._pool = pool
-            response = await client.send(client.build_request("POST", endpoint), stream=True)
-            connection = pool.connections[0]
-            await response.aread()
-            # Inherited stream close reassigns and expires the now-unowned idle object.
-            assert connection.is_closed() and not pool._requests
-            assert (await client.post(endpoint)).status_code == 202
-            assert not pool._requests
 
 
 if __name__ == "__main__":

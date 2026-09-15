@@ -81,7 +81,11 @@ _TIMEOUT_CONSTANTS = ("KEEPALIVE_EXPIRY", "CLIENT_TIMEOUT")
 
 
 def _module_assigns(path: Path) -> dict[str, ast.AST]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return _source_assigns(path.read_text(encoding="utf-8"))
+
+
+def _source_assigns(src: str) -> dict[str, ast.AST]:
+    tree = ast.parse(src)
     out = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -128,7 +132,11 @@ def _eval_simple_constant(node: ast.AST, assigns: dict[str, ast.AST]) -> object:
 
 
 def _has_environ_read(path: Path) -> bool:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return _source_has_environ_read(path.read_text(encoding="utf-8"))
+
+
+def _source_has_environ_read(src: str) -> bool:
+    tree = ast.parse(src)
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
             if isinstance(node.value, ast.Name) and node.value.id == "os":
@@ -142,36 +150,8 @@ def _has_environ_read(path: Path) -> bool:
     return False
 
 
-def _client_call_from_source(src: str) -> ast.Call:
-    """Find the AsyncClient / Client construction Call node."""
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = None
-        if isinstance(node.func, ast.Attribute):
-            name = node.func.attr
-        elif isinstance(node.func, ast.Name):
-            name = node.func.id
-        if name in {"AsyncClient", "Client"}:
-            return node
-    raise AssertionError("no AsyncClient/Client construction found")
-
-
 def _call_kwargs(call: ast.Call) -> dict[str, ast.AST]:
     return {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
-
-
-def _nested_call_kwargs(node: ast.AST, *, expected_names: set[str]) -> dict[str, ast.AST]:
-    """Resolve a nested ``Limits(...)`` / ``Timeout(...)`` call's keyword args."""
-    assert isinstance(node, ast.Call), f"expected Call, got {type(node)}"
-    name = None
-    if isinstance(node.func, ast.Attribute):
-        name = node.func.attr
-    elif isinstance(node.func, ast.Name):
-        name = node.func.id
-    assert name in expected_names, f"expected one of {expected_names}, got {name}"
-    return _call_kwargs(node)
 
 
 def _const_or_name(node: ast.AST) -> object:
@@ -187,88 +167,315 @@ def _const_or_name(node: ast.AST) -> object:
     raise AssertionError(f"unsupported pin expression: {ast.dump(node)}")
 
 
-# Every nested HTTPX control that FP-IG-13 requires (design.md §11.3.3 H).
-_HTTPX_PINNED_OUTER = {
-    "trust_env": False,
-    "http2": False,
-    "http1": True,
+# ---------------------------------------------------------------------------
+# FP-B1DF-3 — the copied raw-client block, its pins, and the no-scan shape.
+# The block replaces the FP-IG-13 HTTPX/httpcore surface (design slice
+# b1-driver-fix §3.4): what is pinned is now B1's own client, not HTTPX's
+# construction arguments.
+# ---------------------------------------------------------------------------
+
+RAW_BEGIN = "# B1-RAW-CLIENT:BEGIN"
+RAW_END = "# B1-RAW-CLIENT:END"
+
+# Imports the copied block needs; identical in both driver modules (§3.4).
+_RAW_REQUIRED_IMPORTS = (
+    "import asyncio",
+    "from collections import OrderedDict",
+    "from dataclasses import dataclass",
+    "from urllib.parse import urlsplit",
+)
+_RAW_FORBIDDEN_MODULES = ("httpx", "httpcore")
+_RAW_RETIRED_CLASSES = ("B1ReservationPool", "B1ReservationTransport")
+_RAW_REQUIRED_CLASSES = (
+    "B1HttpResponse",
+    "B1ProtocolError",
+    "B1PoolSnapshot",
+    "B1RawHttp11Client",
+)
+# The compatibility factory's construction, pinned argument by argument.
+_RAW_FACTORY_PINS = {
+    "max_connections": ("name", "max_connections"),
+    "timeout": ("name", "CLIENT_TIMEOUT"),
+    "keepalive_expiry": ("name", "KEEPALIVE_EXPIRY"),
+    "http_version": "HTTP/1.1",
+    "retries": 0,
     "follow_redirects": False,
+    "trust_env": False,
 }
-_LIMITS_KEYS = ("max_connections", "max_keepalive_connections", "keepalive_expiry")
-_TIMEOUT_KEYS = ("connect", "read", "write", "pool")
+# Capacity validation must precede construction, exactly as before.
+_RAW_CAPACITY_GUARDS = (
+    "isinstance(max_connections, bool)",
+    "isinstance(max_connections, int)",
+    "max_connections <= 0",
+)
+# The four populations FP-B1DF-1 forbids the request path to scan.
+_POPULATION_ATTRS = ("_connections", "_idle", "_requests", "_waiters")
+_SCAN_BUILTINS = frozenset(
+    {
+        "any", "all", "next", "sorted", "min", "max", "sum", "list", "tuple",
+        "set", "frozenset", "filter", "map", "reversed", "enumerate", "zip",
+        "iter",
+    }
+)
+# Entered per request; everything reachable from here is the request path.
+_REQUEST_PATH_ROOT = "post"
 
 
-def _assert_httpx_fully_pinned(path: Path, src: str) -> None:
-    """Parse and pin every nested HTTPX argument (FP-IG-13 / C4)."""
-    call = _client_call_from_source(src)
-    kwargs = _call_kwargs(call)
-
-    for key, expected in _HTTPX_PINNED_OUTER.items():
-        assert key in kwargs, f"{path.name}: AsyncClient missing {key}="
-        assert isinstance(kwargs[key], ast.Constant) and kwargs[key].value is expected, (
-            f"{path.name}: {key}={ast.dump(kwargs[key])} want {expected}"
-        )
-
-    assert "limits" in kwargs, f"{path.name}: AsyncClient missing limits="
-    assert "timeout" in kwargs, f"{path.name}: AsyncClient missing timeout="
-    # No proxy / SSL-context / event-hook arguments (design.md FP-IG-13).
-    for forbidden in ("proxies", "proxy", "verify", "cert", "event_hooks", "mounts"):
-        assert forbidden not in kwargs, f"{path.name}: forbidden client arg {forbidden}"
-
-    limits = _nested_call_kwargs(kwargs["limits"], expected_names={"Limits"})
-    for key in _LIMITS_KEYS:
-        assert key in limits, f"{path.name}: Limits missing {key}="
-    # Capacity must be the *parameter* ``max_connections`` (phase capacity),
-    # not a weakened literal. Both keys bind that same name.
-    assert _const_or_name(limits["keepalive_expiry"]) == ("name", "KEEPALIVE_EXPIRY"), (
-        f"{path.name}: keepalive_expiry must be KEEPALIVE_EXPIRY"
+def _raw_block(path: Path, src: str) -> str:
+    """Return the byte range between the two raw-client markers."""
+    assert src.count(RAW_BEGIN) == 1, (
+        f"{path.name}: raw-client marker {RAW_BEGIN} must appear exactly once"
     )
-    mc = _const_or_name(limits["max_connections"])
-    mk = _const_or_name(limits["max_keepalive_connections"])
-    assert mc == ("name", "max_connections"), (
-        f"{path.name}: max_connections must be the capacity parameter, got {mc}"
+    assert src.count(RAW_END) == 1, (
+        f"{path.name}: raw-client marker {RAW_END} must appear exactly once"
     )
-    assert mk == ("name", "max_connections"), (
-        f"{path.name}: max_keepalive_connections must be the capacity parameter, got {mk}"
-    )
+    start = src.index(RAW_BEGIN)
+    end = src.index(RAW_END) + len(RAW_END)
+    assert start < end, f"{path.name}: raw-client markers are inverted"
+    return src[start:end]
 
-    assert "transport" in kwargs, f"{path.name}: missing transport="
-    transport = _nested_call_kwargs(
-        kwargs["transport"], expected_names={"B1ReservationTransport"}
-    )
-    assert set(transport) == {"limits", "trust_env", "http1", "http2", "retries"}
-    assert ast.dump(transport["limits"]) == ast.dump(kwargs["limits"])
-    for key, expected in {"trust_env": False, "http1": True, "http2": False, "retries": 0}.items():
-        assert isinstance(transport[key], ast.Constant)
-        assert transport[key].value is expected
+
+def _module_imports(src: str) -> set[str]:
+    out: set[str] = set()
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            out.add(ast.unparse(node))
+    return out
+
+
+def _imported_module_roots(src: str) -> set[str]:
+    roots: set[str] = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                roots.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
+def _references_population(node: ast.AST) -> str | None:
+    """Name of the first of the four populations this expression touches."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in _POPULATION_ATTRS:
+            return sub.attr
+    return None
+
+
+def _is_drain_step(stmt: ast.AST, attr: str) -> bool:
+    """True for ``x = self.<attr>.pop*(...)`` — removal, never a scan."""
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        return False
+    value = stmt.value
+    if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+        return False
+    if value.func.attr not in ("pop", "popitem"):
+        return False
+    target = value.func.value
+    return isinstance(target, ast.Attribute) and target.attr == attr
+
+
+def _assert_no_population_scan(path: Path, where: str, fn: ast.AST) -> None:
+    """FP-B1DF-1: no request-path operation iterates a population collection."""
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.For):
+            attr = _references_population(sub.iter)
+            assert attr is None, (
+                f"{path.name}: request-path scan over self.{attr} "
+                f"in {where} (for loop)"
+            )
+        elif isinstance(sub, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for generator in sub.generators:
+                attr = _references_population(generator.iter)
+                assert attr is None, (
+                    f"{path.name}: request-path scan over self.{attr} "
+                    f"in {where} (comprehension)"
+                )
+        elif isinstance(sub, ast.While):
+            attr = _references_population(sub.test)
+            if attr is not None:
+                assert sub.body and _is_drain_step(sub.body[0], attr), (
+                    f"{path.name}: request-path scan over self.{attr} "
+                    f"in {where} (while loop that does not drain it)"
+                )
+        elif isinstance(sub, ast.Call):
+            func = sub.func
+            if isinstance(func, ast.Name) and func.id in _SCAN_BUILTINS:
+                attr = _references_population(sub)
+                assert attr is None, (
+                    f"{path.name}: request-path scan over self.{attr} "
+                    f"in {where} (builtin {func.id})"
+                )
+            if isinstance(func, ast.Attribute) and func.attr in ("values", "items", "keys"):
+                attr = _references_population(func.value)
+                assert attr is None, (
+                    f"{path.name}: request-path scan over self.{attr} "
+                    f"in {where} (dict view)"
+                )
+
+
+def _request_path_functions(
+    tree: ast.Module, cls: ast.ClassDef
+) -> dict[str, ast.AST]:
+    """Transitive closure of ``post`` over self-methods and module helpers."""
+    methods = {
+        n.name: n
+        for n in cls.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    module_fns = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert _REQUEST_PATH_ROOT in methods, "raw client has no post() entry point"
+    resolved: dict[str, ast.AST] = {}
+    pending = [(_REQUEST_PATH_ROOT, methods[_REQUEST_PATH_ROOT])]
+    while pending:
+        name, fn = pending.pop()
+        if name in resolved:
+            continue
+        resolved[name] = fn
+        for sub in ast.walk(fn):
+            if not isinstance(sub, ast.Call):
+                continue
+            func = sub.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+                and func.attr in methods
+            ):
+                pending.append((func.attr, methods[func.attr]))
+            elif isinstance(func, ast.Name) and func.id in module_fns:
+                pending.append((func.id, module_fns[func.id]))
+    return resolved
+
+
+def _assert_raw_client_pinned(path: Path, src: str) -> None:
+    """Pin the raw client's identity, factory arguments and request-path shape."""
+    block = _raw_block(path, src)
     tree = ast.parse(src)
-    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-    pool_class = classes["B1ReservationPool"]
-    transport_class = classes["B1ReservationTransport"]
-    assert [ast.unparse(b) for b in pool_class.bases] == ["httpcore.AsyncConnectionPool"]
-    assert [ast.unparse(b) for b in transport_class.bases] == ["httpx.AsyncHTTPTransport"]
-    assert [n.name for n in pool_class.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))] == ["_assign_requests_to_connections"]
-    init = next(n for n in transport_class.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
-    expected_init = ast.parse("""
-def __init__(self, *, limits, trust_env, http1, http2, retries):
-    super().__init__(limits=limits, trust_env=trust_env, http1=http1, http2=http2, retries=retries)
-    pool = self._pool
-    self._pool = B1ReservationPool(
-        ssl_context=pool._ssl_context,
-        max_connections=pool._max_connections,
-        max_keepalive_connections=pool._max_keepalive_connections,
-        keepalive_expiry=pool._keepalive_expiry,
-        http1=pool._http1, http2=pool._http2, retries=pool._retries,
-    )
-""").body[0]
-    assert ast.dump(init) == ast.dump(expected_init), f"{path.name}: transport/pool construction drift"
 
-    timeout = _nested_call_kwargs(kwargs["timeout"], expected_names={"Timeout"})
-    for key in _TIMEOUT_KEYS:
-        assert key in timeout, f"{path.name}: Timeout missing {key}="
-        assert _const_or_name(timeout[key]) == ("name", "CLIENT_TIMEOUT"), (
-            f"{path.name}: timeout.{key} must be CLIENT_TIMEOUT"
+    imports = _module_imports(src)
+    for required in _RAW_REQUIRED_IMPORTS:
+        assert any(line.startswith(required) for line in imports), (
+            f"{path.name}: raw-client import missing: {required}"
         )
+    for forbidden in _RAW_FORBIDDEN_MODULES:
+        assert forbidden not in _imported_module_roots(src), (
+            f"{path.name}: forbidden client dependency imported: {forbidden}"
+        )
+
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    for retired in _RAW_RETIRED_CLASSES:
+        assert retired not in classes, (
+            f"{path.name}: retired reservation subclass is back: {retired}"
+        )
+    for required in _RAW_REQUIRED_CLASSES:
+        assert required in classes, f"{path.name}: raw-client class missing: {required}"
+        assert f"class {required}" in block, (
+            f"{path.name}: raw-client class {required} is outside the marked block"
+        )
+
+    factory = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "build_httpx_client"
+        ),
+        None,
+    )
+    assert factory is not None, f"{path.name}: compatibility factory missing"
+    assert "def build_httpx_client" in block, (
+        f"{path.name}: the factory is outside the marked block"
+    )
+    assert [a.arg for a in factory.args.kwonlyargs] == ["max_connections"], (
+        f"{path.name}: the factory must take keyword-only max_connections"
+    )
+    body = factory.body
+    if (
+        isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # the factory's own docstring, never a guard
+    guard = body[0]
+    assert isinstance(guard, ast.If), (
+        f"{path.name}: factory validation must precede construction"
+    )
+    guard_src = ast.unparse(guard.test)
+    for fragment in _RAW_CAPACITY_GUARDS:
+        assert fragment in guard_src, (
+            f"{path.name}: factory capacity validation lost {fragment!r}"
+        )
+    raised = guard.body[0]
+    assert isinstance(raised, ast.Raise) and isinstance(raised.exc, ast.Call), (
+        f"{path.name}: factory capacity validation must raise"
+    )
+    assert _call_func_name(raised.exc) == "ValueError", (
+        f"{path.name}: factory capacity validation must raise ValueError"
+    )
+
+    constructions = [
+        n
+        for n in ast.walk(factory)
+        if isinstance(n, ast.Call) and _call_func_name(n) == "B1RawHttp11Client"
+    ]
+    assert len(constructions) == 1, (
+        f"{path.name}: the factory must construct exactly one raw client, "
+        f"got {len(constructions)}"
+    )
+    call = constructions[0]
+    assert not call.args, f"{path.name}: the raw client takes keyword arguments only"
+    kwargs = _call_kwargs(call)
+    assert set(kwargs) == set(_RAW_FACTORY_PINS), (
+        f"{path.name}: raw-client factory pin set is "
+        f"{sorted(kwargs)}, want {sorted(_RAW_FACTORY_PINS)}"
+    )
+    for key, expected in _RAW_FACTORY_PINS.items():
+        bound = _const_or_name(kwargs[key])
+        assert bound == expected, (
+            f"{path.name}: raw-client factory pin {key}={bound!r} want {expected!r}"
+        )
+
+    assert not _source_has_environ_read(src), (
+        f"{path.name} reads os.environ/getenv"
+    )
+
+    client_class = classes["B1RawHttp11Client"]
+    origin = next(
+        (
+            n
+            for n in client_class.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "_bind_origin"
+        ),
+        None,
+    )
+    assert origin is not None, f"{path.name}: the client has no origin binding"
+    origin_src = ast.unparse(origin)
+    assert "self._origin" in origin_src and "raise ValueError" in origin_src, (
+        f"{path.name}: the client must pin a single origin"
+    )
+    assert any(
+        isinstance(n, ast.Compare)
+        and any(isinstance(op, ast.NotEq) for op in n.ops)
+        and "self._origin" in ast.unparse(n)
+        for n in ast.walk(origin)
+    ), f"{path.name}: a second origin is accepted by _bind_origin"
+
+    for name, fn in _request_path_functions(tree, client_class).items():
+        _assert_no_population_scan(path, f"B1RawHttp11Client.{name}", fn)
+
+
+def _assert_raw_blocks_identical(ref_src: str, e2e_src: str) -> None:
+    """FP-B1DF-3: the two copied blocks are byte-identical."""
+    ref_block = _raw_block(REF_PATH, ref_src)
+    e2e_block = _raw_block(E2E_PATH, e2e_src)
+    assert ref_block == e2e_block, (
+        "raw-client block drift between the reference and e2e driver copies"
+    )
 
 
 def _assert_timeout_constants_pinned(path: Path, assigns: dict[str, ast.AST]) -> None:
@@ -367,7 +574,15 @@ def _assert_phase_capacity_bindings(path: Path, src: str) -> None:
 
 
 def test_b1_harness_surface_is_pinned_and_environment_independent():
-    """FP-IG-13: constants, no env reads, full HTTPX pin on every harness surface."""
+    """FP-B1DF-3: constants, no env reads, raw-client pin on every surface.
+
+    Re-pinned, not renamed: the shared-constant, timeout-derivation,
+    no-environment and phase-capacity checks are the ones FP-IG-13 always
+    made; only the client identity they are made against has changed from
+    HTTPX/httpcore to the copied raw block (slice §3.4).
+    """
+    sources = {path: path.read_text(encoding="utf-8") for path in (REF_PATH, E2E_PATH)}
+    _assert_raw_blocks_identical(sources[REF_PATH], sources[E2E_PATH])
     # Profile modules: full pin + no env.
     for path in (REF_PATH, E2E_PATH):
         assigns = _module_assigns(path)
@@ -394,8 +609,13 @@ def test_b1_harness_surface_is_pinned_and_environment_independent():
                 f"INGEST_GATEWAY_WORKERS={getattr(node, 'value', node)}"
             )
         assert not _has_environ_read(path), f"{path} reads os.environ/getenv"
-        _assert_httpx_fully_pinned(path, text)
+        _assert_raw_client_pinned(path, text)
         _assert_phase_capacity_bindings(path, text)
+        # The run functions keep taking an injected client, now annotated as
+        # the raw client (§3.4's four annotation-only edits).
+        assert "B1RawHttp11Client | None" in text, (
+            f"{path.name}: injected-client annotation was not migrated"
+        )
 
     # Actual B1 harness test modules: no profile overrides via env, and the
     # e2e link must not read os.environ at all (review C4). The reference
@@ -413,117 +633,240 @@ def test_b1_harness_surface_is_pinned_and_environment_independent():
     assert "os.environ.get" not in ref_test_src
 
 
-# Omission fixtures: dropping any one nested control must make the pin red.
-_OMISSION_TARGETS: list[tuple[str, str]] = [
-    ("keepalive_expiry", "keepalive_expiry=KEEPALIVE_EXPIRY"),
-    ("max_keepalive_connections", "max_keepalive_connections=max_connections"),
-    ("max_connections", "max_connections=max_connections"),
-    ("connect", "connect=CLIENT_TIMEOUT"),
-    ("read", "read=CLIENT_TIMEOUT"),
-    ("write", "write=CLIENT_TIMEOUT"),
-    ("pool", "pool=CLIENT_TIMEOUT"),
-    ("http1", "http1=True"),
-]
+def _raw_surface_checks(path: Path, src: str) -> None:
+    """Every single-file pin the raw-client surface carries (§3.4)."""
+    _assert_timeout_constants_pinned(path, _source_assigns(src))
+    _assert_raw_client_pinned(path, src)
+    _assert_phase_capacity_bindings(path, src)
 
 
-@pytest.mark.parametrize("target,anchor", _OMISSION_TARGETS, ids=[t[0] for t in _OMISSION_TARGETS])
-def test_fp_ig13_guard_rejects_httpx_control_omission(target: str, anchor: str):
-    """FP-IG-13 negative: omitting any nested HTTPX control is red (C4)."""
-    src = REF_PATH.read_text(encoding="utf-8")
-    assert anchor in src, f"anchor for {target} missing from reference profile"
-    # Drop the keyword argument (and its trailing comma if present).
-    mutated = src.replace(f"            {anchor},\n", "", 1)
-    if mutated == src:
-        mutated = src.replace(f"        {anchor},\n", "", 1)
-    assert mutated != src, f"failed to omit {target}"
-    try:
-        _assert_httpx_fully_pinned(REF_PATH, mutated)
-    except AssertionError:
-        return  # expected red
-    raise AssertionError(f"omitting {target} still passed the HTTPX pin")
-
-
-# Value-changing mutations: retain the argument name but weaken the bound value.
-# Each must make the pin go red (C4 remaining gap / FP-IG-13).
-_VALUE_MUTATIONS: list[tuple[str, str, str]] = [
-    # (id, old_snippet, new_snippet)
-    ("client_timeout_literal", "CLIENT_TIMEOUT = float(BURST_SECONDS)", "CLIENT_TIMEOUT = 0.001"),
+# Independent negative fixtures (§3.4): each removes or changes exactly one
+# pin and must fail for its own named reason, never for a neighbour's.
+_RAW_BLOCK_MUTATIONS: list[tuple[str, Path, str, str, str]] = [
+    # (id, path, old, new, expected reason fragment)
     (
-        "keepalive_expiry_literal",
+        "factory_omits_timeout",
+        REF_PATH,
+        "        max_connections=max_connections,\n        timeout=CLIENT_TIMEOUT,\n",
+        "        max_connections=max_connections,\n",
+        "raw-client factory pin set is",
+    ),
+    (
+        "factory_omits_keepalive_expiry",
+        REF_PATH,
+        "        keepalive_expiry=KEEPALIVE_EXPIRY,\n",
+        "",
+        "raw-client factory pin set is",
+    ),
+    (
+        "factory_omits_capacity",
+        REF_PATH,
+        "        max_connections=max_connections,\n        timeout=CLIENT_TIMEOUT,",
+        "        timeout=CLIENT_TIMEOUT,",
+        "raw-client factory pin set is",
+    ),
+    (
+        "factory_adds_a_proxy_argument",
+        REF_PATH,
+        "        trust_env=False,\n    )",
+        '        trust_env=False,\n        proxy="http://proxy.invalid",\n    )',
+        "raw-client factory pin set is",
+    ),
+    (
+        "timeout_weakened_to_a_literal",
+        REF_PATH,
+        "        max_connections=max_connections,\n        timeout=CLIENT_TIMEOUT,",
+        "        max_connections=max_connections,\n        timeout=0.001,",
+        "raw-client factory pin timeout=",
+    ),
+    (
+        "keepalive_expiry_weakened_to_a_literal",
+        REF_PATH,
+        "        keepalive_expiry=KEEPALIVE_EXPIRY,",
+        "        keepalive_expiry=0.001,",
+        "raw-client factory pin keepalive_expiry=",
+    ),
+    (
+        "capacity_weakened_to_a_literal",
+        REF_PATH,
+        "        max_connections=max_connections,\n        timeout=CLIENT_TIMEOUT,",
+        "        max_connections=1,\n        timeout=CLIENT_TIMEOUT,",
+        "raw-client factory pin max_connections=",
+    ),
+    (
+        "protocol_downgraded_to_http10",
+        REF_PATH,
+        '        http_version="HTTP/1.1",',
+        '        http_version="HTTP/1.0",',
+        "raw-client factory pin http_version=",
+    ),
+    (
+        "one_retry_allowed",
+        REF_PATH,
+        "        retries=0,",
+        "        retries=1,",
+        "raw-client factory pin retries=",
+    ),
+    (
+        "redirects_followed",
+        REF_PATH,
+        "        follow_redirects=False,",
+        "        follow_redirects=True,",
+        "raw-client factory pin follow_redirects=",
+    ),
+    (
+        "environment_trusted",
+        REF_PATH,
+        "        trust_env=False,\n    )",
+        "        trust_env=True,\n    )",
+        "raw-client factory pin trust_env=",
+    ),
+    (
+        "client_timeout_constant_weakened",
+        REF_PATH,
+        "CLIENT_TIMEOUT = float(BURST_SECONDS)",
+        "CLIENT_TIMEOUT = 0.001",
+        "must be float(BURST_SECONDS)",
+    ),
+    (
+        "keepalive_expiry_constant_weakened",
+        REF_PATH,
         "KEEPALIVE_EXPIRY = float(BURST_SECONDS)",
         "KEEPALIVE_EXPIRY = 0.001",
+        "must be float(BURST_SECONDS)",
     ),
     (
-        "max_connections_literal_1",
-        "max_connections=max_connections,\n"
-        "            max_keepalive_connections=max_connections,",
-        "max_connections=1,\n"
-        "            max_keepalive_connections=1,",
+        "capacity_validation_weakened",
+        REF_PATH,
+        "        or max_connections <= 0\n    ):\n        raise ValueError",
+        "        or max_connections < -1\n    ):\n        raise ValueError",
+        "factory capacity validation lost 'max_connections <= 0'",
     ),
     (
-        "max_keepalive_only_literal",
-        "max_keepalive_connections=max_connections,",
-        "max_keepalive_connections=1,",
+        "reservation_pool_restored",
+        REF_PATH,
+        "class B1RawHttp11Client:",
+        "class B1ReservationPool:\n    pass\n\n\nclass B1RawHttp11Client:",
+        "retired reservation subclass is back: B1ReservationPool",
     ),
     (
-        "connect_timeout_literal",
-        "connect=CLIENT_TIMEOUT,",
-        "connect=0.001,",
+        "httpx_dependency_reintroduced",
+        REF_PATH,
+        "import asyncio\nimport json",
+        "import asyncio\nimport httpx\nimport json",
+        "forbidden client dependency imported: httpx",
     ),
     (
-        "read_timeout_literal",
-        "read=CLIENT_TIMEOUT,",
-        "read=0.001,",
+        "block_import_dropped",
+        REF_PATH,
+        "from collections import OrderedDict\n",
+        "",
+        "raw-client import missing: from collections import OrderedDict",
     ),
     (
-        "write_timeout_literal",
-        "write=CLIENT_TIMEOUT,",
-        "write=0.001,",
+        "environment_read_added",
+        REF_PATH,
+        "        self._closed = False\n",
+        '        self._closed = bool(os.environ.get("B1_CLIENT_CLOSED"))\n',
+        "reads os.environ/getenv",
     ),
     (
-        "pool_timeout_literal",
-        "pool=CLIENT_TIMEOUT,",
-        "pool=0.001,",
+        "second_origin_allowed",
+        REF_PATH,
+        "        elif origin != self._origin:\n"
+        '            raise ValueError(f"client is bound to {self._origin}, got {origin}")\n',
+        "        elif origin == self._origin:\n            pass\n",
+        "a second origin is accepted by _bind_origin",
     ),
     (
-        "keepalive_expiry_arg_literal",
-        "keepalive_expiry=KEEPALIVE_EXPIRY,",
-        "keepalive_expiry=0.001,",
+        "acquire_scans_the_connections",
+        REF_PATH,
+        "        if len(self._connections) < self._max_connections:",
+        "        if len([c for c in self._connections.values()]) < self._max_connections:",
+        "request-path scan over self._connections "
+        "in B1RawHttp11Client._checkout (comprehension)",
     ),
     (
-        "http1_false",
-        "http1=True,",
-        "http1=False,",
+        "release_scans_the_idle_connections",
+        REF_PATH,
+        "        if self._give_to_waiter(conn):",
+        "        for _parked in self._idle.values():\n"
+        "            _parked.cid\n"
+        "        if self._give_to_waiter(conn):",
+        "request-path scan over self._idle in B1RawHttp11Client._recycle (for loop)",
+    ),
+    (
+        "drop_scans_through_a_builtin",
+        REF_PATH,
+        "        self._connections.pop(conn.cid, None)",
+        "        next(iter(self._connections), None)\n"
+        "        self._connections.pop(conn.cid, None)",
+        "request-path scan over self._connections in B1RawHttp11Client._drop",
+    ),
+    (
+        "waiter_loop_stops_draining",
+        REF_PATH,
+        "            request_id, waiter = self._waiters.popitem(last=False)\n"
+        "            if waiter.done():",
+        "            request_id, waiter = self._oldest_waiter()\n"
+        "            if waiter.done():",
+        "request-path scan over self._waiters "
+        "in B1RawHttp11Client._give_to_waiter (while loop that does not drain it)",
+    ),
+    (
+        "snapshot_pulled_onto_the_request_path",
+        REF_PATH,
+        "        return B1HttpResponse(status_code, body)",
+        "        self.pool_snapshot()\n        return B1HttpResponse(status_code, body)",
+        "request-path scan over self._requests in B1RawHttp11Client.pool_snapshot",
+    ),
+    (
+        "end_marker_removed",
+        REF_PATH,
+        "# B1-RAW-CLIENT:END\n",
+        "",
+        f"raw-client marker {RAW_END} must appear exactly once",
+    ),
+    (
+        "phase_capacity_replaced_by_a_literal",
+        REF_PATH,
+        "client = build_httpx_client(max_connections=max_in_flight)",
+        "client = build_httpx_client(max_connections=1)",
+        "want ('name', 'max_in_flight')",
+    ),
+    (
+        "e2e_copy_changed_alone",
+        E2E_PATH,
+        "        # The four populations. No request-path helper iterates any of them.\n",
+        "        # The four populations.\n",
+        "raw-client block drift between the reference and e2e driver copies",
     ),
 ]
 
 
 @pytest.mark.parametrize(
-    "mutation_id,old,new",
-    _VALUE_MUTATIONS,
-    ids=[m[0] for m in _VALUE_MUTATIONS],
+    "mutation_id,path,old,new,reason",
+    _RAW_BLOCK_MUTATIONS,
+    ids=[m[0] for m in _RAW_BLOCK_MUTATIONS],
 )
-def test_fp_ig13_guard_rejects_httpx_value_weakening(mutation_id: str, old: str, new: str):
-    """FP-IG-13 negative: value-changing mutations on every nested pin are red (C4)."""
-    src = REF_PATH.read_text(encoding="utf-8")
-    assert old in src, f"anchor for {mutation_id} missing from reference profile"
-    mutated = src.replace(old, new, 1)
-    assert mutated != src, f"failed to apply {mutation_id}"
-    tree_assigns: dict[str, ast.AST] = {}
-    tree = ast.parse(mutated)
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            t = node.targets[0]
-            if isinstance(t, ast.Name):
-                tree_assigns[t.id] = node.value
-    try:
-        # Full surface: assignment inventory + nested HTTPX + phase capacity.
-        _assert_timeout_constants_pinned(REF_PATH, tree_assigns)
-        _assert_httpx_fully_pinned(REF_PATH, mutated)
-        _assert_phase_capacity_bindings(REF_PATH, mutated)
-    except AssertionError:
-        return  # expected red
-    raise AssertionError(f"value mutation {mutation_id} still passed the HTTPX pin")
+def test_b1_raw_client_blocks_reject_independent_mutations(
+    mutation_id: str, path: Path, old: str, new: str, reason: str
+):
+    """FP-B1DF-3 negative: every pin, copy and no-scan rule fails on its own."""
+    sources = {p: p.read_text(encoding="utf-8") for p in (REF_PATH, E2E_PATH)}
+    assert old in sources[path], f"anchor for {mutation_id} missing from {path.name}"
+    mutated = sources[path].replace(old, new, 1)
+    assert mutated != sources[path], f"failed to apply {mutation_id}"
+    sources[path] = mutated
+
+    with pytest.raises(AssertionError) as exc:
+        # Single-file surface first, then cross-copy identity, so a mutation
+        # of one copy is reported as its own defect rather than as drift.
+        _raw_surface_checks(path, mutated)
+        _assert_raw_blocks_identical(sources[REF_PATH], sources[E2E_PATH])
+    assert reason in str(exc.value), (
+        f"{mutation_id} failed for the wrong reason: {exc.value}"
+    )
 
 
 # Phase-capacity mutations (C2 / FP-IG-13): each enclosing phase is pinned to
@@ -1274,46 +1617,6 @@ def test_unhealthy_events_oracle_filters_and_fails_closed():
     # Retired field names must not appear as fingerprint keys.
     assert "cgroup_cpu_s=" not in src
     assert "nr_throttled_delta=" not in src
-
-
-_BD_CONSTRUCTION_MUTATIONS = [
-    ("plain_transport", "transport=B1ReservationTransport(", "transport=httpx.AsyncHTTPTransport("),
-    ("plain_pool", "self._pool = B1ReservationPool(", "self._pool = httpcore.AsyncConnectionPool("),
-    ("unequal_inner_limits", "                max_connections=max_connections,", "                max_connections=1,"),
-    ("transport_environment", "            trust_env=False,", "            trust_env=True,"),
-    ("transport_http2", "            http2=False,", "            http2=True,"),
-] + [
-    ("pool_" + key, key + "=pool._" + key + ",", key + "=" + value + ",")
-    for key, value in (
-        ("max_connections", "1"), ("max_keepalive_connections", "1"),
-        ("keepalive_expiry", "0.001"), ("http1", "False"),
-        ("http2", "True"), ("retries", "1"),
-    )
-] + [
-    ("pool_ssl_context_" + name, "ssl_context=pool._ssl_context,", "ssl_context=" + value + ",")
-    for name, value in (
-        ("none", "None"), ("new", "ssl.SSLContext()"),
-        ("unrelated", "other._ssl_context"),
-    )
-]
-
-
-@pytest.mark.parametrize("path", [REF_PATH, E2E_PATH], ids=["reference", "e2e"])
-@pytest.mark.parametrize("name,old,new", _BD_CONSTRUCTION_MUTATIONS, ids=[m[0] for m in _BD_CONSTRUCTION_MUTATIONS])
-def test_bd_construction_mutations(path, name, old, new):
-    source = path.read_text()
-    assert old in source, name
-    with pytest.raises(AssertionError):
-        _assert_httpx_fully_pinned(path, source.replace(old, new, 1))
-
-
-@pytest.mark.parametrize("path", [REF_PATH, E2E_PATH])
-def test_bd_omitted_transport(path):
-    tree = ast.parse(path.read_text())
-    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_func_name(n) == "AsyncClient")
-    call.keywords = [k for k in call.keywords if k.arg != "transport"]
-    with pytest.raises(AssertionError):
-        _assert_httpx_fully_pinned(path, ast.unparse(tree))
 
 
 def test_bd_import_does_not_construct_client_or_start_server():
