@@ -1,16 +1,75 @@
 schema_version: 1
 benchmarks:
 - id: B1
-  description: 'Ingest webhook: HMAC verify + normalize + fingerprint + dedup lookup (alert-storm front
-    door)'
-  threshold: '>= 200 req/s sustained, p99 < 150 ms, 0 errors at 5x burst for 30s'
+  description: 'Ingest webhook under declared CPU affinities: CI-scale merge gate plus four-measured-role-exclusive-core
+    product record'
+  threshold: 'CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s offered for
+    30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; product recorded, non-gating:
+    served == offered, p99 < 150 ms, 0 errors at 1000 req/s offered for 30s with 4 gateway CPUs
+    exclusive from PG/driver'
   owning_milestone: M3
   status: covered
   tests:
   - services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path
   - tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile
-  - services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile
-  notes: "In-process micro-benchmark of the HMAC verify + normalize + fingerprint hot path    \ (services/gateway/tests/test_hmac_auth.py). The full 5x-burst 30s profile with real    \ HTTP and PG dedup lookup is measured of record by the CI benchmark job via    \ services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile    \ (open-loop 1000 req/s for 30 s; asserts served+errors==offered, errors==0, served==offered,    \ due-time p99<150ms, committed==served, served_rate>=SUSTAINED_FLOOR=200, platform ONLINE),    \ because section 14.4's reference environment excludes a nested scheduler and the e2e job    \ runs inside kind. A green nested run is a sufficient demonstration; a red one is not a    \ refutation. The e2e link (tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile) exercises    \ the sustained profile (open-loop baseline at 200 req/s) and a closed-loop saturation phase    \ against the shipped image and chart with real kubelet probes, asserting completion/p99/accounting    \ and 0 restarts / no Unhealthy events — no rate comparison at the baseline (the floor's    \ assertion of record is the reference tier). max_lateness_ms is a reported diagnostic rather    \ than a bar. Beyond the floor a finite-window burst certifies no sustained served-rate figure    \ near the offered 1000/s. Profile: open-loop, due-time latency, MAX_IN_FLIGHT=BURST_RATE,    \ unmeasured prologue, no environment knob. Serving shape is uvicorn workers=4    \ (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers). Sizing basis for ingestGateway is max+(max-min)    \ over five consecutive runs of cpu_ms_per_request after C2 (disjoint warmup/prologue):    \ 2.031, 1.983, 2.205, 2.102, 2.096 ms/req → basis 2.427; fingerprint    \ cpus=16,cpu_model=11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz,image=os-release:01af466feb100306    \ (same on all five). That basis is void as provenance (cpus=16, clause-failing,    \ ceiling-reaching runs); observations stays empty until five valid CI    \ benchmark-job runs at this head are recorded. Signature cpus≠§14.4 reference 4; CI may re-derive."
+  - services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile
+  - services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile
+  notes: |
+    Two tiers over one shipped ingest path and one classifier. CI-scale gates in both CI and local
+    `scripts/integration-test.sh b1` on the same numbers.
+    The product tier is recorded, non-gating; reason: host-dependent, not in CI.
+    The allocation mechanism is scheduler affinity (sched_setaffinity/taskset), not a CFS bandwidth
+    quota and not a Docker cpuset: each measured role gets an exact, pairwise-disjoint set of logical
+    CPUs, read back from /proc/<pid>/status Cpus_allowed_list and os.sched_getaffinity at window open
+    and again at window close. Effective cpu.max, cpu.stat throttling counters, gateway CPU use and
+    host-busy values are recorded as reported diagnostics only and decide nothing; an unreadable
+    source is serialized as `unavailable` rather than as a zero.
+    CI-scale allocation: the first four CPUs available to the launcher, split 2/1/1 as gateway /
+    PostgreSQL / load driver, on the four-vCPU ubuntu-latest reference host. CI-scale profile:
+    open-loop 500 req/s offered for 30 s = 15000 offered requests, due-time latency,
+    MAX_IN_FLIGHT=500, unmeasured prologue, no environment knob; it asserts placement_ok=1,
+    offered==15000, served+errors==offered, errors==0, served==offered, due-time p99<150ms,
+    committed==served, served_rate>=CI_SCALE_SUSTAINED_FLOOR=450 and platform ONLINE, through the
+    reference tier test
+    services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile.
+    Rate derivation, fixed at design time: 3.034 ms/served request on the contended reference host in
+    CI run 34965890902; 500 x 0.003034 = 1.517 CPU on two exclusive gateway CPUs is 75.85% utilization;
+    the 80% ceiling is 0.80 x 2.00 / 0.003034 = 527.36 req/s, rounded down to the next 100 for the
+    500 req/s offer, with one further fixed 50 req/s finite-window margin giving the 450 req/s
+    served-rate floor.
+    Product allocation: the first eight CPUs available to the launcher, split 4/3/1, so the gateway
+    holds four logical CPUs exclusive of the PostgreSQL and driver sets. Product profile: open-loop
+    1000 req/s offered for 30 s = 30000 offered requests, MAX_IN_FLIGHT=1000, run only through local
+    `scripts/integration-test.sh b1_product` on a host with at least eight available logical CPUs, via
+    services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile. Its
+    three product comparisons errors==0, p99<150ms and served==offered are serialized on the B1
+    fingerprint as met/missed and do not fail that target or the composite `all` route; its exact
+    pairwise-disjoint placement witness, accounting identities served+errors==offered and
+    committed==served, record integrity, the nonbinding MAX_IN_FLIGHT outer gate and
+    served_rate>=SUSTAINED_FLOOR=200 all stay failure-producing.
+    The product tier is absent from CI because a public-repository standard runner has
+    four total vCPUs, and no larger, self-hosted or paid runner class is available on this account.
+    This entry is covered through its gating CI-scale tier; the product link is not reclassified as a
+    gating threshold by that status.
+    In-process micro-benchmark of the HMAC verify + normalize + fingerprint hot path:
+    services/gateway/tests/test_hmac_auth.py.
+    The kind e2e link tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile stays a nested
+    functional/deployment test under its current resource model, exercising the sustained profile
+    (open-loop baseline at 200 req/s) and a closed-loop saturation phase against the shipped image and
+    chart with real kubelet probes, asserting completion/p99/accounting and 0 restarts / no Unhealthy
+    events; three bare-container affinities neither bound nor describe that topology, so it implements
+    neither reference declaration and refutes neither, a green nested run is a sufficient
+    demonstration and a red one is not a refutation.
+    max_lateness_ms is a reported diagnostic rather than a bar, and beyond the floor a finite-window
+    burst certifies no sustained served-rate figure near the offered rate. Serving shape is uvicorn
+    workers=4 (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers); no shipped gateway configuration
+    value moves for either tier.
+    The ingestGateway sizing basis cpuMsPerRequest=2.427 and its empty observations ledger are
+    unchanged and are owned by the B1-LATENCY-BASIS-1 slice, which must collect five consecutive
+    placement-valid CI-scale runs at one collection head before any ledger row, CPU request or CPU
+    limit changes; no run of either tier here is admitted as a sizing observation.
+    Both tiers, the allocation split and the derivation are specified by
+    design/slices/gc-1-reference-topology/design.md and recorded in design/frozen-deviations.md.
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms

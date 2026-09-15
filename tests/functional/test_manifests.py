@@ -147,7 +147,10 @@ GUARDED_STEPS: dict[str, list[int]] = {
     "unit-dashboard-api": [3],
     "unit-go": [7],
     "functional": [9, 10],
-    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 19, 20],
+    # 17 is the B1 wrapper `bash scripts/integration-test.sh b1`: it is neither
+    # a pytest nor a go test step, so it is checked by the bash operand grammar
+    # and EXPECTED_BASH_WRAPPER_COMMANDS instead of the guarded-step envelope.
+    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20],
     "manifest-guard": [5, 6],
 }
 
@@ -232,8 +235,6 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         (None, "services/worker/.venv/bin/python -m pytest "
          "services/worker/tests/test_context_assembly.py"
          "::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v"),
-        (None, "services/worker/.venv/bin/python -m pytest "
-         "services/gateway/tests/test_b1_ingest_burst.py -v -s"),
         (None, "services/worker/.venv/bin/python -m pytest tests/benchmark/test_pg_scale.py -v -s"),
         (None, "services/worker/.venv/bin/python -m pytest "
          "tests/delivery/test_delivery_sizing_ledger.py -v"),
@@ -243,6 +244,13 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
     ],
 }
 assert set(GUARDED_STEPS) == GO_TEST_JOBS | set(EXPECTED_PYTEST_COMMANDS)
+
+# GC-1 FP-GC1-2: the only bash-wrapper step whose operands are pinned by
+# equality, kept as its own literal inventory rather than folded into the
+# pytest one -- _is_pytest_cmd correctly excludes it from that computation.
+EXPECTED_BASH_WRAPPER_COMMANDS: dict[str, list[tuple[int, str]]] = {
+    "benchmark": [(17, "bash scripts/integration-test.sh b1")],
+}
 
 EXPECTED_E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short"
 EXPECTED_E2E_HYGIENE_COMMAND = (
@@ -309,6 +317,11 @@ GUARDED_STEP_COMMAND_WORDS = frozenset({
     "go", "bash", ".venv/bin/python", "services/worker/.venv/bin/python",
 })
 BASH_SCRIPTS = frozenset({
+    # GC-1 FP-GC1-2: the B1 benchmark step is a wrapper around the tracked
+    # launcher, so the bash operand grammar must admit it by name. Without
+    # this admission the workflow parser rejects the step outright and the
+    # route pin never gets to compare it.
+    "scripts/integration-test.sh",
     "scripts/gen-proto.sh",
     "scripts/go-coverage-check.sh",
     "../../scripts/py-coverage-check.sh",
@@ -332,7 +345,12 @@ EXPECTED_CHAIN_CONFIG_FILES = frozenset({
     "services/worker/pyproject.toml",
     "services/dashboard-api/pyproject.toml",
 })
-PYTEST_OPTION_ALLOWLIST = frozenset({"asyncio_mode"})
+# `markers` joins the allowlist for GC-1's three routing markers. It is not a
+# collection override: registering a marker name changes no selection, no
+# rootdir, no python_files/python_functions pattern and no ignore set -- it
+# only stops pytest warning about an unknown mark. The exact three names are
+# pinned independently by test_ci_and_local_b1_route_are_identical.
+PYTEST_OPTION_ALLOWLIST = frozenset({"asyncio_mode", "markers"})
 ADMITTED_DECORATOR_ORIGINS = frozenset({"pytest.fixture", "pytest_asyncio.fixture"})
 SKIP_MARKERS = frozenset({
     "skip", "skipif", "xfail", "expectedFailure", "skipIf", "skipUnless",
@@ -3468,7 +3486,7 @@ def test_threshold_assertion_fixture_count():
     assert len(THRESHOLD_ASSERTION_FIXTURES) == 38
     assert len(THRESHOLD_ASSERTION_POSITIVE_CONTROLS) == 14
     assert len(LINK_LOOP_FIXTURES) == 9
-    assert len(CI_PIN_FIXTURES) == 106
+    assert len(CI_PIN_FIXTURES) == 107
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -3761,19 +3779,29 @@ def _ci_pin_workflow_cases():
 
     add("functional_pytest_gains_an_override_ini", "pytest_command_drift", override_ini)
 
+    # Step 17 is the B1 bash wrapper since GC-1; 19 is the surviving benchmark
+    # pytest step (B2/B10/B11), so the two pytest mutations move there.
     def config_flag(wf):
-        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
-        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + " -c /tmp/alt.ini\n"
+        r = wf["jobs"]["benchmark"]["steps"][19]["run"]
+        wf["jobs"]["benchmark"]["steps"][19]["run"] = r.rstrip() + " -c /tmp/alt.ini\n"
 
     add("benchmark_pytest_gains_a_config_flag", "pytest_command_drift", config_flag)
 
     def deselect(wf):
-        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
-        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + (
+        r = wf["jobs"]["benchmark"]["steps"][19]["run"]
+        wf["jobs"]["benchmark"]["steps"][19]["run"] = r.rstrip() + (
             " --deselect tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput\n"
         )
 
     add("benchmark_pytest_gains_a_deselection", "pytest_command_drift", deselect)
+
+    # The wrapper is rejected by the bash operand grammar, not by the pytest
+    # inventory: an added option word is command_operand_drift.
+    def wrapper_option(wf):
+        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
+        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + " --unexpected-option\n"
+
+    add("benchmark_b1_wrapper_gains_an_option_word", "command_operand_drift", wrapper_option)
 
     def ignore_wide(wf):
         r = wf["jobs"]["functional"]["steps"][9]["run"]
@@ -4385,34 +4413,796 @@ def test_ci_pin_rejects_known_drift(case_id, kind, expected, mutator, tmp_path: 
         raise AssertionError(kind)
 
 
+# ---------------------------------------------------------------------------
+# GC-1 — the B1 manifest contract and the one tracked B1 route (FP-GC1-2/5)
+# ---------------------------------------------------------------------------
+
+B1_LAUNCHER = REPO_ROOT / "scripts" / "integration-test.sh"
+B1_CI_SCALE_LINK = (
+    "services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile"
+)
+B1_PRODUCT_LINK = (
+    "services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile"
+)
+B1_GATEWAY_PYPROJECT = REPO_ROOT / "services" / "gateway" / "pyproject.toml"
+
+# Every clause the shell route must carry, as independent literals. These are
+# not derived from the script: a pin that reads its subject cannot detect
+# drift in it.
+B1_ROUTE_CLAUSES: tuple[str, ...] = (
+    # image build, from the pinned Dockerfile, with the repo root as context
+    "docker build -t dbagent-review-runner:b1 -f deploy/review-runner/Dockerfile .",
+    # driver container: identity, namespaces, mounts, declared CPU
+    'B1_DRIVER_NAME_PREFIX="dbagent-b1-driver-"',
+    '--name "${B1_DRIVER_NAME_PREFIX}${B1_RUN_ID}"',
+    '--label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"',
+    '--label "${B1_ROLE_LABEL_KEY}=driver"',
+    "    --network host \\",
+    "    --pid host \\",
+    '-v "$REPO_ROOT":/workspace:ro',
+    '-v "$B1_RUN_DIR":"$B1_RUN_MOUNT"',
+    '-v "$B1_SOCKET":/var/run/docker.sock',
+    'taskset -c "$cpuset" bash "$B1_RUN_MOUNT/$script"',
+    # 32-hex run id, generated once by the shell
+    'B1_RUN_ID="$(od -An -tx1 -N16 /dev/urandom | tr -d \' \\n\')"',
+    'if [ "${#B1_RUN_ID}" -ne 32 ]; then',
+    # the launcher's own available CPUs, read before any role is narrowed
+    'affinity="$(taskset -pc $$ 2>/dev/null | sed \'s/.*: *//\')"',
+    "b1_expand_cpu_list \"$affinity\" | sort -n -u",
+    'if [ "${#cpus[@]}" -lt 4 ]; then',
+    'if [ "${#cpus[@]}" -lt 8 ]; then',
+    # closed schema-2 launch contracts, both profiles, affinity mechanism
+    '"schema": 2,',
+    '"mechanism": "sched-affinity",',
+    '"profile": "ci-scale",',
+    '"referenceLogicalCpus": 4,',
+    '"profile": "product-exclusive",',
+    '"minimumHostLogicalCpus": 8,',
+    '"gateway": {"allowedCpus": "${gateway_cpus}"},',
+    '"postgres": {"allowedCpus": "${postgres_cpus}"},',
+    '"driver": {"allowedCpus": "${driver_cpus}"}',
+    # writable coverage / pytest-cache / bytecode directories on the run mount
+    'mkdir -p "$B1_RUN_DIR/coverage" "$B1_RUN_DIR/pytest-cache" "$B1_RUN_DIR/pycache"',
+    # label-scoped, verified cleanup
+    'docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"',
+    "trap 'b1_cleanup' EXIT TERM INT",
+    'B1_CLEANUP_FAILED=1',
+)
+
+# Docker bandwidth/cpuset controls, which GC-1 rev 0.5 removed as the
+# allocation primitive. Their ABSENCE is pinned statically here and nowhere
+# else: there is deliberately no runtime check that a role's cgroup carries no
+# quota, because `cpu.max` describes whatever ambient policy the host imposes
+# and is not an oracle for what this launcher applied.
+B1_BANDWIDTH_CONTROLS = (
+    "--cpus",
+    "--cpu-period",
+    "--cpu-quota",
+    "--cpuset-cpus",
+    "cpu_period=",
+    "cpu_quota=",
+    "cpuset_cpus=",
+)
+
+# Which `${cpus[N]}` index each role's generated set must take, per profile.
+B1_AFFINITY_SELECTION = {
+    "b1": {"gateway": (0, 1), "postgres": (2,), "driver": (3,)},
+    "b1_product": {"gateway": (0, 1, 2, 3), "postgres": (4, 5, 6), "driver": (7,)},
+}
+_B1_CPU_INDEX_RE = re.compile(r"\$\{cpus\[(\d+)\]\}")
+_B1_ROLE_SELECTION_RE = re.compile(
+    r'^\s*(gateway|postgres|driver)_cpus="\$\(b1_canonical_cpu_list (.+)\)"\s*$'
+)
+
+
+def _b1_target_region(launcher: str, target: str) -> str:
+    """The shell text of one target, delimited by top-level function headers."""
+    lines = launcher.splitlines()
+    starts = [
+        (index, match.group(1))
+        for index, match in (
+            (i, re.match(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z", line))
+            for i, line in enumerate(lines)
+        )
+        if match
+    ]
+    for position, (index, name) in enumerate(starts):
+        if name != target:
+            continue
+        stop = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        return "\n".join(lines[index + 1:stop])
+    return ""
+
+
+def _b1_affinity_failures(launcher: str) -> list[str]:
+    """Each profile's generated sets: cardinality, disjointness, index range."""
+    fails: list[str] = []
+    for target, expected in B1_AFFINITY_SELECTION.items():
+        region = _b1_target_region(launcher, target)
+        if not region:
+            fails.append(f"affinity_target_missing {target}")
+            continue
+        selected: dict[str, tuple[int, ...]] = {}
+        for line in region.splitlines():
+            match = _B1_ROLE_SELECTION_RE.match(line)
+            if match:
+                selected[match.group(1)] = tuple(
+                    int(n) for n in _B1_CPU_INDEX_RE.findall(match.group(2))
+                )
+        if set(selected) != set(expected):
+            fails.append(f"affinity_selection_missing {target} {sorted(selected)}")
+            continue
+        for role, indices in expected.items():
+            if len(selected[role]) != len(indices):
+                fails.append(
+                    f"affinity_cardinality_drift {target}/{role} {list(selected[role])}"
+                )
+        taken: dict[int, str] = {}
+        for role in ("gateway", "postgres", "driver"):
+            for index in selected[role]:
+                if index in taken:
+                    fails.append(
+                        f"affinity_overlap {target} {taken[index]}/{role} share cpus[{index}]"
+                    )
+                taken[index] = role
+        bound = 4 if target == "b1" else 8
+        outside = sorted(i for i in taken if not 0 <= i < bound)
+        if outside:
+            fails.append(f"affinity_index_drift {target} {outside} outside the first {bound}")
+        if f'if [ "${{#cpus[@]}}" -lt {bound} ]; then' not in region:
+            fails.append(f"affinity_host_floor_drift {target} lacks its -lt {bound} guard")
+    return fails
+
+
+B1_ENV_UNSET_PREFIX = (
+    "env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL "
+    "-u PYTHON_GET_PIP_SHA256"
+)
+B1_PYCACHE_FLAG = "-X pycache_prefix=/run/dbagent-b1/pycache"
+# The three files this slice changes. Coverage is reported over exactly these,
+# once as an aggregate and once per file, all at --fail-under=81.
+B1_COVERED_FILES = (
+    "/workspace/services/gateway/tests/b1_reference_profile.py",
+    "/workspace/services/gateway/tests/test_b1_ingest_burst.py",
+    "/workspace/scripts/b1-affinity-helper.py",
+)
+B1_COVERAGE_FAIL_UNDER = "--fail-under=81"
+B1_COVERAGE_SELECTION = (
+    "-m 'not b1_live and not b1_product and not b1_latency_basis'"
+)
+B1_CI_SCALE_LIVE_SELECTION = "-m 'b1_live and not b1_product and not b1_latency_basis'"
+B1_PRODUCT_SELECTION = "-m b1_product"
+B1_ROUTING_MARKERS = ("b1_live", "b1_product", "b1_latency_basis")
+B1_REJECTED_ESCAPES = (
+    "runs-on: ubuntu-24.04-8core",
+    "self-hosted",
+    "runner-group",
+    "continue-on-error",
+    "|| true",
+    "--deselect",
+    "pytest.mark.skip",
+    "pytest.mark.xfail",
+)
+
+
+def _b1_launcher_source() -> str:
+    return B1_LAUNCHER.read_text(encoding="utf-8")
+
+
+def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
+    """Every clause of the one-tracked-route contract, as named failures."""
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    jobs = workflow.get("jobs") or {}
+    for job_name, expected in EXPECTED_BASH_WRAPPER_COMMANDS.items():
+        job = jobs.get(job_name)
+        if not isinstance(job, dict):
+            add("wrapper_job_missing", job_name)
+            continue
+        if job.get("runs-on") != "ubuntu-latest":
+            add("wrapper_runner_drift", f"{job_name} {job.get('runs-on')!r}")
+        steps = job.get("steps") or []
+        for index, body in expected:
+            if index >= len(steps):
+                add("wrapper_step_missing", f"{job_name}[{index}]")
+                continue
+            got = (steps[index].get("run") or "").strip()
+            if got != body:
+                add("wrapper_body_drift", f"{job_name}[{index}] {got!r}")
+        bodies = [(steps[i].get("run") or "").strip() for i in range(len(steps))]
+        wrapper_indices = [
+            i for i, b in enumerate(bodies) if "scripts/integration-test.sh" in b
+        ]
+        if wrapper_indices != [i for i, _ in expected]:
+            add("wrapper_inventory_drift", f"{job_name} {wrapper_indices}")
+    if "scripts/integration-test.sh" not in BASH_SCRIPTS:
+        add("wrapper_not_admitted")
+    # The three routing markers are static pytest metadata, so the chain-config
+    # allowlist must admit exactly `markers` (ratified GC-1 deviation).
+    if "markers" not in PYTEST_OPTION_ALLOWLIST:
+        add("markers_not_admitted")
+    if not PYTEST_OPTION_ALLOWLIST <= {"asyncio_mode", "markers"}:
+        add("markers_allowlist_widened", str(sorted(PYTEST_OPTION_ALLOWLIST)))
+
+    # b1_product is local only: it must not appear anywhere in the workflow.
+    for job_name, job in jobs.items():
+        for i, step in enumerate(job.get("steps") or []):
+            if "b1_product" in (step.get("run") or ""):
+                add("product_target_in_ci", f"{job_name}[{i}]")
+
+    for clause in B1_ROUTE_CLAUSES:
+        if clause not in launcher:
+            add("route_clause_missing", repr(clause))
+
+    # Marker selections: exact literals, in the right phase.
+    coverage_lines = [
+        ln for ln in launcher.splitlines()
+        if "coverage run" in ln and "pytest" in ln and ln.strip().startswith(B1_ENV_UNSET_PREFIX)
+    ]
+    if len(coverage_lines) != 1:
+        add("coverage_phase_drift", str(len(coverage_lines)))
+    elif B1_COVERAGE_SELECTION not in coverage_lines[0]:
+        add("coverage_selection_drift", coverage_lines[0])
+    live_lines = [
+        ln for ln in launcher.splitlines()
+        if "-m pytest" in ln and B1_CI_SCALE_LIVE_SELECTION in ln
+        and ln.strip().startswith(B1_ENV_UNSET_PREFIX)
+    ]
+    if len(live_lines) != 1:
+        add("live_selection_drift", str(len(live_lines)))
+    elif "coverage run" in live_lines[0]:
+        add("live_phase_traced", live_lines[0])
+    product_lines = [
+        ln for ln in launcher.splitlines()
+        if "-m pytest" in ln and ln.strip().startswith(B1_ENV_UNSET_PREFIX)
+        and ln.rstrip().split(" -o ")[0].endswith(B1_PRODUCT_SELECTION)
+    ]
+    if len(product_lines) != 1:
+        add("product_selection_drift", str(len(product_lines)))
+    elif "coverage run" in product_lines[0]:
+        add("product_phase_traced", product_lines[0])
+
+    # Every driver-side Python command carries the complete four-key prefix,
+    # and keeps its bytecode cache off the read-only source mount: a host
+    # __pycache__ entry arriving through that mount is loaded in preference to
+    # the source and carries the host's own absolute paths into the container.
+    for line in launcher.splitlines():
+        stripped = line.strip()
+        if "python3 -B" not in stripped:
+            continue
+        if not stripped.startswith(B1_ENV_UNSET_PREFIX + " python3 -B"):
+            add("env_unset_prefix_drift", stripped)
+        if B1_PYCACHE_FLAG not in stripped:
+            add("pycache_prefix_drift", stripped)
+    if launcher.count(B1_ENV_UNSET_PREFIX) < 6:
+        add("env_unset_prefix_missing", str(launcher.count(B1_ENV_UNSET_PREFIX)))
+
+    # Coverage is reported at the fixed bar over exactly the changed files:
+    # one aggregate scoped to all three, plus one report per file.
+    report_lines = [
+        ln.strip() for ln in launcher.splitlines()
+        if ln.strip().startswith(B1_ENV_UNSET_PREFIX) and "-m coverage report" in ln
+    ]
+    if len(report_lines) != 1 + len(B1_COVERED_FILES):
+        add("coverage_report_inventory_drift", str(len(report_lines)))
+    else:
+        aggregate, per_file = report_lines[0], report_lines[1:]
+        if f"--include={','.join(B1_COVERED_FILES)}" not in aggregate:
+            add("coverage_aggregate_scope_drift", aggregate)
+        for path, line in zip(B1_COVERED_FILES, per_file):
+            if f"--include={path}" not in line:
+                add("coverage_per_file_scope_drift", line)
+    for line in report_lines:
+        if B1_COVERAGE_FAIL_UNDER not in line:
+            add("coverage_bar_drift", line)
+
+    # Writable coverage/cache paths, never the read-only source mount. Only
+    # driver-side commands are in scope: they are exactly the ones carrying the
+    # four-key prefix, and they are the ones that run against /workspace:ro.
+    for line in launcher.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(B1_ENV_UNSET_PREFIX):
+            continue
+        if "-m coverage" in stripped and "--data-file=/run/dbagent-b1/coverage/.coverage" not in stripped:
+            add("coverage_data_path_drift", stripped)
+        if "-m pytest" in stripped and "-o cache_dir=/run/dbagent-b1/pytest-cache" not in stripped:
+            add("pytest_cache_path_drift", stripped)
+
+    # No pass-through, no caller-supplied profile value.
+    if '"$@"' in launcher.split("b1() {", 1)[-1].split("\nb1_product() {", 1)[0]:
+        add("b1_accepts_pass_through")
+
+    for escape in B1_REJECTED_ESCAPES:
+        if escape in launcher:
+            add("rejected_escape_in_launcher", escape)
+
+    # All three routing markers registered in the gateway pyproject.
+    for marker in B1_ROUTING_MARKERS:
+        if f'"{marker}:' not in markers_toml:
+            add("marker_not_registered", marker)
+
+    # Fixture-side literals: the quota pairs are applied from Python constants,
+    # never read from the environment.
+    fixture_src = (
+        REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
+    ).read_text(encoding="utf-8")
+    for clause in (
+        # The allocation is affinity cardinality, declared in Python.
+        'CI_SCALE_AFFINITY_CARDINALITY = {"gateway": 2, "postgres": 1, "driver": 1}',
+        'PRODUCT_AFFINITY_CARDINALITY = {"gateway": 4, "postgres": 3, "driver": 1}',
+        "B1_PLACEMENT_SCHEMA = 2",
+        'B1_PLACEMENT_MECHANISM = "sched-affinity"',
+        # The gateway command runs under its declared set.
+        'f"taskset -c {b1.format_cpu_list(gateway_cpus)} "',
+        # PostgreSQL is pinned by the closed helper, for both profiles.
+        "_pin_postgres_tree(",
+        # Opening and closing effective-affinity gates.
+        'witness.failures(roles_open, gateway_worker_pids=workers_pre, when="open")',
+        'witness.failures(roles_close, gateway_worker_pids=workers_post, when="close")',
+        "testcontainers_config.ryuk_disabled = True",
+        "stack.callback(_restore_ryuk, testcontainers_config, previous_ryuk)",
+        "previous_ryuk = testcontainers_config.ryuk_disabled",
+        # The host-loopback route overrides, saved and restored in the stack.
+        '("connection_mode_override", ConnectionMode.docker_host)',
+        '("tc_host_override", B1_SIBLING_HOST)',
+        "stack.callback(\n                _restore_attr, testcontainers_config, name,",
+        'B1_SIBLING_HOST = "127.0.0.1"',
+        'B1_DRIVER_NAME_PREFIX = "dbagent-b1-driver-"',
+        'B1_RUN_LABEL_KEY = "dbagent.b1.run"',
+        'B1_ROLE_LABEL_KEY = "dbagent.b1.role"',
+        "if len(matches) != 1:",
+        "network_mode=\"host\"",
+    ):
+        if clause not in fixture_src:
+            add("fixture_clause_missing", repr(clause))
+    if "getenv" in fixture_src or "os.environ.get" in fixture_src:
+        add("fixture_reads_the_environment")
+    for escape in ("pytest.mark.skip", "pytest.mark.xfail", "continue-on-error", "|| true"):
+        if escape in fixture_src:
+            add("rejected_escape_in_fixture", escape)
+
+    # The PostgreSQL pin is unconditional: exactly one call site, and not
+    # inside a profile branch. A helper that runs for only one profile would
+    # leave the other's PostgreSQL wherever Docker put it.
+    fixture_tree = ast.parse(fixture_src)
+    live = next(
+        (n for n in fixture_tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == "_run_b1_reference"), None
+    )
+    if live is None:
+        add("fixture_clause_missing", "'_run_b1_reference'")
+    else:
+        pins = [
+            n for n in ast.walk(live)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_pin_postgres_tree"
+        ]
+        if len(pins) != 1:
+            add("postgres_pin_conditional", f"{len(pins)} call sites")
+        for node in ast.walk(live):
+            if isinstance(node, ast.If) and any(
+                isinstance(c, ast.Call) and getattr(c.func, "id", None) == "_pin_postgres_tree"
+                for c in ast.walk(node)
+            ):
+                add("postgres_pin_conditional", ast.unparse(node.test))
+
+    # No Docker bandwidth or cpuset control anywhere in either carrier. This is
+    # a static check by design: cgroup state is a reported diagnostic, never an
+    # oracle for what the launcher applied.
+    for label, source in (("launcher", launcher), ("fixture", fixture_src)):
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                continue
+            for control in B1_BANDWIDTH_CONTROLS:
+                if control in stripped:
+                    add(f"bandwidth_control_in_{label}", f"{control} :: {stripped[:80]}")
+
+    fails.extend(_b1_affinity_failures(launcher))
+    return fails
+
+
+def test_ci_and_local_b1_route_are_identical():
+    """FP-GC1-2: one tracked launcher owns both B1 routes; CI invokes that target."""
+    wf = _load_wf()
+    assert B1_LAUNCHER.is_file(), "scripts/integration-test.sh must be tracked, not gitignored"
+    launcher = _b1_launcher_source()
+    markers_toml = B1_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
+    assert _b1_route_failures(wf, launcher, markers_toml=markers_toml) == []
+    # The composite local route includes both targets; CI includes only b1.
+    all_case = launcher.split("  all)", 1)[1].split(";;", 1)[0]
+    assert '" b1\n' in all_case or " b1\n" in all_case, all_case
+    assert "b1_product" in all_case, all_case
+    # The script's own anti-drift check names the wrapper literal, not an
+    # inner Docker or pytest command (those never appear in ci.yml).
+    assert "assert_matches_ci 'bash scripts/integration-test.sh b1'" in launcher
+    assert "assert_matches_ci 'docker run" not in launcher
+
+
+_B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
+    # (id, kind, expected reason) -- the mutator is resolved below by id.
+    ("wrapper_body_gains_a_word", "workflow", "wrapper_body_drift"),
+    ("wrapper_step_moved", "workflow", "wrapper_body_drift"),
+    ("benchmark_runner_upgraded", "workflow", "wrapper_runner_drift"),
+    ("product_target_sent_to_ci", "workflow", "product_target_in_ci"),
+    ("launcher_drops_the_image_build", "launcher", "route_clause_missing"),
+    ("driver_loses_the_host_pid_namespace", "launcher", "route_clause_missing"),
+    ("driver_loses_the_host_network", "launcher", "route_clause_missing"),
+    ("source_mount_becomes_writable", "launcher", "route_clause_missing"),
+    ("docker_socket_unmounted", "launcher", "route_clause_missing"),
+    ("profile_renamed_in_the_contract", "launcher", "route_clause_missing"),
+    ("run_id_shortened", "launcher", "route_clause_missing"),
+    ("driver_name_prefix_changed", "launcher", "route_clause_missing"),
+    ("run_label_dropped", "launcher", "route_clause_missing"),
+    ("role_label_dropped", "launcher", "route_clause_missing"),
+    ("cleanup_filter_widened", "launcher", "route_clause_missing"),
+    ("cleanup_trap_removed", "launcher", "route_clause_missing"),
+    ("product_cpu_floor_lowered", "launcher", "affinity_host_floor_drift"),
+    # --- GC-1 rev 0.5: the affinity allocation itself ---
+    ("driver_loses_its_taskset", "launcher", "route_clause_missing"),
+    ("gateway_loses_its_taskset", "fixture", "fixture_clause_missing"),
+    ("launcher_stops_reading_its_own_affinity", "launcher", "route_clause_missing"),
+    ("schema_reverted_to_1", "launcher", "route_clause_missing"),
+    ("mechanism_reverted_to_quota", "launcher", "route_clause_missing"),
+    ("ci_affinity_cardinality_changed", "launcher", "affinity_cardinality_drift"),
+    ("product_affinity_cardinality_changed", "launcher", "affinity_cardinality_drift"),
+    ("gateway_postgres_affinity_overlap", "launcher", "affinity_overlap"),
+    ("gateway_driver_affinity_overlap", "launcher", "affinity_overlap"),
+    ("postgres_driver_affinity_overlap", "launcher", "affinity_overlap"),
+    ("affinity_outside_host_set", "launcher", "affinity_index_drift"),
+    ("cfs_quota_reintroduced_in_launcher", "launcher", "bandwidth_control_in_launcher"),
+    ("cfs_quota_reintroduced_in_fixture", "fixture", "bandwidth_control_in_fixture"),
+    ("cpuset_reintroduced_in_fixture", "fixture", "bandwidth_control_in_fixture"),
+    ("postgres_helper_skipped_for_ci_scale", "fixture", "postgres_pin_conditional"),
+    ("postgres_helper_skipped_for_product", "fixture", "postgres_pin_conditional"),
+    ("postgres_helper_removed", "fixture", "fixture_clause_missing"),
+    ("opening_affinity_gate_removed", "fixture", "fixture_clause_missing"),
+    ("closing_affinity_gate_removed", "fixture", "fixture_clause_missing"),
+    # --- selections, environment, coverage, cleanup ---
+    ("coverage_selection_widened", "launcher", "coverage_selection_drift"),
+    ("live_selection_traced", "launcher", "live_phase_traced"),
+    ("product_selection_widened", "launcher", "product_selection_drift"),
+    ("env_unset_key_dropped", "launcher", "env_unset_prefix_drift"),
+    ("bytecode_cache_left_on_the_source_mount", "launcher", "pycache_prefix_drift"),
+    ("coverage_bar_lowered", "launcher", "coverage_bar_drift"),
+    ("coverage_aggregate_include_widened", "launcher", "coverage_aggregate_scope_drift"),
+    ("coverage_per_file_report_dropped", "launcher", "coverage_report_inventory_drift"),
+    ("coverage_data_file_moved_to_the_source_mount", "launcher", "coverage_data_path_drift"),
+    ("pytest_cache_moved_to_the_source_mount", "launcher", "pytest_cache_path_drift"),
+    ("launcher_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
+    ("launcher_continues_on_error", "launcher", "rejected_escape_in_launcher"),
+    ("marker_registration_removed", "markers", "marker_not_registered"),
+    ("pytest_markers_allowlist_removed", "admission", "markers_not_admitted"),
+    ("ryuk_scope_removed", "fixture", "fixture_clause_missing"),
+    ("ryuk_restore_removed", "fixture", "fixture_clause_missing"),
+    ("connection_mode_override_removed", "fixture", "fixture_clause_missing"),
+    ("tc_host_override_changed", "fixture", "fixture_clause_missing"),
+    ("testcontainers_overrides_not_restored", "fixture", "fixture_clause_missing"),
+    ("driver_identity_accepts_many_matches", "fixture", "fixture_clause_missing"),
+    ("gateway_loses_host_networking", "fixture", "fixture_clause_missing"),
+    ("wrapper_admission_revoked", "admission", "wrapper_not_admitted"),
+]
+
+
+def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str,
+                             fixture: str) -> tuple[dict, str, str, str]:
+    steps = wf["jobs"]["benchmark"]["steps"]
+    if case_id == "wrapper_body_gains_a_word":
+        steps[17]["run"] = steps[17]["run"].strip() + " --unexpected-option"
+    elif case_id == "wrapper_step_moved":
+        steps[17], steps[19] = steps[19], steps[17]
+    elif case_id == "benchmark_runner_upgraded":
+        wf["jobs"]["benchmark"]["runs-on"] = "ubuntu-latest-8-cores"
+    elif case_id == "product_target_sent_to_ci":
+        steps.append({"run": "bash scripts/integration-test.sh b1_product"})
+    elif case_id == "launcher_drops_the_image_build":
+        launcher = launcher.replace(
+            "docker build -t dbagent-review-runner:b1 -f deploy/review-runner/Dockerfile .",
+            "true", 1)
+    elif case_id == "driver_loses_the_host_pid_namespace":
+        launcher = launcher.replace("    --pid host \\\n", "", 1)
+    elif case_id == "driver_loses_the_host_network":
+        launcher = launcher.replace("    --network host \\\n", "", 1)
+    elif case_id == "source_mount_becomes_writable":
+        launcher = launcher.replace('-v "$REPO_ROOT":/workspace:ro', '-v "$REPO_ROOT":/workspace:rw', 1)
+    elif case_id == "docker_socket_unmounted":
+        launcher = launcher.replace('    -v "$B1_SOCKET":/var/run/docker.sock \\\n', "", 1)
+    elif case_id == "profile_renamed_in_the_contract":
+        launcher = launcher.replace('"profile": "ci-scale",', '"profile": "ci-scale-v2",', 1)
+    elif case_id == "run_id_shortened":
+        launcher = launcher.replace('if [ "${#B1_RUN_ID}" -ne 32 ]; then',
+                                    'if [ "${#B1_RUN_ID}" -ne 8 ]; then', 1)
+    elif case_id == "driver_name_prefix_changed":
+        launcher = launcher.replace('B1_DRIVER_NAME_PREFIX="dbagent-b1-driver-"',
+                                    'B1_DRIVER_NAME_PREFIX="b1-"', 1)
+    elif case_id == "run_label_dropped":
+        launcher = launcher.replace('    --label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" \\\n', "", 1)
+    elif case_id == "role_label_dropped":
+        launcher = launcher.replace('    --label "${B1_ROLE_LABEL_KEY}=driver" \\\n', "", 1)
+    elif case_id == "cleanup_filter_widened":
+        launcher = launcher.replace('docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"',
+                                    'docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}"')
+    elif case_id == "cleanup_trap_removed":
+        launcher = launcher.replace("trap 'b1_cleanup' EXIT TERM INT", "true", 1)
+    elif case_id == "product_cpu_floor_lowered":
+        launcher = launcher.replace('if [ "${#cpus[@]}" -lt 8 ]; then',
+                                    'if [ "${#cpus[@]}" -lt 4 ]; then', 1)
+    elif case_id == "driver_loses_its_taskset":
+        launcher = launcher.replace('taskset -c "$cpuset" bash "$B1_RUN_MOUNT/$script"',
+                                    'bash "$B1_RUN_MOUNT/$script"', 1)
+    elif case_id == "gateway_loses_its_taskset":
+        fixture = fixture.replace('f"taskset -c {b1.format_cpu_list(gateway_cpus)} "\n            ',
+                                  "", 1)
+    elif case_id == "launcher_stops_reading_its_own_affinity":
+        launcher = launcher.replace(
+            "affinity=\"$(taskset -pc $$ 2>/dev/null | sed 's/.*: *//')\"",
+            'affinity="0-3"', 1)
+    elif case_id == "schema_reverted_to_1":
+        launcher = launcher.replace('"schema": 2,', '"schema": 1,')
+    elif case_id == "mechanism_reverted_to_quota":
+        launcher = launcher.replace('"mechanism": "sched-affinity",', '"mechanism": "cfs-quota",')
+    elif case_id == "ci_affinity_cardinality_changed":
+        launcher = launcher.replace(
+            'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
+            'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}")"', 1)
+    elif case_id == "product_affinity_cardinality_changed":
+        launcher = launcher.replace(
+            'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}" "${cpus[6]}")"',
+            'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}")"', 1)
+    elif case_id == "gateway_postgres_affinity_overlap":
+        launcher = launcher.replace('postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
+                                    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[1]}")"', 1)
+    elif case_id == "gateway_driver_affinity_overlap":
+        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+                                    'driver_cpus="$(b1_canonical_cpu_list "${cpus[0]}")"', 1)
+    elif case_id == "postgres_driver_affinity_overlap":
+        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[7]}")"',
+                                    'driver_cpus="$(b1_canonical_cpu_list "${cpus[6]}")"', 1)
+    elif case_id == "affinity_outside_host_set":
+        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+                                    'driver_cpus="$(b1_canonical_cpu_list "${cpus[9]}")"', 1)
+    elif case_id == "cfs_quota_reintroduced_in_launcher":
+        launcher = launcher.replace('    --network host \\\n',
+                                    '    --network host \\\n    --cpu-quota 200000 \\\n', 1)
+    elif case_id == "cfs_quota_reintroduced_in_fixture":
+        fixture = fixture.replace("        gateway.with_kwargs(\n",
+                                  "        gateway.with_kwargs(\n            cpu_quota=200000,\n", 1)
+    elif case_id == "cpuset_reintroduced_in_fixture":
+        fixture = fixture.replace("        gateway.with_kwargs(\n",
+                                  '        gateway.with_kwargs(\n            cpuset_cpus="0-1",\n', 1)
+    elif case_id == "postgres_helper_skipped_for_ci_scale":
+        fixture = fixture.replace(
+            "        _pin_postgres_tree(\n",
+            "        if declaration.profile == PRODUCT_PROFILE_NAME:\n         _pin_postgres_tree(\n",
+            1)
+    elif case_id == "postgres_helper_skipped_for_product":
+        fixture = fixture.replace(
+            "        _pin_postgres_tree(\n",
+            "        if declaration.profile == CI_SCALE_PROFILE_NAME:\n         _pin_postgres_tree(\n",
+            1)
+    elif case_id == "postgres_helper_removed":
+        fixture = fixture.replace("_pin_postgres_tree(", "_no_pin(")
+    elif case_id == "opening_affinity_gate_removed":
+        fixture = fixture.replace(
+            'witness.failures(roles_open, gateway_worker_pids=workers_pre, when="open")',
+            "[]", 1)
+    elif case_id == "closing_affinity_gate_removed":
+        fixture = fixture.replace(
+            'witness.failures(roles_close, gateway_worker_pids=workers_post, when="close")',
+            "[]", 1)
+    elif case_id == "coverage_selection_widened":
+        launcher = launcher.replace(B1_COVERAGE_SELECTION, "-m 'not b1_product'", 1)
+    elif case_id == "live_selection_traced":
+        launcher = launcher.replace(
+            f"python3 -B {B1_PYCACHE_FLAG} -m pytest "
+            "services/gateway/tests/test_b1_ingest_burst.py -v -s "
+            + B1_CI_SCALE_LIVE_SELECTION,
+            f"python3 -B {B1_PYCACHE_FLAG} -m coverage run "
+            "--data-file=/run/dbagent-b1/coverage/.coverage "
+            "-m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s "
+            + B1_CI_SCALE_LIVE_SELECTION,
+            1)
+    elif case_id == "product_selection_widened":
+        launcher = launcher.replace("-m b1_product -o cache_dir", "-m b1_live -o cache_dir", 1)
+    elif case_id == "env_unset_key_dropped":
+        launcher = launcher.replace(
+            "env -u PYTHON_VERSION -u PYTHON_PIP_VERSION "
+            "-u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B",
+            "env -u PYTHON_VERSION -u PYTHON_PIP_VERSION "
+            "-u PYTHON_GET_PIP_URL python3 -B", 1)
+    elif case_id == "bytecode_cache_left_on_the_source_mount":
+        launcher = launcher.replace(" -X pycache_prefix=/run/dbagent-b1/pycache", "", 1)
+    elif case_id == "coverage_bar_lowered":
+        launcher = launcher.replace("--fail-under=81", "--fail-under=1")
+    elif case_id == "coverage_aggregate_include_widened":
+        launcher = launcher.replace(f"--include={','.join(B1_COVERED_FILES)}", "", 1)
+    elif case_id == "coverage_per_file_report_dropped":
+        launcher = "\n".join(
+            ln for ln in launcher.splitlines()
+            if f"--include={B1_COVERED_FILES[2]}" not in ln
+        )
+    elif case_id == "coverage_data_file_moved_to_the_source_mount":
+        launcher = launcher.replace("--data-file=/run/dbagent-b1/coverage/.coverage",
+                                    "--data-file=/workspace/.coverage")
+    elif case_id == "pytest_cache_moved_to_the_source_mount":
+        launcher = launcher.replace("-o cache_dir=/run/dbagent-b1/pytest-cache",
+                                    "-o cache_dir=/workspace/.pytest_cache")
+    elif case_id == "launcher_masks_a_failure":
+        launcher = launcher.replace('  b1_run_driver driver.sh "$driver_cpus"',
+                                    '  b1_run_driver driver.sh "$driver_cpus" || true', 1)
+    elif case_id == "launcher_continues_on_error":
+        launcher = launcher + "\ncontinue-on-error\n"
+    elif case_id == "marker_registration_removed":
+        markers = "\n".join(ln for ln in markers.splitlines() if '"b1_product:' not in ln)
+    elif case_id in ("pytest_markers_allowlist_removed", "wrapper_admission_revoked"):
+        pass  # handled by the caller, which edits the module-level allowlist
+    elif case_id == "ryuk_scope_removed":
+        fixture = fixture.replace("testcontainers_config.ryuk_disabled = True", "pass")
+    elif case_id == "ryuk_restore_removed":
+        fixture = fixture.replace(
+            "stack.callback(_restore_ryuk, testcontainers_config, previous_ryuk)", "pass")
+    elif case_id == "connection_mode_override_removed":
+        fixture = fixture.replace(
+            '            ("connection_mode_override", ConnectionMode.docker_host),\n', "", 1)
+    elif case_id == "tc_host_override_changed":
+        fixture = fixture.replace('("tc_host_override", B1_SIBLING_HOST)',
+                                  '("tc_host_override", "172.17.0.1")', 1)
+    elif case_id == "testcontainers_overrides_not_restored":
+        fixture = fixture.replace(
+            "            stack.callback(\n                _restore_attr, testcontainers_config, name,",
+            "            (\n                _restore_attr, testcontainers_config, name,", 1)
+    elif case_id == "driver_identity_accepts_many_matches":
+        fixture = fixture.replace("if len(matches) != 1:", "if len(matches) < 1:", 1)
+    elif case_id == "gateway_loses_host_networking":
+        fixture = fixture.replace('network_mode="host"', 'network_mode="bridge"')
+    else:
+        raise AssertionError(case_id)
+    return wf, launcher, markers, fixture
+
+
+@pytest.mark.parametrize(
+    "case_id, kind, expected",
+    _B1_ROUTE_MUTATIONS,
+    ids=[c[0] for c in _B1_ROUTE_MUTATIONS],
+)
+def test_b1_resource_route_pin_rejects_known_drift(case_id, kind, expected, monkeypatch):
+    """FP-GC1-2/5: each independently mutated clause produces its named failure."""
+    wf = _load_wf()
+    launcher = _b1_launcher_source()
+    markers = B1_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
+    fixture_path = REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
+    fixture = fixture_path.read_text(encoding="utf-8")
+    assert _b1_route_failures(wf, launcher, markers_toml=markers) == [], "positive control"
+
+    if kind == "admission":
+        if case_id == "wrapper_admission_revoked":
+            monkeypatch.setitem(
+                globals(), "BASH_SCRIPTS", BASH_SCRIPTS - {"scripts/integration-test.sh"}
+            )
+        else:
+            monkeypatch.setitem(
+                globals(), "PYTEST_OPTION_ALLOWLIST", PYTEST_OPTION_ALLOWLIST - {"markers"}
+            )
+        fails = _b1_route_failures(wf, launcher, markers_toml=markers)
+        assert any(f.split(" ", 1)[0] == expected for f in fails), f"{case_id}: {fails}"
+        return
+
+    wf, launcher, markers, mutated_fixture = _apply_b1_route_mutation(
+        case_id, wf, launcher, markers, fixture
+    )
+    if kind == "fixture":
+        assert mutated_fixture != fixture, f"{case_id}: fixture mutation was a no-op"
+        tmp = fixture_path.parent / "_b1_route_mutant.py"
+        try:
+            tmp.write_text(mutated_fixture, encoding="utf-8")
+            monkeypatch.setattr(Path, "read_text", _redirecting_read_text(fixture_path, tmp))
+            fails = _b1_route_failures(wf, launcher, markers_toml=markers)
+        finally:
+            monkeypatch.undo()
+            tmp.unlink(missing_ok=True)
+    else:
+        if kind == "launcher":
+            assert launcher != _b1_launcher_source(), f"{case_id}: launcher mutation was a no-op"
+        if kind == "markers":
+            assert markers != B1_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
+        fails = _b1_route_failures(wf, launcher, markers_toml=markers)
+    assert any(f.split(" ", 1)[0] == expected for f in fails), f"{case_id}: {fails}"
+
+
+def _redirecting_read_text(target: Path, replacement: Path):
+    original = Path.read_text
+
+    def patched(self, *args, **kwargs):
+        if self == target:
+            return original(replacement, *args, **kwargs)
+        return original(self, *args, **kwargs)
+
+    return patched
+
+
 def test_b1_entry_matches_its_declared_contract():
-    """FP-IG-10: whole-object equality for B1 against literals of its own."""
+    """FP-GC1-5 (was FP-IG-10): whole-object equality for B1 against literals of its own."""
     data = yaml.safe_load((REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text())
     b1 = next(e for e in data["benchmarks"] if e["id"] == "B1")
     assert b1["id"] == "B1"
     assert b1["description"] == (
-        "Ingest webhook: HMAC verify + normalize + fingerprint + dedup lookup "
-        "(alert-storm front door)"
+        "Ingest webhook under declared CPU affinities: CI-scale merge gate plus "
+        "four-measured-role-exclusive-core product record"
     )
     assert b1["threshold"] == (
-        ">= 200 req/s sustained, p99 < 150 ms, 0 errors at 5x burst for 30s"
+        "CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s "
+        "offered for 30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; "
+        "product recorded, non-gating: served == offered, p99 < 150 ms, 0 errors at "
+        "1000 req/s offered for 30s with 4 gateway CPUs exclusive from PG/driver"
     )
     assert b1["owning_milestone"] == "M3"
+    # `covered` is earned by the gating CI-scale tier. It does not reclassify
+    # the product link as a gating threshold.
     assert b1["status"] == "covered"
     assert b1["tests"] == [
         "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
         "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile",
-        "services/gateway/tests/test_b1_ingest_burst.py::test_b1_ingest_burst_reference_profile",
+        B1_CI_SCALE_LINK,
+        B1_PRODUCT_LINK,
     ]
     assert "concurrency_model" not in b1
     notes = b1["notes"]
+    # CI-scale tier: the two allocations and the gating numbers.
     for clause in (
-        "reference",
-        "SUSTAINED_FLOOR",
+        "CI-scale gates in both CI and local",
+        "`scripts/integration-test.sh b1`",
+        "scheduler affinity (sched_setaffinity/taskset), not a CFS bandwidth",
+        "exact, pairwise-disjoint set of logical",
+        "reported diagnostics only and decide nothing",
+        "`unavailable`",
+        "the first four CPUs available to the launcher, split 2/1/1",
+        "500 req/s offered for 30 s = 15000",
+        "MAX_IN_FLIGHT=500",
+        "served_rate>=CI_SCALE_SUSTAINED_FLOOR=450",
+        "due-time p99<150ms",
+        "placement_ok=1",
+        "3.034 ms/served request",
+        "527.36 req/s",
+        # product tier, with the exact recorded-not-gating reason
+        "recorded, non-gating; reason: host-dependent, not in CI",
+        "the first eight CPUs available to the launcher, split 4/3/1",
+        "holds four logical CPUs exclusive of the PostgreSQL and driver sets",
+        "1000 req/s offered for 30 s = 30000",
+        "MAX_IN_FLIGHT=1000",
+        "`scripts/integration-test.sh b1_product`",
+        "at least eight available logical CPUs",
+        "met/missed",
+        "do not fail that target",
+        "served_rate>=SUSTAINED_FLOOR=200",
+        "four total vCPUs",
+        "no larger, self-hosted or paid runner class is available on this account",
+        # e2e disposition and the routed CPU basis
         "kind",
         "nested",
+        "refutes neither",
+        "B1-LATENCY-BASIS-1",
+        "cpuMsPerRequest=2.427",
+        "design/slices/gc-1-reference-topology/design.md",
+        "design/frozen-deviations.md",
+        # retained vocabulary
+        "reference",
         "open-loop",
-        "MAX_IN_FLIGHT",
         "workers=4",
     ):
         assert clause in notes, f"B1 notes missing {clause!r}"
+    # The notes must not call the product comparisons gating, nor promise to
+    # move either link to a later milestone.
+    for forbidden in (
+        "product tier gates",
+        "product comparisons gate",
+        "will be gating",
+        "will move to",
+        # rev 0.4's falsified allocation primitive must not survive in the
+        # published contract
+        "CPU=2.00/1.00/0.50",
+        "cpu.max pair",
+        "cgroup v2 CPU quota",
+    ):
+        assert forbidden not in notes, f"B1 notes must not say {forbidden!r}"

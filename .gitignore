@@ -240,15 +240,11 @@ node_modules/
 # published document. Untracked-but-not-ignored until now (2026-08-15).
 /rca.md
 
-# Local-only runner for the Docker-dependent test tiers (2026-08-15). Exists
-# solely to run them OUTSIDE the Claude Code Bash sandbox, whose network
-# namespace has only loopback and no routes, so no testcontainers port is ever
-# reachable from inside it. CI does not need this and never will: GitHub-hosted
-# runners have normal networking and ci.yml invokes go test / pytest directly.
-# Local-only, so it is invisible to review AND to test_manifests.py -- which is
-# why it re-checks its copies of ci.yml's test commands on every run and fails
-# loudly on drift (see its header; cf. the -p 1 coordination note in CLAUDE.md).
-/scripts/integration-test.sh
+# scripts/integration-test.sh used to be ignored here as a local-only runner for
+# the Docker-dependent tiers. GC-1 (FP-GC1-2) tracks it instead: ci.yml's
+# benchmark job now invokes `bash scripts/integration-test.sh b1` for the
+# resource-declared B1 deployment, so the same file is the CI route and the
+# local route, and tests/functional/test_manifests.py pins both by equality.
 
 # Walkthrough acceptance artifacts (operator/self-test output; not committed).
 # Dated report names and bootstrap-token files can carry raw secrets.

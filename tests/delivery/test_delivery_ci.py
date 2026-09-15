@@ -488,6 +488,47 @@ def test_dashboard_api_pg_fixture_fails_closed_without_testcontainers(
         next(namespace["pg_dsn"]())
 
 
+_TRACKED_LAUNCHER_REL = "scripts/integration-test.sh"
+_LAUNCHER_FUNCTION_RE = re.compile(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z")
+_LAUNCHER_WRAPPER_RE = re.compile(
+    r"\Abash\s+" + re.escape(_TRACKED_LAUNCHER_REL) + r"\s+([A-Za-z0-9_]+)\Z"
+)
+
+
+def _launcher_target_invocations(target: str) -> list[tuple[list[str], list[str]]]:
+    """(roots, ignores) for the pytest commands one tracked launcher target runs.
+
+    GC-1 moved B1's benchmark step behind `bash scripts/integration-test.sh b1`,
+    so the producing pytest command no longer appears in the workflow at all.
+    It is still exactly one command in exactly one tracked, reviewable file, so
+    this reads it from there. Deliberately resolved from the script rather than
+    hard-coded: a target that stops running the producer stops counting as one,
+    which is what keeps this gate honest rather than merely green.
+
+    Paths inside the launcher are repository-relative and the driver runs at the
+    repository root, so no working-directory resolution applies.
+    """
+    source = (REPO_ROOT / _TRACKED_LAUNCHER_REL).read_text(encoding="utf-8")
+    lines = source.splitlines()
+    # Delimit by the next top-level function definition rather than by a lone
+    # closing brace: the target's body contains heredocs whose JSON payload has
+    # `}` in column 0, and splitting on that would truncate the region before
+    # the commands this resolver is looking for.
+    starts = [
+        (index, match.group(1))
+        for index, match in (
+            (index, _LAUNCHER_FUNCTION_RE.match(line)) for index, line in enumerate(lines)
+        )
+        if match
+    ]
+    for position, (index, name) in enumerate(starts):
+        if name != target:
+            continue
+        end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        return _pytest_invocations("\n".join(lines[index + 1:end]))
+    return []
+
+
 def _jobs_collecting(
     workflow: dict, rel_path: str, *, resolve_workdir: bool
 ) -> list[tuple[str, int]]:
@@ -496,6 +537,9 @@ def _jobs_collecting(
     A file is collected iff it lies under a positional root and is not under
     a path named by an --ignore. Roots and --ignore operands resolve against
     the step's working-directory when resolve_workdir is True.
+
+    A step that is exactly `bash scripts/integration-test.sh <target>` counts as
+    collecting whatever that target's own pytest commands collect.
     """
     target = _norm_path(rel_path)
     hits: list[tuple[str, int]] = []
@@ -507,7 +551,11 @@ def _jobs_collecting(
             if not isinstance(run, str):
                 continue
             wd = _step_working_directory(job, step) if resolve_workdir else None
-            for roots, ignores in _pytest_invocations(run):
+            invocations = list(_pytest_invocations(run))
+            wrapper = _LAUNCHER_WRAPPER_RE.match(run.strip())
+            if wrapper:
+                invocations.extend(_launcher_target_invocations(wrapper.group(1)))
+            for roots, ignores in invocations:
                 resolved_roots = [_resolve_against_workdir(r, wd) for r in roots]
                 resolved_ignores = [_resolve_against_workdir(ig, wd) for ig in ignores]
                 under_root = any(_path_is_under(target, r) for r in resolved_roots)
@@ -995,3 +1043,93 @@ def test_pytest_invocations_does_not_split_on_quoted_separator():
     )
     assert semicolon == [(["tests/delivery"], [])]
     assert ampersand == [(["tests/delivery"], [])]
+
+
+# ---------------------------------------------------------------------------
+# GC-1 FP-GC1-2 — the tracked wrapper indirection, and its limits.
+#
+# CI delegates B1 to `bash scripts/integration-test.sh b1`, so the producing
+# pytest command no longer appears in the workflow at all. FP-IG-26 must still
+# follow the real producer, which is why _jobs_collecting resolves that exact
+# form. These cases prove the resolution is narrow: it reads the named target
+# out of the tracked script, and it returns nothing for a target that does not
+# exist, a script that does not run pytest, or any other bash command.
+# ---------------------------------------------------------------------------
+
+
+_GC1_B1_PRODUCER = "services/gateway/tests/test_b1_ingest_burst.py"
+
+
+def test_gc1_wrapper_target_resolves_b1_producer_only():
+    """FP-GC1-2: the wrapper resolves B1's producer, and only through that form."""
+    launcher = (REPO_ROOT / _TRACKED_LAUNCHER_REL).read_text(encoding="utf-8")
+    assert "bash scripts/integration-test.sh b1" in CI_YML.read_text(encoding="utf-8")
+
+    # Positive: both B1 targets collect the producer through the tracked script.
+    for target in ("b1", "b1_product"):
+        roots = [
+            root
+            for invocation in _launcher_target_invocations(target)
+            for root in invocation[0]
+        ]
+        assert _GC1_B1_PRODUCER in roots, (target, roots)
+    # The workflow step resolves to the benchmark job, and the FP-IG-26
+    # topology still holds: producer strictly before the ledger gate.
+    workflow = _load()
+    hits = _jobs_collecting(workflow, _GC1_B1_PRODUCER, resolve_workdir=True)
+    assert [name for name, _ in hits] == ["benchmark"], hits
+    consumer, producer = check_sizing_ledger_gate_topology(workflow)
+    assert consumer == producer == "benchmark"
+
+    # Negative: a target that is not defined resolves to nothing.
+    assert _launcher_target_invocations("no_such_target") == []
+    # Negative: only the exact wrapper form is recognised.
+    for body in (
+        "bash scripts/integration-test.sh",
+        "bash scripts/integration-test.sh b1 --extra",
+        "bash scripts/gen-proto.sh",
+        "sh scripts/integration-test.sh b1",
+        "bash ./scripts/integration-test.sh b1",
+    ):
+        assert _LAUNCHER_WRAPPER_RE.match(body) is None, body
+    assert _LAUNCHER_WRAPPER_RE.match("bash scripts/integration-test.sh b1").group(1) == "b1"
+
+    # Negative: a wrapper whose target stops running the producer stops
+    # counting as one, so deleting or moving the producer is still detected.
+    stripped = "\n".join(
+        line for line in launcher.splitlines() if _GC1_B1_PRODUCER not in line
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_root = Path(tmp)
+        (fake_root / "scripts").mkdir()
+        (fake_root / "scripts" / "integration-test.sh").write_text(stripped, encoding="utf-8")
+        original = globals()["REPO_ROOT"]
+        globals()["REPO_ROOT"] = fake_root
+        try:
+            assert not [
+                root
+                for invocation in _launcher_target_invocations("b1")
+                for root in invocation[0]
+            ]
+            assert _jobs_collecting(workflow, _GC1_B1_PRODUCER, resolve_workdir=True) == []
+        finally:
+            globals()["REPO_ROOT"] = original
+
+    # A workflow that replaces the B1 wrapper with any other bash command loses
+    # its producer, and the FP-IG-26 gate says so rather than passing vacuously.
+    import copy
+
+    rerouted = copy.deepcopy(workflow)
+    rerouted["jobs"]["benchmark"]["steps"][17]["run"] = "bash scripts/gen-proto.sh"
+    assert _jobs_collecting(rerouted, _GC1_B1_PRODUCER, resolve_workdir=True) == []
+    with pytest.raises(AssertionError, match="exactly one job"):
+        check_sizing_ledger_gate_topology(rerouted)
+
+    # And the direct (non-wrapper) control still works: a job whose own pytest
+    # command names the producer is resolved without any wrapper at all.
+    direct = {"jobs": {"benchmark": {"steps": [
+        {"run": f"services/worker/.venv/bin/python -m pytest {_GC1_B1_PRODUCER} -v"},
+    ]}}}
+    assert _jobs_collecting(direct, _GC1_B1_PRODUCER, resolve_workdir=True) == [("benchmark", 0)]

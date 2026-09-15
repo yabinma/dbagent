@@ -433,10 +433,8 @@ jobs:
       - name: FP-M6-31 A10(v) environment hygiene before B1 reference burst
         run: |
           bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
-      - name: B1 -- ingest-gateway reference burst (FP-IG-7)
-        run: |
-          services/worker/.venv/bin/python -m pytest \
-            services/gateway/tests/test_b1_ingest_burst.py -v -s
+      - name: B1 -- resource-declared CI-scale ingest-gateway burst (FP-GC1-1)
+        run: bash scripts/integration-test.sh b1
 
       # One step so the session-scoped scale_pg seed is shared by B2/B10/B11
       # (§11.1.3 — seeding thrice would triple the cost). Test ids name each bar.

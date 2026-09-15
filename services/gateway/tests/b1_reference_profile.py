@@ -31,6 +31,20 @@ INGEST_GATEWAY_WORKERS = 4
 TRACKER_CMDLINE_MARK = "multiprocessing.resource_tracker"
 WORKER_CMDLINE_MARK = "multiprocessing.spawn"
 
+# GC-1 FP-GC1-1 — the CI-scale resource-declared profile. Distinct names, each
+# bound exactly once at module scope; the product constants above do not move.
+# Derivation (design-time, never recomputed here): 3.034 ms/served request on
+# the contended EPYC reference host, an 80% ceiling on the 2.00-CPU gateway
+# quota gives 527.36 req/s, rounded down to the next 100 → 500 offered/s; one
+# further fixed 50 req/s finite-window margin → a 450 req/s served floor.
+CI_SCALE_BURST_RATE = 500
+CI_SCALE_BURST_SECONDS = 30
+CI_SCALE_TOTAL_REQUESTS = 15_000
+CI_SCALE_P99_MS = 150.0
+CI_SCALE_SUSTAINED_FLOOR = 450
+CI_SCALE_MAX_IN_FLIGHT = 500
+CI_SCALE_PROLOGUE_REQUESTS = 75  # int(500 * 150 / 1000)
+
 # Post-window shed probe slack (FP-IG-36 / §11.3.3 AK). Absorbs connect losses;
 # never load-bearing — the pigeonhole minimum alone forces a shed.
 PROBE_SLACK = 8
@@ -1822,6 +1836,203 @@ def wait_for_classified_workers(
 
 def format_pid_list(pids: set[int] | list[int]) -> str:
     return "+".join(str(p) for p in sorted(set(pids)))
+
+
+# ---------------------------------------------------------------------------
+# GC-1 FP-GC1-4 — cgroup v2 and CPU-list parsing for the placement witness.
+#
+# Test-only helpers: no product endpoint, no product configuration. Each one
+# fails closed on missing, unlimited, malformed or duplicated input; none of
+# them substitutes a zero or ``unavailable`` for a required placement value.
+# ---------------------------------------------------------------------------
+
+
+class B1PlacementParseError(ValueError):
+    """A cgroup/affinity/`/proc/stat` reading could not be used as evidence."""
+
+
+def parse_cpu_list(text: str) -> frozenset[int]:
+    """Parse canonical Linux CPU-list syntax (``0-3,8``) into a CPU-id set.
+
+    Rejects the empty list, whitespace inside the list, non-decimal ids,
+    inverted ranges and any duplicated or overlapping id: the kernel never
+    emits those, so seeing one means the value did not come from where the
+    witness thinks it did.
+    """
+    if not isinstance(text, str):
+        raise B1PlacementParseError(f"CPU list is not a string: {text!r}")
+    stripped = text.strip()
+    if not stripped:
+        raise B1PlacementParseError("CPU list is empty")
+    seen: set[int] = set()
+    for part in stripped.split(","):
+        if part != part.strip() or not part:
+            raise B1PlacementParseError(f"malformed CPU-list element {part!r} in {text!r}")
+        bounds = part.split("-")
+        if len(bounds) == 1:
+            lo = hi = bounds[0]
+        elif len(bounds) == 2:
+            lo, hi = bounds
+        else:
+            raise B1PlacementParseError(f"malformed CPU-list range {part!r} in {text!r}")
+        if not (lo.isdecimal() and hi.isdecimal()):
+            raise B1PlacementParseError(f"non-decimal CPU id in {part!r} ({text!r})")
+        low, high = int(lo), int(hi)
+        if high < low:
+            raise B1PlacementParseError(f"inverted CPU-list range {part!r} in {text!r}")
+        for cpu in range(low, high + 1):
+            if cpu in seen:
+                raise B1PlacementParseError(f"duplicate CPU id {cpu} in {text!r}")
+            seen.add(cpu)
+    return frozenset(seen)
+
+
+def format_cpu_list(cpus: "set[int] | frozenset[int] | list[int]") -> str:
+    """Render a CPU-id set in canonical Linux list syntax (``0-3,8``)."""
+    ordered = sorted(set(cpus))
+    if not ordered:
+        raise B1PlacementParseError("cannot render an empty CPU list")
+    for cpu in ordered:
+        if isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0:
+            raise B1PlacementParseError(f"not a CPU id: {cpu!r}")
+    parts: list[str] = []
+    start = prev = ordered[0]
+    for cpu in ordered[1:] + [None]:  # type: ignore[list-item]
+        if cpu is not None and cpu == prev + 1:
+            prev = cpu
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        if cpu is not None:
+            start = prev = cpu
+    return ",".join(parts)
+
+
+CPU_QUOTA_MAX = "max"
+
+
+def parse_cpu_max(text: str) -> tuple[int | None, int]:
+    """Parse cgroup v2 ``cpu.max`` into ``(quota_us_or_None, period_us)``.
+
+    ``max`` -- no bandwidth limit at all -- is the *expected* reading under
+    GC-1's allocation, which is scheduler affinity, not CFS bandwidth. It maps
+    to a ``None`` quota rather than an error. Nothing here is a placement
+    oracle: this value is a reported diagnostic describing whatever ambient
+    cgroup policy the host happens to impose.
+    """
+    if not isinstance(text, str):
+        raise B1PlacementParseError(f"cpu.max is not a string: {text!r}")
+    fields = text.split()
+    if len(fields) != 2:
+        raise B1PlacementParseError(f"malformed cpu.max {text!r}")
+    quota_raw, period_raw = fields
+    if not period_raw.isdecimal():
+        raise B1PlacementParseError(f"non-decimal cpu.max period {period_raw!r} in {text!r}")
+    period = int(period_raw)
+    if period <= 0:
+        raise B1PlacementParseError(f"non-positive cpu.max period in {text!r}")
+    if quota_raw == CPU_QUOTA_MAX:
+        return None, period
+    if not quota_raw.isdecimal():
+        raise B1PlacementParseError(f"non-decimal cpu.max quota {quota_raw!r} in {text!r}")
+    quota = int(quota_raw)
+    if quota <= 0:
+        raise B1PlacementParseError(f"non-positive cpu.max quota in {text!r}")
+    return quota, period
+
+
+def format_quota_cpus(quota_us: int | None, period_us: int) -> str:
+    """Render an effective bandwidth limit for the reported fingerprint field."""
+    if quota_us is None:
+        return CPU_QUOTA_MAX
+    if period_us <= 0:
+        raise B1PlacementParseError(f"non-positive cpu.max period {period_us}")
+    return f"{quota_us / period_us:.2f}"
+
+
+CPU_STAT_REQUIRED_KEYS = ("usage_usec", "nr_periods", "nr_throttled", "throttled_usec")
+
+
+def parse_cpu_stat(text: str) -> dict[str, int]:
+    """Parse cgroup v2 ``cpu.stat``; every required counter must be present."""
+    if not isinstance(text, str):
+        raise B1PlacementParseError(f"cpu.stat is not a string: {text!r}")
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise B1PlacementParseError(f"malformed cpu.stat line {line!r}")
+        key, raw = fields
+        if key not in CPU_STAT_REQUIRED_KEYS:
+            continue
+        if key in out:
+            raise B1PlacementParseError(f"duplicate cpu.stat key {key!r}")
+        if not raw.isdecimal():
+            raise B1PlacementParseError(f"non-decimal cpu.stat value {raw!r} for {key!r}")
+        out[key] = int(raw)
+    missing = [k for k in CPU_STAT_REQUIRED_KEYS if k not in out]
+    if missing:
+        raise B1PlacementParseError(f"cpu.stat missing {missing}")
+    return out
+
+
+def cpu_stat_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    """Measured-window delta; a decreasing counter invalidates the reading."""
+    out: dict[str, int] = {}
+    for key in CPU_STAT_REQUIRED_KEYS:
+        if key not in before or key not in after:
+            raise B1PlacementParseError(f"cpu.stat delta missing {key!r}")
+        delta = after[key] - before[key]
+        if delta < 0:
+            raise B1PlacementParseError(
+                f"cpu.stat counter {key} decreased: {before[key]} -> {after[key]}"
+            )
+        out[key] = delta
+    return out
+
+
+def parse_proc_stat_busy_usec(text: str, *, clock_ticks: int) -> dict[int, int]:
+    """Per-CPU busy microseconds from ``/proc/stat`` (``total - idle - iowait``)."""
+    if not isinstance(clock_ticks, int) or isinstance(clock_ticks, bool) or clock_ticks <= 0:
+        raise B1PlacementParseError(f"bad clock tick rate {clock_ticks!r}")
+    if not isinstance(text, str):
+        raise B1PlacementParseError(f"/proc/stat is not a string: {text!r}")
+    out: dict[int, int] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or not fields[0].startswith("cpu") or fields[0] == "cpu":
+            continue
+        suffix = fields[0][3:]
+        if not suffix.isdecimal():
+            raise B1PlacementParseError(f"malformed /proc/stat cpu key {fields[0]!r}")
+        cpu = int(suffix)
+        if cpu in out:
+            raise B1PlacementParseError(f"duplicate /proc/stat entry for cpu{cpu}")
+        values = fields[1:]
+        if len(values) < 5:
+            raise B1PlacementParseError(f"short /proc/stat line for cpu{cpu}: {line!r}")
+        for raw in values:
+            if not raw.isdecimal():
+                raise B1PlacementParseError(f"non-decimal /proc/stat field {raw!r}")
+        numbers = [int(raw) for raw in values]
+        busy_ticks = sum(numbers) - numbers[3] - numbers[4]
+        if busy_ticks < 0:
+            raise B1PlacementParseError(f"negative busy time for cpu{cpu}")
+        out[cpu] = busy_ticks * 1_000_000 // clock_ticks
+    if not out:
+        raise B1PlacementParseError("/proc/stat carries no per-CPU lines")
+    return out
+
+
+def serialize_cpu_busy(busy: dict[int, int]) -> str:
+    """CPU-ID-sorted ``id:busy_usec+...`` rendering of a per-CPU busy delta."""
+    if not busy:
+        raise B1PlacementParseError("cannot serialize an empty CPU-busy map")
+    for cpu, value in busy.items():
+        if value < 0:
+            raise B1PlacementParseError(f"negative busy delta for cpu{cpu}")
+    return "+".join(f"{cpu}:{busy[cpu]}" for cpu in sorted(busy))
 
 
 def create_benchmark_app():

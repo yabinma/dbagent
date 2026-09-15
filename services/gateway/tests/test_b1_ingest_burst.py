@@ -22,8 +22,11 @@ import tempfile
 import textwrap
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager, contextmanager
+from types import SimpleNamespace
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 
 import httpx
@@ -45,6 +48,492 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 VALUES_YAML = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
 HMAC_SECRET = "b1-reference-hmac-secret"
 PLATFORM_KEY = "b1-ref-platform"
+
+
+# ---------------------------------------------------------------------------
+# GC-1 — resource-declared reference topology (FP-GC1-1 / 2 / 3 / 4)
+#
+# Everything below is test-only: there is no product endpoint and no product
+# configuration here. Its single job is to make a B1 number unreadable unless
+# the three measured roles demonstrably ran on the CPUs the run claims.
+#
+# The allocation is scheduler affinity, not CFS bandwidth. Revision 0.4 of this
+# slice declared per-role CPU quotas and measured the consequence: a bursty
+# role exhausts a fractional 100 ms allowance early and is then suspended for
+# the remainder of the period, so the gateway was throttled in 43 of 307
+# periods while averaging only 1.15 of its 2.00 declared cores, PostgreSQL in
+# 65 of 308, and CI-scale p99 landed at 614-794 ms against a 150 ms bar. That
+# falsified the primitive, not the bar. Exact, pairwise-disjoint affinity sets
+# give a role its full declared cores at any instant and never suspend it for
+# accounting reasons.
+#
+# "Demonstrably" therefore means effective scheduler state -- /proc/<pid>/status
+# Cpus_allowed_list and os.sched_getaffinity(pid), read for every live process
+# of every role, at window open and again at window close. A `taskset` string
+# the kernel did not enforce cannot masquerade as placement evidence. Every
+# cgroup and host-CPU value below is a reported diagnostic and decides nothing.
+# ---------------------------------------------------------------------------
+
+B1_RUN_MOUNT = Path("/run/dbagent-b1")
+B1_LAUNCH_CONTRACT = B1_RUN_MOUNT / "placement.json"
+B1_WORKSPACE_MOUNT = "/workspace"
+B1_DOCKER_SOCKET = "/var/run/docker.sock"
+B1_RUN_LABEL_KEY = "dbagent.b1.run"
+B1_ROLE_LABEL_KEY = "dbagent.b1.role"
+B1_DRIVER_NAME_PREFIX = "dbagent-b1-driver-"
+B1_RUN_ID_LENGTH = 32
+B1_RUN_ID_ALPHABET = frozenset("0123456789abcdef")
+B1_ROLES = ("gateway", "postgres", "driver")
+B1_GATEWAY_IMPORT_PATH = "services/gateway/tests/b1_reference_profile.py"
+# Both siblings are reached over the host network namespace the driver
+# shares with them; there is no bridge hop to autodetect.
+B1_SIBLING_HOST = "127.0.0.1"
+
+# The launch contract is ephemeral and run-scoped, so the affinity change is a
+# clean break: schema 2 carries CPU lists and a named mechanism, and carries no
+# quota or period key at all. Schema 1 is rejected outright -- shell and
+# fixture ship together and nothing stored is migrated.
+B1_PLACEMENT_SCHEMA = 2
+B1_PLACEMENT_MECHANISM = "sched-affinity"
+
+CI_SCALE_PROFILE_NAME = "ci-scale"
+PRODUCT_PROFILE_NAME = "product-exclusive"
+# Exact per-role affinity cardinalities. CI-scale takes the launcher's first
+# four available CPUs as 2/1/1; product takes the first eight as 4/3/1.
+CI_SCALE_AFFINITY_CARDINALITY = {"gateway": 2, "postgres": 1, "driver": 1}
+PRODUCT_AFFINITY_CARDINALITY = {"gateway": 4, "postgres": 3, "driver": 1}
+CI_SCALE_REFERENCE_LOGICAL_CPUS = 4
+PRODUCT_MINIMUM_HOST_LOGICAL_CPUS = 8
+PRODUCT_GATEWAY_CPU_CARDINALITY = 4
+
+# measurement_authority is derived, never supplied: only a CI-scale run whose
+# observed host really has four logical CPUs is the CI measurement of record.
+AUTHORITY_CI_SCALE_REFERENCE = "ci-scale-reference"
+AUTHORITY_LOCAL_REPLICA = "local-replica"
+AUTHORITY_PRODUCT_LOCAL = "product-local-reference"
+
+PRODUCT_VERDICT_FIELDS = (
+    "product_errors_eq_zero",
+    "product_p99_lt_150_ms",
+    "product_served_eq_offered",
+)
+VERDICT_MET = "met"
+VERDICT_MISSED = "missed"
+
+# Reported-only diagnostics render this when their source cannot be read or
+# parsed. No gating field may ever carry it.
+DIAGNOSTIC_UNAVAILABLE = "unavailable"
+
+# The first five identity fields and the three affinity sets are the gate.
+B1_GATING_PLACEMENT_FIELDS = (
+    "placement_profile",
+    "placement_schema",
+    "placement_run_id",
+    "measurement_authority",
+    "placement_ok",
+    "gateway_allowed_cpus",
+    "postgres_allowed_cpus",
+    "driver_allowed_cpus",
+)
+# Everything after them describes ambient cgroup policy and unrelated host
+# work. None of it can fail a B1 tier.
+B1_DIAGNOSTIC_PLACEMENT_FIELDS = (
+    "gateway_quota_cpus",
+    "gateway_cpu_period_us",
+    "gateway_nr_periods",
+    "gateway_nr_throttled",
+    "gateway_throttled_usec",
+    "postgres_quota_cpus",
+    "postgres_cpu_period_us",
+    "postgres_nr_periods",
+    "postgres_nr_throttled",
+    "postgres_throttled_usec",
+    "driver_quota_cpus",
+    "driver_cpu_period_us",
+    "driver_nr_periods",
+    "driver_nr_throttled",
+    "driver_throttled_usec",
+    "gateway_cpu_busy_usec",
+    "gateway_nonrole_busy_cores_estimate",
+    "gateway_cpu_cores_used",
+)
+B1_PLACEMENT_FIELDS = B1_GATING_PLACEMENT_FIELDS + B1_DIAGNOSTIC_PLACEMENT_FIELDS
+
+
+class B1PlacementError(RuntimeError):
+    """The declared placement could not be proven; no B1 verdict may follow."""
+
+
+@dataclass(frozen=True)
+class B1Profile:
+    """One immutable measured profile. Values come from the profile module."""
+
+    name: str
+    rate: int
+    seconds: int
+    total_requests: int
+    prologue_requests: int
+    max_in_flight: int
+    p99_ms: float
+    sustained_floor: int
+
+    @property
+    def affinity_cardinality(self) -> dict[str, int]:
+        return (
+            dict(CI_SCALE_AFFINITY_CARDINALITY)
+            if self.name == CI_SCALE_PROFILE_NAME
+            else dict(PRODUCT_AFFINITY_CARDINALITY)
+        )
+
+    @property
+    def declared_cpu_total(self) -> int:
+        return sum(self.affinity_cardinality.values())
+
+
+CI_SCALE_PROFILE = B1Profile(
+    name=CI_SCALE_PROFILE_NAME,
+    rate=b1.CI_SCALE_BURST_RATE,
+    seconds=b1.CI_SCALE_BURST_SECONDS,
+    total_requests=b1.CI_SCALE_TOTAL_REQUESTS,
+    prologue_requests=b1.CI_SCALE_PROLOGUE_REQUESTS,
+    max_in_flight=b1.CI_SCALE_MAX_IN_FLIGHT,
+    p99_ms=b1.CI_SCALE_P99_MS,
+    sustained_floor=b1.CI_SCALE_SUSTAINED_FLOOR,
+)
+PRODUCT_PROFILE = B1Profile(
+    name=PRODUCT_PROFILE_NAME,
+    rate=b1.BURST_RATE,
+    seconds=b1.BURST_SECONDS,
+    total_requests=b1.TOTAL_REQUESTS,
+    prologue_requests=b1.PROLOGUE_REQUESTS,
+    max_in_flight=b1.MAX_IN_FLIGHT,
+    p99_ms=b1.P99_MS,
+    sustained_floor=b1.SUSTAINED_FLOOR,
+)
+B1_PROFILES = {CI_SCALE_PROFILE.name: CI_SCALE_PROFILE, PRODUCT_PROFILE.name: PRODUCT_PROFILE}
+
+
+@dataclass(frozen=True)
+class B1PlacementDeclaration:
+    """The parsed schema-2 launch contract.
+
+    The JSON is a launch contract, not a profile configuration interface: the
+    Python constants above are authoritative and every shape below is checked
+    against them, so a hand-edited placement.json cannot move a profile, a
+    mechanism or an affinity cardinality -- it can only fail the run. The CPU
+    *identities* are necessarily dynamic (they come from whatever the launcher
+    was allowed to use), so they are checked against the closed-set rules --
+    canonical form, exact cardinality, pairwise disjointness, union size --
+    rather than against literals.
+    """
+
+    schema: int
+    run_id: str
+    profile: str
+    mechanism: str
+    allowed_cpus: tuple[tuple[str, frozenset[int]], ...]
+    reference_logical_cpus: int | None
+    minimum_host_logical_cpus: int | None
+
+    def allowed(self, role: str) -> frozenset[int]:
+        return dict(self.allowed_cpus)[role]
+
+    @property
+    def declared_union(self) -> frozenset[int]:
+        out: frozenset[int] = frozenset()
+        for _role, cpus in self.allowed_cpus:
+            out |= cpus
+        return out
+
+    @property
+    def driver_name(self) -> str:
+        return f"{B1_DRIVER_NAME_PREFIX}{self.run_id}"
+
+    @property
+    def run_label(self) -> str:
+        return f"{B1_RUN_LABEL_KEY}={self.run_id}"
+
+    def role_label(self, role: str) -> str:
+        return f"{B1_ROLE_LABEL_KEY}={role}"
+
+    def labels(self, role: str) -> dict[str, str]:
+        return {B1_RUN_LABEL_KEY: self.run_id, B1_ROLE_LABEL_KEY: role}
+
+    @classmethod
+    def from_contract(cls, payload: object) -> "B1PlacementDeclaration":
+        if not isinstance(payload, dict):
+            raise B1PlacementError(f"launch contract is not a JSON object: {type(payload).__name__}")
+        profile = payload.get("profile")
+        if profile not in B1_PROFILES:
+            raise B1PlacementError(f"unknown placement profile {profile!r}")
+        ci_scale = profile == CI_SCALE_PROFILE_NAME
+        capacity_key = "referenceLogicalCpus" if ci_scale else "minimumHostLogicalCpus"
+        expected_keys = {"schema", "runId", "profile", "mechanism", "roles", capacity_key}
+        got_keys = set(payload)
+        if got_keys != expected_keys:
+            raise B1PlacementError(
+                f"closed schema-{B1_PLACEMENT_SCHEMA} contract keys {sorted(expected_keys)}; "
+                f"got {sorted(got_keys)}"
+            )
+        if payload["schema"] != B1_PLACEMENT_SCHEMA:
+            raise B1PlacementError(
+                f"unsupported placement schema {payload['schema']!r}; this harness declares "
+                f"scheduler affinity and only understands schema {B1_PLACEMENT_SCHEMA}"
+            )
+        if payload["mechanism"] != B1_PLACEMENT_MECHANISM:
+            raise B1PlacementError(
+                f"unsupported placement mechanism {payload['mechanism']!r}; "
+                f"expected {B1_PLACEMENT_MECHANISM!r}"
+            )
+        run_id = payload["runId"]
+        if (
+            not isinstance(run_id, str)
+            or len(run_id) != B1_RUN_ID_LENGTH
+            or not set(run_id) <= B1_RUN_ID_ALPHABET
+        ):
+            raise B1PlacementError(
+                f"runId must be {B1_RUN_ID_LENGTH} lowercase hex characters; got {run_id!r}"
+            )
+        capacity = payload[capacity_key]
+        if ci_scale and capacity != CI_SCALE_REFERENCE_LOGICAL_CPUS:
+            raise B1PlacementError(
+                f"referenceLogicalCpus is pinned at {CI_SCALE_REFERENCE_LOGICAL_CPUS}; got {capacity!r}"
+            )
+        if not ci_scale and capacity != PRODUCT_MINIMUM_HOST_LOGICAL_CPUS:
+            raise B1PlacementError(
+                f"minimumHostLogicalCpus is pinned at {PRODUCT_MINIMUM_HOST_LOGICAL_CPUS}; "
+                f"got {capacity!r}"
+            )
+        roles = payload["roles"]
+        if not isinstance(roles, dict) or set(roles) != set(B1_ROLES):
+            raise B1PlacementError(f"contract roles must be exactly {sorted(B1_ROLES)}; got {roles!r}")
+        cardinality = B1_PROFILES[profile].affinity_cardinality
+        allowed_pairs: list[tuple[str, frozenset[int]]] = []
+        for role in B1_ROLES:
+            entry = roles[role]
+            if not isinstance(entry, dict) or set(entry) != {"allowedCpus"}:
+                raise B1PlacementError(
+                    f"role {role!r} must carry exactly ['allowedCpus']; got {entry!r}"
+                )
+            raw = entry["allowedCpus"]
+            if not isinstance(raw, str):
+                raise B1PlacementError(f"role {role!r} needs a CPU list; got {raw!r}")
+            cpus = b1.parse_cpu_list(raw)
+            if b1.format_cpu_list(cpus) != raw:
+                raise B1PlacementError(f"role {role!r} CPU list {raw!r} is not canonical")
+            if len(cpus) != cardinality[role]:
+                raise B1PlacementError(
+                    f"profile {profile!r} declares {cardinality[role]} CPU(s) for {role!r}; "
+                    f"contract carries {len(cpus)} ({raw})"
+                )
+            allowed_pairs.append((role, cpus))
+        sets = dict(allowed_pairs)
+        for left, right in (("gateway", "postgres"), ("gateway", "driver"), ("postgres", "driver")):
+            overlap = sets[left] & sets[right]
+            if overlap:
+                raise B1PlacementError(
+                    f"declared sets {left}/{right} overlap on {sorted(overlap)}"
+                )
+        union = frozenset().union(*sets.values())
+        declared_total = B1_PROFILES[profile].declared_cpu_total
+        if len(union) != declared_total:
+            raise B1PlacementError(
+                f"profile {profile!r} declares {declared_total} distinct CPUs; "
+                f"contract union has {len(union)}"
+            )
+        return cls(
+            schema=B1_PLACEMENT_SCHEMA,
+            run_id=run_id,
+            profile=profile,
+            mechanism=B1_PLACEMENT_MECHANISM,
+            allowed_cpus=tuple(allowed_pairs),
+            reference_logical_cpus=capacity if ci_scale else None,
+            minimum_host_logical_cpus=None if ci_scale else capacity,
+        )
+
+
+@dataclass(frozen=True)
+class B1RolePlacement:
+    """Effective scheduler state for one measured role. Purely gating."""
+
+    role: str
+    allowed_cpus: frozenset[int]
+    pids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class B1RoleDiagnostics:
+    """Reported-only cgroup readings for one role. Never gating.
+
+    Every field is already rendered, so an unreadable or nonsensical source
+    reaches the fingerprint as the literal ``unavailable`` rather than as a
+    zero that would read like a measurement.
+    """
+
+    role: str
+    quota_cpus: str = DIAGNOSTIC_UNAVAILABLE
+    cpu_period_us: str = DIAGNOSTIC_UNAVAILABLE
+    nr_periods: str = DIAGNOSTIC_UNAVAILABLE
+    nr_throttled: str = DIAGNOSTIC_UNAVAILABLE
+    throttled_usec: str = DIAGNOSTIC_UNAVAILABLE
+    usage_usec_delta: int | None = None
+    notes: tuple[str, ...] = ()
+
+    def rendered(self) -> tuple[tuple[str, str], ...]:
+        return (
+            (f"{self.role}_quota_cpus", self.quota_cpus),
+            (f"{self.role}_cpu_period_us", self.cpu_period_us),
+            (f"{self.role}_nr_periods", self.nr_periods),
+            (f"{self.role}_nr_throttled", self.nr_throttled),
+            (f"{self.role}_throttled_usec", self.throttled_usec),
+        )
+
+
+class B1PlacementWitness:
+    """Profile-specific validation of the three roles' effective affinities."""
+
+    def __init__(self, declaration: B1PlacementDeclaration, *, host_cpus: frozenset[int]):
+        self.declaration = declaration
+        self.host_cpus = frozenset(host_cpus)
+
+    @property
+    def is_ci_scale(self) -> bool:
+        return self.declaration.profile == CI_SCALE_PROFILE_NAME
+
+    def authority(self, observed_cpu_count: int) -> str:
+        if not self.is_ci_scale:
+            return AUTHORITY_PRODUCT_LOCAL
+        if observed_cpu_count == CI_SCALE_REFERENCE_LOGICAL_CPUS:
+            return AUTHORITY_CI_SCALE_REFERENCE
+        return AUTHORITY_LOCAL_REPLICA
+
+    def failures(
+        self,
+        roles: dict[str, B1RolePlacement],
+        *,
+        gateway_worker_pids: "set[int] | frozenset[int] | tuple[int, ...]" = (),
+        when: str = "open",
+    ) -> list[str]:
+        out: list[str] = []
+        decl = self.declaration
+        profile = B1_PROFILES[decl.profile]
+        cardinality = profile.affinity_cardinality
+        observed: dict[str, frozenset[int]] = {}
+        for role in B1_ROLES:
+            found = roles.get(role)
+            if found is None:
+                out.append(f"{when}: {role}: no effective placement reading")
+                continue
+            observed[role] = found.allowed_cpus
+            if not found.pids:
+                out.append(f"{when}: {role}: no live process observed")
+            declared = decl.allowed(role)
+            if found.allowed_cpus != declared:
+                out.append(
+                    f"{when}: {role}: effective CPUs "
+                    f"{b1.format_cpu_list(found.allowed_cpus) if found.allowed_cpus else '<empty>'}, "
+                    f"declared {b1.format_cpu_list(declared)}"
+                )
+            if len(found.allowed_cpus) != cardinality[role]:
+                out.append(
+                    f"{when}: {role}: {len(found.allowed_cpus)} effective CPUs, profile "
+                    f"{decl.profile} declares {cardinality[role]}"
+                )
+            if found.allowed_cpus and not found.allowed_cpus <= self.host_cpus:
+                out.append(
+                    f"{when}: {role}: effective CPUs "
+                    f"{b1.format_cpu_list(found.allowed_cpus)} are not a subset of the "
+                    f"host-visible {b1.format_cpu_list(self.host_cpus)}"
+                )
+        for left, right in (
+            ("gateway", "postgres"),
+            ("gateway", "driver"),
+            ("postgres", "driver"),
+        ):
+            overlap = observed.get(left, frozenset()) & observed.get(right, frozenset())
+            if overlap:
+                out.append(
+                    f"{when}: {left}/{right}: measured roles share CPUs {sorted(overlap)}"
+                )
+        union = frozenset().union(*observed.values()) if observed else frozenset()
+        if len(observed) == len(B1_ROLES) and len(union) != profile.declared_cpu_total:
+            out.append(
+                f"{when}: measured roles occupy {len(union)} distinct CPUs, profile "
+                f"{decl.profile} declares {profile.declared_cpu_total}"
+            )
+        if self.is_ci_scale:
+            if decl.reference_logical_cpus != CI_SCALE_REFERENCE_LOGICAL_CPUS:
+                out.append(
+                    f"{when}: ci-scale: declared reference capacity "
+                    f"{decl.reference_logical_cpus}, pinned {CI_SCALE_REFERENCE_LOGICAL_CPUS}"
+                )
+            if len(self.host_cpus) < CI_SCALE_REFERENCE_LOGICAL_CPUS:
+                out.append(
+                    f"{when}: ci-scale: host offers {len(self.host_cpus)} logical CPUs, "
+                    f"needs at least {CI_SCALE_REFERENCE_LOGICAL_CPUS}"
+                )
+        else:
+            if len(self.host_cpus) < PRODUCT_MINIMUM_HOST_LOGICAL_CPUS:
+                out.append(
+                    f"{when}: product: host offers {len(self.host_cpus)} logical CPUs, "
+                    f"needs at least {PRODUCT_MINIMUM_HOST_LOGICAL_CPUS}"
+                )
+            gateway_set = observed.get("gateway", frozenset())
+            if len(gateway_set) != PRODUCT_GATEWAY_CPU_CARDINALITY:
+                out.append(
+                    f"{when}: gateway: {len(gateway_set)} exclusive CPUs, product declares "
+                    f"{PRODUCT_GATEWAY_CPU_CARDINALITY}"
+                )
+        workers = set(gateway_worker_pids)
+        if len(workers) != b1.INGEST_GATEWAY_WORKERS:
+            out.append(
+                f"{when}: gateway: {len(workers)} classified workers, declared "
+                f"{b1.INGEST_GATEWAY_WORKERS}"
+            )
+        gateway = roles.get("gateway")
+        if gateway is not None and workers and not workers <= set(gateway.pids):
+            out.append(
+                f"{when}: gateway: worker pids {sorted(workers - set(gateway.pids))} carry no "
+                f"placement reading"
+            )
+        return out
+
+
+def _product_promise_verdicts(result) -> "OrderedDict[str, str]":
+    """The three product-promise comparisons, evaluated once, as met/missed.
+
+    Recorded, not gating (FP-GC1-3): the values and operators are the shipped
+    product promise and do not move; what changed is only that a truthful
+    ``missed`` is data on the fingerprint rather than a failed test. The test
+    that consumes this asserts each serialized token equals its live
+    comparison -- so deleting a comparison, literalizing a token, or letting
+    one disagree with its own operands is still a failure.
+    """
+    verdicts: "OrderedDict[str, str]" = OrderedDict()
+    verdicts["product_errors_eq_zero"] = VERDICT_MET if result.errors == 0 else VERDICT_MISSED
+    verdicts["product_p99_lt_150_ms"] = (
+        VERDICT_MET if result.p99 < PRODUCT_P99_MS else VERDICT_MISSED
+    )
+    verdicts["product_served_eq_offered"] = (
+        VERDICT_MET if result.served == result.offered else VERDICT_MISSED
+    )
+    return verdicts
+
+
+def serialize_product_verdicts(verdicts: "dict[str, str]") -> str:
+    """``field=token,`` in the fixed order, or the empty string for CI-scale."""
+    if not verdicts:
+        return ""
+    if tuple(verdicts) != PRODUCT_VERDICT_FIELDS:
+        raise B1PlacementError(
+            f"product verdict fields {tuple(verdicts)} are not the closed ordered set "
+            f"{PRODUCT_VERDICT_FIELDS}"
+        )
+    for field_name, token in verdicts.items():
+        if token not in (VERDICT_MET, VERDICT_MISSED):
+            raise B1PlacementError(f"{field_name}={token!r} is neither 'met' nor 'missed'")
+    return "".join(f"{name}={verdicts[name]}," for name in PRODUCT_VERDICT_FIELDS)
+
 
 
 # ---------------------------------------------------------------------------
@@ -319,12 +808,13 @@ def _is_never_served_status_code(code: int) -> bool:
     return 400 <= code < 600 and code != 200
 
 
-def test_b1_fingerprint_line_carries_terminal_fields(b1_reference_run):
+@pytest.mark.b1_live
+def test_b1_fingerprint_line_carries_terminal_fields(b1_ci_scale_run):
     """FP-IG-35: three reported-only fields present and reconciled."""
     from collections import Counter
 
-    line = b1_reference_run["fingerprint"]
-    result = b1_reference_run["result"]
+    line = b1_ci_scale_run["fingerprint"]
+    result = b1_ci_scale_run["result"]
     hist_raw = _parse_b1_env_field(line, "status_histogram")
     peak_raw = _parse_b1_env_field(line, "peak_established_connections")
     shed = _parse_b1_env_field(line, "shed_probe")
@@ -348,10 +838,11 @@ def test_b1_fingerprint_line_carries_terminal_fields(b1_reference_run):
     assert shed in {"fired", "absent", "timeout", b1.UNAVAILABLE}
 
 
-def test_b1_fingerprint_line_locates_the_in_flight_population(b1_reference_run):
+@pytest.mark.b1_live
+def test_b1_fingerprint_line_locates_the_in_flight_population(b1_ci_scale_run):
     """FP-IG-37: pool census fields present, reconciled, two safe inequalities."""
-    line = b1_reference_run["fingerprint"]
-    result = b1_reference_run["result"]
+    line = b1_ci_scale_run["fingerprint"]
+    result = b1_ci_scale_run["result"]
 
     peak_pool_conn_raw = _parse_b1_env_field(line, "peak_pool_connections")
     peak_pool_requests_raw = _parse_b1_env_field(line, "peak_pool_requests")
@@ -377,11 +868,12 @@ def test_b1_fingerprint_line_locates_the_in_flight_population(b1_reference_run):
         assert result.pool_connections_seen >= result.peak_pool_connections
 
 
-def test_b1_fingerprint_line_carries_the_per_worker_census(b1_reference_run):
+@pytest.mark.b1_live
+def test_b1_fingerprint_line_carries_the_per_worker_census(b1_ci_scale_run):
     """FP-IG-38: per-worker census fields present and reconciled."""
-    line = b1_reference_run["fingerprint"]
-    result = b1_reference_run["result"]
-    workers_pre = b1_reference_run["workers_pre"]
+    line = b1_ci_scale_run["fingerprint"]
+    result = b1_ci_scale_run["result"]
+    workers_pre = b1_ci_scale_run["workers_pre"]
 
     peaks_raw = _parse_b1_env_field(line, "worker_established_peaks")
     peak_worker_raw = _parse_b1_env_field(line, "peak_worker_established")
@@ -413,10 +905,11 @@ def _parse_leg_triple(raw: str) -> tuple[float, float, float]:
     return float(parts[0]), float(parts[1]), float(parts[2])
 
 
-def test_b1_fingerprint_line_decomposes_the_headline_lateness(b1_reference_run):
+@pytest.mark.b1_live
+def test_b1_fingerprint_line_decomposes_the_headline_lateness(b1_ci_scale_run):
     """FP-IG-39: both leg fields present, numeric, wired to this run."""
-    line = b1_reference_run["fingerprint"]
-    result = b1_reference_run["result"]
+    line = b1_ci_scale_run["fingerprint"]
+    result = b1_ci_scale_run["result"]
 
     split_raw = _parse_b1_env_field(line, "p99_leg_split")
     p99s_raw = _parse_b1_env_field(line, "leg_p99s")
@@ -536,7 +1029,14 @@ def test_window_complete_precedes_derivation_in_source():
 
 
 def test_b1_fixture_samples_cpu_after_on_window_complete():
-    """C1 [consumer path]: cpu_after is the hook sample, not a post-return read."""
+    """C1 [consumer path]: the closing CPU read happens inside the hook.
+
+    The carrier moved with GC-1: gateway CPU is a reported diagnostic taken
+    from the gateway container's own cgroup rather than a /proc walk of a host
+    child, so the property pinned here is that the closing counter is read
+    *inside* ``_after_window`` and consumed from ``marks`` afterwards -- never
+    re-read once the measured window has closed.
+    """
     src = Path(__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     hook = None
@@ -546,11 +1046,29 @@ def test_b1_fixture_samples_cpu_after_on_window_complete():
     assert hook is not None
     hook_src = ast.get_source_segment(src, hook)
     assert hook_src is not None
-    assert "tree_cpu_seconds" in hook_src
-    assert "cpu_after" in hook_src
+    assert "_collect_cpu_diagnostics" in hook_src
+    assert '"after"' in hook_src
+
+    fixture = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_b1_reference"
+    )
+    fixture_src = ast.get_source_segment(src, fixture)
+    assert fixture_src is not None
+    # The retired host-child reader must not have survived anywhere in the
+    # live fixture: it would measure a process tree that no longer owns the
+    # gateway's cgroup.
+    assert "tree_cpu_seconds" not in fixture_src
+    # ... and the collector itself reads the cgroup files, once per phase.
+    collector = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.FunctionDef) and n.name == "_collect_cpu_diagnostics"
+    )
+    collector_src = ast.get_source_segment(src, collector)
+    assert "_read_cpu_files" in collector_src
 
     hooked = False
-    cpu_after_from_marks = False
+    diagnostics_from_marks = False
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             for kw in node.keywords:
@@ -564,15 +1082,17 @@ def test_b1_fixture_samples_cpu_after_on_window_complete():
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "cpu_after"
+            and node.targets[0].id == "diagnostics"
         ):
             seg = ast.get_source_segment(src, node)
             assert seg is not None
-            assert "tree_cpu_seconds" not in seg
-            assert "marks" in seg
-            cpu_after_from_marks = True
+            assert "_role_diagnostics" in seg
+            assert 'marks.get(f"{role}_cpu_stat_before")' in seg
+            assert 'marks.get(f"{role}_cpu_stat_after")' in seg
+            assert "_read_cpu_files" not in seg
+            diagnostics_from_marks = True
     assert hooked
-    assert cpu_after_from_marks
+    assert diagnostics_from_marks
 
 
 @pytest.mark.asyncio
@@ -1488,6 +2008,7 @@ async def test_open_loop_rejects_duplicate_event_ids_across_phases():
     assert transport.calls == 6
 
 
+
 # ---------------------------------------------------------------------------
 # Reference burst fixture
 # ---------------------------------------------------------------------------
@@ -1631,376 +2152,1084 @@ def _b1_gateway_process(argv, *, env, log_path: Path):
             raise RuntimeError(f"{exc}; gateway log={log_path}; tail:\n{tail}") from exc
 
 
-@pytest.fixture(scope="module")
-def b1_reference_run(tmp_path_factory):
-    """Session-scoped single 30 s burst shared by FP-IG-7 and FP-IG-18.
+# ---------------------------------------------------------------------------
+# GC-1 — sibling-container orchestration and the effective-placement probe
+# ---------------------------------------------------------------------------
 
-    Hard-fails when the measurement-of-record dependencies are unavailable —
-    a silent skip would retire FP-IG-7/18 without evidence (C4).
-    """
+
+def _read_launch_contract(path: Path = B1_LAUNCH_CONTRACT) -> object:
     try:
-        from testcontainers.postgres import PostgresContainer
-    except ImportError as exc:
-        raise RuntimeError(
-            "testcontainers is required for B1 measurement-of-record; "
-            "install it rather than skipping"
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise B1PlacementError(
+            f"no schema-{B1_PLACEMENT_SCHEMA} launch contract at {path}; the b1/b1_product "
+            f"shell target writes it before starting the driver"
         ) from exc
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise B1PlacementError(f"launch contract at {path} is not JSON: {exc}") from exc
+
+
+def _resolve_driver_container(client, declaration: B1PlacementDeclaration):
+    """Identify this driver by its two labels -- never by hostname.
+
+    Hostname is not identity: with ``--network host`` it is the *host's* name,
+    and under any other mode it is a truncated container id that no label
+    guarantees belongs to this run. The unique two-label match plus the exact
+    derived name is what ties the running process to the contract it read.
+    """
+    matches = client.containers.list(
+        filters={"label": [declaration.run_label, declaration.role_label("driver")]}
+    )
+    if len(matches) != 1:
+        raise B1PlacementError(
+            f"expected exactly one container labelled {declaration.run_label} + "
+            f"{declaration.role_label('driver')}; found {[c.name for c in matches]}"
+        )
+    driver = matches[0]
+    if driver.name != declaration.driver_name:
+        raise B1PlacementError(
+            f"driver container is named {driver.name!r}, contract derives "
+            f"{declaration.driver_name!r}"
+        )
+    labels = dict(getattr(driver, "labels", None) or {})
+    if labels.get(B1_RUN_LABEL_KEY) != declaration.run_id:
+        raise B1PlacementError(
+            f"driver label {B1_RUN_LABEL_KEY}={labels.get(B1_RUN_LABEL_KEY)!r} disagrees "
+            f"with the contract runId {declaration.run_id!r}"
+        )
+    return driver
+
+
+def _driver_mount_source(driver, destination: str) -> str:
+    """The host source of one driver mount, read back from Docker inspect.
+
+    The siblings are built from the driver's own inspected image id and mount
+    sources, so no caller-provided image or host path can enter the topology.
+    """
+    mounts = (getattr(driver, "attrs", None) or {}).get("Mounts") or []
+    sources = [m.get("Source") for m in mounts if m.get("Destination") == destination]
+    if len(sources) != 1 or not sources[0]:
+        raise B1PlacementError(
+            f"driver container has {len(sources)} mount(s) at {destination}; expected exactly one"
+        )
+    return sources[0]
+
+
+def _exec_text(container, argv: list[str]) -> str:
+    """Run a reader inside a sibling container and return its stdout."""
+    wrapped = container.get_wrapped_container() if hasattr(container, "get_wrapped_container") else container
+    code, output = wrapped.exec_run(argv)
+    if code != 0:
+        raise B1PlacementError(
+            f"{' '.join(argv)} in {wrapped.name} exited {code}: "
+            f"{output.decode('utf-8', 'replace').strip()}"
+        )
+    return output.decode("utf-8", "replace")
+
+
+def _proc_allowed_cpus(pid: int) -> frozenset[int]:
+    """Both affinity views for one pid; they must agree after normalization."""
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise B1PlacementError(f"cannot read /proc/{pid}/status: {exc}") from exc
+    listed = [ln for ln in status.splitlines() if ln.startswith("Cpus_allowed_list:")]
+    if len(listed) != 1:
+        raise B1PlacementError(f"/proc/{pid}/status carries {len(listed)} Cpus_allowed_list lines")
+    from_status = b1.parse_cpu_list(listed[0].split(":", 1)[1].strip())
+    try:
+        from_sched = frozenset(os.sched_getaffinity(pid))
+    except OSError as exc:
+        raise B1PlacementError(f"cannot sched_getaffinity({pid}): {exc}") from exc
+    if from_status != from_sched:
+        raise B1PlacementError(
+            f"pid {pid} affinity views disagree: /proc says "
+            f"{b1.format_cpu_list(from_status)}, sched_getaffinity says "
+            f"{b1.format_cpu_list(from_sched)}"
+        )
+    return from_status
+
+
+def _proc_cgroup_id(pid: int) -> str:
+    try:
+        text = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise B1PlacementError(f"cannot read /proc/{pid}/cgroup: {exc}") from exc
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0":
+            return parts[2]
+    raise B1PlacementError(f"/proc/{pid}/cgroup carries no unified (0::) entry")
+
+
+def _host_cpu_ids() -> frozenset[int]:
+    """The host-visible logical CPU inventory, from the host /proc/stat.
+
+    Deliberately not ``sched_getaffinity(0)``: the driver itself now runs under
+    ``taskset``, so its own affinity is one CPU and would make every role look
+    out of range.
+    """
+    text = Path("/proc/stat").read_text(encoding="utf-8")
+    return frozenset(b1.parse_proc_stat_busy_usec(text, clock_ticks=os.sysconf("SC_CLK_TCK")))
+
+
+def _gateway_set_busy_usec(allowed: frozenset[int]) -> dict[int, int]:
+    text = Path("/proc/stat").read_text(encoding="utf-8")
+    per_cpu = b1.parse_proc_stat_busy_usec(text, clock_ticks=os.sysconf("SC_CLK_TCK"))
+    missing = sorted(set(allowed) - set(per_cpu))
+    if missing:
+        raise b1.B1PlacementParseError(f"/proc/stat carries no counters for gateway CPUs {missing}")
+    return {cpu: per_cpu[cpu] for cpu in sorted(allowed)}
+
+
+def _try_diagnostic(label: str, notes: list[str], reader):
+    """Attempt one reported-only diagnostic; never let it fail the run."""
+    try:
+        return reader()
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never gate
+        notes.append(f"{label}: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _read_cpu_files(container=None):
+    """``(cpu.max, cpu.stat)`` for a sibling container, or for the driver itself."""
+    if container is None:
+        return (
+            Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8"),
+            Path("/sys/fs/cgroup/cpu.stat").read_text(encoding="utf-8"),
+        )
+    return (
+        _exec_text(container, ["cat", "/sys/fs/cgroup/cpu.max"]),
+        _exec_text(container, ["cat", "/sys/fs/cgroup/cpu.stat"]),
+    )
+
+
+def _role_diagnostics(role: str, cpu_max_text, stat_before, stat_after) -> B1RoleDiagnostics:
+    """Render one role's reported-only cgroup fields, failing soft to `unavailable`."""
+    notes: list[str] = []
+    quota_cpus = DIAGNOSTIC_UNAVAILABLE
+    period_us = DIAGNOSTIC_UNAVAILABLE
+    if cpu_max_text is None:
+        notes.append(f"{role} cpu.max: source was not readable")
+        parsed_max = None
+    else:
+        parsed_max = _try_diagnostic(
+            f"{role} cpu.max", notes, lambda: b1.parse_cpu_max(cpu_max_text)
+        )
+    if parsed_max is not None:
+        quota_raw, period_raw = parsed_max
+        quota_cpus = b1.format_quota_cpus(quota_raw, period_raw)
+        period_us = str(period_raw)
+    if stat_before is None or stat_after is None:
+        notes.append(f"{role} cpu.stat: a measured-window snapshot was not readable")
+        delta = None
+    else:
+        delta = _try_diagnostic(
+            f"{role} cpu.stat", notes,
+            lambda: b1.cpu_stat_delta(
+                b1.parse_cpu_stat(stat_before), b1.parse_cpu_stat(stat_after)
+            ),
+        )
+    if delta is None:
+        return B1RoleDiagnostics(
+            role=role, quota_cpus=quota_cpus, cpu_period_us=period_us, notes=tuple(notes)
+        )
+    return B1RoleDiagnostics(
+        role=role,
+        quota_cpus=quota_cpus,
+        cpu_period_us=period_us,
+        nr_periods=str(delta["nr_periods"]),
+        nr_throttled=str(delta["nr_throttled"]),
+        throttled_usec=str(delta["throttled_usec"]),
+        usage_usec_delta=delta["usage_usec"],
+        notes=tuple(notes),
+    )
+
+
+def _role_placement(role: str, pids: "list[int] | tuple[int, ...]") -> B1RolePlacement:
+    """Effective scheduler affinity for every live process of one role."""
+    ordered = tuple(sorted(set(pids)))
+    if not ordered:
+        raise B1PlacementError(f"{role}: no live pid to read placement from")
+    views = [_proc_allowed_cpus(pid) for pid in ordered]
+    distinct = {view for view in views}
+    if len(distinct) != 1:
+        raise B1PlacementError(
+            f"{role}: processes carry different allowed-CPU sets "
+            f"{sorted(b1.format_cpu_list(v) for v in distinct)}"
+        )
+    return B1RolePlacement(role=role, allowed_cpus=views[0], pids=ordered)
+
+
+def _container_root_pid(container) -> int:
+    wrapped = container.get_wrapped_container() if hasattr(container, "get_wrapped_container") else container
+    wrapped.reload()
+    pid = ((wrapped.attrs.get("State") or {}).get("Pid"))
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise B1PlacementError(f"{wrapped.name} reports no live host pid ({pid!r})")
+    return pid
+
+
+def _tree_pids(root_pid: int) -> tuple[int, ...]:
+    return tuple(sorted({root_pid, *b1.iter_live_descendants(root_pid)}))
+
+
+def _snapshot_container_log(container, log_path: Path) -> int:
+    """Copy the sibling's retained Docker log to the run mount; return its size.
+
+    Docker's log store replaces the old ``Popen(stdout=file)`` carrier, so the
+    measured-window prefix is taken here, once, at window completion -- the
+    later shed-probe phase cannot enter the warning count.
+    """
+    wrapped = container.get_wrapped_container() if hasattr(container, "get_wrapped_container") else container
+    payload = wrapped.logs(stdout=True, stderr=True)
+    with log_path.open("wb") as writer:
+        writer.write(payload)
+    return log_path.stat().st_size
+
+
+def _verify_no_survivors(client, declaration: B1PlacementDeclaration) -> None:
+    """Teardown is observed, not assumed (FP-GC1-2)."""
+    survivors = client.containers.list(
+        all=True, filters={"label": [declaration.run_label]}
+    )
+    stragglers = [c.name for c in survivors if c.name != declaration.driver_name]
+    if stragglers:
+        raise B1PlacementError(
+            f"run {declaration.run_id} left containers behind after teardown: {stragglers}"
+        )
+
+
+def _restore_ryuk(config, previous: bool) -> None:
+    config.ryuk_disabled = previous
+
+
+def _restore_attr(config, name: str, previous) -> None:
+    setattr(config, name, previous)
+
+
+def _gateway_config(dsn: str) -> dict:
+    return {
+        "temporal": {"address": "localhost:7233", "namespace": "default", "task_queue": "t"},
+        "storage": {
+            "postgres_dsn": dsn,
+            "s3_endpoint": "http://127.0.0.1:9",
+            "s3_bucket": "b",
+            "s3_access_key": "a",
+            "s3_secret_key": "s",
+            "s3_region": "us-east-1",
+        },
+        "model_gateway": {"url": "http://127.0.0.1:9", "master_key": "k"},
+        "probe_gateway": {"url": "http://127.0.0.1:9"},
+        "signing": {"key_path": "/tmp/nope", "rotation_grace_seconds": 600},
+        "dashboard": {"jwt_secret": "j", "cors_origins": [], "bootstrap_ca_cert_path": ""},
+        "notifications": {"outbound_webhooks": []},
+        "ingest": {
+            "sources": [{"name": "grafana-b1", "secret": HMAC_SECRET}],
+            "correlation_window_seconds": 1800,
+        },
+        "budget_defaults": {"max_rounds": 15, "max_cost_usd": 10.0, "max_wall_seconds": 1800},
+        "agents": {},
+        "tracing": {"backend": "builtin"},
+    }
+
+
+def _migrate_and_seed(dsn: str) -> None:
     from rca_common.db.session import make_engine, make_session_factory
     from rca_common.db.models import Platform
     import alembic.config
     import alembic.command
 
-    with PostgresContainer(
-        "postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent"
-    ) as pg:
-        dsn = pg.get_connection_url()
-        # Migrate
-        mig_dir = REPO_ROOT / "libs" / "py" / "rca_common"
-        # Use alembic from rca_common
-        sys.path.insert(0, str(mig_dir))
-        try:
-            from rca_common.db.session import make_engine as me
-
-            # Run migrations via alembic
-            alembic_ini = mig_dir / "alembic.ini"
-            migrations_dir = mig_dir / "migrations"
-            if alembic_ini.is_file() and migrations_dir.is_dir():
-                cfg = alembic.config.Config(str(alembic_ini))
-                cfg.set_main_option("sqlalchemy.url", dsn)
-                # alembic.ini's script_location is relative; pin absolute path.
-                cfg.set_main_option("script_location", str(migrations_dir))
-                alembic.command.upgrade(cfg, "head")
-            else:
-                # Fallback: create_all
-                from rca_common.db.models import Base
-
-                engine = me(dsn)
-                Base.metadata.create_all(engine)
-                engine.dispose()
-        finally:
-            if str(mig_dir) in sys.path:
-                sys.path.remove(str(mig_dir))
+    mig_dir = REPO_ROOT / "libs" / "py" / "rca_common"
+    alembic_ini = mig_dir / "alembic.ini"
+    migrations_dir = mig_dir / "migrations"
+    if alembic_ini.is_file() and migrations_dir.is_dir():
+        cfg = alembic.config.Config(str(alembic_ini))
+        cfg.set_main_option("sqlalchemy.url", dsn)
+        cfg.set_main_option("script_location", str(migrations_dir))
+        alembic.command.upgrade(cfg, "head")
+    else:
+        from rca_common.db.models import Base
 
         engine = make_engine(dsn)
-        sf = make_session_factory(engine)
-        with sf() as session:
-            session.add(
-                Platform(
-                    platform_key=PLATFORM_KEY,
-                    platform_type="presto",
-                    deployment="k8s",
-                    status="online",
-                    config={},
-                )
+        Base.metadata.create_all(engine)
+        engine.dispose()
+    engine = make_engine(dsn)
+    sf = make_session_factory(engine)
+    with sf() as session:
+        session.add(
+            Platform(
+                platform_key=PLATFORM_KEY,
+                platform_type="presto",
+                deployment="k8s",
+                status="online",
+                config={},
             )
-            session.commit()
+        )
+        session.commit()
+    engine.dispose()
+
+
+def _committed_ingest_rows(dsn: str) -> int:
+    from rca_common.db.session import make_engine, make_session_factory
+    from sqlalchemy import text
+
+    engine = make_engine(dsn)
+    sf = make_session_factory(engine)
+    try:
+        with sf() as session:
+            return int(
+                session.execute(
+                    text(
+                        "SELECT count(*) FROM audit_log "
+                        "WHERE action IN ('event_received','event_merged')"
+                    )
+                ).scalar()
+                or 0
+            )
+    finally:
         engine.dispose()
 
-        port = _free_port()
-        cfg = {
-            "temporal": {"address": "localhost:7233", "namespace": "default", "task_queue": "t"},
-            "storage": {
-                "postgres_dsn": dsn,
-                "s3_endpoint": "http://127.0.0.1:9",
-                "s3_bucket": "b",
-                "s3_access_key": "a",
-                "s3_secret_key": "s",
-                "s3_region": "us-east-1",
-            },
-            "model_gateway": {"url": "http://127.0.0.1:9", "master_key": "k"},
-            "probe_gateway": {"url": "http://127.0.0.1:9"},
-            "signing": {"key_path": "/tmp/nope", "rotation_grace_seconds": 600},
-            "dashboard": {"jwt_secret": "j", "cors_origins": [], "bootstrap_ca_cert_path": ""},
-            "notifications": {"outbound_webhooks": []},
-            "ingest": {
-                "sources": [{"name": "grafana-b1", "secret": HMAC_SECRET}],
-                "correlation_window_seconds": 1800,
-            },
-            "budget_defaults": {
-                "max_rounds": 15,
-                "max_cost_usd": 10.0,
-                "max_wall_seconds": 1800,
-            },
-            "agents": {},
-            "tracing": {"backend": "builtin"},
-        }
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            yaml.safe_dump(cfg, f)
-            cfg_path = f.name
 
-        env = os.environ.copy()
-        env["DBAGENT_GATEWAY_CONFIG"] = cfg_path
-        env["PYTHONPATH"] = os.pathsep.join(
-            [
-                str(_PROFILE_PATH.parent),
-                str(REPO_ROOT / "services" / "gateway"),
-                str(REPO_ROOT / "libs" / "py" / "rca_common"),
-            ]
+def _run_b1_reference(profile: B1Profile, tmp_path_factory):
+    """One placement-valid B1 measurement of ``profile``.
+
+    The driver never starts a gateway inside its own container: the two
+    measured siblings are peer containers, each narrowed to its own exact,
+    pairwise-disjoint CPU set, so every role has an independent and
+    inspectable allocation. Placement is proven before warmup and again at
+    window close; a bad declaration raises ``B1PlacementError`` and no burst is
+    offered under it, while closing drift invalidates the run before any
+    verdict is emitted.
+    """
+    import docker
+    from testcontainers.core.config import ConnectionMode, testcontainers_config
+    from testcontainers.core.container import DockerContainer
+    from testcontainers.postgres import PostgresContainer
+
+    declaration = B1PlacementDeclaration.from_contract(_read_launch_contract())
+    if declaration.profile != profile.name:
+        raise B1PlacementError(
+            f"launch contract declares profile {declaration.profile!r}; this fixture "
+            f"measures {profile.name!r}"
         )
-        log_path = tmp_path_factory.mktemp("b1-gateway") / "gateway.log"
-        print(f"B1 gateway log={log_path}", flush=True)
-        endpoint = f"http://127.0.0.1:{port}/api/v1/events"
-        health = f"http://127.0.0.1:{port}/healthz"
+    client = docker.from_env()
+    driver = _resolve_driver_container(client, declaration)
+    image_id = driver.image.id
+    workspace_source = _driver_mount_source(driver, B1_WORKSPACE_MOUNT)
+    run_source = _driver_mount_source(driver, str(B1_RUN_MOUNT))
+    socket_source = _driver_mount_source(driver, B1_DOCKER_SOCKET)
+
+    run_dir = B1_RUN_MOUNT / f"profile-{profile.name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "gateway.log"
+    log_path.unlink(missing_ok=True)
+    cfg_path = run_dir / "gateway.yaml"
+    gateway_cpus = declaration.allowed("gateway")
+    postgres_cpus = declaration.allowed("postgres")
+
+    with ExitStack() as stack:
+        stack.callback(_verify_no_survivors, client, declaration)
+        previous_ryuk = testcontainers_config.ryuk_disabled
+        # Ryuk is an unmeasured sidecar: it would be a fourth uncontrolled
+        # container inside the measured window, on nobody's declared CPUs.
+        # Scoped to this ExitStack only, never a persistent global setting.
+        testcontainers_config.ryuk_disabled = True
+        stack.callback(_restore_ryuk, testcontainers_config, previous_ryuk)
+        # The driver is in the host network namespace by construction, so a
+        # sibling's published port is on loopback there. testcontainers would
+        # otherwise autodetect "inside a container" and hand back the bridge
+        # gateway address, which nothing is listening on. Scoped to this stack
+        # and restored with it, exactly like the Ryuk setting above.
+        for name, value in (
+            ("connection_mode_override", ConnectionMode.docker_host),
+            ("tc_host_override", B1_SIBLING_HOST),
+        ):
+            stack.callback(
+                _restore_attr, testcontainers_config, name,
+                getattr(testcontainers_config, name),
+            )
+            setattr(testcontainers_config, name, value)
+
+        postgres = PostgresContainer(
+            "postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent"
+        )
+        # No quota, no period, no cpuset: the allocation is scheduler affinity
+        # and it is applied to the process tree, below.
+        postgres.with_kwargs(labels=declaration.labels("postgres"))
+        stack.enter_context(postgres)
+
+        # Both profiles pin PostgreSQL the same way. The postmaster is
+        # Docker-owned, so exactly one short-lived CAP_SYS_NICE helper narrows
+        # its tree and reads every member back; new backends inherit it.
+        _pin_postgres_tree(
+            client,
+            declaration,
+            image_id=image_id,
+            container_id=postgres.get_wrapped_container().id,
+            workspace_source=workspace_source,
+            socket_source=socket_source,
+        )
+        postgres_pid = _container_root_pid(postgres)
+
+        dsn = postgres.get_connection_url()
+        _migrate_and_seed(dsn)
+        cfg_path.write_text(yaml.safe_dump(_gateway_config(dsn)), encoding="utf-8")
+
+        port = _free_port()
+        gateway_command = (
+            f"taskset -c {b1.format_cpu_list(gateway_cpus)} "
+            f"python3 {B1_GATEWAY_IMPORT_PATH} --host {B1_SIBLING_HOST} --port {port}"
+        )
+        gateway = DockerContainer(image_id)
+        gateway.with_command(gateway_command)
+        gateway.with_env("DBAGENT_GATEWAY_CONFIG", str(cfg_path))
+        gateway.with_env(
+            "PYTHONPATH",
+            os.pathsep.join(
+                [
+                    f"{B1_WORKSPACE_MOUNT}/services/gateway/tests",
+                    f"{B1_WORKSPACE_MOUNT}/services/gateway",
+                    f"{B1_WORKSPACE_MOUNT}/libs/py/rca_common",
+                ]
+            ),
+        )
+        gateway.with_volume_mapping(workspace_source, B1_WORKSPACE_MOUNT, "ro")
+        gateway.with_volume_mapping(run_source, str(B1_RUN_MOUNT), "rw")
+        gateway.with_kwargs(
+            labels=declaration.labels("gateway"),
+            network_mode="host",
+            working_dir=B1_WORKSPACE_MOUNT,
+        )
+        stack.enter_context(gateway)
+
+        endpoint = f"http://{B1_SIBLING_HOST}:{port}/api/v1/events"
+        health = f"http://{B1_SIBLING_HOST}:{port}/healthz"
+        _wait_for_gateway(gateway, health, log_path)
+
+        assert httpx.get(health, timeout=5).status_code == 200
+        platform_online = True
+
+        gateway_pid = _container_root_pid(gateway)
+        trackers_pre, workers_pre = b1.wait_for_classified_workers(
+            gateway_pid, workers=b1.INGEST_GATEWAY_WORKERS
+        )
+        gateway_pids = (gateway_pid, *sorted(workers_pre), *sorted(trackers_pre))
+
+        host_cpus = _host_cpu_ids()
+        witness = B1PlacementWitness(declaration, host_cpus=host_cpus)
+
+        driver_root_pid = _container_root_pid(driver)
+
+        def _probe(when: str, workers, gw_pids, pg_pid):
+            # The driver role is its container root plus the live pytest tree:
+            # everything beneath the `taskset` the launcher applied.
+            return {
+                "gateway": _role_placement("gateway", gw_pids),
+                "postgres": _role_placement("postgres", _tree_pids(pg_pid)),
+                "driver": _role_placement(
+                    "driver", (driver_root_pid, *_tree_pids(os.getpid()))
+                ),
+            }
+
+        roles_open = _probe("open", workers_pre, gateway_pids, postgres_pid)
+        # `cpus` is os.cpu_count(), never the affinity-restricted count: the
+        # driver now runs under taskset, so sched_getaffinity(0) would report 1
+        # and silently demote a real CI run to `local-replica`.
+        fp = _host_fingerprint()
+        authority = witness.authority(int(fp["cpus"]))
+        failures = witness.failures(roles_open, gateway_worker_pids=workers_pre, when="open")
+        if failures:
+            print(
+                _placement_fingerprint(declaration, authority, roles_open, failures),
+                flush=True,
+            )
+            raise B1PlacementError(
+                f"{profile.name}: declared placement not observed at window open; "
+                f"run dir {run_dir}; " + "; ".join(failures)
+            )
+
+        warmup = _build_requests(1)[0]
+        prologue = _build_requests(profile.prologue_requests)
+        measured = _build_requests(profile.total_requests)
+        marks: dict = {}
+
+        def _collect_cpu_diagnostics(phase: str) -> None:
+            notes: list[str] = []
+            for role, container in (("gateway", gateway), ("postgres", postgres), ("driver", None)):
+                files = _try_diagnostic(
+                    f"{role} cgroup files", notes, lambda c=container: _read_cpu_files(c)
+                )
+                marks[f"{role}_cpu_max_{phase}"] = files[0] if files else None
+                marks[f"{role}_cpu_stat_{phase}"] = files[1] if files else None
+            marks[f"busy_{phase}"] = _try_diagnostic(
+                "gateway /proc/stat", notes,
+                lambda: _gateway_set_busy_usec(roles_open["gateway"].allowed_cpus),
+            )
+            marks.setdefault("diagnostic_notes", []).extend(notes)
+
+        def _after_prologue() -> None:
+            # Snapshot AFTER the unmeasured prologue so CPU/audit exclude it (C2).
+            _collect_cpu_diagnostics("before")
+            marks["committed_before"] = _committed_ingest_rows(dsn)
+
+        def _after_window() -> None:
+            # Close the reported CPU interval at drain/census stop, before the
+            # O(N) leg derivation; the log prefix is taken strictly after it.
+            _collect_cpu_diagnostics("after")
+            marks["log_prefix_bytes"] = _snapshot_container_log(gateway, log_path)
+
+        result = asyncio.run(
+            b1.run_open_loop(
+                endpoint=endpoint,
+                requests=measured,
+                rate=profile.rate,
+                max_in_flight=profile.max_in_flight,
+                warmup=warmup,
+                prologue=prologue,
+                include_sync_warmup=True,
+                on_prologue_complete=_after_prologue,
+                on_window_complete=_after_window,
+                serve_port=port,
+                worker_pids=sorted(workers_pre),
+            )
+        )
+        concurrency_limit_warnings = _b1_gateway_warning_count(
+            log_path, marks["log_prefix_bytes"]
+        )
+        trackers_post, workers_post = b1.classify_tree(gateway_pid)
+        gateway_pids_post = (gateway_pid, *sorted(workers_post), *sorted(trackers_post))
+
+        # Closing placement gate: a late process that escaped its declared set
+        # invalidates the run before any B1 verdict is emitted.
+        roles_close = _probe("close", workers_post, gateway_pids_post, postgres_pid)
+        closing = witness.failures(roles_close, gateway_worker_pids=workers_post, when="close")
+        if closing:
+            print(
+                _placement_fingerprint(declaration, authority, roles_close, closing),
+                flush=True,
+            )
+            raise B1PlacementError(
+                f"{profile.name}: placement drifted during the measured window; "
+                f"run dir {run_dir}; " + "; ".join(closing)
+            )
+
+        shed_probe = asyncio.run(b1.run_shed_probe(B1_SIBLING_HOST, port))
+
+        diagnostics = {
+            role: _role_diagnostics(
+                role,
+                marks.get(f"{role}_cpu_max_after"),
+                marks.get(f"{role}_cpu_stat_before"),
+                marks.get(f"{role}_cpu_stat_after"),
+            )
+            for role in B1_ROLES
+        }
+        busy_delta = _try_diagnostic(
+            "gateway busy delta", marks.setdefault("diagnostic_notes", []),
+            lambda: _busy_delta(marks["busy_before"], marks["busy_after"]),
+        )
+        span = result.t_last_complete - result.due0
+        if span <= 0:
+            raise B1PlacementError(f"measured span is not positive: {span}")
+        if result.served <= 0:
+            raise B1PlacementError("no request was served; the measurement is undefined")
+        usage_usec = diagnostics["gateway"].usage_usec_delta
+        cpu_ms = usage_usec / 1000.0 / result.served if usage_usec is not None else None
+        cpu_cores_used = usage_usec / 1_000_000.0 / span if usage_usec is not None else None
+        nonrole_busy_cores = (
+            (sum(busy_delta.values()) - usage_usec) / 1_000_000.0 / span
+            if (busy_delta is not None and usage_usec is not None)
+            else None
+        )
+        worker_set_ok = trackers_post == trackers_pre and workers_post == workers_pre
+
+        committed = _committed_ingest_rows(dsn) - int(marks.get("committed_before", 0))
+        values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
+        basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
+
+        med_a, med_b = b1.half_window_medians(result.latencies_ms)
+        status_histogram = b1.serialize_status_histogram(result.status_codes)
+        peak_est = result.peak_established_connections
+        peak_est_str = str(peak_est) if isinstance(peak_est, int) else peak_est
+        peak_pool_conn = result.peak_pool_connections
+        peak_pool_conn_str = str(peak_pool_conn) if isinstance(peak_pool_conn, int) else peak_pool_conn
+        peak_pool_q = result.peak_pool_queued
+        peak_pool_q_str = str(peak_pool_q) if isinstance(peak_pool_q, int) else peak_pool_q
+        pool_seen = result.pool_connections_seen
+        pool_seen_str = str(pool_seen) if isinstance(pool_seen, int) else pool_seen
+        worker_peaks = result.worker_established_peaks
+        worker_peaks_str = b1.serialize_worker_established_peaks(worker_peaks)
+        peak_worker_est = result.peak_worker_established
+        peak_worker_est_str = (
+            str(peak_worker_est) if isinstance(peak_worker_est, int) else peak_worker_est
+        )
+        p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
+        leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
+        verdicts = (
+            _product_promise_verdicts(result)
+            if profile.name == PRODUCT_PROFILE_NAME
+            else OrderedDict()
+        )
+        product_fields = serialize_product_verdicts(verdicts)
+        placement_fields = _serialize_placement_fields(
+            declaration,
+            authority,
+            roles_close,
+            diagnostics,
+            busy_delta,
+            nonrole_busy_cores,
+            cpu_cores_used,
+        )
+        cpu_ms_str = f"{cpu_ms:.3f}" if cpu_ms is not None else DIAGNOSTIC_UNAVAILABLE
+        for note in marks.get("diagnostic_notes", []):
+            print(f"B1 diagnostic unavailable: {note}", flush=True)
+        fingerprint_line = (
+            f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
+            f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
+            f"{placement_fields}"
+            f"max_lateness_ms={result.max_lateness_ms:.1f},"
+            f"p99_ms={result.p99:.1f},served_rate={result.served_rate:.1f},"
+            f"served={result.served},errors={result.errors},committed={int(committed)},"
+            f"platform_online={1 if platform_online else 0},"
+            f"workers_pre={b1.format_pid_list(workers_pre)},"
+            f"workers_post={b1.format_pid_list(workers_post)},"
+            f"median_lateness_a_ms={med_a:.1f},median_lateness_b_ms={med_b:.1f},"
+            f"lateness_drift_ms={result.lateness_drift_ms:.1f},"
+            f"cpu_ms_per_req={cpu_ms_str},"
+            f"basis_ms_per_req={basis},"
+            f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog},"
+            f"status_histogram={status_histogram},"
+            f"concurrency_limit_warnings={concurrency_limit_warnings},"
+            f"peak_established_connections={peak_est_str},"
+            f"shed_probe={shed_probe},"
+            f"peak_pool_connections={peak_pool_conn_str},"
+            f"peak_pool_requests={result.peak_pool_requests},"
+            f"peak_pool_queued={peak_pool_q_str},"
+            f"pool_connections_seen={pool_seen_str},"
+            f"worker_established_peaks={worker_peaks_str},"
+            f"peak_worker_established={peak_worker_est_str},"
+            f"{product_fields}"
+            f"p99_leg_split={p99_leg_split_str},"
+            f"leg_p99s={leg_p99s_str}"
+        )
+        print(fingerprint_line, flush=True)
+
+        yield {
+            "profile": profile,
+            "declaration": declaration,
+            "placement_ok": True,
+            "placement": roles_close,
+            "placement_open": roles_open,
+            "measurement_authority": authority,
+            "diagnostics": diagnostics,
+            "gateway_cpu_busy_usec": busy_delta,
+            "gateway_nonrole_busy_cores_estimate": nonrole_busy_cores,
+            "product_verdicts": dict(verdicts),
+            "result": result,
+            "committed": int(committed),
+            "cpu_ms_per_request": cpu_ms,
+            "gateway_cpu_cores_used": cpu_cores_used,
+            "worker_set_ok": worker_set_ok,
+            "workers_pre": workers_pre,
+            "workers_post": workers_post,
+            "fingerprint": fingerprint_line,
+            "status_histogram": status_histogram,
+            "concurrency_limit_warnings": concurrency_limit_warnings,
+            "gateway_log_path": log_path,
+            "peak_established_connections": peak_est,
+            "peak_pool_connections": peak_pool_conn,
+            "peak_pool_queued": peak_pool_q,
+            "pool_connections_seen": pool_seen,
+            "worker_established_peaks": worker_peaks,
+            "peak_worker_established": peak_worker_est,
+            "p99_leg_split": result.p99_leg_split,
+            "leg_p99s": result.leg_p99s,
+            "shed_probe": shed_probe,
+            "host": fp,
+            "platform_online": platform_online,
+            "basis_ms_per_req": basis,
+        }
+
+
+def _pin_postgres_tree(client, declaration, *, image_id, container_id, workspace_source,
+                       socket_source) -> None:
+    """Run the closed pin helper once, before warmup, then let it disappear."""
+    cpus = declaration.allowed("postgres")
+    client.containers.run(
+        image_id,
+        command=[
+            "python3",
+            f"{B1_WORKSPACE_MOUNT}/scripts/b1-affinity-helper.py",
+            "pin-postgres",
+            container_id,
+            b1.format_cpu_list(cpus),
+            declaration.run_label,
+        ],
+        network_mode="host",
+        pid_mode="host",
+        cap_add=["SYS_NICE"],
+        volumes={
+            workspace_source: {"bind": B1_WORKSPACE_MOUNT, "mode": "ro"},
+            socket_source: {"bind": B1_DOCKER_SOCKET, "mode": "rw"},
+        },
+        labels=declaration.labels("pin-helper"),
+        remove=True,
+        detach=False,
+    )
+
+
+def _wait_for_gateway(gateway, health: str, log_path: Path, *, timeout_s: float = 120.0) -> None:
+    deadline = time.time() + timeout_s
+    wrapped = gateway.get_wrapped_container()
+    while time.time() < deadline:
+        wrapped.reload()
+        if wrapped.status not in {"running", "created"}:
+            _snapshot_container_log(gateway, log_path)
+            raise B1PlacementError(
+                f"gateway container is {wrapped.status}; log={log_path}; tail:\n"
+                f"{_b1_gateway_log_tail(log_path)}"
+            )
         try:
-            with _b1_gateway_process(
-                [sys.executable, str(_PROFILE_PATH), "--host", "127.0.0.1", "--port", str(port)],
-                env=env, log_path=log_path,
-            ) as proc:
-                deadline = time.time() + 30
-                while time.time() < deadline:
-                    if proc.poll() is not None:
-                        raise RuntimeError("gateway exited early")
-                    try:
-                        r = httpx.get(health, timeout=1.0)
-                        if r.status_code == 200:
-                            break
-                    except Exception:
-                        time.sleep(0.2)
-                else:
-                    raise RuntimeError("gateway never became healthy")
+            if httpx.get(health, timeout=1.0).status_code == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+    _snapshot_container_log(gateway, log_path)
+    raise B1PlacementError(
+        f"gateway never became healthy; log={log_path}; tail:\n{_b1_gateway_log_tail(log_path)}"
+    )
 
-                # ONLINE precondition — platform row is online; health proves reachability.
-                assert httpx.get(health, timeout=5).status_code == 200
-                platform_online = True
 
-                # FP-IG-22: wait for the classified serving tree before any CPU read.
-                workers_pre: set[int]
-                trackers_pre: set[int]
-                trackers_pre, workers_pre = b1.wait_for_classified_workers(
-                    proc.pid, workers=b1.INGEST_GATEWAY_WORKERS
-                )
+def _busy_delta(before: dict[int, int], after: dict[int, int]) -> dict[int, int]:
+    if before is None or after is None:
+        raise b1.B1PlacementParseError("gateway-set /proc/stat sample missing")
+    if set(before) != set(after):
+        raise b1.B1PlacementParseError(
+            f"gateway-set /proc/stat CPUs changed mid-window: {sorted(before)} -> {sorted(after)}"
+        )
+    out: dict[int, int] = {}
+    for cpu in sorted(before):
+        delta = after[cpu] - before[cpu]
+        if delta < 0:
+            raise b1.B1PlacementParseError(f"cpu{cpu} busy counter decreased across the window")
+        out[cpu] = delta
+    return out
 
-                warmup = _build_requests(1)[0]
-                prologue = _build_requests(b1.PROLOGUE_REQUESTS)
-                measured = _build_requests(b1.TOTAL_REQUESTS)
-                import asyncio
 
-                marks: dict = {}
+def _serialize_placement_fields(declaration, authority, roles, diagnostics, busy_delta,
+                                nonrole_busy_cores, cpu_cores_used) -> str:
+    """Gating identity and affinity first; every reported diagnostic after.
 
-                def _after_prologue() -> None:
-                    # Snapshot AFTER unmeasured prologue so CPU/audit exclude it (C2).
-                    marks["cpu_before"] = b1.tree_cpu_seconds(proc.pid)
-                    engine_p = make_engine(dsn)
-                    sf_p = make_session_factory(engine_p)
-                    with sf_p() as session:
-                        from sqlalchemy import text
+    The three ``*_allowed_cpus`` values are the CLOSING effective sets, never
+    copies of the launch contract.
+    """
+    parts = [
+        f"placement_profile={declaration.profile}",
+        f"placement_schema={declaration.schema}",
+        f"placement_run_id={declaration.run_id}",
+        f"measurement_authority={authority}",
+        "placement_ok=1",
+    ]
+    for role in B1_ROLES:
+        parts.append(f"{role}_allowed_cpus={b1.format_cpu_list(roles[role].allowed_cpus)}")
+    for role in B1_ROLES:
+        parts.extend(f"{name}={value}" for name, value in diagnostics[role].rendered())
+    busy = (
+        b1.serialize_cpu_busy(busy_delta) if busy_delta is not None else DIAGNOSTIC_UNAVAILABLE
+    )
+    parts.extend(
+        [
+            f"gateway_cpu_busy_usec={busy}",
+            "gateway_nonrole_busy_cores_estimate="
+            + (f"{nonrole_busy_cores:.3f}" if nonrole_busy_cores is not None
+               else DIAGNOSTIC_UNAVAILABLE),
+            "gateway_cpu_cores_used="
+            + (f"{cpu_cores_used:.2f}" if cpu_cores_used is not None
+               else DIAGNOSTIC_UNAVAILABLE),
+        ]
+    )
+    return ",".join(parts) + ","
 
-                        marks["committed_before"] = int(
-                            session.execute(
-                                text(
-                                    "SELECT count(*) FROM audit_log "
-                                    "WHERE action IN ('event_received','event_merged')"
-                                )
-                            ).scalar()
-                            or 0
-                        )
-                    engine_p.dispose()
 
-                def _after_window() -> None:
-                    # Close the gateway CPU interval at drain/census stop, before
-                    # O(N) leg derivation. Meaning of cpu_after is unchanged: end
-                    # of the measured window, not end of post-window arithmetic.
-                    marks["cpu_after"] = b1.tree_cpu_seconds(proc.pid)
-                    marks["log_prefix_bytes"] = log_path.stat().st_size
+def _placement_fingerprint(declaration, authority, roles, failures) -> str:
+    """Printed on a mismatch, before the run is refused: no verdict follows it."""
+    parts = [
+        f"placement_profile={declaration.profile}",
+        f"placement_schema={declaration.schema}",
+        f"placement_run_id={declaration.run_id}",
+        f"measurement_authority={authority}",
+        "placement_ok=0",
+    ]
+    for role in B1_ROLES:
+        found = roles.get(role)
+        if found is None or not found.allowed_cpus:
+            parts.append(f"{role}_allowed_cpus=missing")
+            continue
+        parts.append(f"{role}_allowed_cpus={b1.format_cpu_list(found.allowed_cpus)}")
+    return "B1 placement=" + ",".join(parts) + ",failures=" + "|".join(failures)
 
-                result = asyncio.run(
-                    b1.run_open_loop(
-                        endpoint=endpoint,
-                        requests=measured,
-                        rate=b1.BURST_RATE,
-                        max_in_flight=b1.MAX_IN_FLIGHT,
-                        warmup=warmup,
-                        prologue=prologue,
-                        include_sync_warmup=True,
-                        on_prologue_complete=_after_prologue,
-                        on_window_complete=_after_window,
-                        serve_port=port,
-                        worker_pids=sorted(workers_pre),
-                    )
-                )
-                concurrency_limit_warnings = _b1_gateway_warning_count(
-                    log_path, marks["log_prefix_bytes"]
-                )
-                cpu_after = float(marks["cpu_after"])
-                trackers_post, workers_post = b1.classify_tree(proc.pid)
-                shed_probe = asyncio.run(
-                    b1.run_shed_probe("127.0.0.1", port)
-                )
-                cpu_before = float(marks.get("cpu_before", cpu_after))
-                span = result.t_last_complete - result.due0
-                cpu_ms = (
-                    (cpu_after - cpu_before) * 1000.0 / result.served if result.served else float("inf")
-                )
-                cpu_cores_used = (cpu_after - cpu_before) / span if span > 0 else 0.0
-                worker_set_ok = (
-                    trackers_post == trackers_pre and workers_post == workers_pre
-                )
 
-                # committed count of the measured window only
-                engine = make_engine(dsn)
-                sf = make_session_factory(engine)
-                with sf() as session:
-                    from sqlalchemy import text
+@pytest.fixture(scope="module")
+def b1_ci_scale_run(tmp_path_factory):
+    """FP-GC1-1/4: the gating CI-scale burst under the declared 2/1/1 affinity."""
+    yield from _run_b1_reference(CI_SCALE_PROFILE, tmp_path_factory)
 
-                    committed_total = int(
-                        session.execute(
-                            text(
-                                "SELECT count(*) FROM audit_log "
-                                "WHERE action IN ('event_received','event_merged')"
-                            )
-                        ).scalar()
-                        or 0
-                    )
-                engine.dispose()
-                committed = committed_total - int(marks.get("committed_before", 0))
 
-                values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
-                basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
-
-                fp = _host_fingerprint()
-                med_a, med_b = b1.half_window_medians(result.latencies_ms)
-                status_histogram = b1.serialize_status_histogram(result.status_codes)
-                peak_est = result.peak_established_connections
-                peak_est_str = (
-                    str(peak_est) if isinstance(peak_est, int) else peak_est
-                )
-                peak_pool_conn = result.peak_pool_connections
-                peak_pool_conn_str = (
-                    str(peak_pool_conn) if isinstance(peak_pool_conn, int) else peak_pool_conn
-                )
-                peak_pool_q = result.peak_pool_queued
-                peak_pool_q_str = (
-                    str(peak_pool_q) if isinstance(peak_pool_q, int) else peak_pool_q
-                )
-                pool_seen = result.pool_connections_seen
-                pool_seen_str = (
-                    str(pool_seen) if isinstance(pool_seen, int) else pool_seen
-                )
-                worker_peaks = result.worker_established_peaks
-                worker_peaks_str = b1.serialize_worker_established_peaks(worker_peaks)
-                peak_worker_est = result.peak_worker_established
-                peak_worker_est_str = (
-                    str(peak_worker_est)
-                    if isinstance(peak_worker_est, int)
-                    else peak_worker_est
-                )
-                p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
-                leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
-                fingerprint_line = (
-                    f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
-                    f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
-                    f"max_lateness_ms={result.max_lateness_ms:.1f},"
-                    f"p99_ms={result.p99:.1f},served_rate={result.served_rate:.1f},"
-                    f"served={result.served},errors={result.errors},committed={int(committed)},"
-                    f"platform_online={1 if platform_online else 0},"
-                    f"workers_pre={b1.format_pid_list(workers_pre)},"
-                    f"workers_post={b1.format_pid_list(workers_post)},"
-                    f"median_lateness_a_ms={med_a:.1f},median_lateness_b_ms={med_b:.1f},"
-                    f"lateness_drift_ms={result.lateness_drift_ms:.1f},"
-                    f"cpu_ms_per_req={cpu_ms:.3f},cpu_cores_used={cpu_cores_used:.2f},"
-                    f"basis_ms_per_req={basis},"
-                    f"max_in_flight={result.max_in_flight},max_backlog={result.max_backlog},"
-                    f"status_histogram={status_histogram},"
-                    f"concurrency_limit_warnings={concurrency_limit_warnings},"
-                    f"peak_established_connections={peak_est_str},"
-                    f"shed_probe={shed_probe},"
-                    f"peak_pool_connections={peak_pool_conn_str},"
-                    f"peak_pool_requests={result.peak_pool_requests},"
-                    f"peak_pool_queued={peak_pool_q_str},"
-                    f"pool_connections_seen={pool_seen_str},"
-                    f"worker_established_peaks={worker_peaks_str},"
-                    f"peak_worker_established={peak_worker_est_str},"
-                    f"p99_leg_split={p99_leg_split_str},"
-                    f"leg_p99s={leg_p99s_str}"
-                )
-                print(fingerprint_line, flush=True)
-
-                yield {
-                    "result": result,
-                    "committed": int(committed),
-                    "cpu_ms_per_request": cpu_ms,
-                    "cpu_cores_used": cpu_cores_used,
-                    "alive": proc.poll() is None,
-                    "worker_set_ok": worker_set_ok,
-                    "workers_pre": workers_pre,
-                    "workers_post": workers_post,
-                    "fingerprint": fingerprint_line,
-                    "status_histogram": status_histogram,
-                    "concurrency_limit_warnings": concurrency_limit_warnings,
-                    "gateway_log_path": log_path,
-                    "peak_established_connections": peak_est,
-                    "peak_pool_connections": peak_pool_conn,
-                    "peak_pool_queued": peak_pool_q,
-                    "pool_connections_seen": pool_seen,
-                    "worker_established_peaks": worker_peaks,
-                    "peak_worker_established": peak_worker_est,
-                    "p99_leg_split": result.p99_leg_split,
-                    "leg_p99s": result.leg_p99s,
-                    "shed_probe": shed_probe,
-                    "host": fp,
-                    "platform_online": platform_online,
-                    "basis_ms_per_req": basis,
-                }
-        finally:
-            Path(cfg_path).unlink(missing_ok=True)
+@pytest.fixture(scope="module")
+def b1_product_run(tmp_path_factory):
+    """FP-GC1-3/4: the recorded product-promise burst on exclusive 4/3/1 cores."""
+    yield from _run_b1_reference(PRODUCT_PROFILE, tmp_path_factory)
 
 
 # Module-scope bars for the manifest threshold checker (ordering comparisons
 # against bare Name bindings to numeric literals — FP-M6-31 / §11.1.3).
-P99_MS = 150.0
-SUSTAINED_FLOOR = 200
-MAX_IN_FLIGHT = 1000
-TOTAL_REQUESTS = 30000
+#
+# Two independent literal sets, one per tier. They are deliberately literals
+# rather than imported profile values: the covered-entry AST guard resolves
+# numeric bindings in this file and does not trust an imported runtime value
+# as a threshold, so a drifted profile constant must be caught by the delivery
+# pin that compares the two — not hidden behind an alias.
+CI_SCALE_P99_MS = 150.0
+CI_SCALE_SUSTAINED_FLOOR = 450
+CI_SCALE_MAX_IN_FLIGHT = 500
+CI_SCALE_TOTAL_REQUESTS = 15000
+PRODUCT_P99_MS = 150.0
+PRODUCT_SUSTAINED_FLOOR = 200
+PRODUCT_MAX_IN_FLIGHT = 1000
+PRODUCT_TOTAL_REQUESTS = 30000
 
 
-def test_b1_ingest_burst_reference_profile(b1_reference_run):
-    """FP-IG-7: seven B1 clauses + harness integrity."""
-    r = b1_reference_run["result"]
-    committed = b1_reference_run["committed"]
+@pytest.mark.b1_live
+def test_b1_ci_scale_reference_profile(b1_ci_scale_run):
+    """FP-GC1-1: the gating CI-scale bar under the declared CPU quotas.
+
+    Renamed from ``test_b1_ingest_burst_reference_profile``, not duplicated:
+    this is the same seven-clause B1 shape, restated as fixed numbers for the
+    2.00/1.00/0.50-CPU four-vCPU allocation. It is explicitly not the product
+    promise and predicts nothing about the later write-path slice.
+    """
+    r = b1_ci_scale_run["result"]
+    committed = b1_ci_scale_run["committed"]
     served = r.served
     errors = r.errors
     offered = r.offered
     p99 = r.p99
     served_rate = r.served_rate
     max_in_flight = r.max_in_flight
+    # (0) placement is a precondition, re-asserted here so a fixture refactor
+    # cannot quietly remove it.
+    assert b1_ci_scale_run["placement_ok"] is True, b1_ci_scale_run["fingerprint"]
+    assert offered == CI_SCALE_TOTAL_REQUESTS, (
+        f"offered={offered}; {b1_ci_scale_run['fingerprint']}"
+    )
     # (7) platform ONLINE — fixture seeds status=online and asserts reachability
-    platform_online = b1_reference_run["platform_online"]
+    platform_online = b1_ci_scale_run["platform_online"]
     assert platform_online == True  # noqa: E712 — named Eq for FP-IG-19
     # (1)(2)(3)
     assert served + errors == offered, (
-        f"served+errors!=offered {served}+{errors}!={offered}; {b1_reference_run['fingerprint']}"
+        f"served+errors!=offered {served}+{errors}!={offered}; {b1_ci_scale_run['fingerprint']}"
     )
-    assert errors == 0, f"errors={errors}; {b1_reference_run['fingerprint']}"
-    assert served == offered, f"served={served}; {b1_reference_run['fingerprint']}"
+    assert errors == 0, f"errors={errors}; {b1_ci_scale_run['fingerprint']}"
+    assert served == offered, f"served={served}; {b1_ci_scale_run['fingerprint']}"
     # (4) ordering comparison against module constant — measurement-of-record bar
-    assert p99 < P99_MS, f"p99={p99}; {b1_reference_run['fingerprint']}"
+    assert p99 < CI_SCALE_P99_MS, f"p99={p99}; {b1_ci_scale_run['fingerprint']}"
     # (5)
     assert committed == served, (
-        f"committed={committed} served={served}; {b1_reference_run['fingerprint']}"
+        f"committed={committed} served={served}; {b1_ci_scale_run['fingerprint']}"
     )
     # (6)
-    assert served_rate >= SUSTAINED_FLOOR, (
-        f"served_rate={served_rate}; {b1_reference_run['fingerprint']}"
+    assert served_rate >= CI_SCALE_SUSTAINED_FLOOR, (
+        f"served_rate={served_rate}; {b1_ci_scale_run['fingerprint']}"
     )
     # harness integrity
-    assert max_in_flight < MAX_IN_FLIGHT, (
+    assert max_in_flight < CI_SCALE_MAX_IN_FLIGHT, (
         f"max_in_flight={max_in_flight} hit ceiling; harness was binding"
     )
-    assert b1_reference_run["worker_set_ok"], (
+    assert b1_ci_scale_run["worker_set_ok"], (
         f"worker set changed or under-populated; "
-        f"pre={sorted(b1_reference_run['workers_pre'])} "
-        f"post={sorted(b1_reference_run['workers_post'])}"
+        f"pre={sorted(b1_ci_scale_run['workers_pre'])} "
+        f"post={sorted(b1_ci_scale_run['workers_post'])}"
     )
 
 
-def test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis(b1_reference_run):
-    """FP-IG-18: cpu_ms_per_request <= chart basis."""
+@pytest.mark.b1_live
+def test_b1_ci_scale_fingerprint_proves_placement(b1_ci_scale_run):
+    """FP-GC1-4: the CI-scale run carries its complete effective affinity.
+
+    The gating half is the three `*_allowed_cpus` sets -- exact, and pairwise
+    disjoint. Everything after them is a reported cgroup/host diagnostic and is
+    checked only for presence and shape: those values describe ambient policy,
+    not this run's allocation, and an `unavailable` among them is a truthful
+    record rather than a failure.
+    """
+    line = b1_ci_scale_run["fingerprint"]
+    declaration = b1_ci_scale_run["declaration"]
+    placement = b1_ci_scale_run["placement"]
+    assert "placement_ok=1" in line, line
+    assert _parse_b1_env_field(line, "placement_profile") == CI_SCALE_PROFILE_NAME
+    assert _parse_b1_env_field(line, "placement_schema") == str(B1_PLACEMENT_SCHEMA)
+    assert _parse_b1_env_field(line, "placement_run_id") == declaration.run_id
+    assert _parse_b1_env_field(line, "measurement_authority") == (
+        b1_ci_scale_run["measurement_authority"]
+    )
+    # Exact declared sets, at the declared cardinalities, read back from the
+    # kernel at window close.
+    observed: dict[str, frozenset[int]] = {}
+    for role, cardinality in CI_SCALE_AFFINITY_CARDINALITY.items():
+        effective = placement[role].allowed_cpus
+        observed[role] = effective
+        assert effective == declaration.allowed(role), role
+        assert len(effective) == cardinality, (role, sorted(effective))
+        assert _parse_b1_env_field(line, f"{role}_allowed_cpus") == b1.format_cpu_list(effective)
+        assert _parse_b1_env_field(line, f"{role}_allowed_cpus") != DIAGNOSTIC_UNAVAILABLE
+    assert not observed["gateway"] & observed["postgres"]
+    assert not observed["gateway"] & observed["driver"]
+    assert not observed["postgres"] & observed["driver"]
+    assert len(observed["gateway"] | observed["postgres"] | observed["driver"]) == 4
+    # The opening probe agreed with the closing one.
+    for role in B1_ROLES:
+        assert b1_ci_scale_run["placement_open"][role].allowed_cpus == observed[role]
+    # Gating fields precede every diagnostic, in the pinned order.
+    positions = [line.index(f"{name}=") for name in B1_GATING_PLACEMENT_FIELDS]
+    assert positions == sorted(positions), B1_GATING_PLACEMENT_FIELDS
+    assert max(positions) < min(line.index(f"{name}=") for name in B1_DIAGNOSTIC_PLACEMENT_FIELDS)
+    # Reported-only diagnostics: present, and either a legal value or
+    # `unavailable`. Their content never decides anything here.
+    for role in B1_ROLES:
+        quota = _parse_b1_env_field(line, f"{role}_quota_cpus")
+        assert quota == DIAGNOSTIC_UNAVAILABLE or quota == b1.CPU_QUOTA_MAX or float(quota) > 0
+        period = _parse_b1_env_field(line, f"{role}_cpu_period_us")
+        assert period == DIAGNOSTIC_UNAVAILABLE or int(period) > 0
+        for counter in ("nr_periods", "nr_throttled", "throttled_usec"):
+            value = _parse_b1_env_field(line, f"{role}_{counter}")
+            assert value == DIAGNOSTIC_UNAVAILABLE or int(value) >= 0
+    for name in ("gateway_cpu_busy_usec", "gateway_nonrole_busy_cores_estimate",
+                 "gateway_cpu_cores_used"):
+        assert f"{name}=" in line, name
+    assert "cpu_cores_used=" not in line.replace("gateway_cpu_cores_used=", "")
+    # The CI-scale fingerprint carries no product-verdict field.
+    for field_name in PRODUCT_VERDICT_FIELDS:
+        assert f"{field_name}=" not in line, line
+
+
+@pytest.mark.b1_live
+@pytest.mark.b1_product
+def test_b1_product_exclusive_reference_profile(b1_product_run):
+    """FP-GC1-3: the product promise, recorded on measured-role-exclusive cores.
+
+    Every placement, accounting and record-integrity assertion here is
+    failure-producing. The three product-promise comparisons are not: each is
+    evaluated once, serialized as ``met``/``missed``, and then checked only
+    for agreement with its own live comparison. A truthful ``missed`` is
+    recorded benchmark data, so it leaves this node, ``b1_product`` and
+    ``all`` green; a missing, malformed, literalized or inconsistent token
+    does not.
+    """
+    r = b1_product_run["result"]
+    committed = b1_product_run["committed"]
+    served = r.served
+    errors = r.errors
+    offered = r.offered
+    p99 = r.p99
+    served_rate = r.served_rate
+    max_in_flight = r.max_in_flight
+    line = b1_product_run["fingerprint"]
+    assert b1_product_run["placement_ok"] is True, line
+    assert offered == PRODUCT_TOTAL_REQUESTS, f"offered={offered}; {line}"
+    platform_online = b1_product_run["platform_online"]
+    assert platform_online == True  # noqa: E712 — named Eq for FP-IG-19
+    assert served + errors == offered, (
+        f"served+errors!=offered {served}+{errors}!={offered}; {line}"
+    )
+    assert committed == served, f"committed={committed} served={served}; {line}"
+    assert served_rate >= PRODUCT_SUSTAINED_FLOOR, f"served_rate={served_rate}; {line}"
+    assert max_in_flight < PRODUCT_MAX_IN_FLIGHT, (
+        f"max_in_flight={max_in_flight} hit ceiling; harness was binding"
+    )
+    assert b1_product_run["worker_set_ok"], (
+        f"worker set changed or under-populated; "
+        f"pre={sorted(b1_product_run['workers_pre'])} "
+        f"post={sorted(b1_product_run['workers_post'])}"
+    )
+
+    # Recorded, not gating: each serialized token must equal the result of its
+    # own live comparison. This deliberately does NOT assert any token is
+    # `met`.
+    live = {
+        "product_errors_eq_zero": VERDICT_MET if errors == 0 else VERDICT_MISSED,
+        "product_p99_lt_150_ms": VERDICT_MET if p99 < PRODUCT_P99_MS else VERDICT_MISSED,
+        "product_served_eq_offered": VERDICT_MET if served == offered else VERDICT_MISSED,
+    }
+    assert tuple(live) == PRODUCT_VERDICT_FIELDS
+    for field_name in PRODUCT_VERDICT_FIELDS:
+        assert line.count(f"{field_name}=") == 1, f"{field_name} is not carried exactly once; {line}"
+        token = _parse_b1_env_field(line, field_name)
+        assert token in (VERDICT_MET, VERDICT_MISSED), f"{field_name}={token!r}; {line}"
+        assert token == live[field_name], (
+            f"{field_name} serialized {token!r} but its live comparison says "
+            f"{live[field_name]!r}; {line}"
+        )
+        assert b1_product_run["product_verdicts"][field_name] == live[field_name]
+    assert line.index("product_errors_eq_zero=") < line.index("product_p99_lt_150_ms=")
+    assert line.index("product_p99_lt_150_ms=") < line.index("product_served_eq_offered=")
+    assert line.index("product_served_eq_offered=") < line.index("p99_leg_split=")
+
+
+@pytest.mark.b1_live
+@pytest.mark.b1_product
+def test_b1_product_fingerprint_proves_exclusive_placement(b1_product_run):
+    """FP-GC1-4: four gateway CPUs, exclusive of the other two measured roles."""
+    line = b1_product_run["fingerprint"]
+    placement = b1_product_run["placement"]
+    declaration = b1_product_run["declaration"]
+    assert "placement_ok=1" in line, line
+    assert _parse_b1_env_field(line, "placement_profile") == PRODUCT_PROFILE_NAME
+    assert _parse_b1_env_field(line, "placement_schema") == str(B1_PLACEMENT_SCHEMA)
+    assert _parse_b1_env_field(line, "measurement_authority") == AUTHORITY_PRODUCT_LOCAL
+    for role, cardinality in PRODUCT_AFFINITY_CARDINALITY.items():
+        effective = placement[role].allowed_cpus
+        assert effective == declaration.allowed(role), role
+        assert len(effective) == cardinality, (role, sorted(effective))
+        assert _parse_b1_env_field(line, f"{role}_allowed_cpus") == b1.format_cpu_list(effective)
+        assert b1_product_run["placement_open"][role].allowed_cpus == effective
+    gateway_cpus = placement["gateway"].allowed_cpus
+    assert len(gateway_cpus) == PRODUCT_GATEWAY_CPU_CARDINALITY, sorted(gateway_cpus)
+    assert not gateway_cpus & placement["postgres"].allowed_cpus
+    assert not gateway_cpus & placement["driver"].allowed_cpus
+    assert not placement["postgres"].allowed_cpus & placement["driver"].allowed_cpus
+    assert len(
+        gateway_cpus | placement["postgres"].allowed_cpus | placement["driver"].allowed_cpus
+    ) == 8
+    assert len(placement["gateway"].pids) >= b1.INGEST_GATEWAY_WORKERS + 1
+    assert set(b1_product_run["workers_post"]) <= set(placement["gateway"].pids)
+    # Reported cgroup values cannot turn a correctly placed run into a
+    # placement failure, whatever they say.
+    for role in B1_ROLES:
+        quota = _parse_b1_env_field(line, f"{role}_quota_cpus")
+        assert quota == DIAGNOSTIC_UNAVAILABLE or quota == b1.CPU_QUOTA_MAX or float(quota) > 0
+
+
+@pytest.mark.b1_live
+@pytest.mark.b1_latency_basis
+def test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis(b1_ci_scale_run):
+    """FP-IG-18: cpu_ms_per_request <= chart basis.
+
+    Unchanged comparison, unchanged 2.427 basis. GC-1 neither selects nor
+    repairs this node: requalifying the basis needs five real post-GC-1 CI
+    runs and would move shipped sizing values, which belongs to the separate
+    ``B1-LATENCY-BASIS-1`` slice. Its red, if it is red, is reported there --
+    never skipped, weakened, or counted as a GC-1 pass.
+    """
     values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
     basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
-    measured = b1_reference_run["cpu_ms_per_request"]
+    measured = b1_ci_scale_run["cpu_ms_per_request"]
     assert measured <= basis, (
         f"cpu_ms_per_request={measured} exceeds basis={basis}; "
-        f"{b1_reference_run['fingerprint']}"
+        f"{b1_ci_scale_run['fingerprint']}"
     )
 
 
@@ -2339,6 +3568,7 @@ async def _bd_instant_measurement(driver, endpoint, n, *, rate=1000):
         return result
 
 
+@pytest.mark.b1_live
 @pytest.mark.parametrize("driver", [b1, bd_e2e], ids=["reference", "e2e"])
 @pytest.mark.asyncio
 async def test_b1_instant_server_clears_open_loop_offer(driver):
@@ -3920,55 +5150,1085 @@ def test_b1_gateway_process_reaps_on_failure(tmp_path, monkeypatch, branch):
 
 
 def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monkeypatch):
-    """Execute the fixture's actual callback, serialization and yielded mapping."""
-    from types import SimpleNamespace
+    """Execute the fixture's actual callback, serialization and yielded mapping.
 
+    Container-free: the sibling containers, their cgroup readers and the log
+    store are faked, so this exercises the real ``_run_b1_reference`` source --
+    including its CI-scale (no product verdict) serialization branch and its
+    fail-soft diagnostic path -- inside the traced coverage selection.
+    """
     tree = ast.parse(Path(__file__).read_text())
-    fixture = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "b1_reference_run")
-    callback = next(n for n in ast.walk(fixture) if isinstance(n, ast.FunctionDef) and n.name == "_after_window")
+    fixture = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_b1_reference"
+    )
+    collector = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.FunctionDef) and n.name == "_collect_cpu_diagnostics"
+    )
+    callback = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.FunctionDef) and n.name == "_after_window"
+    )
     warning = b"WARNING:  Exceeded concurrency limit.\n"
     log_path = tmp_path / "gateway.log"
-    log_path.write_bytes(warning * 2)
     marks = {}
-    def cpu(pid):
+    cpu_max = "max 100000"
+    cpu_stat = (
+        "usage_usec 2000000\nnr_periods 300\nnr_throttled 4\nthrottled_usec 900\n"
+    )
+
+    class _FakeLogStore:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def logs(self, stdout=True, stderr=True):
+            if self.payload is None:
+                raise OSError("log store unavailable")
+            return self.payload
+
+    gateway_store = _FakeLogStore(warning * 2)
+
+    def _fake_read_cpu_files(container):
+        # Every cgroup read must precede the log snapshot: a CPU interval that
+        # closed after the log prefix would not be the measured window.
         assert "log_prefix_bytes" not in marks
-        return 1.0
-    monkeypatch.setattr(b1, "tree_cpu_seconds", cpu)
-    namespace = {"b1": b1, "marks": marks, "proc": SimpleNamespace(pid=1, poll=lambda: None), "log_path": log_path}
-    exec(compile(ast.Module(body=[callback], type_ignores=[]), "fixture-callback", "exec"), namespace)
+        if container is postgres_sentinel:
+            raise OSError("cgroup file vanished")  # fail-soft, never gating
+        return cpu_max, cpu_stat
+
+    def _fake_busy(allowed):
+        assert "log_prefix_bytes" not in marks
+        return {cpu: 7 for cpu in sorted(allowed)}
+
+    postgres_sentinel = object()
+    roles_open = {"gateway": _role("gateway", (0, 1), pids=(11,))}
+    namespace = {
+        "b1": b1,
+        "marks": marks,
+        "roles_open": roles_open,
+        "gateway": gateway_store,
+        "postgres": postgres_sentinel,
+        "log_path": log_path,
+        "B1_ROLES": B1_ROLES,
+        "_read_cpu_files": _fake_read_cpu_files,
+        "_gateway_set_busy_usec": _fake_busy,
+        "_try_diagnostic": _try_diagnostic,
+        "_snapshot_container_log": _snapshot_container_log,
+    }
+    exec(compile(ast.Module(body=[collector, callback], type_ignores=[]),
+                 "<fixture-callback>", "exec"), namespace)
     namespace["_after_window"]()
-    assert marks["cpu_after"] == 1.0
+    assert marks["gateway_cpu_stat_after"] == cpu_stat
+    assert marks["postgres_cpu_stat_after"] is None   # fail-soft, not fatal
+    assert marks["busy_after"] == {0: 7, 1: 7}
+    assert any("postgres cgroup files" in note for note in marks["diagnostic_notes"])
+    assert marks["log_prefix_bytes"] == len(warning) * 2
+
     with log_path.open("ab") as output:
         output.write(warning * 2)  # Later shed-probe phase must not enter the prefix.
-    count_assignment = next(n for n in ast.walk(fixture) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "concurrency_limit_warnings" for t in n.targets))
+    count_assignment = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "concurrency_limit_warnings" for t in n.targets)
+    )
     namespace["_b1_gateway_warning_count"] = _b1_gateway_warning_count
-    exec(compile(ast.Module(body=[count_assignment], type_ignores=[]), "fixture-count", "exec"), namespace)
+    exec(compile(ast.Module(body=[count_assignment], type_ignores=[]), "<fixture-count>", "exec"),
+         namespace)
     assert namespace["concurrency_limit_warnings"] == 2
     assert _b1_gateway_warning_count(log_path, log_path.stat().st_size) == 4
-    assignment = next(n for n in ast.walk(fixture) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "fingerprint_line" for t in n.targets))
+
+    # The real diagnostic rendering: a role whose source was unreadable is
+    # `unavailable`, and that does not touch placement.
+    diag_assign = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "diagnostics" for t in n.targets)
+    )
+    namespace["_role_diagnostics"] = _role_diagnostics
+    exec(compile(ast.Module(body=[diag_assign], type_ignores=[]), "<fixture-diagnostics>", "exec"),
+         namespace)
+    rendered = dict(namespace["diagnostics"]["postgres"].rendered())
+    assert set(rendered.values()) == {DIAGNOSTIC_UNAVAILABLE}
+    assert namespace["diagnostics"]["gateway"].quota_cpus == "max"
+
+    # CI-scale serialization branch: the two real statements that decide
+    # whether product verdicts enter the line at all.
+    verdict_assign = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "verdicts" for t in n.targets)
+    )
+    product_assign = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "product_fields" for t in n.targets)
+    )
+    namespace.update(
+        profile=CI_SCALE_PROFILE,
+        OrderedDict=OrderedDict,
+        PRODUCT_PROFILE_NAME=PRODUCT_PROFILE_NAME,
+        _product_promise_verdicts=_product_promise_verdicts,
+        serialize_product_verdicts=serialize_product_verdicts,
+    )
+    exec(
+        compile(ast.Module(body=[verdict_assign, product_assign], type_ignores=[]),
+                "<fixture-verdicts>", "exec"),
+        namespace,
+    )
+    assert namespace["verdicts"] == OrderedDict()
+    assert namespace["product_fields"] == ""
+
+    assignment = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "fingerprint_line" for t in n.targets)
+    )
     mapping = next(n.value for n in ast.walk(fixture) if isinstance(n, ast.Yield))
     # Supply unrelated fixture observations; execute its unchanged consumer expressions.
-    names = {n.id for root in (assignment, mapping) for n in ast.walk(root) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    for name in names - namespace.keys() - {"int", "float", "str"}:
+    names = {
+        n.id for root in (assignment, mapping) for n in ast.walk(root)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+    for name in names - namespace.keys() - {"int", "float", "str", "dict"}:
         namespace[name] = 1
-    namespace.update(fp={"cpus": 1, "cpu_model": "test", "image": "test"},
-                     workers_pre={1}, workers_post={1}, status_histogram="200:3;503:1")
-    attrs = {n.attr for root in (assignment, mapping) for n in ast.walk(root) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "result"}
+    namespace.update(
+        fp={"cpus": 1, "cpu_model": "test", "image": "test"},
+        workers_pre={1}, workers_post={1}, status_histogram="200:3;503:1",
+        placement_fields="placement_profile=ci-scale,placement_ok=1,",
+        cpu_ms_str="2.345", roles_close=roles_open,
+    )
+    attrs = {
+        n.attr for root in (assignment, mapping) for n in ast.walk(root)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "result"
+    }
     namespace["result"] = SimpleNamespace(**dict.fromkeys(attrs, 1))
-    exec(compile(ast.Module(body=[assignment], type_ignores=[]), "fixture-line", "exec"), namespace)
-    yielded = eval(compile(ast.Expression(mapping), "fixture-mapping", "eval"), namespace)
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), "<fixture-line>", "exec"),
+         namespace)
+    yielded = eval(compile(ast.Expression(mapping), "<fixture-mapping>", "eval"), namespace)
     assert "status_histogram=200:3;503:1,concurrency_limit_warnings=2," in yielded["fingerprint"]
+    assert "placement_profile=ci-scale,placement_ok=1," in yielded["fingerprint"]
+    for field_name in PRODUCT_VERDICT_FIELDS:
+        assert f"{field_name}=" not in yielded["fingerprint"]
     assert yielded["concurrency_limit_warnings"] == 2
     assert yielded["gateway_log_path"] == log_path
+    assert yielded["product_verdicts"] == {}
+    assert yielded["placement_ok"] is True
     # Pin the real callback registration and its ordering before the probe.
     calls = [n for n in ast.walk(fixture) if isinstance(n, ast.Call)]
     run = next(n for n in calls if isinstance(n.func, ast.Attribute) and n.func.attr == "run_open_loop")
-    assert any(k.arg == "on_window_complete" and isinstance(k.value, ast.Name) and k.value.id == "_after_window" for k in run.keywords)
+    assert any(
+        k.arg == "on_window_complete" and isinstance(k.value, ast.Name)
+        and k.value.id == "_after_window" for k in run.keywords
+    )
     probe = next(n for n in calls if isinstance(n.func, ast.Attribute) and n.func.attr == "run_shed_probe")
     assert run.lineno < count_assignment.lineno < probe.lineno
-    # A failed snapshot cannot yield a zero-valued count/fingerprint.
-    log_path.unlink()
+    # A failed log snapshot cannot yield a zero-valued count/fingerprint.
     marks.clear()
+    gateway_store.payload = None
     with pytest.raises(OSError):
         namespace["_after_window"]()
     assert "log_prefix_bytes" not in marks
+
+
+
+# ---------------------------------------------------------------------------
+# GC-1 unit tests (FP-GC1-1..5) — no container, no live fixture.
+#
+# Every Docker lifecycle case below uses faked Docker/testcontainers objects
+# and temporary cgroup/proc files, so the whole block stays inside the traced
+# container-free selection and inside the ordinary Python unit tier.
+# ---------------------------------------------------------------------------
+
+
+_AFFINITY_HELPER_PATH = REPO_ROOT / "scripts" / "b1-affinity-helper.py"
+
+
+def _load_affinity_helper():
+    spec = importlib.util.spec_from_file_location("b1_affinity_helper", _AFFINITY_HELPER_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules["b1_affinity_helper"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeContainer:
+    def __init__(self, name, labels=None, pid=None, image_id="sha256:fake"):
+        self.name = name
+        self.labels = dict(labels or {})
+        self.attrs = {"State": {"Pid": pid}, "Mounts": []}
+        self.image = SimpleNamespace(id=image_id)
+        self.id = f"id-{name}"
+
+    def with_mount(self, source, destination):
+        self.attrs["Mounts"].append({"Source": source, "Destination": destination})
+        return self
+
+
+class _FakeContainers:
+    def __init__(self, listing):
+        self._listing = listing
+        self.calls = []
+
+    def list(self, all=False, filters=None):  # noqa: A002 - docker SDK signature
+        self.calls.append((all, dict(filters or {})))
+        wanted = set((filters or {}).get("label", []))
+        out = []
+        for container in self._listing:
+            labels = {f"{k}={v}" for k, v in container.labels.items()}
+            if wanted <= labels:
+                out.append(container)
+        return out
+
+
+class _FakeClient:
+    def __init__(self, listing):
+        self.containers = _FakeContainers(listing)
+
+
+def _declaration_payload(profile=CI_SCALE_PROFILE_NAME, **overrides):
+    run_id = "0123456789abcdef0123456789abcdef"
+    if profile == CI_SCALE_PROFILE_NAME:
+        payload = {
+            "schema": 2,
+            "runId": run_id,
+            "profile": profile,
+            "referenceLogicalCpus": 4,
+            "mechanism": "sched-affinity",
+            "roles": {
+                "gateway": {"allowedCpus": "0-1"},
+                "postgres": {"allowedCpus": "2"},
+                "driver": {"allowedCpus": "3"},
+            },
+        }
+    else:
+        payload = {
+            "schema": 2,
+            "runId": run_id,
+            "profile": profile,
+            "minimumHostLogicalCpus": 8,
+            "mechanism": "sched-affinity",
+            "roles": {
+                "gateway": {"allowedCpus": "0-3"},
+                "postgres": {"allowedCpus": "4-6"},
+                "driver": {"allowedCpus": "7"},
+            },
+        }
+    payload.update(overrides)
+    return payload
+
+
+def _role(role, cpus, pids=(11,)):
+    return B1RolePlacement(role=role, allowed_cpus=frozenset(cpus), pids=tuple(pids))
+
+
+def _ci_scale_roles():
+    return {
+        "gateway": _role("gateway", (0, 1), pids=(11, 12, 13, 14, 15)),
+        "postgres": _role("postgres", (2,)),
+        "driver": _role("driver", (3,)),
+    }
+
+
+def _product_roles():
+    return {
+        "gateway": _role("gateway", (0, 1, 2, 3), pids=(11, 12, 13, 14, 15)),
+        "postgres": _role("postgres", (4, 5, 6)),
+        "driver": _role("driver", (7,)),
+    }
+
+
+def test_b1_cpu_list_parser_accepts_canonical_kernel_forms():
+    """FP-GC1-3/4: canonical list syntax in, canonical list syntax out."""
+    assert b1.parse_cpu_list("0-3") == frozenset({0, 1, 2, 3})
+    assert b1.parse_cpu_list("0-3,8") == frozenset({0, 1, 2, 3, 8})
+    assert b1.parse_cpu_list("7") == frozenset({7})
+    assert b1.parse_cpu_list(" 0-1,4 \n") == frozenset({0, 1, 4})
+    assert b1.parse_cpu_list("3-3") == frozenset({3})
+    # Normalization is a round trip on every canonical form.
+    for text in ("0", "0-3", "0-3,8", "1,3,5", "0-1,4-6,9"):
+        assert b1.format_cpu_list(b1.parse_cpu_list(text)) == text
+    assert b1.format_cpu_list({8, 0, 1, 2, 3}) == "0-3,8"
+    assert b1.format_cpu_list([5]) == "5"
+    for bad in ("", "   ", "0 1", "a", "3-1", "0,0", "0-2,1", "0-", "-1", "1--2", "0,,1"):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_cpu_list(bad)
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.parse_cpu_list(None)
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.format_cpu_list([])
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.format_cpu_list([-1])
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.format_cpu_list([True])
+
+
+def test_b1_cpu_diagnostic_parsers_report_without_gating():
+    """FP-GC1-4: cgroup and /proc/stat readings are reported, never an oracle.
+
+    This replaces rev 0.4's ``test_b1_cpu_max_and_stat_parsers_require_complete_v2_counters``,
+    which asserted the opposite: it made an unquotaed ``cpu.max`` a hard
+    failure. Under scheduler-affinity allocation ``max`` is the *expected*
+    reading, and every one of these sources is a diagnostic whose loss must
+    surface as ``unavailable`` rather than as a placement verdict.
+    """
+    # `max` is a first-class reading now, not an error.
+    assert b1.parse_cpu_max("max 100000") == (None, 100000)
+    assert b1.format_quota_cpus(None, 100000) == "max"
+    assert b1.parse_cpu_max("200000 100000") == (200000, 100000)
+    assert b1.format_quota_cpus(200000, 100000) == "2.00"
+    assert b1.format_quota_cpus(50000, 100000) == "0.50"
+    assert b1.parse_cpu_max(" 50000 100000\n") == (50000, 100000)
+    for bad in ("", "200000", "200000 100000 1", "0 100000", "200000 0",
+                "-1 100000", "abc 100000", "200000 abc", "max", "max max"):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_cpu_max(bad)
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.parse_cpu_max(None)
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.format_quota_cpus(100, 0)
+
+    complete = (
+        "usage_usec 12\nuser_usec 7\nsystem_usec 5\nnr_periods 3\n"
+        "nr_throttled 1\nthrottled_usec 9\nnr_bursts 0\n"
+    )
+    parsed = b1.parse_cpu_stat(complete)
+    assert parsed == {"usage_usec": 12, "nr_periods": 3, "nr_throttled": 1, "throttled_usec": 9}
+    for missing in b1.CPU_STAT_REQUIRED_KEYS:
+        text = "".join(ln + "\n" for ln in complete.splitlines() if not ln.startswith(missing + " "))
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_cpu_stat(text)
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.parse_cpu_stat(complete + "usage_usec 13\n")
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.parse_cpu_stat("usage_usec\n")
+    before = b1.parse_cpu_stat(complete)
+    after = b1.parse_cpu_stat(complete.replace("usage_usec 12", "usage_usec 30"))
+    assert b1.cpu_stat_delta(before, after)["usage_usec"] == 18
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.cpu_stat_delta(after, before)  # counter decreased
+
+    stat = "cpu  1 2 3 4 5\ncpu0 10 0 10 70 10 0 0 0 0 0\ncpu1 20 0 20 40 20 0 0 0 0 0\nintr 9\n"
+    busy = b1.parse_proc_stat_busy_usec(stat, clock_ticks=100)
+    assert busy == {0: 200000, 1: 400000}
+    assert b1.serialize_cpu_busy({1: 4, 0: 3}) == "0:3+1:4"
+    for bad in ("intr 9\n", "cpuX 1 2 3 4 5\n", "cpu0 1 2\n", "cpu0 a b c d e\n"):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_proc_stat_busy_usec(bad, clock_ticks=100)
+
+    # Every one of those failures reaches the fingerprint as `unavailable`,
+    # carries a role/source-specific note, and touches no gating field.
+    unlimited = _role_diagnostics("gateway", "max 100000", complete,
+                                  complete.replace("usage_usec 12", "usage_usec 30"))
+    assert unlimited.quota_cpus == "max"
+    assert unlimited.cpu_period_us == "100000"
+    assert unlimited.usage_usec_delta == 18
+    assert unlimited.notes == ()
+    assert dict(unlimited.rendered()) == {
+        "gateway_quota_cpus": "max", "gateway_cpu_period_us": "100000",
+        "gateway_nr_periods": "0", "gateway_nr_throttled": "0", "gateway_throttled_usec": "0",
+    }
+    for label, cpu_max, stat_before, stat_after in (
+        ("missing cpu.max", None, complete, complete),
+        ("malformed cpu.max", "garbage", complete, complete),
+        ("missing cpu.stat", "max 100000", None, complete),
+        ("incomplete cpu.stat", "max 100000", "usage_usec 1\n", complete),
+        ("decreasing counter", "max 100000",
+         complete.replace("usage_usec 12", "usage_usec 30"), complete),
+    ):
+        diag = _role_diagnostics("postgres", cpu_max, stat_before, stat_after)
+        rendered = dict(diag.rendered())
+        assert DIAGNOSTIC_UNAVAILABLE in rendered.values(), (label, rendered)
+        if "cpu.stat" in label or "counter" in label:
+            assert diag.usage_usec_delta is None, label
+            assert rendered["postgres_nr_throttled"] == DIAGNOSTIC_UNAVAILABLE, label
+        if "cpu.max" in label:
+            assert rendered["postgres_quota_cpus"] == DIAGNOSTIC_UNAVAILABLE, label
+            assert rendered["postgres_cpu_period_us"] == DIAGNOSTIC_UNAVAILABLE, label
+        assert diag.notes, label
+        assert diag.role in diag.notes[0], label
+
+    # A wholly unavailable role still renders all five keys, never a zero.
+    blank = _role_diagnostics("driver", None, None, None)
+    assert set(dict(blank.rendered()).values()) == {DIAGNOSTIC_UNAVAILABLE}
+    # And the serializer keeps them out of the gating prefix entirely.
+    declaration = B1PlacementDeclaration.from_contract(_declaration_payload())
+    line = _serialize_placement_fields(
+        declaration, AUTHORITY_CI_SCALE_REFERENCE, _ci_scale_roles(),
+        {role: _role_diagnostics(role, None, None, None) for role in B1_ROLES},
+        None, None, None,
+    )
+    for field_name in B1_GATING_PLACEMENT_FIELDS:
+        assert f"{field_name}=" in line
+        assert f"{field_name}={DIAGNOSTIC_UNAVAILABLE}" not in line
+    for field_name in B1_DIAGNOSTIC_PLACEMENT_FIELDS:
+        assert f"{field_name}={DIAGNOSTIC_UNAVAILABLE}" in line, field_name
+    assert "placement_ok=1" in line
+
+
+def test_b1_placement_declarations_are_closed_and_pinned(tmp_path):
+    """FP-GC1-1/2/3/4: both schema-2 declarations, closed against every drift."""
+    # The Python constants are authoritative; the module bar literals and the
+    # profile constants must agree, or a "green" run would be measuring a
+    # different profile than the one the manifest advertises.
+    assert CI_SCALE_PROFILE.rate == b1.CI_SCALE_BURST_RATE == 500
+    assert CI_SCALE_PROFILE.seconds == b1.CI_SCALE_BURST_SECONDS == 30
+    assert CI_SCALE_PROFILE.total_requests == CI_SCALE_TOTAL_REQUESTS == 15000
+    assert CI_SCALE_PROFILE.total_requests == CI_SCALE_PROFILE.rate * CI_SCALE_PROFILE.seconds
+    assert CI_SCALE_PROFILE.p99_ms == CI_SCALE_P99_MS == 150.0
+    assert CI_SCALE_PROFILE.sustained_floor == CI_SCALE_SUSTAINED_FLOOR == 450
+    assert CI_SCALE_PROFILE.max_in_flight == CI_SCALE_MAX_IN_FLIGHT == 500
+    assert CI_SCALE_PROFILE.max_in_flight == CI_SCALE_PROFILE.rate  # one second of offer
+    assert CI_SCALE_PROFILE.prologue_requests == 75 == int(500 * 150 / 1000)
+    assert PRODUCT_PROFILE.rate == b1.BURST_RATE == 1000
+    assert PRODUCT_PROFILE.total_requests == PRODUCT_TOTAL_REQUESTS == 30000
+    assert PRODUCT_PROFILE.p99_ms == PRODUCT_P99_MS == 150.0
+    assert PRODUCT_PROFILE.sustained_floor == PRODUCT_SUSTAINED_FLOOR == 200
+    assert PRODUCT_PROFILE.max_in_flight == PRODUCT_MAX_IN_FLIGHT == 1000
+    assert PRODUCT_PROFILE.prologue_requests == b1.PROLOGUE_REQUESTS == 150
+    # The allocation is affinity cardinality, not a CPU quota.
+    assert CI_SCALE_PROFILE.affinity_cardinality == {"gateway": 2, "postgres": 1, "driver": 1}
+    assert PRODUCT_PROFILE.affinity_cardinality == {"gateway": 4, "postgres": 3, "driver": 1}
+    assert CI_SCALE_PROFILE.declared_cpu_total == 4
+    assert PRODUCT_PROFILE.declared_cpu_total == 8
+
+    ci = B1PlacementDeclaration.from_contract(_declaration_payload())
+    assert ci.profile == CI_SCALE_PROFILE_NAME
+    assert ci.schema == 2 and ci.mechanism == "sched-affinity"
+    assert ci.reference_logical_cpus == 4 and ci.minimum_host_logical_cpus is None
+    assert ci.allowed("gateway") == frozenset({0, 1})
+    assert ci.allowed("postgres") == frozenset({2})
+    assert ci.allowed("driver") == frozenset({3})
+    assert ci.declared_union == frozenset({0, 1, 2, 3})
+    assert ci.driver_name == "dbagent-b1-driver-0123456789abcdef0123456789abcdef"
+    assert ci.run_label == "dbagent.b1.run=0123456789abcdef0123456789abcdef"
+    assert ci.role_label("gateway") == "dbagent.b1.role=gateway"
+    assert ci.labels("driver") == {
+        "dbagent.b1.run": "0123456789abcdef0123456789abcdef",
+        "dbagent.b1.role": "driver",
+    }
+    prod = B1PlacementDeclaration.from_contract(_declaration_payload(PRODUCT_PROFILE_NAME))
+    assert prod.minimum_host_logical_cpus == 8 and prod.reference_logical_cpus is None
+    assert prod.allowed("gateway") == frozenset({0, 1, 2, 3})
+    assert prod.allowed("driver") == frozenset({7})
+    assert prod.declared_union == frozenset(range(8))
+    # A many-core replica keeps the shape, only the CPU identities move.
+    shifted = _declaration_payload()
+    shifted["roles"] = {
+        "gateway": {"allowedCpus": "4-5"},
+        "postgres": {"allowedCpus": "6"},
+        "driver": {"allowedCpus": "9"},
+    }
+    assert B1PlacementDeclaration.from_contract(shifted).allowed("driver") == frozenset({9})
+
+    def refuse(payload):
+        with pytest.raises(B1PlacementError):
+            B1PlacementDeclaration.from_contract(payload)
+
+    refuse("not-an-object")
+    refuse(_declaration_payload(profile="other"))
+    # Schema 1 is rejected outright; nothing is migrated.
+    refuse(_declaration_payload(schema=1))
+    refuse(_declaration_payload(schema=3))
+    refuse(_declaration_payload(mechanism="cfs-quota"))
+    refuse(_declaration_payload(mechanism="cpuset"))
+    refuse(_declaration_payload(referenceLogicalCpus=8))
+    refuse(_declaration_payload(PRODUCT_PROFILE_NAME, minimumHostLogicalCpus=4))
+    for bad_id in ("", "0123456789ABCDEF0123456789ABCDEF", "0123",
+                   "0123456789abcdef0123456789abcdeg", 7):
+        refuse(_declaration_payload(runId=bad_id))
+    extra = _declaration_payload()
+    extra["unexpected"] = 1
+    refuse(extra)
+    # A reintroduced bandwidth key cannot enter through the contract.
+    quota_key = _declaration_payload()
+    quota_key["cpuPeriodUs"] = 100000
+    refuse(quota_key)
+    short = _declaration_payload()
+    del short["mechanism"]
+    refuse(short)
+    wrong_capacity = _declaration_payload()
+    del wrong_capacity["referenceLogicalCpus"]
+    wrong_capacity["minimumHostLogicalCpus"] = 8
+    refuse(wrong_capacity)
+    for role in B1_ROLES:
+        widened = _declaration_payload()
+        widened["roles"][role]["quotaCpus"] = 2.0
+        refuse(widened)
+        missing_cpus = _declaration_payload()
+        missing_cpus["roles"][role]["allowedCpus"] = None
+        refuse(missing_cpus)
+        noncanonical = _declaration_payload(PRODUCT_PROFILE_NAME)
+        noncanonical["roles"][role]["allowedCpus"] = {
+            "gateway": "0,1,2,3", "postgres": "4,5,6", "driver": "7",
+        }[role] if role != "driver" else "07"
+        refuse(noncanonical)
+    dropped = _declaration_payload()
+    del dropped["roles"]["driver"]
+    refuse(dropped)
+    # Cardinality, disjointness and union size, one at a time, both profiles.
+    for profile, role, bad_list in (
+        (CI_SCALE_PROFILE_NAME, "gateway", "0-2"),
+        (CI_SCALE_PROFILE_NAME, "gateway", "0"),
+        (CI_SCALE_PROFILE_NAME, "postgres", "2-3"),
+        (CI_SCALE_PROFILE_NAME, "driver", "3-4"),
+        (PRODUCT_PROFILE_NAME, "gateway", "0-4"),
+        (PRODUCT_PROFILE_NAME, "postgres", "4-5"),
+        (PRODUCT_PROFILE_NAME, "driver", "7-8"),
+    ):
+        drift = _declaration_payload(profile)
+        drift["roles"][role]["allowedCpus"] = bad_list
+        refuse(drift)
+    for profile, role, overlapping in (
+        (CI_SCALE_PROFILE_NAME, "postgres", "1"),
+        (CI_SCALE_PROFILE_NAME, "driver", "0"),
+        (PRODUCT_PROFILE_NAME, "postgres", "3-5"),
+        (PRODUCT_PROFILE_NAME, "driver", "6"),
+    ):
+        overlap = _declaration_payload(profile)
+        overlap["roles"][role]["allowedCpus"] = overlapping
+        refuse(overlap)
+
+    # The contract is read from the run mount, never invented.
+    contract = tmp_path / "placement.json"
+    contract.write_text(json.dumps(_declaration_payload()), encoding="utf-8")
+    assert B1PlacementDeclaration.from_contract(_read_launch_contract(contract)).profile == "ci-scale"
+    with pytest.raises(B1PlacementError):
+        _read_launch_contract(tmp_path / "absent.json")
+    broken = tmp_path / "broken.json"
+    broken.write_text("{", encoding="utf-8")
+    with pytest.raises(B1PlacementError):
+        _read_launch_contract(broken)
+
+
+def test_b1_driver_identity_requires_one_matching_name_and_label_pair():
+    """FP-GC1-2: the two-label query is the identity; hostname never is."""
+    declaration = B1PlacementDeclaration.from_contract(_declaration_payload())
+    run_id = declaration.run_id
+    good = _FakeContainer(declaration.driver_name,
+                          {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "driver"})
+    unrelated = _FakeContainer("someone-elses-container", {"app": "other"})
+    other_run = _FakeContainer("dbagent-b1-driver-" + "f" * 32,
+                               {B1_RUN_LABEL_KEY: "f" * 32, B1_ROLE_LABEL_KEY: "driver"})
+    sibling = _FakeContainer("gw", {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "gateway"})
+
+    client = _FakeClient([good, unrelated, other_run, sibling])
+    assert _resolve_driver_container(client, declaration) is good
+    assert client.containers.calls[-1][1]["label"] == [
+        declaration.run_label, declaration.role_label("driver")
+    ]
+
+    with pytest.raises(B1PlacementError):  # zero matches
+        _resolve_driver_container(_FakeClient([unrelated, other_run]), declaration)
+    twin = _FakeContainer(declaration.driver_name,
+                          {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "driver"})
+    with pytest.raises(B1PlacementError):  # more than one match
+        _resolve_driver_container(_FakeClient([good, twin]), declaration)
+    misnamed = _FakeContainer("dbagent-b1-driver-something-else",
+                              {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "driver"})
+    with pytest.raises(B1PlacementError):  # label matches, derived name does not
+        _resolve_driver_container(_FakeClient([misnamed]), declaration)
+
+    mounted = good.with_mount("/host/repo", B1_WORKSPACE_MOUNT).with_mount(
+        "/host/run", str(B1_RUN_MOUNT)
+    ).with_mount("/var/run/docker.sock", B1_DOCKER_SOCKET)
+    assert _driver_mount_source(mounted, B1_WORKSPACE_MOUNT) == "/host/repo"
+    assert _driver_mount_source(mounted, str(B1_RUN_MOUNT)) == "/host/run"
+    assert _driver_mount_source(mounted, B1_DOCKER_SOCKET) == "/var/run/docker.sock"
+    with pytest.raises(B1PlacementError):
+        _driver_mount_source(mounted, "/not-mounted")
+    duplicated = _FakeContainer("d").with_mount("/a", "/workspace").with_mount("/b", "/workspace")
+    with pytest.raises(B1PlacementError):
+        _driver_mount_source(duplicated, B1_WORKSPACE_MOUNT)
+
+
+def test_b1_placement_validator_rejects_each_role_drift():
+    """FP-GC1-4: every affinity drift is named, one at a time, open and close."""
+    ci_decl = B1PlacementDeclaration.from_contract(_declaration_payload())
+    host = frozenset(range(4))
+    witness = B1PlacementWitness(ci_decl, host_cpus=host)
+    workers = {12, 13, 14, 15}
+    roles = _ci_scale_roles()
+    assert witness.failures(roles, gateway_worker_pids=workers) == []
+    assert witness.failures(roles, gateway_worker_pids=workers, when="close") == []
+
+    # Authority is derived, never supplied.
+    assert witness.authority(4) == AUTHORITY_CI_SCALE_REFERENCE
+    assert witness.authority(16) == AUTHORITY_LOCAL_REPLICA
+    assert witness.authority(3) == AUTHORITY_LOCAL_REPLICA
+
+    # Role-by-role set mismatch, both directions of cardinality.
+    for role, wrong in (
+        ("gateway", (0, 2)),
+        ("gateway", (0, 1, 2)),
+        ("gateway", (0,)),
+        ("postgres", (1,)),
+        ("driver", (2,)),
+    ):
+        drifted = dict(roles)
+        drifted[role] = _role(role, wrong, pids=roles[role].pids)
+        found = witness.failures(drifted, gateway_worker_pids=workers)
+        assert any(f.startswith(f"open: {role}: effective CPUs") for f in found), (role, found)
+    for role, wrong in (("gateway", (0,)), ("postgres", (2, 3)), ("driver", (0, 3))):
+        drifted = dict(roles)
+        drifted[role] = _role(role, wrong, pids=roles[role].pids)
+        found = witness.failures(drifted, gateway_worker_pids=workers)
+        assert any("effective CPUs, profile" in f for f in found), (role, found)
+
+    # Each of the three pairwise overlaps, independently.
+    for left, right, shared in (
+        ("gateway", "postgres", (0,)),
+        ("gateway", "driver", (1,)),
+        ("postgres", "driver", (2,)),
+    ):
+        overlapping = dict(roles)
+        overlapping[right] = _role(right, shared, pids=roles[right].pids)
+        found = witness.failures(overlapping, gateway_worker_pids=workers)
+        assert any(f"{left}/{right}: measured roles share CPUs" in f for f in found), found
+
+    # A CPU outside the host-visible inventory.
+    outside = dict(roles)
+    outside["driver"] = _role("driver", (99,))
+    found = witness.failures(outside, gateway_worker_pids=workers)
+    assert any("not a subset of the host-visible" in f for f in found), found
+
+    for role in B1_ROLES:
+        absent = {k: v for k, v in roles.items() if k != role}
+        found = witness.failures(absent, gateway_worker_pids=workers)
+        assert any(f == f"open: {role}: no effective placement reading" for f in found), found
+        empty = dict(roles)
+        empty[role] = B1RolePlacement(role=role, allowed_cpus=roles[role].allowed_cpus, pids=())
+        found = witness.failures(empty, gateway_worker_pids=workers)
+        assert any("no live process observed" in f for f in found), found
+
+    found = witness.failures(roles, gateway_worker_pids={12, 13, 14})
+    assert any("classified workers" in f for f in found), found
+    found = witness.failures(roles, gateway_worker_pids={12, 13, 14, 99})
+    assert any("carry no placement reading" in f for f in found), found
+    tiny_host = B1PlacementWitness(ci_decl, host_cpus=frozenset({0, 1}))
+    found = tiny_host.failures(roles, gateway_worker_pids=workers)
+    assert any("needs at least 4" in f for f in found), found
+    # The closing probe names its own phase, so drift is attributable.
+    closing = witness.failures(
+        {**roles, "gateway": _role("gateway", (0, 2), pids=roles["gateway"].pids)},
+        gateway_worker_pids=workers, when="close",
+    )
+    assert any(f.startswith("close: gateway: effective CPUs") for f in closing), closing
+
+    prod_decl = B1PlacementDeclaration.from_contract(_declaration_payload(PRODUCT_PROFILE_NAME))
+    prod_host = frozenset(range(8))
+    prod_witness = B1PlacementWitness(prod_decl, host_cpus=prod_host)
+    assert prod_witness.authority(16) == AUTHORITY_PRODUCT_LOCAL
+    prod_roles = _product_roles()
+    assert prod_witness.failures(prod_roles, gateway_worker_pids={12, 13, 14, 15}) == []
+    shared = dict(prod_roles)
+    shared["postgres"] = _role("postgres", (3, 4, 5))
+    found = prod_witness.failures(shared, gateway_worker_pids={12, 13, 14, 15})
+    assert any("measured roles share CPUs" in f for f in found), found
+    narrow = dict(prod_roles)
+    narrow["gateway"] = _role("gateway", (0, 1, 2), pids=prod_roles["gateway"].pids)
+    found = prod_witness.failures(narrow, gateway_worker_pids={12, 13, 14, 15})
+    assert any("exclusive CPUs, product declares 4" in f for f in found), found
+    moved = dict(prod_roles)
+    moved["driver"] = _role("driver", (6,))
+    found = prod_witness.failures(moved, gateway_worker_pids={12, 13, 14, 15})
+    assert any("declared 7" in f for f in found), found
+    small_host = B1PlacementWitness(prod_decl, host_cpus=frozenset(range(7)))
+    found = small_host.failures(prod_roles, gateway_worker_pids={12, 13, 14, 15})
+    assert any("needs at least 8" in f for f in found), found
+
+    line = _placement_fingerprint(ci_decl, AUTHORITY_CI_SCALE_REFERENCE, roles, ["gateway: bad"])
+    assert "placement_ok=0" in line and "failures=gateway: bad" in line
+    assert "gateway_allowed_cpus=0-1" in line
+    partial = _placement_fingerprint(
+        ci_decl, AUTHORITY_LOCAL_REPLICA, {"gateway": roles["gateway"]}, ["driver: missing"]
+    )
+    assert "postgres_allowed_cpus=missing" in partial
+
+
+def test_b1_container_cleanup_is_label_scoped_and_verified():
+    """FP-GC1-2: reverse teardown, exact label scope, survivor failure."""
+    declaration = B1PlacementDeclaration.from_contract(_declaration_payload())
+    run_id = declaration.run_id
+    driver = _FakeContainer(declaration.driver_name,
+                            {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "driver"})
+    unrelated = _FakeContainer("unrelated", {"app": "other"})
+    other_run = _FakeContainer("old-gateway", {B1_RUN_LABEL_KEY: "e" * 32,
+                                               B1_ROLE_LABEL_KEY: "gateway"})
+    client = _FakeClient([driver, unrelated, other_run])
+    _verify_no_survivors(client, declaration)  # the driver itself is not a survivor
+    assert client.containers.calls[-1] == (True, {"label": [declaration.run_label]})
+    # Unrelated containers and other runs are neither listed nor removed.
+    assert unrelated in client.containers._listing and other_run in client.containers._listing
+
+    survivor = _FakeContainer("gw", {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "gateway"})
+    with pytest.raises(B1PlacementError, match="left containers behind"):
+        _verify_no_survivors(_FakeClient([driver, survivor]), declaration)
+
+    # Source-level ordering: the survivor check is registered first so it runs
+    # last, and postgres is entered before the gateway so the gateway is
+    # stopped first (reverse order).
+    src = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fixture = next(n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "_run_b1_reference")
+    calls = [n for n in ast.walk(fixture) if isinstance(n, ast.Call)]
+
+    def line_of(predicate):
+        return next(n.lineno for n in calls if predicate(n))
+
+    verify_at = line_of(lambda n: isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "callback"
+                        and n.args and isinstance(n.args[0], ast.Name)
+                        and n.args[0].id == "_verify_no_survivors")
+    enters = [n.lineno for n in calls if isinstance(n.func, ast.Attribute)
+              and n.func.attr == "enter_context"]
+    assert verify_at < min(enters)
+    postgres_enter = line_of(lambda n: isinstance(n.func, ast.Attribute)
+                             and n.func.attr == "enter_context"
+                             and n.args and isinstance(n.args[0], ast.Name)
+                             and n.args[0].id == "postgres")
+    gateway_enter = line_of(lambda n: isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "enter_context"
+                            and n.args and isinstance(n.args[0], ast.Name)
+                            and n.args[0].id == "gateway")
+    assert postgres_enter < gateway_enter
+
+    # The scoped Ryuk lifecycle: disabled for the sibling lifetime only, and
+    # its prior value restored through the same stack.
+    fixture_src = ast.get_source_segment(src, fixture)
+    assert "previous_ryuk = testcontainers_config.ryuk_disabled" in fixture_src
+    assert "testcontainers_config.ryuk_disabled = True" in fixture_src
+    assert "stack.callback(_restore_ryuk, testcontainers_config, previous_ryuk)" in fixture_src
+    config = SimpleNamespace(ryuk_disabled=False)
+    _restore_ryuk(config, True)
+    assert config.ryuk_disabled is True
+    _restore_ryuk(config, False)
+    assert config.ryuk_disabled is False
+
+
+def test_b1_postgres_affinity_helper_is_closed_and_fails_partial_pin(tmp_path):
+    """FP-GC1-3/4: label/PID resolution, tree walk, readback, closed interface."""
+    helper = _load_affinity_helper()
+    run_id = "0123456789abcdef0123456789abcdef"
+    assert helper.parse_run_label(f"dbagent.b1.run={run_id}") == run_id
+    for bad in ("dbagent.b1.role=postgres", run_id, f"dbagent.b1.run={run_id[:31]}",
+                f"dbagent.b1.run={run_id.upper()}", "dbagent.b1.run="):
+        with pytest.raises(helper.PinError):
+            helper.parse_run_label(bad)
+    # Both profiles' declared PostgreSQL lists go through the same helper.
+    ci_decl = B1PlacementDeclaration.from_contract(_declaration_payload())
+    prod_decl = B1PlacementDeclaration.from_contract(_declaration_payload(PRODUCT_PROFILE_NAME))
+    assert helper.parse_cpu_list(b1.format_cpu_list(ci_decl.allowed("postgres"))) == [2]
+    assert helper.parse_cpu_list(b1.format_cpu_list(prod_decl.allowed("postgres"))) == [4, 5, 6]
+    assert helper.parse_cpu_list("4-6") == [4, 5, 6]
+    assert helper.parse_cpu_list("0-1,7") == [0, 1, 7]
+    for bad in ("", "a", "3-1", "0,0", "0 1", "1--2"):
+        with pytest.raises(helper.PinError):
+            helper.parse_cpu_list(bad)
+
+    container = _FakeContainer("pg", {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "postgres"},
+                               pid=4242)
+
+    class _Getter:
+        def __init__(self, found):
+            self._found = found
+
+        def get(self, _id):
+            return self._found
+
+    client = SimpleNamespace(containers=_Getter(container))
+    assert helper.resolve_postgres_root_pid("pg", run_id, client=client) == 4242
+    stale = _FakeContainer("pg", {B1_RUN_LABEL_KEY: "f" * 32, B1_ROLE_LABEL_KEY: "postgres"},
+                           pid=1)
+    with pytest.raises(helper.PinError):
+        helper.resolve_postgres_root_pid("pg", run_id, client=SimpleNamespace(containers=_Getter(stale)))
+    wrong_role = _FakeContainer("pg", {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "gateway"},
+                                pid=1)
+    with pytest.raises(helper.PinError):
+        helper.resolve_postgres_root_pid("pg", run_id,
+                                         client=SimpleNamespace(containers=_Getter(wrong_role)))
+    dead = _FakeContainer("pg", {B1_RUN_LABEL_KEY: run_id, B1_ROLE_LABEL_KEY: "postgres"}, pid=0)
+    with pytest.raises(helper.PinError):
+        helper.resolve_postgres_root_pid("pg", run_id,
+                                         client=SimpleNamespace(containers=_Getter(dead)))
+
+    # Fake /proc: 100 -> {101, 102}; 102 -> {103}
+    def write_tree(root, mapping):
+        for pid, children in mapping.items():
+            task = root / str(pid) / "task" / str(pid)
+            task.mkdir(parents=True)
+            (task / "children").write_text(" ".join(str(c) for c in children))
+
+    proc = tmp_path / "proc"
+    write_tree(proc, {100: [101, 102], 101: [], 102: [103], 103: []})
+    assert helper.walk_process_tree(100, proc_root=proc) == [100, 101, 102, 103]
+    assert helper.walk_process_tree(999, proc_root=proc) == []
+
+    applied: dict[int, set[int]] = {}
+
+    def setter(pid, cpus):
+        if pid == 103:
+            raise ProcessLookupError  # vanished mid-walk: not a live member
+        applied[pid] = set(cpus)
+
+    def getter(pid):
+        return applied[pid]
+
+    pinned = helper.pin_tree(100, [4, 5, 6], proc_root=proc,
+                             set_affinity=setter, get_affinity=getter)
+    assert pinned == [100, 101, 102]
+    assert applied == {100: {4, 5, 6}, 101: {4, 5, 6}, 102: {4, 5, 6}}
+
+    def refusing(pid, cpus):
+        if pid == 102:
+            raise OSError("EPERM")
+        applied[pid] = set(cpus)
+
+    with pytest.raises(helper.PinError, match="cannot set affinity"):
+        helper.pin_tree(100, [4, 5, 6], proc_root=proc,
+                        set_affinity=refusing, get_affinity=getter)
+
+    def lying(pid):
+        return {0} if pid == 101 else applied[pid]
+
+    with pytest.raises(helper.PinError, match="read back"):
+        helper.pin_tree(100, [4, 5, 6], proc_root=proc,
+                        set_affinity=setter, get_affinity=lying)
+    with pytest.raises(helper.PinError, match="not live"):
+        helper.pin_tree(999, [4], proc_root=proc, set_affinity=setter, get_affinity=getter)
+
+    # Closed interface: one subcommand, three positional operands, no escape
+    # hatch for an arbitrary pid or command.
+    assert helper.main(["pin-postgres", "pg", "4-6", f"dbagent.b1.run={run_id}"],
+                       client=SimpleNamespace(containers=_Getter(dead))) == 1
+    with pytest.raises(SystemExit):
+        helper.main([])
+    with pytest.raises(SystemExit):
+        helper.main(["pin-pid", "1", "0"])
+    with pytest.raises(SystemExit):
+        helper.main(["pin-postgres", "pg", "4-6"])
+    source = _AFFINITY_HELPER_PATH.read_text(encoding="utf-8")
+    for forbidden in ("subprocess", "os.system", "eval(", "exec("):
+        assert forbidden not in source, forbidden
+
+    # The live fixture invokes the pin unconditionally -- there is no
+    # per-profile branch that could leave a CI-scale PostgreSQL unpinned.
+    fixture_src = ast.get_source_segment(
+        Path(__file__).read_text(encoding="utf-8"),
+        next(
+            n for n in ast.parse(Path(__file__).read_text(encoding="utf-8")).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_run_b1_reference"
+        ),
+    )
+    assert "_pin_postgres_tree(" in fixture_src
+    calls = [
+        n for n in ast.walk(ast.parse(textwrap.dedent(fixture_src)))
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_pin_postgres_tree"
+    ]
+    assert len(calls) == 1, "the PostgreSQL pin must be applied exactly once, for both profiles"
+    guarded = [
+        n for n in ast.walk(ast.parse(textwrap.dedent(fixture_src)))
+        if isinstance(n, ast.If)
+        and any(isinstance(c, ast.Call) and getattr(c.func, "id", None) == "_pin_postgres_tree"
+                for c in ast.walk(n))
+    ]
+    assert not guarded, "the PostgreSQL pin must not sit behind a profile condition"
+
+
+def _fake_ci_scale_run(**overrides):
+    values = {
+        "offered": CI_SCALE_TOTAL_REQUESTS,
+        "served": CI_SCALE_TOTAL_REQUESTS,
+        "errors": 0,
+        "p99": 100.0,
+        "served_rate": 500.0,
+        "max_in_flight": 499,
+    }
+    values.update(overrides)
+    result = SimpleNamespace(**values)
+    return {
+        "result": result,
+        "committed": overrides.get("committed", result.served),
+        "placement_ok": overrides.get("placement_ok", True),
+        "platform_online": overrides.get("platform_online", True),
+        "worker_set_ok": overrides.get("worker_set_ok", True),
+        "workers_pre": {1, 2, 3, 4},
+        "workers_post": {1, 2, 3, 4},
+        "fingerprint": "B1 env=placement_ok=1,",
+    }
+
+
+def test_b1_ci_scale_bar_boundaries():
+    """FP-GC1-1: the gating CI-scale node is red on each boundary miss."""
+    test_b1_ci_scale_reference_profile(_fake_ci_scale_run())
+    # served rate: 450 passes, one ulp below it does not.
+    test_b1_ci_scale_reference_profile(_fake_ci_scale_run(served_rate=450.0))
+    with pytest.raises(AssertionError, match="served_rate"):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(served_rate=449.999))
+    # p99: strictly below 150 ms.
+    test_b1_ci_scale_reference_profile(_fake_ci_scale_run(p99=149.999))
+    with pytest.raises(AssertionError, match="p99"):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(p99=150.0))
+    # errors, offer completeness, accounting.
+    with pytest.raises(AssertionError, match="errors"):
+        test_b1_ci_scale_reference_profile(
+            _fake_ci_scale_run(errors=1, served=CI_SCALE_TOTAL_REQUESTS - 1,
+                               committed=CI_SCALE_TOTAL_REQUESTS - 1)
+        )
+    with pytest.raises(AssertionError, match="offered"):
+        test_b1_ci_scale_reference_profile(
+            _fake_ci_scale_run(offered=14999, served=14999, committed=14999)
+        )
+    with pytest.raises(AssertionError, match="served"):
+        test_b1_ci_scale_reference_profile(
+            _fake_ci_scale_run(served=14999, committed=14999)
+        )
+    with pytest.raises(AssertionError, match="committed"):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(committed=14999))
+    # the nonbinding outer gate at 500
+    test_b1_ci_scale_reference_profile(_fake_ci_scale_run(max_in_flight=499))
+    with pytest.raises(AssertionError, match="ceiling"):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(max_in_flight=500))
+    # placement, platform and worker-set preconditions
+    with pytest.raises(AssertionError):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(placement_ok=False))
+    with pytest.raises(AssertionError):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(platform_online=False))
+    with pytest.raises(AssertionError, match="worker set"):
+        test_b1_ci_scale_reference_profile(_fake_ci_scale_run(worker_set_ok=False))
+
+
+def _fake_product_run(*, errors=0, p99=100.0, served=None, offered=PRODUCT_TOTAL_REQUESTS,
+                      tokens=None, extra="", **overrides):
+    served = offered - errors if served is None else served
+    result = SimpleNamespace(
+        offered=offered, served=served, errors=errors, p99=p99,
+        served_rate=overrides.get("served_rate", 999.0),
+        max_in_flight=overrides.get("max_in_flight", 999),
+    )
+    verdicts = _product_promise_verdicts(result)
+    if tokens is not None:
+        verdicts = OrderedDict(tokens)
+    rendered = "".join(f"{k}={v}," for k, v in verdicts.items())
+    line = (
+        "B1 env=placement_ok=1,p99_ms=%.1f," % p99
+        + rendered
+        + extra
+        + "p99_leg_split=0.000/0.000/0.000,leg_p99s=0.000/0.000/0.000"
+    )
+    return {
+        "result": result,
+        "committed": overrides.get("committed", served),
+        "placement_ok": overrides.get("placement_ok", True),
+        "platform_online": overrides.get("platform_online", True),
+        "worker_set_ok": overrides.get("worker_set_ok", True),
+        "workers_pre": {1, 2, 3, 4},
+        "workers_post": {1, 2, 3, 4},
+        "product_verdicts": dict(verdicts),
+        "fingerprint": line,
+    }
+
+
+def test_b1_product_verdicts_record_met_and_missed_without_truth_gating():
+    """FP-GC1-3/5: the three statuses are recorded data, not a bar.
+
+    Positive controls first: a truthful ``missed`` for each comparison, one at
+    a time, must leave the node green. Then every way of making the record
+    dishonest -- a corrupted token, a literalized token that disagrees with its
+    own operands, an absent field, a duplicated field, an unknown token -- must
+    make it red.
+    """
+    # The evaluator itself, at the equality boundary of each operand.
+    assert _product_promise_verdicts(
+        SimpleNamespace(errors=0, p99=149.999, served=10, offered=10)
+    ) == OrderedDict([
+        ("product_errors_eq_zero", "met"),
+        ("product_p99_lt_150_ms", "met"),
+        ("product_served_eq_offered", "met"),
+    ])
+    assert _product_promise_verdicts(
+        SimpleNamespace(errors=1, p99=150.0, served=9, offered=10)
+    ) == OrderedDict([
+        ("product_errors_eq_zero", "missed"),
+        ("product_p99_lt_150_ms", "missed"),
+        ("product_served_eq_offered", "missed"),
+    ])
+    assert tuple(_product_promise_verdicts(
+        SimpleNamespace(errors=0, p99=1.0, served=1, offered=1)
+    )) == PRODUCT_VERDICT_FIELDS
+
+    # Positive controls: truthfully missed, one comparison at a time, green.
+    test_b1_product_exclusive_reference_profile(_fake_product_run())
+    test_b1_product_exclusive_reference_profile(
+        _fake_product_run(errors=5, committed=PRODUCT_TOTAL_REQUESTS - 5)
+    )
+    test_b1_product_exclusive_reference_profile(_fake_product_run(p99=3000.0))
+    # `served == offered` can only miss when an offer errored: the gating
+    # identity served + errors == offered forbids an isolated shortfall, so
+    # this control necessarily misses the error comparison too.
+    shortfall = _fake_product_run(errors=1, committed=PRODUCT_TOTAL_REQUESTS - 1)
+    assert shortfall["product_verdicts"]["product_served_eq_offered"] == "missed"
+    assert shortfall["product_verdicts"]["product_p99_lt_150_ms"] == "met"
+    test_b1_product_exclusive_reference_profile(shortfall)
+    # ... and all three missed at once is still a valid record.
+    run = _fake_product_run(errors=7, p99=9000.0,
+                            committed=PRODUCT_TOTAL_REQUESTS - 7)
+    assert set(run["product_verdicts"].values()) == {"missed"}
+    test_b1_product_exclusive_reference_profile(run)
+
+    # Corrupted token: serialized value disagrees with its live comparison.
+    for field_name in PRODUCT_VERDICT_FIELDS:
+        tokens = dict.fromkeys(PRODUCT_VERDICT_FIELDS, "met")
+        tokens[field_name] = "missed"
+        with pytest.raises(AssertionError, match=field_name):
+            test_b1_product_exclusive_reference_profile(_fake_product_run(tokens=tokens))
+    # Literalized token: p99 is genuinely missed but the record claims met.
+    tokens = dict.fromkeys(PRODUCT_VERDICT_FIELDS, "met")
+    with pytest.raises(AssertionError, match="product_p99_lt_150_ms"):
+        test_b1_product_exclusive_reference_profile(
+            _fake_product_run(p99=9000.0, tokens=tokens)
+        )
+    # Unknown token, absent field, duplicated field.
+    with pytest.raises(AssertionError, match="product_errors_eq_zero"):
+        test_b1_product_exclusive_reference_profile(
+            _fake_product_run(tokens={**dict.fromkeys(PRODUCT_VERDICT_FIELDS, "met"),
+                                      "product_errors_eq_zero": "unknown"})
+        )
+    for field_name in PRODUCT_VERDICT_FIELDS:
+        tokens = {k: "met" for k in PRODUCT_VERDICT_FIELDS if k != field_name}
+        with pytest.raises(AssertionError, match=field_name):
+            test_b1_product_exclusive_reference_profile(_fake_product_run(tokens=tokens))
+        with pytest.raises(AssertionError, match=field_name):
+            test_b1_product_exclusive_reference_profile(
+                _fake_product_run(extra=f"{field_name}=met,")
+            )
+    # Gating assertions are untouched by the recorded boundary.
+    with pytest.raises(AssertionError):
+        test_b1_product_exclusive_reference_profile(_fake_product_run(placement_ok=False))
+    with pytest.raises(AssertionError, match="committed"):
+        test_b1_product_exclusive_reference_profile(_fake_product_run(committed=17))
+    with pytest.raises(AssertionError, match="served_rate"):
+        test_b1_product_exclusive_reference_profile(_fake_product_run(served_rate=199.0))
+    with pytest.raises(AssertionError, match="ceiling"):
+        test_b1_product_exclusive_reference_profile(_fake_product_run(max_in_flight=1000))
+    with pytest.raises(AssertionError, match="offered"):
+        test_b1_product_exclusive_reference_profile(
+            _fake_product_run(offered=29999, served=29999, committed=29999)
+        )
+
+    # The serializer is closed over the exact ordered field set and token set.
+    assert serialize_product_verdicts({}) == ""
+    assert serialize_product_verdicts(
+        OrderedDict((name, "met") for name in PRODUCT_VERDICT_FIELDS)
+    ) == "product_errors_eq_zero=met,product_p99_lt_150_ms=met,product_served_eq_offered=met,"
+    with pytest.raises(B1PlacementError):
+        serialize_product_verdicts({"product_errors_eq_zero": "met"})
+    with pytest.raises(B1PlacementError):
+        serialize_product_verdicts(
+            OrderedDict((name, "yes") for name in PRODUCT_VERDICT_FIELDS)
+        )
+    reordered = OrderedDict((name, "met") for name in reversed(PRODUCT_VERDICT_FIELDS))
+    with pytest.raises(B1PlacementError):
+        serialize_product_verdicts(reordered)

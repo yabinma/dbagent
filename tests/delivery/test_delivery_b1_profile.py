@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib.util
+import re
 import time
 from pathlib import Path
 
@@ -1121,19 +1122,29 @@ def _node_compare(node: ast.AST) -> ast.Compare | None:
     return None
 
 
+# GC-1 renamed the reference node and re-pointed the live fixture; both names
+# are declared once so every pin below moves together.
+CI_SCALE_REF_TEST = "test_b1_ci_scale_reference_profile"
+PRODUCT_REF_TEST = "test_b1_product_exclusive_reference_profile"
+CI_SCALE_FIXTURE = "b1_ci_scale_run"
+PRODUCT_FIXTURE = "b1_product_run"
+LIVE_RUN_IMPL = "_run_b1_reference"
+
 # Exact twenty-node inventory. Each entry: (test_file, test_name, required_names,
 # required_op_types or None, equality_admitted).
 # Equality is admitted ONLY for B1 accounting clauses.
 B1_INVENTORY: list[tuple[Path, str, frozenset[str], frozenset[type] | None, bool]] = [
-    # --- FP-IG-7 reference: 7 B1 clauses + max_in_flight harness = 8 ---
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"platform_online"}), frozenset({ast.Eq}), True),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"served", "errors", "offered"}), frozenset({ast.Eq}), True),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"errors"}), frozenset({ast.Eq}), True),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"served", "offered"}), frozenset({ast.Eq}), True),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"p99", "P99_MS"}), frozenset({ast.Lt}), False),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"committed", "served"}), frozenset({ast.Eq}), True),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"served_rate", "SUSTAINED_FLOOR"}), frozenset({ast.GtE}), False),
-    (REF_TEST, "test_b1_ingest_burst_reference_profile", frozenset({"max_in_flight", "MAX_IN_FLIGHT"}), frozenset({ast.Lt}), False),
+    # --- FP-IG-7 / FP-GC1-1 CI-scale reference: 7 B1 clauses + max_in_flight = 8 ---
+    # Renamed, not retired, by the GC-1 slice: same clauses, restated against
+    # the CI-scale bar literals for the declared 2.00/1.00/0.50-CPU allocation.
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"platform_online"}), frozenset({ast.Eq}), True),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"served", "errors", "offered"}), frozenset({ast.Eq}), True),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"errors"}), frozenset({ast.Eq}), True),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"served", "offered"}), frozenset({ast.Eq}), True),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"p99", "CI_SCALE_P99_MS"}), frozenset({ast.Lt}), False),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"committed", "served"}), frozenset({ast.Eq}), True),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"served_rate", "CI_SCALE_SUSTAINED_FLOOR"}), frozenset({ast.GtE}), False),
+    (REF_TEST, CI_SCALE_REF_TEST, frozenset({"max_in_flight", "CI_SCALE_MAX_IN_FLIGHT"}), frozenset({ast.Lt}), False),
     # --- FP-IG-9 e2e: twelve clauses ---
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"platform_online"}), frozenset({ast.Eq}), True),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"served", "errors"}), frozenset({ast.Eq}), True),
@@ -1260,7 +1271,7 @@ def _mutate_source(src: str, mutation: str) -> str:
         old = (
             "    assert served + errors == offered, (\n"
             "        f\"served+errors!=offered {served}+{errors}!={offered}; "
-            "{b1_reference_run['fingerprint']}\"\n"
+            "{b1_ci_scale_run['fingerprint']}\"\n"
             "    )"
         )
         assert old in src, "accounting_deleted anchor missing"
@@ -1279,7 +1290,7 @@ def _mutate_source(src: str, mutation: str) -> str:
         old = (
             "    assert committed == served, (\n"
             "        f\"committed={committed} served={served}; "
-            "{b1_reference_run['fingerprint']}\"\n"
+            "{b1_ci_scale_run['fingerprint']}\"\n"
             "    )"
         )
         assert old in src, "committed_weakened anchor missing"
@@ -1287,21 +1298,21 @@ def _mutate_source(src: str, mutation: str) -> str:
             old,
             "    assert committed >= served, (\n"
             "        f\"committed={committed} served={served}; "
-            "{b1_reference_run['fingerprint']}\"\n"
+            "{b1_ci_scale_run['fingerprint']}\"\n"
             "    )",
             1,
         )
     if mutation == "p99_deleted":
-        # 4. p99 < P99_MS deleted
-        old = "    assert p99 < P99_MS, f\"p99={p99}; {b1_reference_run['fingerprint']}\""
+        # 4. p99 < CI_SCALE_P99_MS deleted
+        old = "    assert p99 < CI_SCALE_P99_MS, f\"p99={p99}; {b1_ci_scale_run['fingerprint']}\""
         assert old in src, "p99_deleted anchor missing"
-        return src.replace(old, "    # mutated: p99 < P99_MS deleted", 1)
+        return src.replace(old, "    # mutated: p99 < CI_SCALE_P99_MS deleted", 1)
     if mutation == "committed_bare_expression":
         # 5. assert committed == served → bare expression
         old = (
             "    assert committed == served, (\n"
             "        f\"committed={committed} served={served}; "
-            "{b1_reference_run['fingerprint']}\"\n"
+            "{b1_ci_scale_run['fingerprint']}\"\n"
             "    )"
         )
         assert old in src, "committed_bare_expression anchor missing"
@@ -1312,36 +1323,36 @@ def _mutate_source(src: str, mutation: str) -> str:
         )
     if mutation == "under_if_false":
         # 6. qualifying assertion moved under if False
-        old = "    assert p99 < P99_MS, f\"p99={p99}; {b1_reference_run['fingerprint']}\""
+        old = "    assert p99 < CI_SCALE_P99_MS, f\"p99={p99}; {b1_ci_scale_run['fingerprint']}\""
         assert old in src, "under_if_false anchor missing"
         return src.replace(
             old,
             "    if False:\n"
-            "        assert p99 < P99_MS, f\"p99={p99}; {b1_reference_run['fingerprint']}\"",
+            "        assert p99 < CI_SCALE_P99_MS, f\"p99={p99}; {b1_ci_scale_run['fingerprint']}\"",
             1,
         )
     if mutation == "in_nested_def":
         # 7. qualifying assertion moved into uncalled nested def
         old = (
-            "    assert served_rate >= SUSTAINED_FLOOR, (\n"
-            "        f\"served_rate={served_rate}; {b1_reference_run['fingerprint']}\"\n"
+            "    assert served_rate >= CI_SCALE_SUSTAINED_FLOOR, (\n"
+            "        f\"served_rate={served_rate}; {b1_ci_scale_run['fingerprint']}\"\n"
             "    )"
         )
         assert old in src, "in_nested_def anchor missing"
         return src.replace(
             old,
             "    def _hidden():\n"
-            "        assert served_rate >= SUSTAINED_FLOOR, (\n"
-            "            f\"served_rate={served_rate}; {b1_reference_run['fingerprint']}\"\n"
+            "        assert served_rate >= CI_SCALE_SUSTAINED_FLOOR, (\n"
+            "            f\"served_rate={served_rate}; {b1_ci_scale_run['fingerprint']}\"\n"
             "        )\n"
             "    # nested not called",
             1,
         )
     if mutation == "rate_floor_deleted":
-        # 8. served_rate >= SUSTAINED_FLOOR deleted
+        # 8. served_rate >= CI_SCALE_SUSTAINED_FLOOR deleted
         old = (
-            "    assert served_rate >= SUSTAINED_FLOOR, (\n"
-            "        f\"served_rate={served_rate}; {b1_reference_run['fingerprint']}\"\n"
+            "    assert served_rate >= CI_SCALE_SUSTAINED_FLOOR, (\n"
+            "        f\"served_rate={served_rate}; {b1_ci_scale_run['fingerprint']}\"\n"
             "    )"
         )
         assert old in src, "rate_floor_deleted anchor missing"
@@ -1354,11 +1365,11 @@ B1_NEGATIVE_MUTATIONS: list[tuple[str, Path, frozenset[str]]] = [
     ("accounting_deleted", REF_TEST, frozenset({"served", "errors", "offered"})),
     ("platform_online_deleted", E2E_TEST, frozenset({"platform_online"})),
     ("committed_weakened", REF_TEST, frozenset({"committed", "served"})),
-    ("p99_deleted", REF_TEST, frozenset({"p99", "P99_MS"})),
+    ("p99_deleted", REF_TEST, frozenset({"p99", "CI_SCALE_P99_MS"})),
     ("committed_bare_expression", REF_TEST, frozenset({"committed", "served"})),
-    ("under_if_false", REF_TEST, frozenset({"p99", "P99_MS"})),
-    ("in_nested_def", REF_TEST, frozenset({"served_rate", "SUSTAINED_FLOOR"})),
-    ("rate_floor_deleted", REF_TEST, frozenset({"served_rate", "SUSTAINED_FLOOR"})),
+    ("under_if_false", REF_TEST, frozenset({"p99", "CI_SCALE_P99_MS"})),
+    ("in_nested_def", REF_TEST, frozenset({"served_rate", "CI_SCALE_SUSTAINED_FLOOR"})),
+    ("rate_floor_deleted", REF_TEST, frozenset({"served_rate", "CI_SCALE_SUSTAINED_FLOOR"})),
 ]
 
 
@@ -1371,11 +1382,7 @@ def test_fp_ig19_guard_rejects_required_mutations(mutation_id, path, required_na
     """FP-IG-19: each of the eight mutations is genuinely red against the guard."""
     src = path.read_text(encoding="utf-8")
     # Healthy source must currently match.
-    test_name = (
-        "test_b1_ingest_burst_reference_profile"
-        if path == REF_TEST
-        else "test_b1_ingest_burst_profile"
-    )
+    test_name = CI_SCALE_REF_TEST if path == REF_TEST else "test_b1_ingest_burst_profile"
     healthy = _nodes_for(path, test_name)
     # Find the inventory entry for this mutation's names on this path.
     eq_ok = True
@@ -1386,9 +1393,9 @@ def test_fp_ig19_guard_rejects_required_mutations(mutation_id, path, required_na
             eq_ok = eok
             break
     # For p99 / rate floor use ordering ops.
-    if required_names == frozenset({"p99", "P99_MS"}):
+    if required_names in (frozenset({"p99", "P99_MS"}), frozenset({"p99", "CI_SCALE_P99_MS"})):
         ops, eq_ok = frozenset({ast.Lt}), False
-    if required_names == frozenset({"served_rate", "SUSTAINED_FLOOR"}):
+    if required_names == frozenset({"served_rate", "CI_SCALE_SUSTAINED_FLOOR"}):
         ops, eq_ok = frozenset({ast.GtE}), False
 
     assert _inventory_match(healthy, required_names, ops, eq_ok) is not None, (
@@ -1415,13 +1422,13 @@ _STANDALONE_DELETIONS: list[tuple[str, Path, str, frozenset[str]]] = [
     (
         "ref_errors_eq_0",
         REF_TEST,
-        '    assert errors == 0, f"errors={errors}; {b1_reference_run[\'fingerprint\']}"',
+        '    assert errors == 0, f"errors={errors}; {b1_ci_scale_run[\'fingerprint\']}"',
         frozenset({"errors"}),
     ),
     (
         "ref_served_eq_offered",
         REF_TEST,
-        '    assert served == offered, f"served={served}; {b1_reference_run[\'fingerprint\']}"',
+        '    assert served == offered, f"served={served}; {b1_ci_scale_run[\'fingerprint\']}"',
         frozenset({"served", "offered"}),
     ),
     (
@@ -1464,11 +1471,7 @@ def test_fp_ig19_guard_rejects_standalone_error_and_served_deletion(
     """
     src = path.read_text(encoding="utf-8")
     assert anchor in src, f"anchor for {mutation_id} missing in {path.name}"
-    test_name = (
-        "test_b1_ingest_burst_reference_profile"
-        if path == REF_TEST
-        else "test_b1_ingest_burst_profile"
-    )
+    test_name = CI_SCALE_REF_TEST if path == REF_TEST else "test_b1_ingest_burst_profile"
     healthy = _nodes_for(path, test_name)
     assert (
         _inventory_match(healthy, required_names, frozenset({ast.Eq}), True) is not None
@@ -1642,9 +1645,23 @@ assert callable(module.characterize_b1_instant_server)
 
 
 def _assert_b1_output_capture_ownership(reference_source, e2e_sources):
+    """FP-IG-40 under GC-1's carrier change.
+
+    The measured gateway is no longer a host child of the driver: it is a
+    sibling container, so Docker's log store -- not an inherited stdout pipe --
+    is what the driver reads. The hazard FP-IG-40 exists for is unchanged
+    (an unread pipe fills and the workers block), and it is now structurally
+    impossible on the live path: nothing in the live fixture calls Popen at
+    all. What is pinned here is that the fixture reads the retained log through
+    the Docker API into a regular file on the writable run mount, at window
+    completion, and that the ``_b1_gateway_process`` helper -- still the
+    tracked carrier for the host-child shape and its own unit evidence --
+    keeps its regular-file sink.
+    """
     tree = ast.parse(reference_source)
     helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_b1_gateway_process")
-    fixture = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "b1_reference_run")
+    fixture = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == LIVE_RUN_IMPL)
+    snapshot = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_snapshot_container_log")
     launches = [n for n in ast.walk(helper) if isinstance(n, ast.Call) and _call_func_name(n) == "Popen"]
     assert len(launches) == 1
     launch = launches[0]
@@ -1655,14 +1672,47 @@ def _assert_b1_output_capture_ownership(reference_source, e2e_sources):
     writer_scope = next(n for n in ast.walk(helper) if isinstance(n, ast.With) and any(isinstance(i.optional_vars, ast.Name) and i.optional_vars.id == "writer" for i in n.items))
     assert ast.unparse(writer_scope.items[0].context_expr) == "log_path.open('xb')"
     assert launch in list(ast.walk(writer_scope))
-    owned = [n for n in ast.walk(fixture) if isinstance(n, ast.With) and any(isinstance(i.context_expr, ast.Call) and _call_func_name(i.context_expr) == "_b1_gateway_process" and isinstance(i.optional_vars, ast.Name) and i.optional_vars.id == "proc" for i in n.items)]
-    assert len(owned) == 1
-    call = owned[0].items[0].context_expr
-    assert {k.arg: ast.unparse(k.value) for k in call.keywords} == {"env": "env", "log_path": "log_path"}
-    assert "_PROFILE_PATH" in ast.unparse(call.args[0])
+
+    # The live fixture owns no inherited pipe at all.
     assert not any(isinstance(n, ast.Call) and _call_func_name(n) == "Popen" for n in ast.walk(fixture))
+    assert not any(isinstance(n, ast.Call) and _call_func_name(n) == "_b1_gateway_process" for n in ast.walk(fixture))
+    # The snapshot helper writes the Docker-retained log to a regular file and
+    # reports the exact prefix length the warning count is scoped to.
+    assert any(isinstance(n, ast.Call) and _call_func_name(n) == "logs" for n in ast.walk(snapshot))
+    assert any(
+        isinstance(n, ast.With)
+        and ast.unparse(n.items[0].context_expr) == "log_path.open('wb')"
+        for n in ast.walk(snapshot)
+    )
+    assert any(
+        isinstance(n, ast.Return) and n.value is not None
+        and "stat().st_size" in ast.unparse(n.value)
+        for n in ast.walk(snapshot)
+    )
+    # It is called from the window-completion hook, and its result is what
+    # scopes the concurrency-warning count.
+    window = next(n for n in ast.walk(fixture) if isinstance(n, ast.FunctionDef) and n.name == "_after_window")
+    assert any(isinstance(n, ast.Call) and _call_func_name(n) == "_snapshot_container_log" for n in ast.walk(window))
+    count = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "concurrency_limit_warnings" for t in n.targets)
+    )
+    assert "_b1_gateway_warning_count" in ast.unparse(count)
+    assert "log_prefix_bytes" in ast.unparse(count)
+    # The two measured siblings are owned by one ExitStack and the burst runs
+    # inside it.
+    owned = [n for n in ast.walk(fixture) if isinstance(n, ast.With) and any(isinstance(i.context_expr, ast.Call) and _call_func_name(i.context_expr) == "ExitStack" for i in n.items)]
+    assert len(owned) == 1
+    entered = [
+        ast.unparse(n.args[0]) for n in ast.walk(owned[0])
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "enter_context" and n.args
+    ]
+    assert entered == ["postgres", "gateway"], entered
     assert any(isinstance(n, ast.Call) and _call_func_name(n) == "run_open_loop" for n in ast.walk(owned[0]))
     assert any(isinstance(n, ast.Call) and _call_func_name(n) == "get" for n in ast.walk(owned[0]))
+
     for source in e2e_sources:
         assert not any(isinstance(n, ast.Call) and _call_func_name(n) == "Popen" for n in ast.walk(ast.parse(source)))
     load_tree = ast.parse(e2e_sources[1])
@@ -1677,7 +1727,12 @@ def test_b1_output_capture_ownership():
     _assert_b1_output_capture_ownership(source, e2e_sources)
     for mutant in (
         source.replace("stdout=writer", "stdout=subprocess.PIPE", 1),
-        source.replace("with _b1_gateway_process(", "with subprocess.Popen(", 1),
+        source.replace('marks["log_prefix_bytes"] = _snapshot_container_log(gateway, log_path)',
+                       'marks["log_prefix_bytes"] = 0', 1),
+        source.replace("stack.enter_context(gateway)", "gateway.start()", 1),
+        source.replace("payload = wrapped.logs(stdout=True, stderr=True)",
+                       'payload = b""', 1),
+        source.replace("return log_path.stat().st_size", "return 0", 1),
     ):
         with pytest.raises(AssertionError):
             _assert_b1_output_capture_ownership(mutant, e2e_sources)
@@ -1719,3 +1774,605 @@ def test_b1_e2e_finite_capture_drains_large_output():
     assert captures[0].returncode == 0
     assert captures[0].stdout == " " * 2097152 + '{"items": []}'
     assert captures[0].stderr == marker
+
+
+# ---------------------------------------------------------------------------
+# GC-1 — the two-tier harness surface, the placement fingerprint and the
+# routed CPU basis (FP-GC1-1 / 3 / 4 / 6).
+#
+# Every literal below is declared here, independently of the module it pins:
+# a pin derived from its own subject detects nothing.
+# ---------------------------------------------------------------------------
+
+CI_SCALE_BARS = {
+    "CI_SCALE_BURST_RATE": 500,
+    "CI_SCALE_BURST_SECONDS": 30,
+    "CI_SCALE_TOTAL_REQUESTS": 15000,
+    "CI_SCALE_P99_MS": 150.0,
+    "CI_SCALE_SUSTAINED_FLOOR": 450,
+    "CI_SCALE_MAX_IN_FLIGHT": 500,
+    "CI_SCALE_PROLOGUE_REQUESTS": 75,
+}
+PRODUCT_BARS = {
+    "PRODUCT_P99_MS": 150.0,
+    "PRODUCT_SUSTAINED_FLOOR": 200,
+    "PRODUCT_MAX_IN_FLIGHT": 1000,
+    "PRODUCT_TOTAL_REQUESTS": 30000,
+}
+# Which profile constant each test-module bar literal must equal.
+_BAR_TO_PROFILE_CONSTANT = {
+    "CI_SCALE_P99_MS": "CI_SCALE_P99_MS",
+    "CI_SCALE_SUSTAINED_FLOOR": "CI_SCALE_SUSTAINED_FLOOR",
+    "CI_SCALE_MAX_IN_FLIGHT": "CI_SCALE_MAX_IN_FLIGHT",
+    "CI_SCALE_TOTAL_REQUESTS": "CI_SCALE_TOTAL_REQUESTS",
+    "PRODUCT_P99_MS": "P99_MS",
+    "PRODUCT_SUSTAINED_FLOOR": "SUSTAINED_FLOOR",
+    "PRODUCT_MAX_IN_FLIGHT": "MAX_IN_FLIGHT",
+    "PRODUCT_TOTAL_REQUESTS": "TOTAL_REQUESTS",
+}
+GC1_ROLES = ("gateway", "postgres", "driver")
+# Gating identity and effective affinity first; every cgroup/host diagnostic
+# after. The order is the contract: a reader must be able to stop at
+# `driver_allowed_cpus` and have seen everything that decided the verdict.
+GC1_GATING_PLACEMENT_FIELDS = (
+    "placement_profile",
+    "placement_schema",
+    "placement_run_id",
+    "measurement_authority",
+    "placement_ok",
+    "gateway_allowed_cpus",
+    "postgres_allowed_cpus",
+    "driver_allowed_cpus",
+)
+GC1_DIAGNOSTIC_PLACEMENT_FIELDS = (
+    "gateway_quota_cpus",
+    "gateway_cpu_period_us",
+    "gateway_nr_periods",
+    "gateway_nr_throttled",
+    "gateway_throttled_usec",
+    "postgres_quota_cpus",
+    "postgres_cpu_period_us",
+    "postgres_nr_periods",
+    "postgres_nr_throttled",
+    "postgres_throttled_usec",
+    "driver_quota_cpus",
+    "driver_cpu_period_us",
+    "driver_nr_periods",
+    "driver_nr_throttled",
+    "driver_throttled_usec",
+    "gateway_cpu_busy_usec",
+    "gateway_nonrole_busy_cores_estimate",
+    "gateway_cpu_cores_used",
+)
+GC1_PLACEMENT_FIELDS = GC1_GATING_PLACEMENT_FIELDS + GC1_DIAGNOSTIC_PLACEMENT_FIELDS
+GC1_PRODUCT_FIELDS = (
+    "product_errors_eq_zero",
+    "product_p99_lt_150_ms",
+    "product_served_eq_offered",
+)
+GC1_RETIRED_FINGERPRINT_KEYS = ("cpu_cores_used",)
+# The allocation is affinity cardinality, not a CPU quota.
+GC1_AFFINITY_CARDINALITIES = {
+    "ci-scale": {"gateway": 2, "postgres": 1, "driver": 1},
+    "product-exclusive": {"gateway": 4, "postgres": 3, "driver": 1},
+}
+GC1_PLACEMENT_SCHEMA = 2
+GC1_PLACEMENT_MECHANISM = "sched-affinity"
+GC1_DIAGNOSTIC_UNAVAILABLE = "unavailable"
+# Docker bandwidth/cpuset controls, removed as the allocation primitive.
+GC1_BANDWIDTH_CONTROLS = ("--cpus", "--cpu-period", "--cpu-quota", "--cpuset-cpus",
+                          "cpu_period=", "cpu_quota=", "cpuset_cpus=")
+GC1_MARKERS = ("b1_live", "b1_product", "b1_latency_basis")
+GC1_BASIS_MS_PER_REQUEST = 2.427
+GC1_BASIS_OWNER = "B1-LATENCY-BASIS-1"
+# Top-level directories the FP-GC1-6 guard may open. The gitignored
+# specification tree is deliberately absent: the guard must stay
+# collectable in CI, where that tree does not exist.
+GC1_TRACKED_CARRIER_ROOTS = frozenset({"deploy", "tests", "services", "libs", "scripts"})
+GC1_PRESERVED_ORACLES = (
+    "test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis",
+    "test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run",
+)
+
+
+def _module_tuple(tree: ast.Module, name: str) -> tuple:
+    node = next(
+        n.value for n in tree.body
+        if isinstance(n, ast.Assign) and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name) and n.targets[0].id == name
+    )
+    return ast.literal_eval(node)
+
+
+def _decorator_markers(func: ast.AST) -> set[str]:
+    out: set[str] = set()
+    for dec in getattr(func, "decorator_list", []):
+        node = dec.func if isinstance(dec, ast.Call) else dec
+        text = ast.unparse(node)
+        if text.startswith("pytest.mark."):
+            out.add(text.split("pytest.mark.", 1)[1])
+    return out
+
+
+def _live_marker_failures(src: str) -> list[str]:
+    """The closed live-fixture/marker mapping (design slice §3.3).
+
+    Every function that injects a live fixture carries ``b1_live``; product
+    consumers also carry ``b1_product``; the CPU-basis comparison also carries
+    ``b1_latency_basis``; and the full-window instant-server self-witness --
+    which takes no fixture but does run a real 30-second offer -- carries
+    ``b1_live`` too. Adding an unmarked live consumer is a named failure, so
+    the traced container-free selection cannot silently acquire live work.
+    """
+    tree = ast.parse(src)
+    fails: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = {a.arg for a in node.args.args}
+        markers = _decorator_markers(node)
+        live = params & {CI_SCALE_FIXTURE, PRODUCT_FIXTURE}
+        if not live:
+            continue
+        if not node.name.startswith("test"):
+            fails.append(f"{node.name}: non-test consumer of a live fixture")
+            continue
+        if "b1_live" not in markers:
+            fails.append(f"{node.name}: live-fixture consumer without b1_live")
+        if PRODUCT_FIXTURE in params and "b1_product" not in markers:
+            fails.append(f"{node.name}: product-fixture consumer without b1_product")
+        if CI_SCALE_FIXTURE in params and PRODUCT_FIXTURE in params:
+            fails.append(f"{node.name}: injects both live fixtures")
+    witness = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and n.name == "test_b1_instant_server_clears_open_loop_offer"), None
+    )
+    if witness is None:
+        fails.append("test_b1_instant_server_clears_open_loop_offer: missing")
+    elif "b1_live" not in _decorator_markers(witness):
+        fails.append("test_b1_instant_server_clears_open_loop_offer: without b1_live")
+    basis = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and n.name == GC1_PRESERVED_ORACLES[0]), None
+    )
+    if basis is None:
+        fails.append(f"{GC1_PRESERVED_ORACLES[0]}: missing")
+    elif "b1_latency_basis" not in _decorator_markers(basis):
+        fails.append(f"{GC1_PRESERVED_ORACLES[0]}: without b1_latency_basis")
+    return fails
+
+
+def _product_partition_failures(src: str) -> list[str]:
+    """The recorded/gating partition inside the product node.
+
+    The three product comparisons are recorded: the node may check that a
+    serialized token *equals its own live comparison*, and may check the token
+    is one of the two admitted words. It may not require any token to be
+    ``met`` -- that would turn a recorded status back into a bar.
+    """
+    tree = ast.parse(src)
+    fails: list[str] = []
+    node = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and n.name == PRODUCT_REF_TEST), None
+    )
+    if node is None:
+        return [f"{PRODUCT_REF_TEST}: missing"]
+    for cmp_node in ast.walk(node):
+        if not isinstance(cmp_node, ast.Compare):
+            continue
+        if not any(isinstance(op, ast.Eq) for op in cmp_node.ops):
+            continue
+        rendered = [ast.unparse(c) for c in cmp_node.comparators]
+        if any(r in ("VERDICT_MET", "'met'", '"met"') for r in rendered):
+            fails.append(f"{PRODUCT_REF_TEST}: truth-gates a recorded status: {ast.unparse(cmp_node)}")
+    body = ast.get_source_segment(src, node) or ""
+    for gating in (
+        "assert served + errors == offered",
+        "assert committed == served",
+        'assert b1_product_run["placement_ok"] is True',
+        "assert served_rate >= PRODUCT_SUSTAINED_FLOOR",
+        "assert max_in_flight < PRODUCT_MAX_IN_FLIGHT",
+        'assert b1_product_run["worker_set_ok"]',
+    ):
+        if gating not in body:
+            fails.append(f"{PRODUCT_REF_TEST}: missing gating assertion {gating!r}")
+    for recorded in ("token == live[field_name]", "token in (VERDICT_MET, VERDICT_MISSED)"):
+        if recorded not in body:
+            fails.append(f"{PRODUCT_REF_TEST}: missing record-consistency check {recorded!r}")
+    return fails
+
+
+def _verdict_evaluator_failures(src: str) -> list[str]:
+    """The three comparisons themselves: names, order, operators, operands."""
+    tree = ast.parse(src)
+    fails: list[str] = []
+    if _module_tuple(tree, "PRODUCT_VERDICT_FIELDS") != GC1_PRODUCT_FIELDS:
+        fails.append("PRODUCT_VERDICT_FIELDS is not the closed ordered triple")
+    fn = next(
+        (n for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == "_product_promise_verdicts"), None
+    )
+    if fn is None:
+        return fails + ["_product_promise_verdicts: missing"]
+    assigned: list[str] = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant):
+                assigned.append(target.slice.value)
+    if tuple(assigned) != GC1_PRODUCT_FIELDS:
+        fails.append(f"_product_promise_verdicts assigns {tuple(assigned)}")
+    body = ast.get_source_segment(src, fn) or ""
+    for operand in ("result.errors == 0", "result.p99 < PRODUCT_P99_MS",
+                    "result.served == result.offered"):
+        if operand not in body:
+            fails.append(f"_product_promise_verdicts lost the comparison {operand!r}")
+    for literalized in ('= VERDICT_MET\n', '= "met"\n', "= 'met'\n"):
+        if literalized in body:
+            fails.append(f"_product_promise_verdicts literalizes a status: {literalized!r}")
+    return fails
+
+
+def test_b1_harness_surface_is_pinned_and_environment_independent_gc1():
+    """FP-GC1-1/3: both immutable profiles, the marker map, the recorded partition."""
+    profile_src = REF_PATH.read_text(encoding="utf-8")
+    test_src = REF_TEST.read_text(encoding="utf-8")
+    profile_assigns = _source_assigns(profile_src)
+    test_assigns = _source_assigns(test_src)
+
+    # The CI-scale profile constants live beside the untouched product ones.
+    for name, expected in CI_SCALE_BARS.items():
+        assert name in profile_assigns, f"b1_reference_profile.py missing {name}"
+        assert _eval_simple_constant(profile_assigns[name], profile_assigns) == expected, name
+    for name, expected in SHARED_CONSTANTS.items():
+        assert _eval_simple_constant(profile_assigns[name], profile_assigns) == expected, name
+    assert _eval_simple_constant(
+        profile_assigns["CI_SCALE_TOTAL_REQUESTS"], profile_assigns
+    ) == (
+        _eval_simple_constant(profile_assigns["CI_SCALE_BURST_RATE"], profile_assigns)
+        * _eval_simple_constant(profile_assigns["CI_SCALE_BURST_SECONDS"], profile_assigns)
+    )
+    # ... and the e2e copy is untouched by GC-1.
+    assert "CI_SCALE_BURST_RATE" not in _module_assigns(E2E_PATH)
+
+    # The test module's independent bar literals equal their profile counterparts.
+    for name, expected in {**CI_SCALE_BARS, **PRODUCT_BARS}.items():
+        if name not in _BAR_TO_PROFILE_CONSTANT:
+            continue
+        assert name in test_assigns, f"test_b1_ingest_burst.py missing {name}"
+        node = test_assigns[name]
+        assert isinstance(node, ast.Constant), f"{name} must be a numeric literal"
+        assert node.value == expected, f"{name}={node.value}"
+        counterpart = _BAR_TO_PROFILE_CONSTANT[name]
+        assert _eval_simple_constant(profile_assigns[counterpart], profile_assigns) == expected, (
+            f"{name} disagrees with b1_reference_profile.{counterpart}"
+        )
+
+    # Affinity cardinalities are literals in the test module, one per profile,
+    # and the allocation carries no bandwidth control anywhere.
+    tree = ast.parse(test_src)
+    for profile, cardinalities in GC1_AFFINITY_CARDINALITIES.items():
+        name = (
+            "CI_SCALE_AFFINITY_CARDINALITY" if profile == "ci-scale"
+            else "PRODUCT_AFFINITY_CARDINALITY"
+        )
+        assert ast.literal_eval(test_assigns[name]) == cardinalities, name
+        assert sum(cardinalities.values()) == (4 if profile == "ci-scale" else 8), profile
+    assert ast.literal_eval(test_assigns["B1_PLACEMENT_SCHEMA"]) == GC1_PLACEMENT_SCHEMA
+    assert ast.literal_eval(test_assigns["B1_PLACEMENT_MECHANISM"]) == GC1_PLACEMENT_MECHANISM
+    assert _module_tuple(tree, "B1_ROLES") == GC1_ROLES
+    for line in test_src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            continue
+        for control in GC1_BANDWIDTH_CONTROLS:
+            assert control not in stripped, f"bandwidth control survives: {stripped[:80]}"
+
+    # Closed live-fixture/marker mapping, and the registered marker set.
+    assert _live_marker_failures(test_src) == []
+    markers_toml = (REPO_ROOT / "services" / "gateway" / "pyproject.toml").read_text(encoding="utf-8")
+    for marker in GC1_MARKERS:
+        assert f'"{marker}:' in markers_toml, f"{marker} is not registered"
+
+    # Recorded/gating partition and the evaluator behind it.
+    assert _product_partition_failures(test_src) == []
+    assert _verdict_evaluator_failures(test_src) == []
+
+    # No profile knob comes from the environment; the driver semantics are kept.
+    assert not _has_environ_read(REF_PATH)
+    assert "getenv" not in test_src and "os.environ.get" not in test_src
+    assert "E2E_B1_CONCURRENCY" not in test_src
+    _raw_surface_checks(REF_PATH, profile_src)
+
+    # Negative controls: one mutation at a time, each named.
+    unmarked = test_src.replace(
+        "@pytest.mark.b1_live\ndef test_b1_ci_scale_fingerprint_proves_placement(",
+        "def test_b1_ci_scale_fingerprint_proves_placement(", 1)
+    assert unmarked != test_src
+    assert any("without b1_live" in f for f in _live_marker_failures(unmarked))
+    unproducted = test_src.replace(
+        "@pytest.mark.b1_live\n@pytest.mark.b1_product\ndef test_b1_product_exclusive_reference_profile(",
+        "@pytest.mark.b1_live\ndef test_b1_product_exclusive_reference_profile(", 1)
+    assert unproducted != test_src
+    assert any("without b1_product" in f for f in _live_marker_failures(unproducted))
+    unbasised = test_src.replace("@pytest.mark.b1_latency_basis\n", "", 1)
+    assert unbasised != test_src
+    assert any("without b1_latency_basis" in f for f in _live_marker_failures(unbasised))
+    unwitnessed = test_src.replace(
+        "@pytest.mark.b1_live\n@pytest.mark.parametrize(\"driver\", [b1, bd_e2e], "
+        "ids=[\"reference\", \"e2e\"])\n@pytest.mark.asyncio\nasync def "
+        "test_b1_instant_server_clears_open_loop_offer(",
+        "@pytest.mark.parametrize(\"driver\", [b1, bd_e2e], ids=[\"reference\", \"e2e\"])\n"
+        "@pytest.mark.asyncio\nasync def test_b1_instant_server_clears_open_loop_offer(", 1)
+    assert unwitnessed != test_src
+    assert any("instant_server" in f for f in _live_marker_failures(unwitnessed))
+    smuggled = test_src + (
+        "\n\ndef test_b1_smuggled_live_consumer(b1_ci_scale_run):\n"
+        "    assert b1_ci_scale_run\n"
+    )
+    assert any("without b1_live" in f for f in _live_marker_failures(smuggled))
+
+    truth_gated = test_src.replace(
+        "        assert token == live[field_name], (",
+        "        assert token == VERDICT_MET\n        assert token == live[field_name], (", 1)
+    assert truth_gated != test_src
+    assert any("truth-gates" in f for f in _product_partition_failures(truth_gated))
+    ungated = test_src.replace("    assert committed == served, f\"committed={committed} "
+                               "served={served}; {line}\"\n", "", 1)
+    assert ungated != test_src
+    assert any("missing gating assertion" in f for f in _product_partition_failures(ungated))
+    for operand, replacement in (
+        ("result.errors == 0", "False"),
+        ("result.p99 < PRODUCT_P99_MS", "False"),
+        ("result.served == result.offered", "False"),
+    ):
+        deleted = test_src.replace(operand, replacement, 1)
+        assert deleted != test_src
+        assert any("lost the comparison" in f for f in _verdict_evaluator_failures(deleted)), operand
+    reordered = test_src.replace(
+        'PRODUCT_VERDICT_FIELDS = (\n    "product_errors_eq_zero",\n'
+        '    "product_p99_lt_150_ms",\n    "product_served_eq_offered",\n)',
+        'PRODUCT_VERDICT_FIELDS = (\n    "product_p99_lt_150_ms",\n'
+        '    "product_errors_eq_zero",\n    "product_served_eq_offered",\n)', 1)
+    assert reordered != test_src
+    assert any("closed ordered triple" in f for f in _verdict_evaluator_failures(reordered))
+
+
+def _placement_surface_failures(src: str) -> list[str]:
+    """Exact fingerprint field names, order and placement in the B1 line."""
+    tree = ast.parse(src)
+    fails: list[str] = []
+    gating = _module_tuple(tree, "B1_GATING_PLACEMENT_FIELDS")
+    diagnostics = _module_tuple(tree, "B1_DIAGNOSTIC_PLACEMENT_FIELDS")
+    if gating != GC1_GATING_PLACEMENT_FIELDS:
+        fails.append(f"B1_GATING_PLACEMENT_FIELDS drift: {gating}")
+    if diagnostics != GC1_DIAGNOSTIC_PLACEMENT_FIELDS:
+        fails.append(f"B1_DIAGNOSTIC_PLACEMENT_FIELDS drift: {diagnostics}")
+    if gating + diagnostics != GC1_PLACEMENT_FIELDS:
+        fails.append("B1_PLACEMENT_FIELDS is not the two blocks in order")
+    composition = next(
+        (ast.unparse(n.value) for n in tree.body
+         if isinstance(n, ast.Assign) and len(n.targets) == 1
+         and isinstance(n.targets[0], ast.Name)
+         and n.targets[0].id == "B1_PLACEMENT_FIELDS"), None
+    )
+    if composition != "B1_GATING_PLACEMENT_FIELDS + B1_DIAGNOSTIC_PLACEMENT_FIELDS":
+        fails.append(f"B1_PLACEMENT_FIELDS is not gating-first: {composition}")
+
+    fn = next(
+        (n for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == "_serialize_placement_fields"), None
+    )
+    if fn is None:
+        return fails + ["_serialize_placement_fields: missing"]
+    body = ast.get_source_segment(src, fn) or ""
+    # Reconstruct the emission order from the serializer's own literals. The
+    # per-role blocks are contiguous runs under `for role in B1_ROLES`, so each
+    # expands role-major.
+    emitted: list[str] = []
+    for match in re.finditer(r'[f]?"(\{role\}_)?([a-z_0-9]+)=', body):
+        emitted.append(("{role}_" if match.group(1) else "") + match.group(2))
+    expanded: list[str] = []
+    index = 0
+    while index < len(emitted):
+        if not emitted[index].startswith("{role}_"):
+            expanded.append(emitted[index])
+            index += 1
+            continue
+        run = []
+        while index < len(emitted) and emitted[index].startswith("{role}_"):
+            run.append(emitted[index][len("{role}_"):])
+            index += 1
+        for role in GC1_ROLES:
+            expanded.extend(f"{role}_{suffix}" for suffix in run)
+    # The five diagnostic keys per role are rendered by B1RoleDiagnostics, not
+    # inline, so splice them in at their declared position.
+    diag_fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "rendered"), None
+    )
+    if diag_fn is None:
+        fails.append("B1RoleDiagnostics.rendered: missing")
+    else:
+        rendered_body = ast.get_source_segment(src, diag_fn) or ""
+        per_role = [
+            m.group(1) for m in re.finditer(r'f"\{self\.role\}_([a-z_0-9]+)"', rendered_body)
+        ]
+        anchor = expanded.index("gateway_cpu_busy_usec") if "gateway_cpu_busy_usec" in expanded \
+            else len(expanded)
+        spliced = [f"{role}_{suffix}" for role in GC1_ROLES for suffix in per_role]
+        expanded = expanded[:anchor] + spliced + expanded[anchor:]
+    if tuple(expanded) != GC1_PLACEMENT_FIELDS:
+        fails.append(f"_serialize_placement_fields emits {tuple(expanded)}")
+
+    live = next(
+        (n for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == LIVE_RUN_IMPL), None
+    )
+    if live is None:
+        return fails + [f"{LIVE_RUN_IMPL}: missing"]
+    assign = next(
+        (n for n in ast.walk(live)
+         if isinstance(n, ast.Assign)
+         and any(isinstance(t, ast.Name) and t.id == "fingerprint_line" for t in n.targets)), None
+    )
+    if assign is None:
+        return fails + ["fingerprint_line: missing"]
+    line = ast.unparse(assign)
+    if "{placement_fields}" not in line:
+        fails.append("fingerprint_line carries no placement block")
+    else:
+        before = line.index("workers=")
+        block = line.index("{placement_fields}")
+        after = line.index("max_lateness_ms=")
+        if not before < block < after:
+            fails.append("placement block is not between workers= and the latency fields")
+    if "{product_fields}" not in line:
+        fails.append("fingerprint_line carries no product-verdict slot")
+    elif not line.index("{product_fields}") < line.index("p99_leg_split="):
+        fails.append("product verdicts are not immediately before p99_leg_split")
+    for retired in GC1_RETIRED_FINGERPRINT_KEYS:
+        if f",{retired}=" in line or f"'{retired}=" in line:
+            fails.append(f"retired fingerprint key {retired!r} is still emitted")
+    if "gateway_cpu_cores_used" not in ast.unparse(fn):
+        fails.append("gateway_cpu_cores_used is not emitted")
+
+    # Every reported diagnostic must have an `unavailable` fallback, and no
+    # gating field may ever carry one.
+    serializer = ast.unparse(fn)
+    for name in ("gateway_cpu_busy_usec", "gateway_nonrole_busy_cores_estimate",
+                 "gateway_cpu_cores_used"):
+        if "DIAGNOSTIC_UNAVAILABLE" not in serializer:
+            fails.append(f"{name} has no unavailable fallback")
+            break
+    diag_src = ast.get_source_segment(
+        src,
+        next(n for n in tree.body
+             if isinstance(n, ast.FunctionDef) and n.name == "_role_diagnostics"),
+    ) or ""
+    if "DIAGNOSTIC_UNAVAILABLE" not in diag_src or "_try_diagnostic" not in diag_src:
+        fails.append("_role_diagnostics has no fail-soft path")
+    # A diagnostic failure must never reach placement_ok.
+    if "placement_ok" in diag_src:
+        fails.append("_role_diagnostics touches placement_ok")
+    return fails
+
+
+def test_b1_placement_fingerprint_surface_is_pinned():
+    """FP-GC1-4: gating affinity first, diagnostics after, `unavailable` fallback."""
+    src = REF_TEST.read_text(encoding="utf-8")
+    assert len(GC1_PLACEMENT_FIELDS) == 26
+    assert len(set(GC1_PLACEMENT_FIELDS)) == 26
+    assert len(GC1_GATING_PLACEMENT_FIELDS) == 8
+    for role in GC1_ROLES:
+        assert f"{role}_allowed_cpus" in GC1_GATING_PLACEMENT_FIELDS
+        for suffix in ("quota_cpus", "cpu_period_us", "nr_periods",
+                       "nr_throttled", "throttled_usec"):
+            assert f"{role}_{suffix}" in GC1_DIAGNOSTIC_PLACEMENT_FIELDS
+            assert f"{role}_{suffix}" not in GC1_GATING_PLACEMENT_FIELDS
+    assert _placement_surface_failures(src) == []
+
+    # Negative controls, one mutation at a time.
+    dropped = src.replace('    "driver_throttled_usec",\n', "", 1)
+    assert dropped != src
+    assert any("DIAGNOSTIC_PLACEMENT_FIELDS drift" in f
+               for f in _placement_surface_failures(dropped))
+    ungated = src.replace('    "driver_allowed_cpus",\n', "", 1)
+    assert ungated != src
+    assert any("GATING_PLACEMENT_FIELDS drift" in f for f in _placement_surface_failures(ungated))
+    # Moving a diagnostic into the gating prefix is red.
+    reordered = src.replace(
+        'B1_PLACEMENT_FIELDS = B1_GATING_PLACEMENT_FIELDS + B1_DIAGNOSTIC_PLACEMENT_FIELDS',
+        'B1_PLACEMENT_FIELDS = B1_DIAGNOSTIC_PLACEMENT_FIELDS + B1_GATING_PLACEMENT_FIELDS', 1)
+    assert reordered != src
+    assert any("not gating-first" in f for f in _placement_surface_failures(reordered))
+    renamed = src.replace('f"gateway_cpu_cores_used="', 'f"cpu_cores_used="', 1)
+    if renamed != src:
+        assert _placement_surface_failures(renamed) != []
+    moved = src.replace('f"{placement_fields}"\n            f"max_lateness_ms=',
+                        'f"max_lateness_ms=', 1)
+    assert moved != src
+    assert any("no placement block" in f or "not between" in f
+               for f in _placement_surface_failures(moved))
+    unslotted = src.replace('            f"{product_fields}"\n', "", 1)
+    assert unslotted != src
+    assert any("product-verdict slot" in f for f in _placement_surface_failures(unslotted))
+    # Removing the fail-soft path, or letting a diagnostic reach placement_ok.
+    hardened = src.replace("_try_diagnostic(", "_must_succeed(")
+    assert hardened != src
+    assert any("no fail-soft path" in f for f in _placement_surface_failures(hardened))
+    gating_diag = src.replace(
+        '        notes.append(f"{role} cpu.max: source was not readable")',
+        '        notes.append(f"{role} cpu.max: source was not readable"); placement_ok = False', 1)
+    assert gating_diag != src
+    assert any("touches placement_ok" in f for f in _placement_surface_failures(gating_diag))
+
+
+def test_gc1_preserves_and_routes_unqualified_cpu_basis():
+    """FP-GC1-6: the stale 2.427 basis stays visible, unchanged and routed.
+
+    Reads only tracked carriers, deliberately: this guard must stay collectable
+    in CI, where the gitignored design tree does not exist.
+    """
+    import yaml as _yaml
+
+    values_path = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
+    values = _yaml.safe_load(values_path.read_text(encoding="utf-8"))
+    basis = values["ingestGateway"]["sizingBasis"]
+    assert float(basis["cpuMsPerRequest"]) == GC1_BASIS_MS_PER_REQUEST
+    assert basis["observations"] == []
+    assert "cpuMsPerRequest: 2.427" in values_path.read_text(encoding="utf-8")
+
+    thresholds = _yaml.safe_load(
+        (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(encoding="utf-8")
+    )
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    notes = b1_entry["notes"]
+    assert GC1_BASIS_OWNER in notes, "B1 notes must route the basis to its owning slice"
+    assert "cpuMsPerRequest=2.427" in notes
+    assert "five consecutive" in notes
+
+    # Both oracle carriers keep their names and their comparisons.
+    ref_src = REF_TEST.read_text(encoding="utf-8")
+    ledger_src = (
+        REPO_ROOT / "tests" / "delivery" / "test_delivery_sizing_ledger.py"
+    ).read_text(encoding="utf-8")
+    assert f"def {GC1_PRESERVED_ORACLES[0]}(" in ref_src
+    assert f"def {GC1_PRESERVED_ORACLES[1]}(" in ledger_src
+    basis_fn = next(
+        n for n in ast.parse(ref_src).body
+        if isinstance(n, ast.FunctionDef) and n.name == GC1_PRESERVED_ORACLES[0]
+    )
+    body = ast.get_source_segment(ref_src, basis_fn) or ""
+    assert "assert measured <= basis" in body
+    assert 'values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"]' in body
+    # It is routed out of both GC-1 targets rather than skipped or weakened.
+    assert "b1_latency_basis" in _decorator_markers(basis_fn)
+    for weakening in ("pytest.mark.skip", "pytest.mark.xfail", "pytest.skip("):
+        assert weakening not in body, f"{GC1_PRESERVED_ORACLES[0]} must not {weakening}"
+
+    # This guard reads no gitignored design carrier.
+    guard_src = Path(__file__).read_text(encoding="utf-8")
+    guard_fn = next(
+        n for n in ast.parse(guard_src).body
+        if isinstance(n, ast.FunctionDef) and n.name == "test_gc1_preserves_and_routes_unqualified_cpu_basis"
+    )
+    roots = set()
+    for node in ast.walk(guard_fn):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)):
+            continue
+        left = node.left
+        while isinstance(left, ast.BinOp) and isinstance(left.op, ast.Div):
+            left = left.left
+        parent = node
+        while isinstance(parent.left, ast.BinOp):
+            parent = parent.left
+        if isinstance(left, ast.Name) and left.id == "REPO_ROOT":
+            assert isinstance(parent.right, ast.Constant), ast.unparse(node)
+            roots.add(parent.right.value)
+    assert roots, "guard opens no repository carrier at all"
+    assert roots <= GC1_TRACKED_CARRIER_ROOTS, sorted(roots - GC1_TRACKED_CARRIER_ROOTS)
