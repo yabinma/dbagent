@@ -485,6 +485,7 @@ B1_DRIVER_NAME_PREFIX="dbagent-b1-driver-"
 B1_RUN_ID=""
 B1_RUN_DIR=""
 B1_CLEANUP_FAILED=0
+B1_RUN_DIR_FAILED=0
 # GC-3: the review-runner image is built once per invocation and reused by
 # every arm of the 28-arm discovery sweep. Rebuilding per arm would put a
 # multi-minute, uncontrolled compile on the measured host between measurements.
@@ -581,12 +582,57 @@ b1_complete_sibling_pairs() {
   done
 }
 
+# Empty this run's directory through the same root-capable path that filled it.
+#
+# The driver container runs as the runner image's default user, root, and
+# writes into the run mount: pytest's cache tree, the profile's generated
+# gateway.yaml and gateway.log. On a ROOTLESS daemon -- every developer host
+# here -- container root IS the invoking user, so those files are already ours
+# and this never runs. On a ROOTFUL daemon -- every GitHub-hosted runner -- it
+# is uid 0, the directories it creates inside the mount are root-owned and mode
+# 0755, and the unprivileged `runner` user cannot unlink their contents: a
+# plain `rm -rf` fails with EACCES after a perfectly good measurement. Measured
+# on CI 2026-09-16: both manual topology-probe dispatches lost 27 of 28 arms
+# that way after a green arm 0, and the ordinary b1 step of the preceding
+# benchmark run hit the same three path shapes. (The run ids stay in
+# design/fix.md and tests/functional/test_b1_cleanup_run_dir.py: this file is
+# a GC-3 sizing carrier, which may carry no diagnostic run id at all.)
+#
+# The removal therefore happens where the privilege is, in one short-lived
+# container over the same mount, carrying this run's labels so it is never
+# anonymous. Only the CONTENTS go: the mount point itself is busy, and it is
+# the host-owned mktemp directory the shell must drop anyway -- so the removal
+# the target checks, and the surviving-directory test that follows it, stay
+# exactly where they were. Chowning the tree back to `id -u` instead would be
+# wrong on precisely one of the two daemons: under rootless, container uid N
+# is host subuid 100000+N, so handing the files to "1000" hands them to a
+# stranger. Deleting as root is the same operation on both.
+#
+# This function's own exit status is deliberately not an oracle: whether the
+# run directory is gone is, and b1_cleanup tests that immediately afterwards.
+b1_purge_run_dir() {
+  [ "$B1_IMAGE_BUILT" -eq 1 ] || return 0
+  docker run --rm \
+    --label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" \
+    --label "${B1_ROLE_LABEL_KEY}=cleanup" \
+    -v "$B1_RUN_DIR":"$B1_RUN_MOUNT" \
+    "$B1_IMAGE_TAG" \
+    find "$B1_RUN_MOUNT" -mindepth 1 -delete >/dev/null 2>&1
+  return 0
+}
+
 # Fail-safe lifecycle guard. The driver fixture owns both siblings and stops
 # them in reverse order; this removes anything carrying THIS run's label if the
 # driver died before it could, verifies the filtered list is then empty, and
 # only then drops the run directory. A cleanup that cannot finish fails the
 # target -- a leaked container on a measured role's CPUs would silently contend
 # with the next measurement.
+#
+# The two failures are reported and carried SEPARATELY. Both still fail the
+# target, but they are not the same diagnosis -- a surviving container contends
+# for a measured role's CPUs, a surviving run directory does not -- and
+# conflating them made every rootful-Docker cleanup announce "left containers
+# behind" over a container census that was empty.
 b1_cleanup() {
   [ -n "$B1_RUN_ID" ] || return 0
   local ids
@@ -601,7 +647,35 @@ b1_cleanup() {
     B1_CLEANUP_FAILED=1
   fi
   if [ -n "$B1_RUN_DIR" ] && [ -d "$B1_RUN_DIR" ]; then
-    rm -rf "$B1_RUN_DIR" || B1_CLEANUP_FAILED=1
+    # Quietly first: on a rootless daemon this is the whole story, and the
+    # EACCES lines a rootful daemon prints here are about files the purge
+    # below is about to remove anyway.
+    rm -rf "$B1_RUN_DIR" 2>/dev/null
+    if [ -d "$B1_RUN_DIR" ]; then
+      b1_purge_run_dir
+      rm -rf "$B1_RUN_DIR"
+    fi
+    if [ -d "$B1_RUN_DIR" ]; then
+      echo "integration-test.sh: run ${B1_RUN_ID} could not remove its run directory ${B1_RUN_DIR}" >&2
+      B1_RUN_DIR_FAILED=1
+    fi
+  fi
+  # The purge is itself a container of this run, created after the census
+  # above, so census again -- "a container carrying this run's label does not
+  # outlive cleanup" has to hold for the cleanup role too. Measured here
+  # 2026-09-16: `docker run --rm` returns only once the daemon has removed the
+  # record (8/8 probes read empty), so this normally finds nothing; the
+  # force-removal is kept because a container that merely LAGS is not a leak,
+  # and only one that survives removal contends with the next measurement.
+  ids="$(docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" 2>/dev/null)"
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null 2>&1
+    ids="$(docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" 2>/dev/null)"
+  fi
+  if [ -n "$ids" ]; then
+    echo "integration-test.sh: run ${B1_RUN_ID} left containers behind: $(echo "$ids" | tr '\n' ' ')" >&2
+    B1_CLEANUP_FAILED=1
   fi
   return 0
 }
@@ -632,7 +706,16 @@ b1_prepare() {
   # driver never starts. Creating them here gives CI the shape a developer
   # host already has. They stay empty: the anonymous volume mounts over them.
   mkdir -p "$REPO_ROOT/libs/py/rca_common/.venv" "$REPO_ROOT/services/worker/.venv" || return 1
-  trap 'b1_cleanup' EXIT TERM INT
+  # The probe sweep is already under way when this runs for arms 1..N, and the
+  # window it covers -- the first arm's multi-minute image build -- is the one
+  # most likely to be killed. Replacing the collector with a bare cleanup for
+  # the duration would lose the `invalid` artifact GC-3 §3.3 promises on a kill
+  # (review.md 2026-09-16 W1), so ADD to the trap instead of overwriting it.
+  if [ "${B1_PROBE_FINISHED:-1}" -eq 0 ]; then
+    trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT
+  else
+    trap 'b1_cleanup' EXIT TERM INT
+  fi
   if [ "$B1_IMAGE_BUILT" -eq 0 ]; then
     docker build -t dbagent-review-runner:b1 -f deploy/review-runner/Dockerfile . || return 1
     B1_IMAGE_BUILT=1
@@ -738,7 +821,7 @@ B1_CI_SCALE_DRIVER
   local rc=$?
   b1_cleanup
   trap - EXIT TERM INT
-  if [ "$B1_CLEANUP_FAILED" -ne 0 ]; then return 1; fi
+  if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
   return "$rc"
 }
 
@@ -787,7 +870,7 @@ B1_PRODUCT_DRIVER
   local rc=$?
   b1_cleanup
   trap - EXIT TERM INT
-  if [ "$B1_CLEANUP_FAILED" -ne 0 ]; then return 1; fi
+  if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
   return "$rc"
 }
 
@@ -864,6 +947,7 @@ b1_topology_probe_arm() {
   B1_RUN_ID=""
   B1_RUN_DIR=""
   B1_CLEANUP_FAILED=0
+  B1_RUN_DIR_FAILED=0
   b1_prepare || return 1
   trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT
   driver_cpus="$(python3 "$B1_PROBE_PLANNER" contract \
@@ -890,6 +974,10 @@ b1_topology_probe_arm() {
   trap 'b1_topology_probe_finish' EXIT TERM INT
   if [ "$B1_CLEANUP_FAILED" -ne 0 ]; then
     echo "integration-test.sh: arm $index left containers behind; the sweep stops here" >&2
+    return 1
+  fi
+  if [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then
+    echo "integration-test.sh: arm $index could not remove its run directory; the sweep stops here" >&2
     return 1
   fi
   return "$rc"

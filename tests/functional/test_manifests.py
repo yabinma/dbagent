@@ -4486,6 +4486,16 @@ B1_ROUTE_CLAUSES: tuple[str, ...] = (
     'docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"',
     "trap 'b1_cleanup' EXIT TERM INT",
     'B1_CLEANUP_FAILED=1',
+    # the run directory is emptied where the privilege is (the driver writes it
+    # as the image's root user, which on CI's ROOTFUL daemon is host uid 0) and
+    # its own survival is a failure of its own, never a container verdict
+    'B1_RUN_DIR_FAILED=1',
+    'find "$B1_RUN_MOUNT" -mindepth 1 -delete',
+    '--label "${B1_ROLE_LABEL_KEY}=cleanup"',
+    'if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi',
+    # the purge container is censused too: force-remove, then verify
+    '    docker rm -f $ids >/dev/null 2>&1\n    ids="$(docker ps -aq --filter '
+    '"label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" 2>/dev/null)"',
 )
 
 # The runner image declares VOLUME mountpoints under /workspace, and the
@@ -4575,6 +4585,190 @@ _B1_CPU_INDEX_RE = re.compile(r"\$\{cpus\[(\d+)\]\}")
 _B1_ROLE_SELECTION_RE = re.compile(
     r'^\s*(gateway|postgres|driver)_cpus="\$\(b1_canonical_cpu_list (.+)\)"\s*$'
 )
+
+
+# ---------------------------------------------------------------------------
+# The cleanup contract (GC-1 design/slices/gc-1-reference-topology §3.3): remove
+# this run's containers, fail if any survive, then drop the run directory --
+# and report those two as the separate facts they are.
+#
+# The run directory is written by the driver container as the runner image's
+# default user, root. On CI's ROOTFUL daemon that is host uid 0, so the host's
+# own `rm -rf` cannot unlink it and the removal must happen through a
+# root-capable path. What is pinned here is that the removal is attempted after
+# the container census, that its outcome is judged by whether the directory
+# survived, and that a surviving directory never prints the container verdict.
+# ---------------------------------------------------------------------------
+B1_CLEANUP_CENSUS = 'docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"'
+B1_CONTAINER_VERDICT = "left containers behind"
+B1_RUN_DIR_VERDICT = "could not remove its run directory"
+B1_CLEANUP_RUN_DIR_GUARD = 'if [ -n "$B1_RUN_DIR" ] && [ -d "$B1_RUN_DIR" ]; then'
+B1_CLEANUP_REMOVAL = 'rm -rf "$B1_RUN_DIR"'
+B1_CLEANUP_SURVIVOR_TEST = 'if [ -d "$B1_RUN_DIR" ]; then'
+B1_PURGE_TARGET = "b1_purge_run_dir"
+# The measured container's identity, asserted where it is applied. Two B1
+# containers now carry this run's label -- the driver and the short-lived
+# cleanup purge -- so "the literal appears somewhere in the launcher" would no
+# longer prove the driver still has it.
+B1_DRIVER_TARGET = "b1_run_driver"
+B1_DRIVER_CLAUSES = (
+    '--name "${B1_DRIVER_NAME_PREFIX}${B1_RUN_ID}"',
+    '--label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"',
+    '--label "${B1_ROLE_LABEL_KEY}=driver"',
+    "--network host",
+    "--pid host",
+    '-v "$REPO_ROOT":/workspace:ro',
+    '-v "$B1_RUN_DIR":"$B1_RUN_MOUNT"',
+    '-v "$B1_SOCKET":/var/run/docker.sock',
+    'taskset -c "$cpuset" bash "$B1_RUN_MOUNT/$script"',
+)
+B1_PURGE_CLAUSES = (
+    # only when the image this run built actually exists
+    '[ "$B1_IMAGE_BUILT" -eq 1 ] || return 0',
+    # one short-lived, run-scoped, self-removing container ...
+    "docker run --rm",
+    '--label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}"',
+    '--label "${B1_ROLE_LABEL_KEY}=cleanup"',
+    # ... over this run's mount and nothing else ...
+    '-v "$B1_RUN_DIR":"$B1_RUN_MOUNT"',
+    '"$B1_IMAGE_TAG"',
+    # ... which empties it without unlinking the busy mount point itself.
+    'find "$B1_RUN_MOUNT" -mindepth 1 -delete',
+)
+B1_CLEANUP_GATE = (
+    'if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi'
+)
+
+
+def _uncommented(region: str) -> str:
+    return "\n".join(
+        line for line in region.splitlines() if not line.strip().startswith("#")
+    )
+
+
+def _b1_cleanup_failures(launcher: str) -> list[str]:
+    """The lifecycle guard's two failures stay two failures."""
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    region = _uncommented(_b1_target_region(launcher, "b1_cleanup"))
+    if not region:
+        add("cleanup_target_missing")
+        return fails
+    if B1_CLEANUP_RUN_DIR_GUARD not in region:
+        add("cleanup_run_dir_guard_missing")
+        return fails
+    # Three parts, in this order: the container census, the run-directory
+    # branch it brackets, and the second census that covers the purge
+    # container the branch itself created. The branch is delimited by its own
+    # closing `fi` at the function's indentation; every `fi` inside it is
+    # deeper.
+    census_part, after_guard = region.split(B1_CLEANUP_RUN_DIR_GUARD, 1)
+    if "\n  fi" not in after_guard:
+        add("cleanup_run_dir_branch_unterminated")
+        return fails
+    run_dir_part, post_purge_part = after_guard.split("\n  fi", 1)
+
+    # (1) the container census: two filtered reads, one verdict, one flag, and
+    # no opinion at all about the run directory.
+    if census_part.count(B1_CLEANUP_CENSUS) != 2:
+        add("cleanup_census_inventory_drift", str(census_part.count(B1_CLEANUP_CENSUS)))
+    if B1_CONTAINER_VERDICT not in census_part:
+        add("cleanup_container_verdict_missing")
+    if "B1_CLEANUP_FAILED=1" not in census_part:
+        add("cleanup_container_flag_missing")
+    if "B1_RUN_DIR_FAILED" in census_part:
+        add("cleanup_container_branch_sets_the_run_dir_flag")
+
+    # (2) the run directory: removed after the census, through the root-capable
+    # path when the plain removal could not do it, and judged by survival.
+    if "B1_CLEANUP_FAILED" in run_dir_part:
+        add("cleanup_run_dir_sets_the_container_flag")
+    if B1_CONTAINER_VERDICT in run_dir_part:
+        add("cleanup_run_dir_blames_containers")
+    if B1_RUN_DIR_VERDICT not in run_dir_part:
+        add("cleanup_run_dir_verdict_missing")
+    if "B1_RUN_DIR_FAILED=1" not in run_dir_part:
+        add("cleanup_run_dir_flag_missing")
+    if B1_PURGE_TARGET not in run_dir_part:
+        add("cleanup_purge_missing")
+    if B1_CLEANUP_REMOVAL not in run_dir_part:
+        add("cleanup_removal_missing")
+    else:
+        removal_tail = run_dir_part.rsplit(B1_CLEANUP_REMOVAL, 1)[-1]
+        if (B1_CLEANUP_SURVIVOR_TEST not in removal_tail
+                or "B1_RUN_DIR_FAILED=1" not in removal_tail):
+            add("cleanup_removal_unchecked", " ".join(removal_tail.split())[:80])
+
+    # (2b) the purge container is a container of this run, created after the
+    # first census -- so the run is censused again, with the same
+    # force-remove-then-verify shape, and a survivor is still fatal.
+    if post_purge_part.count(B1_CLEANUP_CENSUS) != 2:
+        add("cleanup_post_purge_census_missing", str(post_purge_part.count(B1_CLEANUP_CENSUS)))
+    if B1_CONTAINER_VERDICT not in post_purge_part:
+        add("cleanup_post_purge_verdict_missing")
+    if "B1_CLEANUP_FAILED=1" not in post_purge_part:
+        add("cleanup_post_purge_flag_missing")
+    if "B1_RUN_DIR_FAILED" in post_purge_part:
+        add("cleanup_post_purge_sets_the_run_dir_flag")
+    if B1_CLEANUP_REMOVAL in post_purge_part:
+        add("cleanup_removes_the_run_dir_after_the_last_census")
+    if region.count(B1_CONTAINER_VERDICT) != 2:
+        add("cleanup_container_verdict_inventory_drift", str(region.count(B1_CONTAINER_VERDICT)))
+
+    # (3) the driver container still carries its own identity and mounts.
+    driver = _uncommented(_b1_target_region(launcher, B1_DRIVER_TARGET))
+    if not driver:
+        add("driver_target_missing")
+    else:
+        for clause in B1_DRIVER_CLAUSES:
+            if clause not in driver:
+                add("driver_clause_missing", repr(clause))
+
+    # (4) the purge container itself, and the tree it is allowed to touch.
+    purge = _uncommented(_b1_target_region(launcher, B1_PURGE_TARGET))
+    if not purge:
+        add("purge_target_missing")
+    else:
+        for clause in B1_PURGE_CLAUSES:
+            if clause not in purge:
+                add("purge_clause_missing", repr(clause))
+        for mount in ("$REPO_ROOT", "/workspace", "docker.sock"):
+            if mount in purge:
+                add("purge_mounts_more_than_the_run_dir", mount)
+
+    # (5) every consumer gates on BOTH flags ...
+    for target in ("b1", "b1_product"):
+        if B1_CLEANUP_GATE not in _uncommented(_b1_target_region(launcher, target)):
+            add("consumer_ignores_the_run_dir_failure", target)
+
+    # ... and the arm loop names the one that actually happened.
+    arm = _uncommented(_b1_target_region(launcher, "b1_topology_probe_arm"))
+    if not arm:
+        add("arm_target_missing")
+        return fails
+    if "B1_RUN_DIR_FAILED=0" not in arm:
+        add("arm_does_not_reset_the_run_dir_flag")
+    if arm.count(B1_CONTAINER_VERDICT) != 1:
+        add("arm_container_verdict_inventory_drift", str(arm.count(B1_CONTAINER_VERDICT)))
+    if arm.count(B1_RUN_DIR_VERDICT) != 1:
+        add("arm_run_dir_verdict_inventory_drift", str(arm.count(B1_RUN_DIR_VERDICT)))
+    for flag, verdict in (
+        ("B1_CLEANUP_FAILED", B1_CONTAINER_VERDICT),
+        ("B1_RUN_DIR_FAILED", B1_RUN_DIR_VERDICT),
+    ):
+        gate = f'if [ "${flag}" -ne 0 ]; then'
+        if gate not in arm:
+            add("arm_gate_missing", flag)
+            continue
+        branch = arm.split(gate, 1)[1].split("\n  fi", 1)[0]
+        if verdict not in branch:
+            add("arm_gate_reports_the_other_failure", flag)
+        if "return 1" not in branch:
+            add("arm_gate_does_not_stop_the_sweep", flag)
+    return fails
 
 
 def _b1_target_region(launcher: str, target: str) -> str:
@@ -4896,6 +5090,7 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
 
     fails.extend(_b1_affinity_failures(launcher))
     fails.extend(_b1_mountpoint_failures(launcher))
+    fails.extend(_b1_cleanup_failures(launcher))
     return fails
 
 
@@ -4976,6 +5171,10 @@ GC3_PROBE_LAUNCHER_CLAUSES: tuple[str, ...] = (
     # EXIT-trap-safe collector, exactly once, and its status is the target's
     "trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT",
     "trap 'b1_topology_probe_finish' EXIT TERM INT",
+    # ... including across b1_prepare, whose first-arm image build is the long
+    # window: it ADDS its cleanup to the collector trap instead of replacing it,
+    # so a kill during the build still writes the closed `invalid` artifact.
+    'if [ "${B1_PROBE_FINISHED:-1}" -eq 0 ]; then',
     '[ "$B1_PROBE_FINISHED" -eq 0 ] || return 0',
     'python3 "$B1_PROBE_PLANNER" collect \\',
     'if [ "$rc" -ne 0 ]; then return "$rc"; fi',
@@ -5263,6 +5462,16 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
     assert per_arm_build != launcher
     assert "probe_clause_missing" in _reasons(text=per_arm_build)
 
+    prepare_overwrites_the_collector = launcher.replace(
+        '  if [ "${B1_PROBE_FINISHED:-1}" -eq 0 ]; then\n'
+        "    trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT\n"
+        "  else\n"
+        "    trap 'b1_cleanup' EXIT TERM INT\n"
+        "  fi\n",
+        "  trap 'b1_cleanup' EXIT TERM INT\n", 1)
+    assert prepare_overwrites_the_collector != launcher
+    assert "probe_clause_missing" in _reasons(text=prepare_overwrites_the_collector)
+
     no_collector = launcher.replace("trap 'b1_topology_probe_finish' EXIT TERM INT", "true")
     assert no_collector != launcher
     assert "probe_clause_missing" in _reasons(text=no_collector)
@@ -5315,7 +5524,7 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("profile_renamed_in_the_contract", "launcher", "route_clause_missing"),
     ("run_id_shortened", "launcher", "route_clause_missing"),
     ("driver_name_prefix_changed", "launcher", "route_clause_missing"),
-    ("run_label_dropped", "launcher", "route_clause_missing"),
+    ("run_label_dropped", "launcher", "driver_clause_missing"),
     ("role_label_dropped", "launcher", "route_clause_missing"),
     ("cleanup_filter_widened", "launcher", "route_clause_missing"),
     ("cleanup_trap_removed", "launcher", "route_clause_missing"),
@@ -5370,7 +5579,38 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("driver_identity_accepts_many_matches", "fixture", "fixture_clause_missing"),
     ("gateway_loses_host_networking", "fixture", "fixture_clause_missing"),
     ("wrapper_admission_revoked", "admission", "wrapper_not_admitted"),
+    # --- the run directory the rootful daemon writes as uid 0 (fix.md D1) ---
+    ("cleanup_blames_containers_for_the_run_dir", "launcher",
+     "cleanup_run_dir_sets_the_container_flag"),
+    ("arm_blames_containers_for_the_run_dir", "launcher",
+     "arm_container_verdict_inventory_drift"),
+    ("cleanup_drops_the_root_capable_purge", "launcher", "cleanup_purge_missing"),
+    ("cleanup_stops_checking_that_the_run_dir_is_gone", "launcher",
+     "cleanup_removal_unchecked"),
+    ("purge_stops_deleting", "launcher", "purge_clause_missing"),
+    ("purge_loses_its_run_label", "launcher", "purge_clause_missing"),
+    ("purge_gains_the_source_mount", "launcher", "purge_mounts_more_than_the_run_dir"),
+    ("b1_ignores_the_run_dir_failure", "launcher", "consumer_ignores_the_run_dir_failure"),
+    ("arm_does_not_reset_the_run_dir_flag", "launcher", "arm_does_not_reset_the_run_dir_flag"),
+    ("cleanup_drops_the_post_purge_census", "launcher", "cleanup_post_purge_census_missing"),
+    ("post_purge_census_is_not_fatal", "launcher", "cleanup_post_purge_flag_missing"),
 ]
+
+
+# The second census stanza, as one literal, so the two mutations below remove
+# exactly it and nothing that looks like it.
+_B1_POST_PURGE_CENSUS = """  ids="$(docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" 2>/dev/null)"
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null 2>&1
+    ids="$(docker ps -aq --filter "label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" 2>/dev/null)"
+  fi
+  if [ -n "$ids" ]; then
+    echo "integration-test.sh: run ${B1_RUN_ID} left containers behind: $(echo "$ids" | tr '\\n' ' ')" >&2
+    B1_CLEANUP_FAILED=1
+  fi
+  return 0
+}"""
 
 
 def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str,
@@ -5405,7 +5645,10 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
         launcher = launcher.replace('B1_DRIVER_NAME_PREFIX="dbagent-b1-driver-"',
                                     'B1_DRIVER_NAME_PREFIX="b1-"', 1)
     elif case_id == "run_label_dropped":
-        launcher = launcher.replace('    --label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" \\\n', "", 1)
+        launcher = launcher.replace(
+            '    --name "${B1_DRIVER_NAME_PREFIX}${B1_RUN_ID}" \\\n'
+            '    --label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" \\\n',
+            '    --name "${B1_DRIVER_NAME_PREFIX}${B1_RUN_ID}" \\\n', 1)
     elif case_id == "role_label_dropped":
         launcher = launcher.replace('    --label "${B1_ROLE_LABEL_KEY}=driver" \\\n', "", 1)
     elif case_id == "cleanup_filter_widened":
@@ -5561,6 +5804,49 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
             "            (\n                _restore_attr, testcontainers_config, name,", 1)
     elif case_id == "driver_identity_accepts_many_matches":
         fixture = fixture.replace("if len(matches) != 1:", "if len(matches) < 1:", 1)
+    elif case_id == "cleanup_drops_the_post_purge_census":
+        launcher = launcher.replace(_B1_POST_PURGE_CENSUS, "  return 0\n}", 1)
+    elif case_id == "post_purge_census_is_not_fatal":
+        launcher = launcher.replace(
+            _B1_POST_PURGE_CENSUS,
+            _B1_POST_PURGE_CENSUS.replace("    B1_CLEANUP_FAILED=1\n", "", 1), 1)
+    elif case_id == "cleanup_blames_containers_for_the_run_dir":
+        # The defect fix.md D1 describes: one flag for two unrelated facts.
+        launcher = launcher.replace("      B1_RUN_DIR_FAILED=1", "      B1_CLEANUP_FAILED=1", 1)
+    elif case_id == "arm_blames_containers_for_the_run_dir":
+        launcher = launcher.replace(
+            "arm $index could not remove its run directory; the sweep stops here",
+            "arm $index left containers behind; the sweep stops here", 1)
+    elif case_id == "cleanup_drops_the_root_capable_purge":
+        launcher = launcher.replace("      b1_purge_run_dir\n", "", 1)
+    elif case_id == "cleanup_stops_checking_that_the_run_dir_is_gone":
+        launcher = launcher.replace(
+            '    if [ -d "$B1_RUN_DIR" ]; then\n'
+            '      echo "integration-test.sh: run ${B1_RUN_ID} could not remove its run '
+            'directory ${B1_RUN_DIR}" >&2\n'
+            "      B1_RUN_DIR_FAILED=1\n"
+            "    fi\n",
+            "", 1)
+    elif case_id == "purge_stops_deleting":
+        launcher = launcher.replace('find "$B1_RUN_MOUNT" -mindepth 1 -delete',
+                                    'find "$B1_RUN_MOUNT" -mindepth 1', 1)
+    elif case_id == "purge_loses_its_run_label":
+        launcher = launcher.replace(
+            '    --label "${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" \\\n'
+            '    --label "${B1_ROLE_LABEL_KEY}=cleanup" \\\n',
+            '    --label "${B1_ROLE_LABEL_KEY}=cleanup" \\\n', 1)
+    elif case_id == "purge_gains_the_source_mount":
+        launcher = launcher.replace(
+            '    --label "${B1_ROLE_LABEL_KEY}=cleanup" \\\n',
+            '    --label "${B1_ROLE_LABEL_KEY}=cleanup" \\\n'
+            '    -v "$REPO_ROOT":/workspace \\\n', 1)
+    elif case_id == "b1_ignores_the_run_dir_failure":
+        launcher = launcher.replace(
+            'if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; '
+            "then return 1; fi",
+            'if [ "$B1_CLEANUP_FAILED" -ne 0 ]; then return 1; fi', 1)
+    elif case_id == "arm_does_not_reset_the_run_dir_flag":
+        launcher = launcher.replace("  B1_RUN_DIR_FAILED=0\n", "", 1)
     elif case_id == "gateway_loses_host_networking":
         fixture = fixture.replace('network_mode="host"', 'network_mode="bridge"')
     else:
