@@ -21,6 +21,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -156,6 +157,13 @@ B1_DIAGNOSTIC_PLACEMENT_FIELDS = (
     "gateway_cpu_busy_usec",
     "gateway_nonrole_busy_cores_estimate",
     "gateway_cpu_cores_used",
+    # GC-2 (FP-GC2-5): host and PostgreSQL attribution for the reference
+    # record. Reported-only on both profiles, like everything above them: the
+    # two free-form strings are percent-encoded so a comma inside a kernel
+    # value cannot be read as a field separator.
+    "postgres_usage_usec",
+    "gateway_thread_siblings_pct",
+    "spectre_v2_pct",
 )
 B1_PLACEMENT_FIELDS = B1_GATING_PLACEMENT_FIELDS + B1_DIAGNOSTIC_PLACEMENT_FIELDS
 
@@ -2284,6 +2292,76 @@ def _gateway_set_busy_usec(allowed: frozenset[int]) -> dict[int, int]:
     return {cpu: per_cpu[cpu] for cpu in sorted(allowed)}
 
 
+# ---------------------------------------------------------------------------
+# GC-2 (FP-GC2-5) — reported-only host diagnostics.
+#
+# These three readers exist so the live read and its deterministic tests run
+# the same code. Each returns its canonical, unencoded string or raises; only
+# the `_try_diagnostic` boundary turns a failure into `unavailable`, and a
+# partial map is never emitted as if it were complete. Nothing here decides a
+# placement or a performance verdict.
+# ---------------------------------------------------------------------------
+
+# Percent-encoding safe set: everything else, commas and spaces included,
+# becomes %XX with uppercase hex so the B1 `name=value` grammar stays
+# unambiguous and the value still round-trips exactly.
+B1_DIAGNOSTIC_SAFE_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:+"
+)
+# The kernel spells the per-CPU directory `cpu<id>`; §3.6's `<id>` names that
+# directory. Reading `<root>/<id>/...` finds nothing on any Linux host, so the
+# field would be permanently `unavailable` -- an honest miss that reports
+# nothing (observed on the pre-change local CI-scale run).
+B1_CPU_DIRECTORY_PREFIX = "cpu"
+B1_THREAD_SIBLINGS_RELATIVE = "topology/thread_siblings_list"
+B1_SPECTRE_V2_FILE = "spectre_v2"
+
+
+def _percent_encode_diagnostic(value: str) -> str:
+    """Percent-encode one free-form diagnostic value (uppercase hex)."""
+    if not isinstance(value, str):
+        raise b1.B1PlacementParseError(f"diagnostic value is not a string: {value!r}")
+    out: list[str] = []
+    for byte in value.encode("utf-8"):
+        char = chr(byte)
+        out.append(char if char in B1_DIAGNOSTIC_SAFE_CHARACTERS else f"%{byte:02X}")
+    return "".join(out)
+
+
+def _read_gateway_thread_siblings(
+    cpu_ids: frozenset[int], *, cpu_root: Path = Path("/sys/devices/system/cpu")
+) -> str:
+    """`<cpu>:<siblings>` for every gateway CPU, CPU-id sorted, `+`-joined.
+
+    Each kernel list is canonicalized through the existing CPU-list
+    parser/formatter, so a value the kernel could not have emitted raises
+    rather than reaching the record.
+    """
+    ordered = sorted(cpu_ids)
+    if not ordered:
+        raise b1.B1PlacementParseError("no gateway CPU to read thread siblings for")
+    parts: list[str] = []
+    for cpu in ordered:
+        raw = (
+            cpu_root
+            / f"{B1_CPU_DIRECTORY_PREFIX}{cpu}"
+            / B1_THREAD_SIBLINGS_RELATIVE
+        ).read_text(encoding="utf-8")
+        parts.append(f"{cpu}:{b1.format_cpu_list(b1.parse_cpu_list(raw))}")
+    return "+".join(parts)
+
+
+def _read_spectre_v2(
+    *, vulnerabilities_root: Path = Path("/sys/devices/system/cpu/vulnerabilities")
+) -> str:
+    """The host's `spectre_v2` mitigation string, whitespace-normalized."""
+    raw = (vulnerabilities_root / B1_SPECTRE_V2_FILE).read_text(encoding="utf-8")
+    collapsed = " ".join(raw.split())
+    if not collapsed:
+        raise b1.B1PlacementParseError("spectre_v2 is empty")
+    return collapsed
+
+
 def _try_diagnostic(label: str, notes: list[str], reader):
     """Attempt one reported-only diagnostic; never let it fail the run."""
     try:
@@ -2656,6 +2734,16 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         measured = _build_requests(profile.total_requests)
         marks: dict = {}
 
+        # FP-GC2-5: host attribution, read once after the opening placement
+        # witness so the CPU set is the proven one. Both are reported-only and
+        # fail soft to `unavailable`.
+        topology_notes: list[str] = marks.setdefault("diagnostic_notes", [])
+        gateway_thread_siblings = _try_diagnostic(
+            "gateway thread_siblings_list", topology_notes,
+            lambda: _read_gateway_thread_siblings(roles_open["gateway"].allowed_cpus),
+        )
+        spectre_v2 = _try_diagnostic("spectre_v2", topology_notes, _read_spectre_v2)
+
         def _collect_cpu_diagnostics(phase: str) -> None:
             notes: list[str] = []
             for role, container in (("gateway", gateway), ("postgres", postgres), ("driver", None)):
@@ -2782,6 +2870,8 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             busy_delta,
             nonrole_busy_cores,
             cpu_cores_used,
+            gateway_thread_siblings=gateway_thread_siblings,
+            spectre_v2=spectre_v2,
         )
         cpu_ms_str = f"{cpu_ms:.3f}" if cpu_ms is not None else DIAGNOSTIC_UNAVAILABLE
         for note in marks.get("diagnostic_notes", []):
@@ -2921,7 +3011,8 @@ def _busy_delta(before: dict[int, int], after: dict[int, int]) -> dict[int, int]
 
 
 def _serialize_placement_fields(declaration, authority, roles, diagnostics, busy_delta,
-                                nonrole_busy_cores, cpu_cores_used) -> str:
+                                nonrole_busy_cores, cpu_cores_used,
+                                gateway_thread_siblings=None, spectre_v2=None) -> str:
     """Gating identity and affinity first; every reported diagnostic after.
 
     The three ``*_allowed_cpus`` values are the CLOSING effective sets, never
@@ -2941,6 +3032,9 @@ def _serialize_placement_fields(declaration, authority, roles, diagnostics, busy
     busy = (
         b1.serialize_cpu_busy(busy_delta) if busy_delta is not None else DIAGNOSTIC_UNAVAILABLE
     )
+    # Already measured by the harness for the PostgreSQL role; GC-2 only stops
+    # dropping it. No extra cgroup read and no new measurement interval.
+    postgres_usage = diagnostics["postgres"].usage_usec_delta
     parts.extend(
         [
             f"gateway_cpu_busy_usec={busy}",
@@ -2950,6 +3044,15 @@ def _serialize_placement_fields(declaration, authority, roles, diagnostics, busy
             "gateway_cpu_cores_used="
             + (f"{cpu_cores_used:.2f}" if cpu_cores_used is not None
                else DIAGNOSTIC_UNAVAILABLE),
+            "postgres_usage_usec="
+            + (str(postgres_usage) if postgres_usage is not None
+               else DIAGNOSTIC_UNAVAILABLE),
+            "gateway_thread_siblings_pct="
+            + (_percent_encode_diagnostic(gateway_thread_siblings)
+               if gateway_thread_siblings is not None else DIAGNOSTIC_UNAVAILABLE),
+            "spectre_v2_pct="
+            + (_percent_encode_diagnostic(spectre_v2)
+               if spectre_v2 is not None else DIAGNOSTIC_UNAVAILABLE),
         ]
     )
     return ",".join(parts) + ","
@@ -3111,6 +3214,26 @@ def test_b1_ci_scale_fingerprint_proves_placement(b1_ci_scale_run):
                  "gateway_cpu_cores_used"):
         assert f"{name}=" in line, name
     assert "cpu_cores_used=" not in line.replace("gateway_cpu_cores_used=", "")
+    # GC-2 (FP-GC2-5): the three added attribution fields are present, in the
+    # pinned order, and legally encoded. Their values decide nothing here --
+    # only that a value which is present can be decoded back exactly.
+    diagnostic_positions = [line.index(f"{name}=") for name in B1_DIAGNOSTIC_PLACEMENT_FIELDS]
+    assert diagnostic_positions == sorted(diagnostic_positions), (
+        B1_DIAGNOSTIC_PLACEMENT_FIELDS
+    )
+    usage = _parse_b1_env_field(line, "postgres_usage_usec")
+    assert usage == DIAGNOSTIC_UNAVAILABLE or int(usage) >= 0, usage
+    siblings = _parse_b1_env_field(line, "gateway_thread_siblings_pct")
+    if siblings != DIAGNOSTIC_UNAVAILABLE:
+        decoded = urllib.parse.unquote(siblings)
+        assert _percent_encode_diagnostic(decoded) == siblings, decoded
+        mapped = {int(entry.split(":", 1)[0]) for entry in decoded.split("+")}
+        assert mapped == set(observed["gateway"]), (sorted(mapped), sorted(observed["gateway"]))
+    spectre = _parse_b1_env_field(line, "spectre_v2_pct")
+    if spectre != DIAGNOSTIC_UNAVAILABLE:
+        decoded_spectre = urllib.parse.unquote(spectre)
+        assert _percent_encode_diagnostic(decoded_spectre) == spectre, decoded_spectre
+        assert decoded_spectre == " ".join(decoded_spectre.split()), decoded_spectre
     # The CI-scale fingerprint carries no product-verdict field.
     for field_name in PRODUCT_VERDICT_FIELDS:
         assert f"{field_name}=" not in line, line
@@ -5565,6 +5688,168 @@ def test_b1_cpu_diagnostic_parsers_report_without_gating():
     for field_name in B1_DIAGNOSTIC_PLACEMENT_FIELDS:
         assert f"{field_name}={DIAGNOSTIC_UNAVAILABLE}" in line, field_name
     assert "placement_ok=1" in line
+
+
+def test_gc2_host_diagnostics_encode_round_trip_and_fail_soft(tmp_path):
+    """FP-GC2-5: canonical map, exact encoding, whitespace, and honest misses.
+
+    Every source is a temporary tree supplied here; production uses the
+    defaults. Nothing below can change a placement or a performance verdict --
+    the closing assertions prove exactly that.
+    """
+    # (a) The encoder: uppercase hex, the pinned safe set, exact round trip.
+    assert _percent_encode_diagnostic("0:0-1+1:0-1") == "0:0-1+1:0-1"
+    assert _percent_encode_diagnostic("0:0,8+8:0,8") == "0:0%2C8+8:0%2C8"
+    assert _percent_encode_diagnostic("Mitigation: Enhanced / Automatic IBRS") == (
+        "Mitigation:%20Enhanced%20%2F%20Automatic%20IBRS"
+    )
+    assert _percent_encode_diagnostic("100%") == "100%25"
+    assert _percent_encode_diagnostic("a=b") == "a%3Db"
+    assert _percent_encode_diagnostic("") == ""
+    for raw in (
+        "0:0-1+1:0-1", "0:0,8+8:0,8", "Mitigation: Enhanced IBRS, IBPB: conditional",
+        "100%", "a=b", "weird\u00e9 value", "tabs\tand\nnewlines",
+    ):
+        assert urllib.parse.unquote(_percent_encode_diagnostic(raw)) == raw, raw
+    encoded = _percent_encode_diagnostic("Mitigation: IBRS, IBPB: conditional")
+    assert "," not in encoded and " " not in encoded, encoded
+    # Every escape is uppercase hex, so two harnesses cannot spell the same
+    # value two ways.
+    for escape in re.findall(r"%(..)", encoded):
+        assert escape == escape.upper() and all(
+            c in "0123456789ABCDEF" for c in escape
+        ), escape
+    assert set(encoded) <= B1_DIAGNOSTIC_SAFE_CHARACTERS | {"%"}
+    with pytest.raises(b1.B1PlacementParseError):
+        _percent_encode_diagnostic(None)
+
+    # (b) The sibling reader: canonical, CPU-id sorted, whole-field failure.
+    cpu_root = tmp_path / "cpu"
+
+    def _write_siblings(cpu: int, value: str) -> None:
+        # The kernel's own directory name, `cpu<id>` — the reader must look
+        # there and nowhere else.
+        target = cpu_root / f"cpu{cpu}" / "topology"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "thread_siblings_list").write_text(value, encoding="utf-8")
+
+    # A tree that omits the `cpu` prefix is not a sysfs tree: the reader must
+    # fail rather than quietly report a partial or empty map.
+    unprefixed = tmp_path / "unprefixed"
+    (unprefixed / "0" / "topology").mkdir(parents=True)
+    (unprefixed / "0" / "topology" / "thread_siblings_list").write_text(
+        "0-1\n", encoding="utf-8"
+    )
+    with pytest.raises(OSError):
+        _read_gateway_thread_siblings(frozenset({0}), cpu_root=unprefixed)
+
+    _write_siblings(0, "0-1\n")
+    _write_siblings(1, "0-1\n")
+    assert _read_gateway_thread_siblings(
+        frozenset({1, 0}), cpu_root=cpu_root
+    ) == "0:0-1+1:0-1"
+    # A comma-bearing kernel list survives canonicalization and is escaped only
+    # at the encoder, never dropped.
+    _write_siblings(8, "0,8\n")
+    _write_siblings(0, "0,8\n")
+    raw_map = _read_gateway_thread_siblings(frozenset({8, 0}), cpu_root=cpu_root)
+    assert raw_map == "0:0,8+8:0,8"
+    assert _percent_encode_diagnostic(raw_map) == "0:0%2C8+8:0%2C8"
+    # Non-canonical but legal kernel spelling is canonicalized, not echoed.
+    _write_siblings(2, "3,2\n")
+    _write_siblings(3, "2-3\n")
+    assert _read_gateway_thread_siblings(
+        frozenset({2, 3}), cpu_root=cpu_root
+    ) == "2:2-3+3:2-3"
+    # A missing CPU, an unreadable file, an empty file, a malformed list and an
+    # empty CPU set are each a whole-field failure -- never a partial map.
+    for bad_cpus, label in (
+        (frozenset({0, 99}), "missing cpu"),
+        (frozenset(), "no gateway cpu"),
+    ):
+        with pytest.raises((OSError, b1.B1PlacementParseError)):
+            _read_gateway_thread_siblings(bad_cpus, cpu_root=cpu_root)
+    for bad_value, label in ((" ", "empty"), ("0--1\n", "malformed range"),
+                             ("x\n", "non-decimal"), ("0,0\n", "duplicate")):
+        _write_siblings(4, bad_value)
+        with pytest.raises(b1.B1PlacementParseError):
+            _read_gateway_thread_siblings(frozenset({4}), cpu_root=cpu_root)
+
+    # (c) The spectre reader: whitespace collapsed, empty and missing refused.
+    vuln_root = tmp_path / "vulnerabilities"
+    vuln_root.mkdir()
+    (vuln_root / "spectre_v2").write_text(
+        "  Mitigation:  Enhanced / Automatic IBRS,\n IBPB: conditional \n", encoding="utf-8"
+    )
+    assert _read_spectre_v2(vulnerabilities_root=vuln_root) == (
+        "Mitigation: Enhanced / Automatic IBRS, IBPB: conditional"
+    )
+    (vuln_root / "spectre_v2").write_text("   \n\t ", encoding="utf-8")
+    with pytest.raises(b1.B1PlacementParseError):
+        _read_spectre_v2(vulnerabilities_root=vuln_root)
+    with pytest.raises(OSError):
+        _read_spectre_v2(vulnerabilities_root=tmp_path / "absent")
+
+    # (d) Every one of those failures reaches the record as `unavailable`,
+    # with a note, through the one fail-soft boundary.
+    notes: list[str] = []
+    assert _try_diagnostic(
+        "gateway thread_siblings_list", notes,
+        lambda: _read_gateway_thread_siblings(frozenset({99}), cpu_root=cpu_root),
+    ) is None
+    assert _try_diagnostic(
+        "spectre_v2", notes, lambda: _read_spectre_v2(vulnerabilities_root=vuln_root)
+    ) is None
+    assert len(notes) == 2 and all(note for note in notes)
+
+    # (e) Rendering: present values are encoded in the pinned order; absent
+    # ones are `unavailable`; the gating prefix is untouched either way.
+    complete = (
+        "usage_usec 12\nuser_usec 7\nsystem_usec 5\nnr_periods 3\n"
+        "nr_throttled 1\nthrottled_usec 9\nnr_bursts 0\n"
+    )
+    later = complete.replace("usage_usec 12", "usage_usec 4012")
+    rendered_roles = {
+        role: _role_diagnostics(role, "max 100000", complete, later) for role in B1_ROLES
+    }
+    declaration = B1PlacementDeclaration.from_contract(_declaration_payload())
+    line = _serialize_placement_fields(
+        declaration, AUTHORITY_CI_SCALE_REFERENCE, _ci_scale_roles(), rendered_roles,
+        {0: 10, 1: 20}, 0.5, 1.5,
+        gateway_thread_siblings="0:0,8+8:0,8",
+        spectre_v2="Mitigation: Enhanced IBRS, IBPB: conditional",
+    )
+    assert _parse_b1_env_field(line, "postgres_usage_usec") == "4000"
+    assert _parse_b1_env_field(line, "gateway_thread_siblings_pct") == "0:0%2C8+8:0%2C8"
+    spectre_field = _parse_b1_env_field(line, "spectre_v2_pct")
+    assert urllib.parse.unquote(spectre_field) == (
+        "Mitigation: Enhanced IBRS, IBPB: conditional"
+    )
+    # The escaping is what keeps the grammar intact: the two free-form values
+    # carry commas, and the line still parses into its declared fields.
+    for field_name in B1_PLACEMENT_FIELDS:
+        assert _parse_b1_env_field(line, field_name) != ""
+    positions = [line.index(f"{name}=") for name in B1_PLACEMENT_FIELDS]
+    assert positions == sorted(positions), B1_PLACEMENT_FIELDS
+
+    # Absent values render `unavailable`, and never a zero that would read like
+    # a measurement.
+    blank = _serialize_placement_fields(
+        declaration, AUTHORITY_CI_SCALE_REFERENCE, _ci_scale_roles(),
+        {role: _role_diagnostics(role, None, None, None) for role in B1_ROLES},
+        None, None, None,
+    )
+    for field_name in ("postgres_usage_usec", "gateway_thread_siblings_pct",
+                       "spectre_v2_pct"):
+        assert f"{field_name}={DIAGNOSTIC_UNAVAILABLE}" in blank, field_name
+        assert field_name in B1_DIAGNOSTIC_PLACEMENT_FIELDS
+        assert field_name not in B1_GATING_PLACEMENT_FIELDS
+    # Availability changes no gating field and no verdict.
+    for field_name in B1_GATING_PLACEMENT_FIELDS:
+        assert _parse_b1_env_field(line, field_name) == _parse_b1_env_field(
+            blank, field_name
+        ), field_name
+    assert "placement_ok=1" in blank
 
 
 def test_b1_placement_declarations_are_closed_and_pinned(tmp_path):

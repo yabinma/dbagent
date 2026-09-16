@@ -79,8 +79,13 @@ EXPECTED_CONCURRENCY_MODEL = {
             "tables": ["audit_log"],
             "call_sites": [
                 {
+                    # GC-2: the remaining real under-lock write_audit call.
+                    # The committed-existing-case merge writes its own audit
+                    # row inside merge_existing_event_with_audit; B11's
+                    # threshold, writer count, pool model and durability are
+                    # unchanged by that.
                     "file": "services/gateway/gateway/ingest.py",
-                    "line": 131,
+                    "line": 158,
                     "in": "IngestService._ingest_txn",
                     "symbol": "write_audit",
                     "expr": "write_audit(",
@@ -3372,6 +3377,14 @@ def test_b11_declares_exactly_four_writer_processes_matching_shipped_code():
         assert action in resolved, f"notes cites {action} but file has no write_audit"
         assert int(lineno) == resolved[action], (
             f"notes {action}:{lineno} != resolved {resolved[action]}"
+        )
+    # GC-2: those three references are the ONLY line numbers B11 declares. An
+    # unparsed one -- the retired "second call site at line 165" prose, say --
+    # is a carrier nothing resolves, so it can go stale silently.
+    unparsed = re.sub(r"event_(?:merged|received|rejected):\d+", "", notes)
+    for pattern in (r"\bline\s+\d+", r"\bat\s+line\b", r"\blines\s+\d+"):
+        assert not re.search(pattern, unparsed), (
+            f"B11 notes carry an unparsed line reference matching {pattern}"
         )
 
 

@@ -8,6 +8,12 @@ Responses:
 FP-IG-5: the database transaction runs off the event loop via
 ``run_in_threadpool``. FP-IG-16: open-path correlation uses a transaction-
 scoped advisory lock with a lock-free merge fast path.
+
+FP-GC2-1/2/3: that lock-free fast path is one parameterized data-modifying
+statement (``merge_existing_event_with_audit``) which selects the same
+candidate as ``find_open_by_fingerprint`` and inserts both the merged event
+and its ``event_merged`` audit row; a miss writes nothing and continues on
+the unchanged reject / advisory-lock / deciding-re-read / open path.
 """
 from __future__ import annotations
 
@@ -25,6 +31,7 @@ from rca_common.investigation_repo import (
     find_open_by_fingerprint,
     get_platform,
     insert_alert_event,
+    merge_existing_event_with_audit,
     merge_platform_budget,
 )
 
@@ -90,6 +97,23 @@ class IngestService:
     ) -> tuple[int, dict[str, Any], uuid.UUID | None]:
         """Synchronous DB transaction; invoked via run_in_threadpool (FP-IG-5)."""
         with self._session_factory() as session:
+            # FP-GC2-1: the dominant request — a merge into an already
+            # committed non-terminal case — is one parameterized statement
+            # that writes both the alert_events row and its audit_log row,
+            # then the one unchanged durable commit. A miss has written
+            # nothing and falls through to the frozen protocol below.
+            existing_id = merge_existing_event_with_audit(
+                session,
+                event=event,
+                default_correlation_window_seconds=self._correlation_window_seconds,
+            )
+            if existing_id is not None:
+                session.commit()
+                return 200, {
+                    "status": "merged",
+                    "investigation_id": str(existing_id),
+                }, None
+
             platform = get_platform(session, event["platform_key"])
             if platform is None:
                 self._reject(session, event, "unknown_platform_key")
@@ -108,40 +132,9 @@ class IngestService:
             elif "correlation_window" in cfg:
                 window = int(cfg["correlation_window"])
 
-            # Lock-free correlation read — merge path takes no lock (FP-IG-16).
-            existing = find_open_by_fingerprint(
-                session,
-                fingerprint=event["fingerprint"],
-                platform_key=event["platform_key"],
-                correlation_window_seconds=window,
-            )
-            if existing is not None:
-                insert_alert_event(
-                    session,
-                    event_id=uuid.UUID(event["event_id"]),
-                    fingerprint=event["fingerprint"],
-                    source=event["source"],
-                    platform_key=event["platform_key"],
-                    severity=event["severity"],
-                    payload_ref=None,
-                    normalized=event,
-                    disposition="merged",
-                    investigation_id=existing.investigation_id,
-                )
-                write_audit(
-                    session,
-                    action="event_merged",
-                    actor=actor_system(),
-                    investigation_id=existing.investigation_id,
-                    detail={"event_id": event["event_id"], "fingerprint": event["fingerprint"]},
-                )
-                session.commit()
-                return 200, {
-                    "status": "merged",
-                    "investigation_id": str(existing.investigation_id),
-                }, None
-
-            # Open path: advisory lock then re-read under the lock.
+            # Open path: advisory lock then re-read under the lock. The
+            # lock-free read-and-merge already happened above as one
+            # statement, so no second pre-lock lookup is emitted here.
             acquire_correlation_lock(session, event["platform_key"], event["fingerprint"])
             existing = find_open_by_fingerprint(
                 session,

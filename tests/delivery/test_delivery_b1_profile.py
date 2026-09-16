@@ -1843,6 +1843,12 @@ GC1_DIAGNOSTIC_PLACEMENT_FIELDS = (
     "gateway_cpu_busy_usec",
     "gateway_nonrole_busy_cores_estimate",
     "gateway_cpu_cores_used",
+    # GC-2 (FP-GC2-5): three appended reported-only attribution fields. They
+    # sit after every existing diagnostic and before nothing: the gating
+    # prefix is unchanged, and none of them can fail a B1 tier.
+    "postgres_usage_usec",
+    "gateway_thread_siblings_pct",
+    "spectre_v2_pct",
 )
 GC1_PLACEMENT_FIELDS = GC1_GATING_PLACEMENT_FIELDS + GC1_DIAGNOSTIC_PLACEMENT_FIELDS
 GC1_PRODUCT_FIELDS = (
@@ -2265,8 +2271,8 @@ def _placement_surface_failures(src: str) -> list[str]:
 def test_b1_placement_fingerprint_surface_is_pinned():
     """FP-GC1-4: gating affinity first, diagnostics after, `unavailable` fallback."""
     src = REF_TEST.read_text(encoding="utf-8")
-    assert len(GC1_PLACEMENT_FIELDS) == 26
-    assert len(set(GC1_PLACEMENT_FIELDS)) == 26
+    assert len(GC1_PLACEMENT_FIELDS) == 29
+    assert len(set(GC1_PLACEMENT_FIELDS)) == 29
     assert len(GC1_GATING_PLACEMENT_FIELDS) == 8
     for role in GC1_ROLES:
         assert f"{role}_allowed_cpus" in GC1_GATING_PLACEMENT_FIELDS
@@ -2376,3 +2382,351 @@ def test_gc1_preserves_and_routes_unqualified_cpu_basis():
             roots.add(parent.right.value)
     assert roots, "guard opens no repository carrier at all"
     assert roots <= GC1_TRACKED_CARRIER_ROOTS, sorted(roots - GC1_TRACKED_CARRIER_ROOTS)
+
+
+# ---------------------------------------------------------------------------
+# GC-2 — the write-path slice's source and configuration boundary (FP-GC2-7).
+#
+# Every literal below is declared here, independently of the module it pins.
+# The pin is structural: it says what this slice did and did not change. It
+# infers no performance from source shape -- the EPYC 7763 CI record required
+# by FP-GC2-4 remains the only performance acceptance evidence.
+# ---------------------------------------------------------------------------
+
+GC2_INGEST_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "ingest.py"
+GC2_MAIN_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "main.py"
+GC2_REPO_PATH = (
+    REPO_ROOT / "libs" / "py" / "rca_common" / "rca_common" / "investigation_repo.py"
+)
+GC2_SESSION_PATH = (
+    REPO_ROOT / "libs" / "py" / "rca_common" / "rca_common" / "db" / "session.py"
+)
+GC2_LAUNCHER_PATH = REPO_ROOT / "scripts" / "integration-test.sh"
+GC2_VALUES_PATH = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
+
+GC2_FUSED_HELPER = "merge_existing_event_with_audit"
+GC2_TXN = "_ingest_txn"
+# The failure-producing comparisons the CI-scale bar is made of. Each must be
+# a bare assert on a comparison in the named test, not a recorded verdict.
+GC2_CI_SCALE_REQUIRED_ASSERTIONS = frozenset(
+    {
+        "offered == CI_SCALE_TOTAL_REQUESTS",
+        "served + errors == offered",
+        "errors == 0",
+        "served == offered",
+        "p99 < CI_SCALE_P99_MS",
+        "committed == served",
+        "served_rate >= CI_SCALE_SUSTAINED_FLOOR",
+        "max_in_flight < CI_SCALE_MAX_IN_FLIGHT",
+    }
+)
+GC2_FIXED_CI_SCALE_LITERALS = {
+    "CI_SCALE_BURST_RATE": 500,
+    "CI_SCALE_BURST_SECONDS": 30,
+    "CI_SCALE_TOTAL_REQUESTS": 15000,
+    "CI_SCALE_P99_MS": 150.0,
+    "CI_SCALE_SUSTAINED_FLOOR": 450,
+    "CI_SCALE_MAX_IN_FLIGHT": 500,
+}
+# Serve/pool/durability knobs this slice is forbidden to touch.
+GC2_MAX_CONNECTIONS_PER_WORKER = 150
+GC2_BACKLOG = 2048
+GC2_GATEWAY_WORKERS = "4"
+GC2_DURABILITY_TOKENS = ("synchronous_commit", "fsync", "full_page_writes")
+GC2_DEFERRED_AUDIT_TOKENS = (
+    "BackgroundTask",
+    "background_tasks",
+    "create_task",
+    "run_in_executor",
+    "ThreadPoolExecutor",
+    "Queue(",
+    "asyncio",
+    "after_response",
+    "batch",
+    "defer",
+)
+# CI-scale 2/1/1 and product 4/3/1, spelled as the launcher spells them.
+GC2_LAUNCHER_AFFINITY_LINES = (
+    'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
+    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
+    'driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+    'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}" "${cpus[2]}" "${cpus[3]}")"',
+    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}" "${cpus[6]}")"',
+    'driver_cpus="$(b1_canonical_cpu_list "${cpus[7]}")"',
+)
+GC2_RAW_CLIENT_LIMIT = "client = build_httpx_client(max_connections=max_in_flight)"
+# The GC-2 investigation's own numbers. Neither may become a sizing carrier
+# value or a B1-LATENCY-BASIS-1 observation; the ledger's population and
+# lifecycle stay with test_delivery_sizing_ledger.py and that later slice.
+GC2_INVESTIGATION_CPU_MS = "5.271"
+GC2_INVESTIGATION_RUN_ID = "35057395036"
+GC2_SIZING_CARRIERS = (
+    ("deploy", "charts", "dbagent", "values.yaml"),
+    ("tests", "benchmark", "thresholds.yaml"),
+    ("tests", "delivery", "test_delivery_sizing_ledger.py"),
+    ("services", "gateway", "tests", "b1_reference_profile.py"),
+    ("services", "gateway", "tests", "test_b1_ingest_burst.py"),
+    ("scripts", "integration-test.sh"),
+)
+GC2_DIAGNOSTIC_FIELDS = (
+    "postgres_usage_usec",
+    "gateway_thread_siblings_pct",
+    "spectre_v2_pct",
+)
+GC2_DIAGNOSTIC_SAFE_CHARACTERS = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:+"
+)
+
+
+def _gc2_function(tree: ast.AST, name: str, *, cls: str | None = None) -> ast.AST:
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != name:
+            continue
+        if cls is None:
+            return node
+        for parent in ast.walk(tree):
+            if (
+                isinstance(parent, ast.ClassDef)
+                and parent.name == cls
+                and node in parent.body
+            ):
+                return node
+    raise AssertionError(f"{name} not found")
+
+
+def _gc2_named_calls(node: ast.AST, name: str) -> list[ast.Call]:
+    out = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        spelled = (
+            func.id if isinstance(func, ast.Name)
+            else (func.attr if isinstance(func, ast.Attribute) else None)
+        )
+        if spelled == name:
+            out.append(child)
+    return out
+
+
+def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
+    """FP-GC2-7: the fused call order, the fixed bar, and the untouched knobs."""
+    ingest_src = GC2_INGEST_PATH.read_text(encoding="utf-8")
+    ingest_tree = ast.parse(ingest_src)
+    txn = _gc2_function(ingest_tree, GC2_TXN, cls="IngestService")
+    ingest_fn = _gc2_function(ingest_tree, "ingest", cls="IngestService")
+
+    # (1) Exactly one fused call, first, before the platform lookup; the merged
+    # return is preceded by exactly one commit inside its own branch.
+    fused = _gc2_named_calls(txn, GC2_FUSED_HELPER)
+    assert len(fused) == 1, [c.lineno for c in fused]
+    platform_calls = _gc2_named_calls(txn, "get_platform")
+    assert platform_calls, "the fallback lost its platform lookup"
+    assert fused[0].lineno < min(c.lineno for c in platform_calls), (
+        "the fused merge must be the first database operation"
+    )
+    assert len(_gc2_named_calls(ingest_tree, GC2_FUSED_HELPER)) == 1
+    assert not _gc2_named_calls(ingest_fn, GC2_FUSED_HELPER), (
+        "the fused statement must not run on the event loop"
+    )
+
+    merged_branch = None
+    for node in ast.walk(txn):
+        if isinstance(node, ast.If) and "existing_id is not None" in ast.unparse(node.test):
+            merged_branch = node
+    assert merged_branch is not None, "the merged fast branch is gone"
+    branch_commits = _gc2_named_calls(merged_branch, "commit")
+    branch_returns = [n for n in ast.walk(merged_branch) if isinstance(n, ast.Return)]
+    assert len(branch_commits) == 1, [c.lineno for c in branch_commits]
+    assert len(branch_returns) == 1
+    assert branch_commits[0].lineno < branch_returns[0].lineno, (
+        "a 2xx must not be produced before the durable commit"
+    )
+    returned = ast.unparse(branch_returns[0])
+    assert returned.startswith("return (200,"), returned
+    assert "'status': 'merged'" in returned, returned
+    assert returned.rstrip().endswith("None)"), (
+        "a merge must return no workflow id"
+    )
+
+    # (2) The fallback keeps run_in_threadpool, lock-before-deciding-read and
+    # the workflow boundary.
+    assert _gc2_named_calls(ingest_fn, "run_in_threadpool"), "off-loop dispatch is gone"
+    lock_calls = _gc2_named_calls(txn, "acquire_correlation_lock")
+    find_calls = _gc2_named_calls(txn, "find_open_by_fingerprint")
+    assert len(lock_calls) == 1 and len(find_calls) == 1, (
+        [c.lineno for c in lock_calls], [c.lineno for c in find_calls]
+    )
+    assert lock_calls[0].lineno < find_calls[0].lineno, (
+        "the deciding correlation read must happen under the advisory lock"
+    )
+    starters = _gc2_named_calls(ingest_tree, "start_investigation")
+    started_in_ingest = _gc2_named_calls(ingest_fn, "start_investigation")
+    assert len(started_in_ingest) == 1 and len(starters) == 1
+    assert not _gc2_named_calls(txn, "start_investigation")
+    guard = next(
+        node for node in ast.walk(ingest_fn)
+        if isinstance(node, ast.If) and "investigation_id is not None" in ast.unparse(node.test)
+    )
+    assert _gc2_named_calls(guard, "start_investigation"), (
+        "the workflow start lost its opened-branch guard"
+    )
+    # No deferred, batched or off-transaction audit machinery appeared.
+    for token in GC2_DEFERRED_AUDIT_TOKENS:
+        assert token not in ingest_src, f"deferred audit machinery: {token}"
+    session_scopes = [
+        node for node in ast.walk(txn)
+        if isinstance(node, ast.With)
+        and "self._session_factory()" in ast.unparse(node)
+    ]
+    assert len(session_scopes) == 1, "one request, one session scope"
+
+    # (3) The CI-scale bar is unchanged and still failure-producing.
+    test_src = REF_TEST.read_text(encoding="utf-8")
+    test_assigns = _source_assigns(test_src)
+    profile_assigns = _module_assigns(REF_PATH)
+    for name, expected in GC2_FIXED_CI_SCALE_LITERALS.items():
+        assert _eval_simple_constant(profile_assigns[name], profile_assigns) == expected, name
+    for name in ("CI_SCALE_TOTAL_REQUESTS", "CI_SCALE_P99_MS",
+                 "CI_SCALE_SUSTAINED_FLOOR", "CI_SCALE_MAX_IN_FLIGHT"):
+        node = test_assigns[name]
+        assert isinstance(node, ast.Constant), name
+        assert node.value == GC2_FIXED_CI_SCALE_LITERALS[name], name
+    ci_scale_test = _gc2_function(ast.parse(test_src), CI_SCALE_REF_TEST)
+    observed = {
+        ast.unparse(node.test) for node in ast.walk(ci_scale_test)
+        if isinstance(node, ast.Assert)
+    }
+    missing = GC2_CI_SCALE_REQUIRED_ASSERTIONS - observed
+    assert not missing, sorted(missing)
+    for node in ast.walk(ci_scale_test):
+        if isinstance(node, ast.Assert) and ast.unparse(node.test) in (
+            GC2_CI_SCALE_REQUIRED_ASSERTIONS
+        ):
+            assert isinstance(node.test, ast.Compare), ast.unparse(node.test)
+    body = ast.get_source_segment(test_src, ci_scale_test) or ""
+    for weakening in ("pytest.mark.skip", "pytest.mark.xfail", "pytest.skip(",
+                      "VERDICT_MET", "VERDICT_MISSED"):
+        assert weakening not in body, f"{CI_SCALE_REF_TEST} must not {weakening}"
+
+    # (4) Serve parameters, pool construction and durability are untouched.
+    main_src = GC2_MAIN_PATH.read_text(encoding="utf-8")
+    main_assigns = _source_assigns(main_src)
+    assert ast.literal_eval(
+        main_assigns["DEFAULT_MAX_CONNECTIONS_PER_WORKER"]
+    ) == GC2_MAX_CONNECTIONS_PER_WORKER
+    assert ast.literal_eval(main_assigns["BACKLOG"]) == GC2_BACKLOG
+    assert f'"DBAGENT_GATEWAY_WORKERS", "{GC2_GATEWAY_WORKERS}"' in main_src
+    assert "limit_concurrency=max_connections" in main_src
+    engine_calls = _gc2_named_calls(ast.parse(main_src), "make_engine")
+    assert len(engine_calls) == 1
+    assert not engine_calls[0].keywords, "the gateway engine gained a pool keyword"
+    assert len(engine_calls[0].args) == 1
+    session_src = GC2_SESSION_PATH.read_text(encoding="utf-8")
+    factory_defs = [
+        node for node in ast.parse(session_src).body
+        if isinstance(node, ast.FunctionDef) and node.name == "make_engine"
+    ]
+    assert len(factory_defs) == 1
+    assert "create_engine(dsn, future=True, **kwargs)" in session_src, (
+        "make_engine gained or lost a pool default"
+    )
+    for token in GC2_DURABILITY_TOKENS:
+        assert token not in main_src, token
+        assert token not in ingest_src, token
+        assert token not in session_src, token
+        assert token not in GC2_REPO_PATH.read_text(encoding="utf-8"), token
+
+    # (5) The GC-1 launcher allocation and the raw client's limit are unchanged.
+    launcher_src = GC2_LAUNCHER_PATH.read_text(encoding="utf-8")
+    for line in GC2_LAUNCHER_AFFINITY_LINES:
+        assert line in launcher_src, line
+    profile_src = REF_PATH.read_text(encoding="utf-8")
+    assert GC2_RAW_CLIENT_LIMIT in profile_src
+    assert "MAX_IN_FLIGHT = BURST_RATE" in profile_src
+    for profile, cardinalities in GC1_AFFINITY_CARDINALITIES.items():
+        name = (
+            "CI_SCALE_AFFINITY_CARDINALITY" if profile == "ci-scale"
+            else "PRODUCT_AFFINITY_CARDINALITY"
+        )
+        assert ast.literal_eval(test_assigns[name]) == cardinalities, name
+
+    # (6) The chart basis is unchanged, and this slice's own investigation
+    # numbers are in no tracked sizing carrier. Ledger emptiness is NOT
+    # asserted: its population belongs to test_delivery_sizing_ledger.py and
+    # to B1-LATENCY-BASIS-1.
+    import yaml as _yaml
+
+    values_text = GC2_VALUES_PATH.read_text(encoding="utf-8")
+    values = _yaml.safe_load(values_text)
+    basis = values["ingestGateway"]["sizingBasis"]
+    assert float(basis["cpuMsPerRequest"]) == GC1_BASIS_MS_PER_REQUEST == 2.427
+    assert "cpuMsPerRequest: 2.427" in values_text
+    for observation in basis["observations"] or []:
+        rendered = str(observation)
+        assert GC2_INVESTIGATION_CPU_MS not in rendered, rendered
+        assert GC2_INVESTIGATION_RUN_ID not in rendered, rendered
+    for parts in GC2_SIZING_CARRIERS:
+        carrier = REPO_ROOT.joinpath(*parts)
+        assert carrier.is_file(), carrier
+        text_ = carrier.read_text(encoding="utf-8")
+        assert GC2_INVESTIGATION_CPU_MS not in text_, f"{parts[-1]} carries 5.271"
+        assert GC2_INVESTIGATION_RUN_ID not in text_, f"{parts[-1]} carries the run id"
+    thresholds = _yaml.safe_load(
+        (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(encoding="utf-8")
+    )
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    assert GC1_BASIS_OWNER in b1_entry["notes"]
+    assert "cpuMsPerRequest=2.427" in b1_entry["notes"]
+
+    # (7) The three GC-2 diagnostics are appended, reported-only, and escaped.
+    assert GC1_DIAGNOSTIC_PLACEMENT_FIELDS[-3:] == GC2_DIAGNOSTIC_FIELDS
+    for field_name in GC2_DIAGNOSTIC_FIELDS:
+        assert field_name not in GC1_GATING_PLACEMENT_FIELDS, field_name
+    assert _placement_surface_failures(test_src) == []
+    safe_node = _source_assigns(test_src)["B1_DIAGNOSTIC_SAFE_CHARACTERS"]
+    assert isinstance(safe_node, ast.Call)
+    assert set(ast.literal_eval(safe_node.args[0])) == set(GC2_DIAGNOSTIC_SAFE_CHARACTERS)
+    serializer = ast.get_source_segment(
+        test_src,
+        _gc2_function(ast.parse(test_src), "_serialize_placement_fields"),
+    ) or ""
+    for field_name in GC2_DIAGNOSTIC_FIELDS:
+        assert f'"{field_name}="' in serializer, field_name
+        assert serializer.count(f'"{field_name}="') == 1, field_name
+    assert serializer.count("_percent_encode_diagnostic(") == 2, serializer
+    assert serializer.count("DIAGNOSTIC_UNAVAILABLE") >= 5
+
+    # Negative controls: one mutation at a time, each named.
+    unordered = ingest_src.replace(
+        "            existing_id = merge_existing_event_with_audit(",
+        "            platform = get_platform(session, event['platform_key'])\n"
+        "            existing_id = merge_existing_event_with_audit(", 1)
+    assert unordered != ingest_src
+    mutated = ast.parse(unordered)
+    mutated_txn = _gc2_function(mutated, GC2_TXN, cls="IngestService")
+    assert _gc2_named_calls(mutated_txn, GC2_FUSED_HELPER)[0].lineno > min(
+        c.lineno for c in _gc2_named_calls(mutated_txn, "get_platform")
+    ), "the ordering pin would not notice a reordered platform lookup"
+    late_commit = ingest_src.replace(
+        "            if existing_id is not None:\n                session.commit()\n",
+        "            if existing_id is not None:\n", 1)
+    assert late_commit != ingest_src
+    late_branch = None
+    for node in ast.walk(_gc2_function(ast.parse(late_commit), GC2_TXN, cls="IngestService")):
+        if isinstance(node, ast.If) and "existing_id is not None" in ast.unparse(node.test):
+            late_branch = node
+    assert late_branch is not None
+    assert not _gc2_named_calls(late_branch, "commit"), (
+        "the commit-before-return pin would not notice a dropped commit"
+    )
+    unlocked = ingest_src.replace(
+        "            acquire_correlation_lock(session, event[\"platform_key\"], "
+        "event[\"fingerprint\"])\n", "", 1)
+    assert unlocked != ingest_src
+    assert not _gc2_named_calls(
+        _gc2_function(ast.parse(unlocked), GC2_TXN, cls="IngestService"),
+        "acquire_correlation_lock",
+    ), "the lock-ordering pin would not notice a removed advisory lock"

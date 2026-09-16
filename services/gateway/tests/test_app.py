@@ -22,6 +22,13 @@ class _Sess:
     def commit(self):
         return None
 
+    def execute(self, *a, **k):
+        # GC-2: the fused merge statement finds no candidate in this fake
+        # store, so every request here takes the frozen fallback path.
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = None
+        return result
+
     def scalars(self, *a, **k):
         class R:
             def __iter__(self):

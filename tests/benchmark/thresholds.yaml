@@ -222,10 +222,16 @@ benchmarks:
     \ correctness. The 1000/s figure is derived from B1 rather than from this entry: B1 requires\
     \ the ingest front door to sustain a 5x burst of 200 req/s for 30 s with 0\
     \ errors, and services/gateway/gateway/ingest.py writes exactly one audit_log row\
-    \ per ingested alert on four mutually exclusive branches (event_merged:131,\
-    \ event_received:200, event_rejected:233; the merge action has a second call\
-    \ site at line 165 of the same file - one reference per action above, the\
-    \ representative first occurrence), so the storage tier absorbs 1000 audit\
+    \ per ingested alert on four mutually exclusive branches (event_merged:158,\
+    \ event_received:193, event_rejected:226; one reference per action, the\
+    \ representative first occurrence). GC-2 leaves that one-row-per-alert\
+    \ accounting unchanged while moving the committed-existing-case merge into\
+    \ the fused statement merge_existing_event_with_audit, which writes its\
+    \ event_merged row itself; the under-lock merge, open and reject branches\
+    \ still call write_audit, and the representative above is the remaining\
+    \ real under-lock write_audit call. B11 measures the audit-table insert\
+    \ station, not the whole HTTP merge transaction: B1, not B11, gates the\
+    \ fused ingest shape. So the storage tier absorbs 1000 audit\
     \ inserts/s at that burst. The recorded ~995/s was measured under the four-writer\
     \ model and is not comparable with any seven-writer figure (section 14.4 rule 3).\
     \ The first seven-writer reference measurement is read by the existing B11 branch\
@@ -248,7 +254,7 @@ benchmarks:
         tables: [audit_log]
         call_sites:
           - file: services/gateway/gateway/ingest.py
-            line: 131
+            line: 158
             in: IngestService._ingest_txn
             symbol: write_audit
             expr: "write_audit("

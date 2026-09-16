@@ -10,7 +10,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import Integer, Text, bindparam, select, text, update
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID as PG_UUID
 from sqlalchemy.orm import Session
 
 from rca_common.audit import actor_system, write_audit
@@ -133,6 +134,165 @@ def find_open_by_fingerprint(
         now=now,
     )
     return session.scalars(stmt).first()
+
+
+# ---------------------------------------------------------------------------
+# GC-2 (FP-GC2-1/2/3): the committed existing-case merge as one statement.
+#
+# The dominant ingest request is a merge into an already committed, non-terminal
+# investigation. Expressed through the ORM it costs four round trips plus two
+# flush INSERTs; expressed here it is one parameterized data-modifying statement
+# that selects the same candidate as ``find_open_by_fingerprint`` and inserts
+# both the alert_events row and its audit_log row, still inside the caller's
+# transaction and still before the caller's one durable COMMIT.
+#
+# Every request value below is a typed bind parameter. No value, status,
+# JSON fragment, table name or interval is interpolated into the SQL, and the
+# statement itself is built exactly once at import.
+# ---------------------------------------------------------------------------
+
+# Closed, ordered rendering of the non-terminal status set for the bound
+# ``text[]`` parameter — the same set ``find_open_by_fingerprint_stmt`` uses.
+NON_TERMINAL_STATUS_LIST = tuple(sorted(NON_TERMINAL_STATUSES))
+
+MERGE_EXISTING_EVENT_AUDIT_ACTION = "event_merged"
+MERGE_EXISTING_EVENT_AUDIT_ACTOR = "system"
+
+_MERGE_EXISTING_EVENT_WITH_AUDIT_SQL = """
+WITH platform AS MATERIALIZED (
+    SELECT p.platform_key,
+           CASE
+             WHEN p.config ? 'correlation_window_seconds' THEN
+               CASE
+                 WHEN jsonb_typeof(p.config -> 'correlation_window_seconds')
+                          IN ('number', 'string')
+                  AND (p.config ->> 'correlation_window_seconds') ~ '^-?[0-9]+$'
+                  AND octet_length(
+                        p.config ->> 'correlation_window_seconds'
+                      ) <= 11
+                 THEN CASE
+                        WHEN (p.config ->> 'correlation_window_seconds')::bigint
+                               BETWEEN -2147483648 AND 2147483647
+                        THEN (p.config ->> 'correlation_window_seconds')::integer
+                        ELSE NULL
+                      END
+                 ELSE NULL
+               END
+             WHEN p.config ? 'correlation_window' THEN
+               CASE
+                 WHEN jsonb_typeof(p.config -> 'correlation_window')
+                          IN ('number', 'string')
+                  AND (p.config ->> 'correlation_window') ~ '^-?[0-9]+$'
+                  AND octet_length(p.config ->> 'correlation_window') <= 11
+                 THEN CASE
+                        WHEN (p.config ->> 'correlation_window')::bigint
+                               BETWEEN -2147483648 AND 2147483647
+                        THEN (p.config ->> 'correlation_window')::integer
+                        ELSE NULL
+                      END
+                 ELSE NULL
+               END
+             ELSE :default_correlation_window_seconds
+           END AS window_seconds
+      FROM platforms AS p
+     WHERE p.platform_key = :platform_key
+       AND lower(p.status) = 'online'
+),
+candidate AS MATERIALIZED (
+    SELECT i.investigation_id
+      FROM platform AS p
+      JOIN alert_events AS ae
+        ON ae.platform_key = p.platform_key
+      JOIN investigations AS i
+        ON i.investigation_id = ae.investigation_id
+     WHERE p.window_seconds IS NOT NULL
+       AND ae.fingerprint = :fingerprint
+       AND ae.investigation_id IS NOT NULL
+       AND ae.received_at >= :statement_at
+                             - make_interval(secs => p.window_seconds)
+       AND i.status = ANY(:non_terminal_statuses)
+     ORDER BY ae.received_at DESC
+     LIMIT 1
+),
+event_write AS (
+    INSERT INTO alert_events
+        (event_id, fingerprint, source, platform_key, severity, payload_ref,
+         normalized, disposition, investigation_id, reject_reason, received_at)
+    SELECT :event_id, :fingerprint, :source, :platform_key, :severity, NULL,
+           :normalized, 'merged', candidate.investigation_id, NULL, :statement_at
+      FROM candidate
+    RETURNING investigation_id
+),
+audit_write AS (
+    INSERT INTO audit_log
+        (investigation_id, actor, action, detail, at)
+    SELECT event_write.investigation_id, 'system', 'event_merged',
+           jsonb_build_object(
+               'event_id', :event_id_text,
+               'fingerprint', :fingerprint
+           ),
+           :statement_at
+      FROM event_write
+    RETURNING investigation_id
+)
+SELECT investigation_id FROM audit_write
+"""
+
+_MERGE_EXISTING_EVENT_WITH_AUDIT_STMT = text(
+    _MERGE_EXISTING_EVENT_WITH_AUDIT_SQL
+).bindparams(
+    bindparam("platform_key", type_=Text),
+    bindparam("fingerprint", type_=Text),
+    bindparam("source", type_=Text),
+    bindparam("severity", type_=Text),
+    bindparam("event_id", type_=PG_UUID(as_uuid=True)),
+    bindparam("event_id_text", type_=Text),
+    bindparam("normalized", type_=JSONB),
+    bindparam("non_terminal_statuses", type_=ARRAY(Text)),
+    bindparam("statement_at", type_=TIMESTAMP(timezone=True)),
+    bindparam("default_correlation_window_seconds", type_=Integer),
+)
+
+
+def merge_existing_event_with_audit(
+    session: Session,
+    *,
+    event: dict[str, Any],
+    default_correlation_window_seconds: int,
+    now: datetime | None = None,
+) -> uuid.UUID | None:
+    """Merge one event into an already committed case in a single statement.
+
+    FP-GC2-1: on a hit this performs exactly one parameterized SQL statement —
+    the candidate select, the ``alert_events`` insert with disposition
+    ``merged`` and the ``audit_log`` ``event_merged`` insert are CTEs of one
+    data-modifying statement, so PostgreSQL either applies both rows or
+    neither. No ORM object is materialized and nothing is flushed.
+
+    Returns the merged investigation UUID, or ``None`` when the platform is
+    unknown/not online, its correlation-window override is not safe for this
+    static statement, or no eligible investigation exists. A ``None`` result
+    has written nothing: the caller continues on the frozen reject/advisory-
+    lock/open path in the same transaction (FP-GC2-3).
+
+    The helper never commits; transaction ownership stays with the caller.
+    """
+    statement_at = now or datetime.now(timezone.utc)
+    return session.execute(
+        _MERGE_EXISTING_EVENT_WITH_AUDIT_STMT,
+        {
+            "platform_key": event["platform_key"],
+            "fingerprint": event["fingerprint"],
+            "source": event["source"],
+            "severity": event["severity"],
+            "event_id": uuid.UUID(str(event["event_id"])),
+            "event_id_text": str(event["event_id"]),
+            "normalized": event,
+            "non_terminal_statuses": list(NON_TERMINAL_STATUS_LIST),
+            "statement_at": statement_at,
+            "default_correlation_window_seconds": default_correlation_window_seconds,
+        },
+    ).scalar_one_or_none()
 
 
 def _latest_investigation(session: Session, investigation_id: uuid.UUID) -> Investigation | None:

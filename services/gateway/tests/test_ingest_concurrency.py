@@ -46,6 +46,7 @@ async def test_ingest_does_no_sync_db_work_on_the_event_loop():
 
     # Patch the DB work so only the session-factory block takes time.
     with (
+        patch("gateway.ingest.merge_existing_event_with_audit", return_value=None),
         patch("gateway.ingest.get_platform", return_value=None),
         patch("gateway.ingest.insert_alert_event"),
         patch("gateway.ingest.write_audit"),
@@ -87,6 +88,7 @@ async def test_ingest_does_no_sync_db_work_on_the_event_loop():
         transport=ASGITransport(app=app2), base_url="http://test"
     ) as client:
         with (
+            patch("gateway.ingest.merge_existing_event_with_audit", return_value=None),
             patch("gateway.ingest.get_platform", return_value=None),
             patch("gateway.ingest.insert_alert_event"),
             patch("gateway.ingest.write_audit"),
@@ -149,3 +151,50 @@ def test_ingest_txn_is_a_sync_function_dispatched_through_the_threadpool():
     for node in ast.walk(ingest_fn):
         if isinstance(node, ast.Attribute) and node.attr == "_session_factory":
             raise AssertionError("ingest body must not call _session_factory")
+
+    # FP-GC2-3: every database helper, including GC-2's fused merge statement,
+    # is reachable only from the plain synchronous transaction method. A
+    # database call on the event loop would defeat FP-IG-5 no matter how cheap
+    # the statement is.
+    db_helpers = {
+        "merge_existing_event_with_audit",
+        "get_platform",
+        "find_open_by_fingerprint",
+        "acquire_correlation_lock",
+        "insert_alert_event",
+        "write_audit",
+        "create_investigation",
+    }
+
+    def _called_names(fn):
+        names = set()
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+        return names
+
+    txn_calls = _called_names(txn_fn)
+    assert "merge_existing_event_with_audit" in txn_calls, (
+        "_ingest_txn must call the fused merge helper"
+    )
+    assert db_helpers <= txn_calls, sorted(db_helpers - txn_calls)
+    assert not (db_helpers & _called_names(ingest_fn)), (
+        "async ingest() must call no database helper directly: "
+        f"{sorted(db_helpers & _called_names(ingest_fn))}"
+    )
+    # Anywhere else in the module, the helper may only appear inside
+    # `_ingest_txn` — never at class or module level.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "merge_existing_event_with_audit"
+        ):
+            assert txn_fn.lineno <= node.lineno <= (txn_fn.end_lineno or node.lineno), (
+                f"fused merge called at line {node.lineno}, outside _ingest_txn"
+            )
