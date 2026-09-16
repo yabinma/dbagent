@@ -44,7 +44,16 @@ on:
     types: [opened, synchronize, reopened]
   schedule:
     - cron: '0 3 * * *'          # nightly e2e
+  # GC-3 FP-GC3-2: the manual discovery route. The boolean defaults to false,
+  # so an ordinary manual run of this workflow behaves exactly as before and
+  # the 28-arm sweep costs nothing until somebody asks for it by name.
   workflow_dispatch:
+    inputs:
+      b1_topology_probe:
+        description: Run GC-3 B1 topology discovery
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   lint:
@@ -562,3 +571,38 @@ jobs:
             /tmp/rca-e2e/**
             tests/e2e/*.log
           if-no-files-found: ignore
+
+  # GC-3 FP-GC3-2: the B1 reference-topology discovery instrument.
+  #
+  # NO `needs:` -- deliberately. This job is not part of the merge gate, is in
+  # no ordinary job's needs closure, and must be able to run while the
+  # `functional` job is the known `gc3_decision_missing` red that the probe
+  # head carries by design. `benchmark` and `e2e` skip through their own needs
+  # chains on such a dispatch; this job still produces its measurement.
+  #
+  # It measures 28 closed placements of the UNCHANGED CI-scale burst and
+  # records one truthful met/missed value per unchanged comparison. A candidate
+  # that misses the bar is data and does not fail this job; a missing arm, a
+  # bad placement or topology, an accounting failure or an unwritable artifact
+  # does. `if: always()` on the upload exists so a broken sweep still surfaces
+  # its `invalid` artifact -- it never converts the failing command's exit
+  # status into success, because the upload is a separate, later step.
+  #
+  # 28 x (30 s window + warmup + sibling startup + teardown) plus one image
+  # build is about 30-45 minutes; 75 leaves room for setup variance without
+  # leaving an unbounded runner.
+  b1-topology-probe:
+    name: B1 topology discovery (GC-3, manual, recorded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    if: github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true
+    steps:
+      - uses: actions/checkout@v4
+      - name: B1 topology discovery -- the closed 28-arm candidate set (FP-GC3-2)
+        run: bash scripts/integration-test.sh b1_topology_probe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b1-topology-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/b1-topology-probe-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: error

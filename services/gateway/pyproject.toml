@@ -38,4 +38,5 @@ markers = [
     "b1_live: consumes a live B1 fixture or the full-window driver self-witness; never traced",
     "b1_product: product-promise live node; selected only by scripts/integration-test.sh b1_product",
     "b1_latency_basis: CPU-basis oracle owned by B1-LATENCY-BASIS-1; outside both GC-1 targets",
+    "b1_topology_probe: GC-3 discovery arm in b1_topology_probe_live.py; selected only by scripts/integration-test.sh b1_topology_probe",
 ]

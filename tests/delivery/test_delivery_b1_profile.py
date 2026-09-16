@@ -4,17 +4,25 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib.util
+import json
 import re
 import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REF_PATH = REPO_ROOT / "services" / "gateway" / "tests" / "b1_reference_profile.py"
 E2E_PATH = REPO_ROOT / "tests" / "e2e" / "b1_e2e_profile.py"
 REF_TEST = REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
 E2E_TEST = REPO_ROOT / "tests" / "e2e" / "test_e2e_load.py"
+# GC-3: the live-only discovery module and the stdlib-only topology helper it
+# shares with the host launcher. The live module is deliberately not
+# `test_`-prefixed, so no directory collection discovers it.
+PROBE_TEST = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe_live.py"
+PROBE_HELPER = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe.py"
+GC3_DECISION = REPO_ROOT / "tests" / "benchmark" / "b1_topology_decision.json"
 
 
 def _load(path: Path, name: str):
@@ -1128,6 +1136,11 @@ CI_SCALE_REF_TEST = "test_b1_ci_scale_reference_profile"
 PRODUCT_REF_TEST = "test_b1_product_exclusive_reference_profile"
 CI_SCALE_FIXTURE = "b1_ci_scale_run"
 PRODUCT_FIXTURE = "b1_product_run"
+# GC-3 (FP-GC3-2): the discovery fixture. It is named here because the marker
+# map identifies live consumers by PARAMETER NAME -- a new live fixture that
+# this file does not know about is invisible to the map, which is exactly how
+# an unmarked live node would end up inside the traced coverage phase.
+PROBE_FIXTURE = "b1_topology_probe_run"
 LIVE_RUN_IMPL = "_run_b1_reference"
 
 # Exact twenty-node inventory. Each entry: (test_file, test_name, required_names,
@@ -1824,7 +1837,13 @@ GC1_GATING_PLACEMENT_FIELDS = (
     "postgres_allowed_cpus",
     "driver_allowed_cpus",
 )
-GC1_DIAGNOSTIC_PLACEMENT_FIELDS = (
+# GC-3 (FP-GC3-5) split this inventory in two. The schema-2 line -- the
+# product-local profile, and the ordinary CI-scale contract until a topology is
+# ratified -- keeps exactly the GC-1/GC-2 sequence below. The schema-3 line has
+# its own inventory further down: it carries the physical-topology claim in its
+# GATING prefix and therefore does not repeat `gateway_thread_siblings_pct`
+# among its diagnostics. One shared tuple could not say that.
+GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS = (
     "gateway_quota_cpus",
     "gateway_cpu_period_us",
     "gateway_nr_periods",
@@ -1850,7 +1869,7 @@ GC1_DIAGNOSTIC_PLACEMENT_FIELDS = (
     "gateway_thread_siblings_pct",
     "spectre_v2_pct",
 )
-GC1_PLACEMENT_FIELDS = GC1_GATING_PLACEMENT_FIELDS + GC1_DIAGNOSTIC_PLACEMENT_FIELDS
+GC1_PLACEMENT_FIELDS = GC1_GATING_PLACEMENT_FIELDS + GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS
 GC1_PRODUCT_FIELDS = (
     "product_errors_eq_zero",
     "product_p99_lt_150_ms",
@@ -1868,7 +1887,7 @@ GC1_DIAGNOSTIC_UNAVAILABLE = "unavailable"
 # Docker bandwidth/cpuset controls, removed as the allocation primitive.
 GC1_BANDWIDTH_CONTROLS = ("--cpus", "--cpu-period", "--cpu-quota", "--cpuset-cpus",
                           "cpu_period=", "cpu_quota=", "cpuset_cpus=")
-GC1_MARKERS = ("b1_live", "b1_product", "b1_latency_basis")
+GC1_MARKERS = ("b1_live", "b1_product", "b1_latency_basis", "b1_topology_probe")
 GC1_BASIS_MS_PER_REQUEST = 2.427
 GC1_BASIS_OWNER = "B1-LATENCY-BASIS-1"
 # Top-level directories the FP-GC1-6 guard may open. The gitignored
@@ -1900,15 +1919,14 @@ def _decorator_markers(func: ast.AST) -> set[str]:
     return out
 
 
-def _live_marker_failures(src: str) -> list[str]:
-    """The closed live-fixture/marker mapping (design slice §3.3).
+def _live_consumer_failures(src: str, *, where: str) -> list[str]:
+    """The closed live-fixture/marker mapping, applied to one module.
 
     Every function that injects a live fixture carries ``b1_live``; product
-    consumers also carry ``b1_product``; the CPU-basis comparison also carries
-    ``b1_latency_basis``; and the full-window instant-server self-witness --
-    which takes no fixture but does run a real 30-second offer -- carries
-    ``b1_live`` too. Adding an unmarked live consumer is a named failure, so
-    the traced container-free selection cannot silently acquire live work.
+    consumers also carry ``b1_product``; discovery consumers also carry
+    ``b1_topology_probe``; and no function injects two live fixtures. Adding an
+    unmarked live consumer -- in either module -- is a named failure, so the
+    traced container-free selection cannot silently acquire live work.
     """
     tree = ast.parse(src)
     fails: list[str] = []
@@ -1917,18 +1935,46 @@ def _live_marker_failures(src: str) -> list[str]:
             continue
         params = {a.arg for a in node.args.args}
         markers = _decorator_markers(node)
-        live = params & {CI_SCALE_FIXTURE, PRODUCT_FIXTURE}
+        live = params & {CI_SCALE_FIXTURE, PRODUCT_FIXTURE, PROBE_FIXTURE}
         if not live:
             continue
         if not node.name.startswith("test"):
-            fails.append(f"{node.name}: non-test consumer of a live fixture")
+            # The fixture definitions themselves are the one admitted
+            # exception: `def b1_topology_probe_run(...)` takes no live
+            # fixture, so only a *consumer* reaches here.
+            fails.append(f"{where}::{node.name}: non-test consumer of a live fixture")
             continue
         if "b1_live" not in markers:
-            fails.append(f"{node.name}: live-fixture consumer without b1_live")
+            fails.append(f"{where}::{node.name}: live-fixture consumer without b1_live")
         if PRODUCT_FIXTURE in params and "b1_product" not in markers:
-            fails.append(f"{node.name}: product-fixture consumer without b1_product")
-        if CI_SCALE_FIXTURE in params and PRODUCT_FIXTURE in params:
-            fails.append(f"{node.name}: injects both live fixtures")
+            fails.append(f"{where}::{node.name}: product-fixture consumer without b1_product")
+        if PROBE_FIXTURE in params and "b1_topology_probe" not in markers:
+            fails.append(
+                f"{where}::{node.name}: probe-fixture consumer without b1_topology_probe"
+            )
+        if PROBE_FIXTURE in params and "b1_product" in markers:
+            fails.append(f"{where}::{node.name}: probe node carries b1_product")
+        if len(live) > 1:
+            fails.append(f"{where}::{node.name}: injects more than one live fixture")
+    return fails
+
+
+def _live_marker_failures(src: str, probe_src: str | None = None) -> list[str]:
+    """The dual-module map: the harness module, and the live-only probe module.
+
+    The probe node deliberately does NOT live in the harness module: a second
+    CI job collecting ``test_b1_ingest_burst.py`` would break FP-IG-26's
+    one-producer invariant. Passing both sources here keeps one mapping for
+    both files rather than two mappings that can disagree.
+    """
+    fails = _live_consumer_failures(src, where=REF_TEST.name)
+    if probe_src is not None:
+        fails.extend(_live_consumer_failures(probe_src, where=PROBE_TEST.name))
+        if PROBE_FIXTURE not in probe_src:
+            fails.append(f"{PROBE_TEST.name}: defines no {PROBE_FIXTURE} fixture")
+    if PROBE_FIXTURE in src:
+        fails.append(f"{REF_TEST.name}: defines or consumes the probe fixture")
+    tree = ast.parse(src)
     witness = next(
         (n for n in ast.walk(tree)
          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -2156,7 +2202,7 @@ def _placement_surface_failures(src: str) -> list[str]:
     diagnostics = _module_tuple(tree, "B1_DIAGNOSTIC_PLACEMENT_FIELDS")
     if gating != GC1_GATING_PLACEMENT_FIELDS:
         fails.append(f"B1_GATING_PLACEMENT_FIELDS drift: {gating}")
-    if diagnostics != GC1_DIAGNOSTIC_PLACEMENT_FIELDS:
+    if diagnostics != GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS:
         fails.append(f"B1_DIAGNOSTIC_PLACEMENT_FIELDS drift: {diagnostics}")
     if gating + diagnostics != GC1_PLACEMENT_FIELDS:
         fails.append("B1_PLACEMENT_FIELDS is not the two blocks in order")
@@ -2278,7 +2324,7 @@ def test_b1_placement_fingerprint_surface_is_pinned():
         assert f"{role}_allowed_cpus" in GC1_GATING_PLACEMENT_FIELDS
         for suffix in ("quota_cpus", "cpu_period_us", "nr_periods",
                        "nr_throttled", "throttled_usec"):
-            assert f"{role}_{suffix}" in GC1_DIAGNOSTIC_PLACEMENT_FIELDS
+            assert f"{role}_{suffix}" in GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS
             assert f"{role}_{suffix}" not in GC1_GATING_PLACEMENT_FIELDS
     assert _placement_surface_failures(src) == []
 
@@ -2468,9 +2514,16 @@ GC2_SIZING_CARRIERS = (
     ("services", "gateway", "tests", "test_b1_ingest_burst.py"),
     ("scripts", "integration-test.sh"),
 )
-GC2_DIAGNOSTIC_FIELDS = (
+# GC-3 (FP-GC3-5): the same split, applied to GC-2's appended attribution tail.
+# The product line still ends in all three; the schema-3 line ends in two,
+# because its gateway sibling map moved into the gating prefix.
+GC3_PRODUCT_DIAGNOSTIC_TAIL = (
     "postgres_usage_usec",
     "gateway_thread_siblings_pct",
+    "spectre_v2_pct",
+)
+GC3_CI_SCALE_DIAGNOSTIC_TAIL = (
+    "postgres_usage_usec",
     "spectre_v2_pct",
 )
 GC2_DIAGNOSTIC_SAFE_CHARACTERS = (
@@ -2682,8 +2735,8 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
     assert "cpuMsPerRequest=2.427" in b1_entry["notes"]
 
     # (7) The three GC-2 diagnostics are appended, reported-only, and escaped.
-    assert GC1_DIAGNOSTIC_PLACEMENT_FIELDS[-3:] == GC2_DIAGNOSTIC_FIELDS
-    for field_name in GC2_DIAGNOSTIC_FIELDS:
+    assert GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS[-3:] == GC3_PRODUCT_DIAGNOSTIC_TAIL
+    for field_name in GC3_PRODUCT_DIAGNOSTIC_TAIL:
         assert field_name not in GC1_GATING_PLACEMENT_FIELDS, field_name
     assert _placement_surface_failures(test_src) == []
     safe_node = _source_assigns(test_src)["B1_DIAGNOSTIC_SAFE_CHARACTERS"]
@@ -2693,7 +2746,7 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
         test_src,
         _gc2_function(ast.parse(test_src), "_serialize_placement_fields"),
     ) or ""
-    for field_name in GC2_DIAGNOSTIC_FIELDS:
+    for field_name in GC3_PRODUCT_DIAGNOSTIC_TAIL:
         assert f'"{field_name}="' in serializer, field_name
         assert serializer.count(f'"{field_name}="') == 1, field_name
     assert serializer.count("_percent_encode_diagnostic(") == 2, serializer
@@ -2730,3 +2783,804 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
         _gc2_function(ast.parse(unlocked), GC2_TXN, cls="IngestService"),
         "acquire_correlation_lock",
     ), "the lock-ordering pin would not notice a removed advisory lock"
+
+
+# ---------------------------------------------------------------------------
+# GC-3 — the closed candidate space, the discovery artifact and the decision
+# carrier (FP-GC3-3 / 4 / 6).
+#
+# Every literal below is declared here, independently of the modules it pins.
+# The two tests in this block are the slice's fail-closed carriers: while
+# `tests/benchmark/b1_topology_decision.json` does not exist they BOTH fail
+# with the named reason `gc3_decision_missing`. That is deliberate and it is
+# the design's own statement of the probe head: the decision cannot be written
+# until two EPYC 7763 discovery artifacts have been measured at this exact
+# SHA, and absence must never read as a skip, a default or a placeholder.
+# ---------------------------------------------------------------------------
+
+GC3_DECISION_MISSING_REASON = "gc3_decision_missing"
+GC3_PROBE_PROFILE_NAME = "ci-scale-probe"
+GC3_CONTRACT_SCHEMA = 3
+GC3_SCHEMA2 = 2
+GC3_REFERENCE_CPU_MODEL = "AMD EPYC 7763 64-Core Processor"
+GC3_REFERENCE_LOGICAL_CPUS = 4
+GC3_ARMS_PER_ARTIFACT = 28
+GC3_ORIENTATIONS = (0, 1)
+GC3_ROUNDS = (0, 1)
+GC3_TOPOLOGY_IDS = (
+    "driver-isolated",
+    "gateway-core",
+    "gateway-isolated",
+    "gateway-split",
+    "postgres-core",
+    "postgres-isolated",
+    "postgres-split",
+)
+# The abstract maps over the two sibling pairs (a, b) and (c, d). Relationships,
+# never CPU ids: `{a, b}` is one physical core on the 7763 guest and on the i7
+# replica alike, while the ids differ on both.
+GC3_TOPOLOGY_MAPS = {
+    "gateway-core": {"gateway": ("a", "b"), "postgres": ("c",), "driver": ("d",),
+                     "unassigned": ()},
+    "gateway-split": {"gateway": ("a", "c"), "postgres": ("b",), "driver": ("d",),
+                      "unassigned": ()},
+    "postgres-core": {"gateway": ("a",), "postgres": ("c", "d"), "driver": ("b",),
+                      "unassigned": ()},
+    "postgres-split": {"gateway": ("b",), "postgres": ("a", "c"), "driver": ("d",),
+                       "unassigned": ()},
+    "postgres-isolated": {"gateway": ("a",), "postgres": ("c",), "driver": ("b",),
+                          "unassigned": ("d",)},
+    "driver-isolated": {"gateway": ("a",), "postgres": ("b",), "driver": ("c",),
+                        "unassigned": ("d",)},
+    "gateway-isolated": {"gateway": ("c",), "postgres": ("a",), "driver": ("b",),
+                         "unassigned": ("d",)},
+}
+GC3_VERDICT_FIELDS = (
+    "offered_eq_15000",
+    "served_plus_errors_eq_offered",
+    "errors_eq_zero",
+    "served_eq_offered",
+    "p99_lt_150_ms",
+    "committed_eq_served",
+    "served_rate_gte_450",
+    "max_in_flight_lt_500",
+    "platform_online",
+    "worker_set_stable",
+)
+GC3_INTEGRITY_VERDICT_FIELDS = (
+    "offered_eq_15000",
+    "served_plus_errors_eq_offered",
+    "committed_eq_served",
+    "platform_online",
+    "worker_set_stable",
+)
+GC3_PERFORMANCE_VERDICT_FIELDS = (
+    "errors_eq_zero",
+    "served_eq_offered",
+    "p99_lt_150_ms",
+    "served_rate_gte_450",
+    "max_in_flight_lt_500",
+)
+# The schema-3 CI-scale inventory. The physical-topology claim is GATING; the
+# gateway sibling map appears here exactly once and therefore not among the
+# diagnostics below.
+GC3_CI_SCALE_GATING_PLACEMENT_FIELDS = (
+    "placement_profile",
+    "placement_schema",
+    "placement_run_id",
+    "measurement_authority",
+    "reference_topology",
+    "reference_cpus",
+    "unassigned_cpus",
+    "placement_ok",
+    "gateway_allowed_cpus",
+    "postgres_allowed_cpus",
+    "driver_allowed_cpus",
+    "gateway_thread_siblings_pct",
+    "postgres_thread_siblings_pct",
+    "driver_thread_siblings_pct",
+)
+GC3_CI_SCALE_DIAGNOSTIC_PLACEMENT_FIELDS = (
+    "gateway_quota_cpus",
+    "gateway_cpu_period_us",
+    "gateway_nr_periods",
+    "gateway_nr_throttled",
+    "gateway_throttled_usec",
+    "postgres_quota_cpus",
+    "postgres_cpu_period_us",
+    "postgres_nr_periods",
+    "postgres_nr_throttled",
+    "postgres_throttled_usec",
+    "driver_quota_cpus",
+    "driver_cpu_period_us",
+    "driver_nr_periods",
+    "driver_nr_throttled",
+    "driver_throttled_usec",
+    "gateway_cpu_busy_usec",
+    "gateway_nonrole_busy_cores_estimate",
+    "gateway_cpu_cores_used",
+    "postgres_usage_usec",
+    "spectre_v2_pct",
+)
+GC3_CI_SCALE_PLACEMENT_FIELDS = (
+    GC3_CI_SCALE_GATING_PLACEMENT_FIELDS + GC3_CI_SCALE_DIAGNOSTIC_PLACEMENT_FIELDS
+)
+GC3_TOPOLOGY_ONLY_FIELDS = (
+    "reference_topology",
+    "reference_cpus",
+    "unassigned_cpus",
+    "postgres_thread_siblings_pct",
+    "driver_thread_siblings_pct",
+)
+GC3_LAUNCHER = REPO_ROOT / "scripts" / "integration-test.sh"
+GC3_CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+GC3_DELIVERY_CI = REPO_ROOT / "tests" / "delivery" / "test_delivery_ci.py"
+GC3_PRODUCER_REL = "services/gateway/tests/test_b1_ingest_burst.py"
+GC3_PROBE_LIVE_REL = "services/gateway/tests/b1_topology_probe_live.py"
+GC3_COVERAGE_SELECTION = (
+    "-m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'"
+)
+GC3_LIVE_SELECTION = (
+    "-m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'"
+)
+GC3_PROBE_SELECTION = "-m b1_topology_probe"
+GC3_PRODUCT_SELECTION = "-m b1_product"
+GC3_PROBE_JOB = "b1-topology-probe"
+# The GC-2 RCA's own diagnostics. Neither may become a sizing observation nor a
+# selection threshold: mean CPU explains a result and cannot prove due-time
+# p99, errors, completion or audit accounting.
+GC3_RCA_POSTGRES_MS = "2.105"
+GC3_RCA_GATEWAY_MS = "1.901"
+GC3_RCA_RUN_ID = "35080052686"
+GC3_SIZING_CARRIERS = (
+    ("deploy", "charts", "dbagent", "values.yaml"),
+    ("tests", "benchmark", "thresholds.yaml"),
+    ("tests", "delivery", "test_delivery_sizing_ledger.py"),
+    ("services", "gateway", "tests", "b1_reference_profile.py"),
+    ("services", "gateway", "tests", "test_b1_ingest_burst.py"),
+    ("services", "gateway", "tests", "b1_topology_probe.py"),
+    ("services", "gateway", "tests", "b1_topology_probe_live.py"),
+    ("scripts", "integration-test.sh"),
+)
+GC3_WEAKENINGS = (
+    "pytest.mark.skip",
+    "pytest.mark.xfail",
+    "pytest.skip(",
+    "--deselect",
+    "continue-on-error",
+    "|| true",
+)
+GC3_BANDWIDTH_CONTROLS = GC1_BANDWIDTH_CONTROLS
+
+gc3 = _load(PROBE_HELPER, "gc3_topology_probe")
+
+
+def _gc3_emitted_fields(src: str, name: str) -> tuple[str, ...]:
+    """The field names one serializer emits, in emission order.
+
+    Reconstructed from the function's own literals rather than from a tuple it
+    could import: a pin derived from its subject detects nothing. Each
+    ``for role in B1_ROLES`` loop expands role-major on its own, so two
+    consecutive per-role blocks cannot be folded into one interleaved run.
+    """
+    tree = ast.parse(src)
+    fn = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name), None
+    )
+    if fn is None:
+        return ()
+    rendered_fn = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "rendered"),
+        None,
+    )
+    per_role_diagnostics = (
+        [m.group(1) for m in re.finditer(r'f"\{self\.role\}_([a-z_0-9]+)"',
+                                         ast.get_source_segment(src, rendered_fn) or "")]
+        if rendered_fn is not None else []
+    )
+
+    def literals(text: str) -> list[str]:
+        return [m.group(2) for m in re.finditer(r'[f]?"(\{role\}_)?([a-z_0-9]+)=', text)]
+
+    out: list[str] = []
+    for stmt in fn.body:
+        # The RAW source segment, never ast.unparse: unparse normalises string
+        # quoting and the literals this reconstruction reads would vanish.
+        text = ast.get_source_segment(src, stmt) or ""
+        if isinstance(stmt, ast.For) and ast.unparse(stmt.iter) == "B1_ROLES":
+            if "rendered()" in text:
+                for role in GC1_ROLES:
+                    out.extend(f"{role}_{suffix}" for suffix in per_role_diagnostics)
+                continue
+            suffixes = [m.group(1) for m in re.finditer(r'f"\{role\}_([a-z_0-9]+)=', text)]
+            for role in GC1_ROLES:
+                out.extend(f"{role}_{suffix}" for suffix in suffixes)
+            continue
+        out.extend(literals(text))
+    return tuple(out)
+
+
+def _gc3_topology_surface_failures(src: str) -> list[str]:
+    """FP-GC3-5: the schema-3 inventory, and its separation from schema 2."""
+    tree = ast.parse(src)
+    fails: list[str] = []
+    gating = _module_tuple(tree, "B1_TOPOLOGY_GATING_PLACEMENT_FIELDS")
+    diagnostics = _module_tuple(tree, "B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS")
+    if gating != GC3_CI_SCALE_GATING_PLACEMENT_FIELDS:
+        fails.append(f"schema-3 gating inventory drift: {gating}")
+    if diagnostics != GC3_CI_SCALE_DIAGNOSTIC_PLACEMENT_FIELDS:
+        fails.append(f"schema-3 diagnostic inventory drift: {diagnostics}")
+    composition = next(
+        (ast.unparse(n.value) for n in tree.body
+         if isinstance(n, ast.Assign) and len(n.targets) == 1
+         and isinstance(n.targets[0], ast.Name)
+         and n.targets[0].id == "B1_TOPOLOGY_PLACEMENT_FIELDS"), None
+    )
+    if composition != (
+        "B1_TOPOLOGY_GATING_PLACEMENT_FIELDS + B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS"
+    ):
+        fails.append(f"schema-3 fields are not gating-first: {composition}")
+    # No field is duplicated within the schema-3 line, and the topology claim is
+    # gating rather than diagnostic.
+    if len(set(GC3_CI_SCALE_PLACEMENT_FIELDS)) != len(GC3_CI_SCALE_PLACEMENT_FIELDS):
+        fails.append("schema-3 line repeats a field")
+    if "gateway_thread_siblings_pct" in diagnostics:
+        fails.append("gateway_thread_siblings_pct is duplicated in the schema-3 diagnostics")
+    for field in GC3_TOPOLOGY_ONLY_FIELDS:
+        if field not in gating:
+            fails.append(f"{field} is not gating under schema 3")
+        if field in GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS or field in GC1_GATING_PLACEMENT_FIELDS:
+            fails.append(f"{field} leaked into the schema-2 inventory")
+    if diagnostics[-2:] != GC3_CI_SCALE_DIAGNOSTIC_TAIL:
+        fails.append(f"schema-3 tail is {diagnostics[-2:]}")
+    if GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS[-3:] != GC3_PRODUCT_DIAGNOSTIC_TAIL:
+        fails.append("the schema-2 product tail changed")
+    # The two serializers are separate functions, each emitting exactly its own
+    # inventory in order. The schema-2 one is byte-unchanged from GC-1/GC-2.
+    emitted = _gc3_emitted_fields(src, "_serialize_topology_placement_fields")
+    if emitted != GC3_CI_SCALE_PLACEMENT_FIELDS:
+        fails.append(f"_serialize_topology_placement_fields emits {emitted}")
+    legacy = _gc3_emitted_fields(src, "_serialize_placement_fields")
+    if legacy != GC1_PLACEMENT_FIELDS:
+        fails.append(f"_serialize_placement_fields emits {legacy}")
+    # The inventory is selected from the parsed contract, not shared.
+    live = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == LIVE_RUN_IMPL), None
+    )
+    if live is None:
+        return fails + [f"{LIVE_RUN_IMPL}: missing"]
+    body = ast.get_source_segment(src, live) or ""
+    if "if declaration.carries_topology:" not in body:
+        fails.append("the serializer is not selected from the parsed contract")
+    for clause in (
+        "_serialize_topology_placement_fields(",
+        "_serialize_placement_fields(",
+        "siblings_before = _read_reference_sibling_groups(declaration)",
+        "siblings_open = _read_reference_sibling_groups(declaration)",
+        "siblings_close = _read_reference_sibling_groups(declaration)",
+        "sibling_groups=siblings_open",
+    ):
+        if clause not in body:
+            fails.append(f"{LIVE_RUN_IMPL} lost {clause!r}")
+    return fails
+
+
+def _gc3_candidate_space_failures() -> list[str]:
+    """FP-GC3-1: seven classes, two orientations, two rounds, 28 unique arms."""
+    fails: list[str] = []
+    if tuple(sorted(gc3.TOPOLOGY_CLASSES)) != GC3_TOPOLOGY_IDS:
+        fails.append(f"topology ids {tuple(sorted(gc3.TOPOLOGY_CLASSES))}")
+        return fails
+    if gc3.TOPOLOGY_IDS != GC3_TOPOLOGY_IDS:
+        fails.append("TOPOLOGY_IDS is not the lexically sorted closed set")
+    for topology, expected in GC3_TOPOLOGY_MAPS.items():
+        got = gc3.TOPOLOGY_CLASSES[topology]
+        if {k: tuple(v) for k, v in got.items()} != expected:
+            fails.append(f"{topology} maps {got}, expected {expected}")
+    if gc3.ARMS_PER_ARTIFACT != GC3_ARMS_PER_ARTIFACT:
+        fails.append(f"arms per artifact {gc3.ARMS_PER_ARTIFACT}")
+    if tuple(gc3.ORIENTATIONS) != GC3_ORIENTATIONS or tuple(gc3.ROUNDS) != GC3_ROUNDS:
+        fails.append("orientations/rounds are not the closed pairs")
+    # Two independent pairings, so the enumeration is a relationship rather than
+    # a CPU-id literal: the 7763 guest's (0,1)/(2,3) and an i7 replica's
+    # (0,8)/(1,9) must produce the same 28 relationships.
+    for pair0, pair1 in (((0, 1), (2, 3)), ((0, 8), (1, 9))):
+        arms = gc3.enumerate_arms(pair0, pair1)
+        if len(arms) != GC3_ARMS_PER_ARTIFACT:
+            fails.append(f"{pair0}/{pair1}: {len(arms)} arms")
+            continue
+        keys = {(a["topology"], a["round"], a["orientation"]) for a in arms}
+        if len(keys) != GC3_ARMS_PER_ARTIFACT:
+            fails.append(f"{pair0}/{pair1}: {len(keys)} unique arms")
+        # Round 1 reverses both orders, so no class owns only late arms.
+        first_round = [a["topology"] for a in arms if a["round"] == 0]
+        second_round = [a["topology"] for a in arms if a["round"] == 1]
+        if first_round == second_round:
+            fails.append("both rounds run in the same order")
+        if [a["orientation"] for a in arms[:2]] != [0, 1]:
+            fails.append("round 0 does not run orientation 0 then 1")
+        if [a["orientation"] for a in arms[14:16]] != [1, 0]:
+            fails.append("round 1 does not run orientation 1 then 0")
+        reference = frozenset((*pair0, *pair1))
+        for arm in arms:
+            roles = {r: gc3.parse_cpu_list(arm["roles"][r]) for r in ("gateway", "postgres", "driver")}
+            if len(roles["driver"]) != 1:
+                fails.append(f"{arm['topology']}: driver holds {sorted(roles['driver'])}")
+            if not 1 <= len(roles["gateway"]) <= 2 or not 1 <= len(roles["postgres"]) <= 2:
+                fails.append(f"{arm['topology']}: role cardinality outside 1..2")
+            union = roles["gateway"] | roles["postgres"] | roles["driver"]
+            if len(union) != sum(len(v) for v in roles.values()):
+                fails.append(f"{arm['topology']}: measured roles overlap")
+            if not union <= reference:
+                fails.append(f"{arm['topology']}: allocates outside the reference set")
+            idle = reference - union
+            if len(idle) > 1:
+                fails.append(f"{arm['topology']}: {len(idle)} unassigned CPUs")
+            rendered = gc3.format_cpu_list(idle) if idle else "none"
+            if arm["unassignedCpus"] != rendered:
+                fails.append(f"{arm['topology']}: unassignedCpus {arm['unassignedCpus']}")
+    if tuple(gc3.VERDICT_FIELDS) != GC3_VERDICT_FIELDS:
+        fails.append(f"verdict fields {tuple(gc3.VERDICT_FIELDS)}")
+    if tuple(gc3.INTEGRITY_VERDICT_FIELDS) != GC3_INTEGRITY_VERDICT_FIELDS:
+        fails.append("integrity verdict block drift")
+    if tuple(gc3.PERFORMANCE_VERDICT_FIELDS) != GC3_PERFORMANCE_VERDICT_FIELDS:
+        fails.append("performance verdict block drift")
+    if set(GC3_INTEGRITY_VERDICT_FIELDS) & set(GC3_PERFORMANCE_VERDICT_FIELDS):
+        fails.append("a verdict is both integrity and performance")
+    if set(GC3_INTEGRITY_VERDICT_FIELDS) | set(GC3_PERFORMANCE_VERDICT_FIELDS) != set(
+        GC3_VERDICT_FIELDS
+    ):
+        fails.append("the two verdict blocks do not partition the vocabulary")
+    return fails
+
+
+def _gc3_selector_failures() -> list[str]:
+    """FP-GC3-3: eligibility, ranking and the absence of any override."""
+    fails: list[str] = []
+    # The decision CLI takes exactly two input paths and one output path.
+    src = PROBE_HELPER.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    builder = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_parser"), None
+    )
+    if builder is None:
+        return ["build_parser: missing"]
+    body = ast.get_source_segment(src, builder) or ""
+    decide_block = body.split('sub.add_parser("decide"', 1)
+    if len(decide_block) != 2:
+        return ["the decide subcommand is missing"]
+    options = re.findall(r'decide\.add_argument\("([^"]+)"', decide_block[1])
+    if options != ["first", "second", "out"]:
+        fails.append(f"the decide CLI takes {options}")
+    if any(option.startswith("-") for option in options):
+        fails.append("the decide CLI accepts an option")
+    for forbidden in ("candidate", "threshold", "tie", "topology=", "--force", "--select"):
+        if forbidden in decide_block[1]:
+            fails.append(f"the decide CLI exposes {forbidden!r}")
+    # CPU diagnostics may not enter the ranking.
+    score = ast.get_source_segment(
+        src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "score_topology")
+    ) or ""
+    for operand in ("p99Ms", "maxInFlight", "servedRate"):
+        if operand not in score:
+            fails.append(f"the ranking lost {operand}")
+    for diagnostic in ("postgresUsageUsec", "gatewayCpuCoresUsed", "cpu_ms", "usage_usec"):
+        if diagnostic in score:
+            fails.append(f"the ranking uses the CPU diagnostic {diagnostic}")
+    if gc3.REFERENCE_CPU_MODEL != GC3_REFERENCE_CPU_MODEL:
+        fails.append(f"reference model {gc3.REFERENCE_CPU_MODEL!r}")
+    if gc3.REFERENCE_LOGICAL_CPUS != GC3_REFERENCE_LOGICAL_CPUS:
+        fails.append(f"reference logical CPUs {gc3.REFERENCE_LOGICAL_CPUS}")
+    return fails
+
+
+GC3_PROBE_NODE = "test_b1_ci_scale_topology_probe_record"
+
+
+def _gc3_probe_partition_failures(src: str) -> list[str]:
+    """FP-GC3-2: the recorded/gating partition inside the discovery node.
+
+    The five INTEGRITY statuses are asserted directly -- a miss there means the
+    measurement is undefined. The five PERFORMANCE statuses are recorded: the
+    node may check that a token equals its own live comparison and that it is
+    one of the two admitted words, and it may not require any of them to be
+    ``met``. Truth-gating one would stop the sweep at the first expected miss
+    and destroy the evidence the decision needs.
+    """
+    tree = ast.parse(src)
+    fails: list[str] = []
+    node = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == GC3_PROBE_NODE),
+        None,
+    )
+    if node is None:
+        return [f"{GC3_PROBE_NODE}: missing"]
+    body = ast.get_source_segment(src, node) or ""
+    for performance in GC3_PERFORMANCE_VERDICT_FIELDS:
+        if f'"{performance}"' in body or f"'{performance}'" in body:
+            fails.append(f"{GC3_PROBE_NODE}: names the performance status {performance}")
+    if "probe.PERFORMANCE_VERDICT_FIELDS" not in body:
+        fails.append(f"{GC3_PROBE_NODE}: does not record the performance block")
+    # A `== VERDICT_MET` assertion is admissible ONLY inside the loop over the
+    # integrity block. Anywhere else it turns a recorded datum back into a bar.
+    admitted: set[int] = set()
+    for loop in ast.walk(node):
+        if isinstance(loop, ast.For) and "INTEGRITY_VERDICT_FIELDS" in ast.unparse(loop.iter):
+            admitted.update(
+                id(n) for n in ast.walk(loop) if isinstance(n, ast.Assert)
+            )
+    gating = [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Assert) and id(n) in admitted
+        and re.search(r"==\s*probe\.VERDICT_MET\b", ast.unparse(n.test))
+    ]
+    if not gating:
+        fails.append(
+            f"{GC3_PROBE_NODE}: the integrity block is iterated but never asserted met"
+        )
+    for assertion in ast.walk(node):
+        if not isinstance(assertion, ast.Assert):
+            continue
+        rendered = ast.unparse(assertion.test)
+        # `token in (VERDICT_MET, VERDICT_MISSED)` is the admitted-word check,
+        # not a bar: it passes for either word. Only an EQUALITY against `met`
+        # turns a datum back into a threshold.
+        if not re.search(r"==\s*probe\.VERDICT_MET\b", rendered):
+            continue
+        if id(assertion) not in admitted:
+            fails.append(f"{GC3_PROBE_NODE}: truth-gates a recorded status: {rendered}")
+    # The two record-consistency checks the recorded half rests on.
+    for recorded in ("token == live[field]", "token in (probe.VERDICT_MET, probe.VERDICT_MISSED)"):
+        if recorded not in body:
+            fails.append(f"{GC3_PROBE_NODE}: missing record-consistency check {recorded!r}")
+    # ...and the preconditions that make a record admissible at all.
+    for gating in (
+        'assert run["placement_ok"] is True',
+        "record = harness.build_probe_arm_record(run, context)",
+        "harness.write_probe_arm_record(record)",
+    ):
+        if gating not in body:
+            fails.append(f"{GC3_PROBE_NODE}: missing gating step {gating!r}")
+    return fails
+
+
+def _gc3_scope_failures() -> list[str]:
+    """FP-GC3-6: what this slice may not have moved, checked independently."""
+    fails: list[str] = []
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    harness = REF_TEST.read_text(encoding="utf-8")
+    probe_live = PROBE_TEST.read_text(encoding="utf-8")
+    probe_helper = PROBE_HELPER.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(GC3_CI_YML.read_text(encoding="utf-8"))
+
+    # (1) The three marker selections, exactly.
+    for literal in (GC3_COVERAGE_SELECTION, GC3_LIVE_SELECTION, GC3_PROBE_SELECTION,
+                    GC3_PRODUCT_SELECTION):
+        if literal not in launcher:
+            fails.append(f"marker selection missing: {literal}")
+    if launcher.count(GC3_PROBE_SELECTION) != 1:
+        fails.append("the probe selection appears more than once")
+
+    # (2) FP-IG-26: exactly one collector of the frozen producer, and the probe
+    # job collects only the live-only module.
+    if GC3_PRODUCER_REL not in GC3_DELIVERY_CI.read_text(encoding="utf-8"):
+        fails.append("test_delivery_ci.py no longer names the frozen producer")
+    b1_region = launcher.split("\nb1() {", 1)[1].split("\nb1_product() {", 1)[0]
+    if GC3_PRODUCER_REL not in b1_region:
+        fails.append("the b1 target no longer collects the producer lexically")
+    probe_region = launcher.split("\nb1_topology_probe() {", 1)
+    if len(probe_region) != 2:
+        fails.append("the b1_topology_probe target is missing")
+    else:
+        region = probe_region[1].split("\n}\n", 1)[0]
+        if GC3_PRODUCER_REL in region:
+            fails.append("the probe target collects the frozen producer")
+        if GC3_PROBE_LIVE_REL not in region:
+            fails.append("the probe target does not collect the live-only module")
+
+    # (3) The probe job: conditional, independent, three steps, honest upload.
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get(GC3_PROBE_JOB)
+    if not isinstance(job, dict):
+        fails.append("the probe job is missing from ci.yml")
+    else:
+        if "needs" in job:
+            fails.append("the probe job has a needs edge")
+        if job.get("timeout-minutes") != 75:
+            fails.append(f"probe timeout {job.get('timeout-minutes')}")
+        steps = job.get("steps") or []
+        if len(steps) != 3:
+            fails.append(f"probe job has {len(steps)} steps")
+        else:
+            if (steps[1].get("run") or "").strip() != (
+                "bash scripts/integration-test.sh b1_topology_probe"
+            ):
+                fails.append("probe wrapper step drift")
+            if steps[2].get("uses") != "actions/upload-artifact@v4":
+                fails.append("probe upload step drift")
+            if (steps[2].get("if") or "").strip() != "always()":
+                fails.append("probe upload is not always()")
+        for name, other in jobs.items():
+            needs = other.get("needs")
+            listed = [needs] if isinstance(needs, str) else list(needs or [])
+            if GC3_PROBE_JOB in listed:
+                fails.append(f"{name} waits on the probe job")
+
+    # (4) The unchanged CI-scale bar, still failure-producing, still direct.
+    ci_scale = _gc2_function(ast.parse(harness), CI_SCALE_REF_TEST)
+    observed = {
+        ast.unparse(node.test) for node in ast.walk(ci_scale) if isinstance(node, ast.Assert)
+    }
+    missing = GC2_CI_SCALE_REQUIRED_ASSERTIONS - observed
+    if missing:
+        fails.append(f"the CI-scale bar lost {sorted(missing)}")
+    profile_assigns = _module_assigns(REF_PATH)
+    for name, expected in GC2_FIXED_CI_SCALE_LITERALS.items():
+        if _eval_simple_constant(profile_assigns[name], profile_assigns) != expected:
+            fails.append(f"{name} moved")
+    # The discovery profile copies the workload; it does not restate it.
+    harness_assigns = _source_assigns(harness)
+    probe_profile = harness_assigns.get("CI_SCALE_PROBE_PROFILE")
+    if probe_profile is None:
+        fails.append("CI_SCALE_PROBE_PROFILE is missing")
+    else:
+        rendered = ast.unparse(probe_profile)
+        for field in ("rate", "seconds", "total_requests", "prologue_requests",
+                      "max_in_flight", "p99_ms", "sustained_floor"):
+            if f"{field}=CI_SCALE_PROFILE.{field}" not in rendered:
+                fails.append(f"the probe profile does not copy {field} from CI_SCALE_PROFILE")
+
+    # (5) Excluded knobs. This slice touches no product source at all.
+    main_src = GC2_MAIN_PATH.read_text(encoding="utf-8")
+    main_assigns = _source_assigns(main_src)
+    if ast.literal_eval(
+        main_assigns["DEFAULT_MAX_CONNECTIONS_PER_WORKER"]
+    ) != GC2_MAX_CONNECTIONS_PER_WORKER:
+        fails.append("limit_concurrency moved")
+    if ast.literal_eval(main_assigns["BACKLOG"]) != GC2_BACKLOG:
+        fails.append("BACKLOG moved")
+    if f'"DBAGENT_GATEWAY_WORKERS", "{GC2_GATEWAY_WORKERS}"' not in main_src:
+        fails.append("the worker count moved")
+    if "limit_concurrency=max_connections" not in main_src:
+        fails.append("the concurrency limiter moved")
+    session_src = GC2_SESSION_PATH.read_text(encoding="utf-8")
+    if "create_engine(dsn, future=True, **kwargs)" not in session_src:
+        fails.append("make_engine gained or lost a pool default")
+    for token in GC2_DURABILITY_TOKENS:
+        for name, text in (("main", main_src), ("session", session_src),
+                           ("ingest", GC2_INGEST_PATH.read_text(encoding="utf-8"))):
+            if token in text:
+                fails.append(f"{name} touches durability token {token}")
+    if "MAX_IN_FLIGHT = BURST_RATE" not in REF_PATH.read_text(encoding="utf-8"):
+        fails.append("MAX_IN_FLIGHT moved")
+    if ast.literal_eval(harness_assigns["PRODUCT_AFFINITY_CARDINALITY"]) != (
+        GC1_AFFINITY_CARDINALITIES["product-exclusive"]
+    ):
+        fails.append("the product-local 4/3/1 placement moved")
+    if ast.literal_eval(harness_assigns["B1_PLACEMENT_SCHEMA"]) != GC3_SCHEMA2:
+        fails.append("the schema-2 contract moved")
+    if 'b1_product() {' not in launcher or '"minimumHostLogicalCpus": 8,' not in launcher:
+        fails.append("the product-local route moved")
+    if 'if [ "${#cpus[@]}" -lt 8 ]; then' not in launcher:
+        fails.append("the product-local host floor moved")
+    product_region = launcher.split("\nb1_product() {", 1)[1].split("\nB1_CPU", 1)[0]
+    if "b1_complete_sibling_pairs" in product_region:
+        fails.append("the SMT-pair prerequisite leaked into b1_product")
+
+    # (6) The ordinary b1 prerequisite: named failure, never a skip, and the
+    # 2/1/1 mapping over the first four allowed CPUs is untouched at this head.
+    for clause in (
+        'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")',
+        'if [ "${#sibling_pairs[@]}" -lt 2 ]; then',
+        'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
+        'postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
+        'driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+    ):
+        if clause not in b1_region and clause not in launcher:
+            fails.append(f"the ordinary b1 route lost {clause!r}")
+
+    # (7) No escape hatch, no bandwidth control, in any carrier this slice adds.
+    for label, text in (("launcher", launcher), ("probe live", probe_live),
+                        ("probe helper", probe_helper)):
+        for escape in GC3_WEAKENINGS:
+            if escape in text:
+                fails.append(f"{label} carries {escape}")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                continue
+            for control in GC3_BANDWIDTH_CONTROLS:
+                if control in stripped:
+                    fails.append(f"{label} reintroduces {control}")
+
+    # (8) No profile, candidate, affinity or bar value from the environment or
+    # from a caller argument. The only environment reads in the helper are the
+    # GitHub run identity of the record.
+    if "getenv" in harness or "os.environ.get" in harness:
+        fails.append("the harness reads the environment")
+    env_reads = set(re.findall(r'os\.environ\.get\("([A-Z_]+)"', probe_helper))
+    if not env_reads <= {"GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"}:
+        fails.append(f"the probe helper reads {sorted(env_reads)}")
+    if "os.environ.get" in probe_live or "getenv" in probe_live:
+        fails.append("the probe live module reads the environment")
+
+    # (9) The sizing ledger is untouched and carries none of the RCA values.
+    values_text = GC2_VALUES_PATH.read_text(encoding="utf-8")
+    if "cpuMsPerRequest: 2.427" not in values_text:
+        fails.append("cpuMsPerRequest moved")
+    for parts in GC3_SIZING_CARRIERS:
+        carrier = REPO_ROOT.joinpath(*parts)
+        if not carrier.is_file():
+            fails.append(f"{parts[-1]} is missing")
+            continue
+        text = carrier.read_text(encoding="utf-8")
+        for value in (GC3_RCA_POSTGRES_MS, GC3_RCA_GATEWAY_MS, GC3_RCA_RUN_ID):
+            if value in text:
+                fails.append(f"{parts[-1]} carries the diagnostic {value}")
+    return fails
+
+
+def test_gc3_reference_topology_decision_is_evidence_backed():
+    """FP-GC3-3: the tracked decision is the selector's own result, or nothing.
+
+    RED BY DESIGN at the probe implementation head, with the named reason
+    ``gc3_decision_missing``. Two complete EPYC 7763 discovery artifacts, from
+    distinct GitHub runs at this exact SHA, must be measured before a decision
+    can exist. This never skips, never defaults and never writes a placeholder:
+    a selected topology that nothing measured is precisely the failure this
+    slice exists to prevent.
+    """
+    assert _gc3_selector_failures() == []
+
+    assert GC3_DECISION.is_file(), (
+        f"{GC3_DECISION_MISSING_REASON}: "
+        f"tests/benchmark/b1_topology_decision.json does not exist. Dispatch "
+        f"ci.yml twice with b1_topology_probe=true at this head, keep the two "
+        f"complete {GC3_REFERENCE_CPU_MODEL} artifacts, and generate the carrier "
+        f"with `b1_topology_probe.py decide`. Absence is never a skip, a default "
+        f"or a placeholder."
+    )
+
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    # The carrier is canonical, so the recomputation below reads the same bytes
+    # a reviewer does.
+    assert gc3.canonical_json(decision) == GC3_DECISION.read_text(encoding="utf-8")
+    assert decision["schema"] == gc3.DECISION_SCHEMA
+    assert decision["topologySetVersion"] == gc3.TOPOLOGY_SET_VERSION
+    assert decision["status"] in (gc3.DECISION_SELECTED, gc3.DECISION_UNHOSTABLE)
+
+    embedded = decision["artifacts"]
+    assert len(embedded) == 2
+    runs = {entry["githubRunId"] for entry in embedded}
+    assert len(runs) == 2, f"both artifacts come from run {sorted(runs)}"
+    for entry in embedded:
+        assert entry["url"].startswith("https://github.com/"), entry["url"]
+        assert str(entry["githubRunId"]) in entry["url"]
+        artifact = entry["artifact"]
+        assert artifact["status"] == "complete"
+        assert artifact["cpuModel"] == GC3_REFERENCE_CPU_MODEL
+        assert artifact["logicalCpuCount"] == GC3_REFERENCE_LOGICAL_CPUS
+        assert len(artifact["arms"]) == GC3_ARMS_PER_ARTIFACT
+        assert artifact["headSha"] == decision["headSha"]
+
+    # The decision must be exactly what the immutable selector derives from the
+    # artifacts the file itself carries -- recomputed here, never trusted.
+    recomputed = gc3.recompute_decision(decision)
+    assert recomputed["status"] == decision["status"]
+    assert recomputed["selected"] == decision["selected"]
+    assert list(recomputed["ratifiable"]) == list(decision["ratifiable"])
+    if decision["status"] == gc3.DECISION_SELECTED:
+        assert decision["selected"] in GC3_TOPOLOGY_IDS
+        assert decision["selected"] in decision["ratifiable"]
+        assert decision["score"] == recomputed["score"]
+    else:
+        assert decision["selected"] is None
+        assert decision["ratifiable"] == []
+
+
+def test_gc3_reference_topology_scope_and_decision_are_pinned():
+    """FP-GC3-3/4/6: the candidate space, the excluded knobs and the decision.
+
+    Every clause the probe head can decide is checked BEFORE the carrier is
+    required, so this test enforces the scope boundary even while it is red.
+    The carrier assertion is the last of the head's checks and the first of the
+    decision's: below it are the clauses that only a measured decision can
+    settle -- the selected topology literal in the launcher, the Python
+    declaration surface and the B1 manifest note.
+    """
+    assert _gc3_candidate_space_failures() == []
+    assert _gc3_topology_surface_failures(REF_TEST.read_text(encoding="utf-8")) == []
+    assert _live_marker_failures(
+        REF_TEST.read_text(encoding="utf-8"), PROBE_TEST.read_text(encoding="utf-8")
+    ) == []
+    probe_src = PROBE_TEST.read_text(encoding="utf-8")
+    assert _gc3_probe_partition_failures(probe_src) == []
+    assert _gc3_scope_failures() == []
+
+    # Negative control: truth-gating a recorded performance status is red.
+    gated = probe_src.replace(
+        "        assert token == live[field], (field, token, live[field])",
+        "        assert token == probe.VERDICT_MET\n"
+        "        assert token == live[field], (field, token, live[field])", 1)
+    assert "VERDICT_MET" in gated
+    assert gated != probe_src
+    assert any("truth-gates" in f for f in _gc3_probe_partition_failures(gated))
+    ungated = probe_src.replace(
+        "        assert verdicts[field] == probe.VERDICT_MET, (", "        assert True, (", 1)
+    assert ungated != probe_src
+    assert _gc3_probe_partition_failures(ungated) != []
+    unrecorded = probe_src.replace("        assert token == live[field], (field, token, live[field])",
+                                   "        pass", 1)
+    assert unrecorded != probe_src
+    assert any("record-consistency" in f for f in _gc3_probe_partition_failures(unrecorded))
+    unwritten = probe_src.replace("    harness.write_probe_arm_record(record)", "", 1)
+    assert unwritten != probe_src
+    assert any("gating step" in f for f in _gc3_probe_partition_failures(unwritten))
+
+    # Both fail-closed carriers name the reason, and neither reaches for a skip.
+    own_src = Path(__file__).read_text(encoding="utf-8")
+    assert GC3_DECISION_MISSING_REASON == gc3.DECISION_MISSING_REASON == "gc3_decision_missing"
+    for name in ("test_gc3_reference_topology_decision_is_evidence_backed",
+                 "test_gc3_reference_topology_scope_and_decision_are_pinned"):
+        node = next(
+            n for n in ast.parse(own_src).body
+            if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+        # The carrier is REQUIRED, and its absence is reported under the named
+        # reason. Checked structurally, not by substring: this very function
+        # has to be able to name the weakenings it forbids.
+        asserts = [n for n in ast.walk(node) if isinstance(n, ast.Assert)]
+        required = [
+            n for n in asserts if ast.unparse(n.test) == "GC3_DECISION.is_file()"
+        ]
+        assert len(required) == 1, f"{name}: the carrier is not required exactly once"
+        assert required[0].msg is not None, f"{name}: the carrier failure is unnamed"
+        assert "GC3_DECISION_MISSING_REASON" in ast.unparse(required[0].msg), name
+        assert not node.decorator_list, f"{name}: carries a decorator"
+        calls = {
+            ast.unparse(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)
+        }
+        for weakening in ("pytest.skip", "pytest.xfail", "pytest.importorskip"):
+            assert weakening not in calls, f"{name} must not call {weakening}"
+        # ...and it is a statement of the function body, never nested inside a
+        # branch that could route around it.
+        assert any(stmt is required[0] for stmt in node.body), (
+            f"{name}: the carrier requirement is conditional"
+        )
+
+    assert GC3_DECISION.is_file(), (
+        f"{GC3_DECISION_MISSING_REASON}: "
+        f"tests/benchmark/b1_topology_decision.json does not exist, so no topology "
+        f"is selected and none may be applied to the ordinary B1 route. Every "
+        f"scope clause above holds at this probe head; what remains is the "
+        f"measurement."
+    )
+
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    harness = REF_TEST.read_text(encoding="utf-8")
+    thresholds = yaml.safe_load(
+        (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(encoding="utf-8")
+    )
+    notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
+    if decision["status"] == gc3.DECISION_SELECTED:
+        selected = decision["selected"]
+        assert f'"topology": "{selected}"' in launcher, selected
+        assert selected in harness
+        assert selected in notes
+        assert "the first four CPUs available to the launcher, split 2/1/1" not in notes
+        assert "first two complete SMT sibling pairs available to the launcher" in notes
+        cardinality = gc3.topology_cardinality(selected)
+        assert ast.literal_eval(
+            _source_assigns(harness)["CI_SCALE_AFFINITY_CARDINALITY"]
+        ) == cardinality
+    else:
+        for topology in GC3_TOPOLOGY_IDS:
+            assert f'"topology": "{topology}"' not in launcher, topology
+        assert "first two complete SMT sibling pairs available to the launcher" not in notes
+        b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+        assert b1_entry["status"] == "covered", (
+            "an unhostable decision never relabels the B1 gate"
+        )

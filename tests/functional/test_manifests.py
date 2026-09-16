@@ -134,6 +134,9 @@ EXPECTED_CI_JOBS = {
     "benchmark",
     "images",
     "e2e",
+    # GC-3 FP-GC3-2: the manual discovery instrument. Conditional, independent
+    # (no needs:), and deliberately outside every gating chain.
+    "b1-topology-probe",
 }
 GO_TEST_JOBS = {"unit-go", "functional", "benchmark", "manifest-guard"}
 GO_TOOLCHAIN_ENV_NAMES = {"CC", "CXX", "FC", "AR", "PKG_CONFIG"}
@@ -174,6 +177,10 @@ EXPECTED_NEEDS_GRAPH: dict[str, tuple[str, ...]] = {
     "benchmark": ("functional",),
     "images": ("lint",),
     "e2e": ("functional",),
+    # No edge at all, in either direction: the probe must start while the probe
+    # head's `functional` job is the known gc3_decision_missing red, and no
+    # ordinary job may wait on a 75-minute discovery sweep.
+    "b1-topology-probe": (),
 }
 assert set(EXPECTED_NEEDS_GRAPH) == EXPECTED_CI_JOBS
 
@@ -250,6 +257,8 @@ assert set(GUARDED_STEPS) == GO_TEST_JOBS | set(EXPECTED_PYTEST_COMMANDS)
 # pytest one -- _is_pytest_cmd correctly excludes it from that computation.
 EXPECTED_BASH_WRAPPER_COMMANDS: dict[str, list[tuple[int, str]]] = {
     "benchmark": [(17, "bash scripts/integration-test.sh b1")],
+    # GC-3 FP-GC3-2: step 1, between the checkout and the always() upload.
+    "b1-topology-probe": [(1, "bash scripts/integration-test.sh b1_topology_probe")],
 }
 
 EXPECTED_E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short"
@@ -372,6 +381,12 @@ _BRACED_PARAM_RE = re.compile(
 )
 
 CONDITIONAL_JOBS = {
+    # GC-3 FP-GC3-2: manual only, and only when asked for by name. `== true`
+    # rather than a truthiness test: a `workflow_dispatch` boolean arrives as a
+    # real boolean, and a string comparison would run the sweep on "false".
+    "b1-topology-probe": (
+        "github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true"
+    ),
     "e2e": (
         "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || "
         "startsWith(github.ref, 'refs/tags/') || github.event_name == 'pull_request' || "
@@ -381,6 +396,10 @@ CONDITIONAL_JOBS = {
 CONDITIONAL_STEPS = {
     "images": [(7, "github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')")],
     "e2e": [(7, "failure()")],
+    # The upload is the ONLY conditional step of the probe job, and it is the
+    # last one: `always()` makes a broken sweep surface its invalid artifact
+    # without ever masking step 1's exit status.
+    "b1-topology-probe": [(2, "always()")],
 }
 
 
@@ -4628,14 +4647,26 @@ B1_COVERED_FILES = (
     "/workspace/services/gateway/tests/b1_reference_profile.py",
     "/workspace/services/gateway/tests/test_b1_ingest_burst.py",
     "/workspace/scripts/b1-affinity-helper.py",
+    # GC-3 FP-GC3-1/2/3: the stdlib-only enumerator/parser/collector/selector.
+    # It joins the aggregate AND the exact per-file report at the same bar --
+    # it is container-free helper code, so no substitute applies to it.
+    "/workspace/services/gateway/tests/b1_topology_probe.py",
 )
 B1_COVERAGE_FAIL_UNDER = "--fail-under=81"
+# GC-3: every ordinary selection carries `not b1_topology_probe` explicitly.
+# The probe node lives in a separate, non-`test_`-prefixed module that no
+# directory collection discovers, so this is defence in depth rather than the
+# mechanism -- but a marker that selects nothing is exactly how a live node
+# would end up inside the traced container-free phase.
 B1_COVERAGE_SELECTION = (
-    "-m 'not b1_live and not b1_product and not b1_latency_basis'"
+    "-m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'"
 )
-B1_CI_SCALE_LIVE_SELECTION = "-m 'b1_live and not b1_product and not b1_latency_basis'"
+B1_CI_SCALE_LIVE_SELECTION = (
+    "-m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'"
+)
 B1_PRODUCT_SELECTION = "-m b1_product"
-B1_ROUTING_MARKERS = ("b1_live", "b1_product", "b1_latency_basis")
+B1_PROBE_SELECTION = "-m b1_topology_probe"
+B1_ROUTING_MARKERS = ("b1_live", "b1_product", "b1_latency_basis", "b1_topology_probe")
 B1_REJECTED_ESCAPES = (
     "runs-on: ubuntu-24.04-8core",
     "self-hosted",
@@ -4883,6 +4914,391 @@ def test_ci_and_local_b1_route_are_identical():
     # inner Docker or pytest command (those never appear in ci.yml).
     assert "assert_matches_ci 'bash scripts/integration-test.sh b1'" in launcher
     assert "assert_matches_ci 'docker run" not in launcher
+
+
+# ---------------------------------------------------------------------------
+# GC-3 — the manual topology-discovery route (FP-GC3-2 / 4 / 6).
+#
+# Every literal below is declared here, independently of the files it pins.
+# The clauses are deliberately split between "the probe exists and is
+# dispatch-only" and "the ordinary merge gate is untouched": this slice adds a
+# measurement instrument, and the one thing it must never do is become one.
+# ---------------------------------------------------------------------------
+
+GC3_PROBE_JOB = "b1-topology-probe"
+GC3_PROBE_TARGET = "b1_topology_probe"
+GC3_PROBE_LIVE_MODULE = "services/gateway/tests/b1_topology_probe_live.py"
+GC3_PROBE_HELPER_MODULE = "services/gateway/tests/b1_topology_probe.py"
+GC3_PRODUCER_MODULE = "services/gateway/tests/test_b1_ingest_burst.py"
+GC3_PROBE_INPUT = {
+    "description": "Run GC-3 B1 topology discovery",
+    "required": False,
+    "default": False,
+    "type": "boolean",
+}
+GC3_PROBE_JOB_IF = (
+    "github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true"
+)
+GC3_PROBE_TIMEOUT_MINUTES = 75
+GC3_PROBE_STEP_USES = {0: "actions/checkout@v4", 2: "actions/upload-artifact@v4"}
+GC3_PROBE_WRAPPER = (1, "bash scripts/integration-test.sh b1_topology_probe")
+GC3_PROBE_UPLOAD_WITH = {
+    "name": "b1-topology-probe-${{ github.run_id }}-${{ github.run_attempt }}",
+    "path": (
+        "${{ runner.temp }}/b1-topology-probe-"
+        "${{ github.run_id }}-${{ github.run_attempt }}.json"
+    ),
+    "if-no-files-found": "error",
+}
+GC3_PROBE_UPLOAD_IF = "always()"
+# The launcher clauses the discovery route is made of, as independent literals.
+GC3_PROBE_LAUNCHER_CLAUSES: tuple[str, ...] = (
+    # allowlisted target, guarded by the same anti-drift check as b1
+    "|b1|b1_product|b1_topology_probe) ;;",
+    "assert_matches_ci 'bash scripts/integration-test.sh b1_topology_probe'",
+    # the outer accumulator and the final artifact live outside any B1_RUN_DIR
+    'B1_PROBE_ACCUMULATOR="$(mktemp -d -t dbagent-b1-probe-XXXXXXXXXX)"',
+    'B1_PROBE_PLAN="$B1_PROBE_ACCUMULATOR/plan.json"',
+    'mkdir -p "$B1_PROBE_ACCUMULATOR/records"',
+    'B1_PROBE_ARTIFACT="$(b1_topology_probe_artifact_path "$outer_run_id")"',
+    "printf '%s/b1-topology-probe-%s-%s.json' \"$temp\" \"$GITHUB_RUN_ID\" \"$GITHUB_RUN_ATTEMPT\"",
+    "printf '%s/b1-topology-probe-local-%s-1.json' \"$temp\" \"$1\"",
+    # one build, then one fresh driver/run-id/run-dir per arm
+    'if [ "$B1_IMAGE_BUILT" -eq 0 ]; then',
+    "b1_prepare || return 1",
+    'b1_run_driver driver-probe.sh "$driver_cpus"',
+    # the planner is the topology authority; the shell only copies its contract
+    '--plan "$B1_PROBE_PLAN" --arm "$index" --run-id "$B1_RUN_ID" \\',
+    '--out "$B1_RUN_DIR/placement.json" --context "$B1_RUN_DIR/probe-context.json"',
+    # the record leaves the run mount BEFORE the per-arm cleanup can delete it
+    'cp "$B1_RUN_DIR/arm-record.json" \\',
+    "b1_cleanup",
+    # EXIT-trap-safe collector, exactly once, and its status is the target's
+    "trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT",
+    "trap 'b1_topology_probe_finish' EXIT TERM INT",
+    '[ "$B1_PROBE_FINISHED" -eq 0 ] || return 0',
+    'python3 "$B1_PROBE_PLANNER" collect \\',
+    'if [ "$rc" -ne 0 ]; then return "$rc"; fi',
+)
+# The ordinary CI-scale route, unchanged by this slice. The 2/1/1 mapping over
+# the first four allowed CPUs is still pinned by _b1_affinity_failures; what is
+# added here is the new prerequisite, which narrows WHICH hosts may run it
+# without changing WHAT it allocates.
+GC3_ORDINARY_B1_CLAUSES: tuple[str, ...] = (
+    'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")',
+    'if [ "${#sibling_pairs[@]}" -lt 2 ]; then',
+    'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
+    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
+    'driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+)
+
+
+def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
+    """Every clause of the dispatch-only discovery contract, as named failures."""
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    # (1) the manual input contract
+    on = workflow.get(True) if True in workflow else workflow.get("on")
+    dispatch = (on or {}).get("workflow_dispatch")
+    if not isinstance(dispatch, dict) or "inputs" not in dispatch:
+        add("dispatch_input_missing", repr(dispatch))
+    else:
+        inputs = dispatch["inputs"]
+        if set(inputs) != {GC3_PROBE_TARGET}:
+            add("dispatch_input_inventory_drift", str(sorted(inputs)))
+        elif inputs[GC3_PROBE_TARGET] != GC3_PROBE_INPUT:
+            add("dispatch_input_drift", str(inputs[GC3_PROBE_TARGET]))
+
+    # (2) the job envelope
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get(GC3_PROBE_JOB)
+    if not isinstance(job, dict):
+        add("probe_job_missing")
+        return fails
+    if job.get("runs-on") != "ubuntu-latest":
+        add("probe_runner_drift", repr(job.get("runs-on")))
+    if job.get("timeout-minutes") != GC3_PROBE_TIMEOUT_MINUTES:
+        add("probe_timeout_drift", repr(job.get("timeout-minutes")))
+    if "needs" in job:
+        add("probe_needs_edge", repr(job.get("needs")))
+    if _normalize_ws(job.get("if") or "") != _normalize_ws(GC3_PROBE_JOB_IF):
+        add("probe_condition_drift", repr(job.get("if")))
+    if "continue-on-error" in job:
+        add("probe_masks_status", "job continue-on-error")
+    steps = job.get("steps") or []
+    if len(steps) != 3:
+        add("probe_step_inventory_drift", str(len(steps)))
+        return fails
+    for index, uses in GC3_PROBE_STEP_USES.items():
+        if steps[index].get("uses") != uses:
+            add("probe_step_action_drift", f"[{index}] {steps[index].get('uses')!r}")
+    wrapper_index, wrapper_body = GC3_PROBE_WRAPPER
+    if (steps[wrapper_index].get("run") or "").strip() != wrapper_body:
+        add("probe_wrapper_drift", repr((steps[wrapper_index].get("run") or "").strip()))
+    for index, step in enumerate(steps):
+        if "continue-on-error" in step:
+            add("probe_masks_status", f"[{index}] continue-on-error")
+        body = step.get("run") or ""
+        if "|| true" in body or "; true" in body:
+            add("probe_masks_status", f"[{index}] exit-code masking")
+    upload = steps[2]
+    if _normalize_ws(upload.get("if") or "") != GC3_PROBE_UPLOAD_IF:
+        add("probe_upload_condition_drift", repr(upload.get("if")))
+    if (upload.get("with") or {}) != GC3_PROBE_UPLOAD_WITH:
+        add("probe_upload_contract_drift", str(upload.get("with")))
+    # The upload must be the LAST step: a later `run:` would execute after an
+    # always() step and could reintroduce status masking.
+    if 2 != len(steps) - 1:
+        add("probe_upload_not_last")
+
+    # (3) no ordinary job waits on it, and it waits on nothing
+    for name, other in jobs.items():
+        if name == GC3_PROBE_JOB:
+            continue
+        needs = other.get("needs")
+        listed = [needs] if isinstance(needs, str) else list(needs or [])
+        if GC3_PROBE_JOB in listed:
+            add("probe_in_gating_chain", name)
+        for step in other.get("steps") or []:
+            if GC3_PROBE_TARGET in (step.get("run") or ""):
+                add("probe_target_in_ordinary_job", name)
+
+    # (4) the launcher route
+    for clause in GC3_PROBE_LAUNCHER_CLAUSES:
+        if clause not in launcher:
+            add("probe_clause_missing", repr(clause))
+    for clause in GC3_ORDINARY_B1_CLAUSES:
+        if clause not in launcher:
+            add("ordinary_b1_clause_missing", repr(clause))
+    region = _b1_target_region(launcher, GC3_PROBE_TARGET)
+    if not region:
+        add("probe_target_missing")
+        return fails
+    if '"$@"' in region:
+        add("probe_accepts_pass_through")
+    for masking in ("|| true", "|| :", "; true", "set +e"):
+        if masking in region:
+            add("probe_masks_status", f"launcher {masking}")
+    arm_region = _b1_target_region(launcher, "b1_topology_probe_arm")
+    for masking in ("|| true", "|| :", "set +e"):
+        if masking in arm_region:
+            add("probe_masks_status", f"arm {masking}")
+    # Exactly one pytest command, lexically inside the target, whose only
+    # positional operand is the live-only module. test_delivery_ci.py resolves
+    # each target's collection from this region and does not follow helper
+    # calls, so the placement is the contract.
+    pytest_lines = [ln.strip() for ln in region.splitlines() if "-m pytest" in ln]
+    if len(pytest_lines) != 1:
+        add("probe_pytest_inventory_drift", str(len(pytest_lines)))
+    else:
+        line = pytest_lines[0]
+        operands = [
+            word for word in line.split()
+            if word.endswith(".py") and not word.startswith("-")
+        ]
+        if operands != [GC3_PROBE_LIVE_MODULE]:
+            add("probe_collection_drift", str(operands))
+        if GC3_PRODUCER_MODULE in line:
+            add("probe_collects_the_producer", line)
+        if B1_PROBE_SELECTION not in line:
+            add("probe_selection_drift", line)
+        if not line.startswith(B1_ENV_UNSET_PREFIX):
+            add("probe_env_unset_prefix_drift", line)
+        if B1_PYCACHE_FLAG not in line:
+            add("probe_pycache_prefix_drift", line)
+        if "-o cache_dir=/run/dbagent-b1/pytest-cache" not in line:
+            add("probe_cache_path_drift", line)
+        if "coverage run" in line:
+            add("probe_phase_traced", line)
+    # It never joins the local composite route.
+    all_case = launcher.split("  all)", 1)[1].split(";;", 1)[0]
+    if GC3_PROBE_TARGET in all_case:
+        add("probe_target_in_all", all_case)
+
+    # (5) the marker is registered, and the live module carries both markers on
+    # exactly one node that consumes the named probe fixture.
+    if f'"{GC3_PROBE_TARGET}:' not in markers_toml:
+        add("probe_marker_not_registered")
+    live_path = REPO_ROOT / GC3_PROBE_LIVE_MODULE
+    helper_path = REPO_ROOT / GC3_PROBE_HELPER_MODULE
+    if not live_path.is_file():
+        add("probe_live_module_missing")
+        return fails
+    if not helper_path.is_file():
+        add("probe_helper_module_missing")
+    if live_path.name.startswith("test_") or live_path.name.endswith("_test.py"):
+        add("probe_live_module_is_collectable", live_path.name)
+    live_src = live_path.read_text(encoding="utf-8")
+    live_tree = ast.parse(live_src)
+    nodes = [
+        node for node in ast.walk(live_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+    ]
+    if len(nodes) != 1:
+        add("probe_node_inventory_drift", str([n.name for n in nodes]))
+    else:
+        node = nodes[0]
+        markers = {
+            ast.unparse(d.func if isinstance(d, ast.Call) else d).split("pytest.mark.", 1)[-1]
+            for d in node.decorator_list
+            if ast.unparse(d.func if isinstance(d, ast.Call) else d).startswith("pytest.mark.")
+        }
+        for marker in ("b1_live", GC3_PROBE_TARGET):
+            if marker not in markers:
+                add("probe_node_marker_missing", marker)
+        if "b1_product" in markers:
+            add("probe_node_carries_product_marker")
+        if "b1_topology_probe_run" not in {a.arg for a in node.args.args}:
+            add("probe_node_fixture_drift", str([a.arg for a in node.args.args]))
+    for escape in ("pytest.mark.skip", "pytest.mark.xfail", "pytest.skip(", "--deselect"):
+        if escape in live_src:
+            add("probe_live_module_escape", escape)
+    return fails
+
+
+def test_gc3_probe_and_ratified_b1_routes_are_pinned():
+    """FP-GC3-2/4/6: the discovery route is manual, honest and not a gate.
+
+    What this pins TODAY is the probe head: the dispatch input, the independent
+    job, the single-operand collection, the three marker selections, and the
+    ordinary CI-scale route left exactly as GC-1 shipped it apart from the new
+    two-complete-SMT-pair prerequisite. The selected-topology mapping and the
+    replacement manifest wording belong to FP-GC3-4 and arrive only once the
+    decision carrier exists -- this guard deliberately asserts no selected
+    topology, because none has been measured.
+    """
+    wf = _load_wf()
+    launcher = _b1_launcher_source()
+    markers_toml = B1_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
+    assert _gc3_probe_failures(wf, launcher, markers_toml=markers_toml) == []
+    # The merge gate still runs exactly one B1 target, and it is not this one.
+    ci_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "bash scripts/integration-test.sh b1\n" in ci_text
+    assert ci_text.count("bash scripts/integration-test.sh b1_topology_probe") == 1
+    assert "bash scripts/integration-test.sh b1_product" not in ci_text
+    # No decision carrier is claimed at this head, and no topology literal has
+    # been applied to the ordinary route.
+    for topology in (
+        "gateway-core", "gateway-split", "postgres-core", "postgres-split",
+        "postgres-isolated", "driver-isolated", "gateway-isolated",
+    ):
+        assert f'"topology": "{topology}"' not in launcher, topology
+
+    # Negative controls: one mutation at a time, each named.
+    import copy as _copy
+
+    def _reasons(workflow=None, text=None, markers=None) -> set[str]:
+        return {
+            f.split(" ", 1)[0]
+            for f in _gc3_probe_failures(
+                workflow if workflow is not None else _load_wf(),
+                text if text is not None else launcher,
+                markers_toml=markers if markers is not None else markers_toml,
+            )
+        }
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"][GC3_PROBE_JOB]["needs"] = ["functional"]
+    assert "probe_needs_edge" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"]["benchmark"]["needs"] = [GC3_PROBE_JOB]
+    assert "probe_in_gating_chain" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"][GC3_PROBE_JOB]["timeout-minutes"] = 360
+    assert "probe_timeout_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"][GC3_PROBE_JOB]["steps"][2]["if"] = "success()"
+    assert "probe_upload_condition_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"][GC3_PROBE_JOB]["steps"][1], mutated["jobs"][GC3_PROBE_JOB]["steps"][2] = (
+        mutated["jobs"][GC3_PROBE_JOB]["steps"][2],
+        mutated["jobs"][GC3_PROBE_JOB]["steps"][1],
+    )
+    assert {"probe_wrapper_drift", "probe_step_action_drift"} & _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"][GC3_PROBE_JOB]["steps"][1]["continue-on-error"] = True
+    assert "probe_masks_status" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated["jobs"][GC3_PROBE_JOB]["steps"][2]["with"]["path"] = "/tmp/anything.json"
+    assert "probe_upload_contract_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    on_key = True if True in mutated else "on"
+    mutated[on_key]["workflow_dispatch"]["inputs"][GC3_PROBE_TARGET]["default"] = True
+    assert "dispatch_input_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated[on_key]["workflow_dispatch"] = None
+    assert "dispatch_input_missing" in _reasons(workflow=mutated)
+
+    collects_producer = launcher.replace(
+        f"-m pytest {GC3_PROBE_LIVE_MODULE}",
+        f"-m pytest {GC3_PRODUCER_MODULE} {GC3_PROBE_LIVE_MODULE}", 1)
+    assert collects_producer != launcher
+    assert {"probe_collection_drift", "probe_collects_the_producer"} <= _reasons(
+        text=collects_producer
+    )
+
+    widened = launcher.replace(f" {B1_PROBE_SELECTION} ", " -m b1_live ", 1)
+    assert widened != launcher
+    assert "probe_selection_drift" in _reasons(text=widened)
+
+    traced = launcher.replace(
+        f"{B1_PYCACHE_FLAG} -m pytest {GC3_PROBE_LIVE_MODULE}",
+        f"{B1_PYCACHE_FLAG} -m coverage run -m pytest {GC3_PROBE_LIVE_MODULE}", 1)
+    assert traced != launcher
+    assert "probe_phase_traced" in _reasons(text=traced)
+
+    per_arm_build = launcher.replace('if [ "$B1_IMAGE_BUILT" -eq 0 ]; then', "if true; then", 1)
+    assert per_arm_build != launcher
+    assert "probe_clause_missing" in _reasons(text=per_arm_build)
+
+    no_collector = launcher.replace("trap 'b1_topology_probe_finish' EXIT TERM INT", "true")
+    assert no_collector != launcher
+    assert "probe_clause_missing" in _reasons(text=no_collector)
+
+    lost_record = launcher.replace('cp "$B1_RUN_DIR/arm-record.json" \\', 'true \\', 1)
+    assert lost_record != launcher
+    assert "probe_clause_missing" in _reasons(text=lost_record)
+
+    inner_accumulator = launcher.replace(
+        'B1_PROBE_ACCUMULATOR="$(mktemp -d -t dbagent-b1-probe-XXXXXXXXXX)"',
+        'B1_PROBE_ACCUMULATOR="$B1_RUN_DIR/probe"', 1)
+    assert inner_accumulator != launcher
+    assert "probe_clause_missing" in _reasons(text=inner_accumulator)
+
+    masked = launcher.replace(
+        'if [ "$rc" -ne 0 ]; then return "$rc"; fi', "return 0", 1)
+    assert masked != launcher
+    assert "probe_clause_missing" in _reasons(text=masked)
+
+    joined_all = launcher.replace(
+        '             run_step "B1 product promise (recorded, non-gating)" b1_product ;;',
+        '             run_step "B1 product promise (recorded, non-gating)" b1_product\n'
+        '             run_step "probe" b1_topology_probe ;;', 1)
+    assert joined_all != launcher
+    assert "probe_target_in_all" in _reasons(text=joined_all)
+
+    no_prerequisite = launcher.replace(
+        'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")', "true", 1)
+    assert no_prerequisite != launcher
+    assert "ordinary_b1_clause_missing" in _reasons(text=no_prerequisite)
+
+    unregistered = "\n".join(
+        ln for ln in markers_toml.splitlines() if f'"{GC3_PROBE_TARGET}:' not in ln
+    )
+    assert unregistered != markers_toml
+    assert "probe_marker_not_registered" in _reasons(markers=unregistered)
 
 
 _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
