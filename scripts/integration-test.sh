@@ -46,8 +46,13 @@
 #   `go test *` or `pytest *`, which would exempt any invocation anywhere with any flags
 #   (including `go test -exec`, which will run an arbitrary binary for you).
 #
-#   CI is unaffected and needs none of this: GitHub-hosted runners have normal networking,
-#   so `ci.yml` runs these same tests directly.
+#   CI needs none of this for the go and py tiers: GitHub-hosted runners have normal
+#   networking, so `ci.yml` runs those tests directly.
+#
+#   The b1 tier is the exception, and it is deliberate: ci.yml's `benchmark` job step 17
+#   runs `bash scripts/integration-test.sh b1` -- THIS script -- so the gating CI-scale
+#   route and the local one are one launcher rather than two that can drift. That wrapper
+#   step is pinned by equality in tests/functional/test_manifests.py.
 #
 # WHAT IT RUNS
 #
@@ -96,8 +101,9 @@ case "$WHAT" in
 usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run]
 
   all  (default)  go + py + b1 + b1_product -- the local acceptance route
-  b1              the resource-declared CI-scale B1 benchmark (gating; same
-                  target CI runs), in quota-bearing containers
+  b1              the resource-declared CI-scale B1 benchmark (gating; the
+                  same target ci.yml runs), under a 2/1/1 CPU affinity
+                  allocation over the first four available CPUs
   b1_product      the recorded, non-gating 1000 req/s product-promise run on
                   measured-role-exclusive cores; needs >= 8 logical CPUs
   go              go test ./... -race -timeout 300s -p 1
@@ -573,6 +579,15 @@ b1_prepare() {
   mkdir -p "$B1_RUN_DIR/coverage" "$B1_RUN_DIR/pytest-cache" "$B1_RUN_DIR/pycache" || return 1
   chmod 0777 "$B1_RUN_DIR" "$B1_RUN_DIR/coverage" "$B1_RUN_DIR/pytest-cache" \
     "$B1_RUN_DIR/pycache" || return 1
+  # The runner image declares VOLUME mountpoints under /workspace (FP-RR-1,
+  # deploy/review-runner/Dockerfile) so its Python shims shadow any host
+  # virtualenv. Docker materialises each one as an anonymous volume at
+  # `docker run` and creates the mountpoint if it is missing -- which it
+  # cannot do inside the read-only /workspace bind below (EROFS), so on a
+  # fresh checkout, where these gitignored directories do not yet exist, the
+  # driver never starts. Creating them here gives CI the shape a developer
+  # host already has. They stay empty: the anonymous volume mounts over them.
+  mkdir -p "$REPO_ROOT/libs/py/rca_common/.venv" "$REPO_ROOT/services/worker/.venv" || return 1
   trap 'b1_cleanup' EXIT TERM INT
   docker build -t dbagent-review-runner:b1 -f deploy/review-runner/Dockerfile . || return 1
 }

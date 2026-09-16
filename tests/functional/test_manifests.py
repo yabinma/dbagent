@@ -4469,6 +4469,69 @@ B1_ROUTE_CLAUSES: tuple[str, ...] = (
     'B1_CLEANUP_FAILED=1',
 )
 
+# The runner image declares VOLUME mountpoints under /workspace, and the
+# driver binds the repository there read-only. Docker materialises an image
+# VOLUME as an anonymous volume at `docker run` and creates its mountpoint if
+# the path is missing -- which it cannot do inside a read-only bind (EROFS).
+# The set is READ FROM THE IMAGE, not restated here, so the launcher's mkdir
+# and the Dockerfile cannot drift apart: adding a VOLUME without preparing its
+# mountpoint is exactly the defect this pin exists to catch.
+B1_RUNNER_DOCKERFILE = REPO_ROOT / "deploy" / "review-runner" / "Dockerfile"
+_B1_VOLUME_LINE_RE = re.compile(r"^\s*VOLUME\s+\[(?P<body>[^\]]*)\]\s*$", re.MULTILINE)
+B1_SOURCE_MOUNT = "/workspace/"
+
+
+def _b1_image_volume_paths() -> tuple[str, ...]:
+    """The runner image's VOLUME mountpoints, as declared in the Dockerfile."""
+    bodies = _B1_VOLUME_LINE_RE.findall(
+        B1_RUNNER_DOCKERFILE.read_text(encoding="utf-8")
+    )
+    if len(bodies) != 1:
+        return ()
+    return tuple(re.findall(r'"([^"]+)"', bodies[0]))
+
+
+def _b1_mountpoint_failures(launcher: str) -> list[str]:
+    """The image's /workspace VOLUMEs are created on the host before the run."""
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    volumes = _b1_image_volume_paths()
+    if not volumes:
+        add("image_volume_declaration_unreadable")
+        return fails
+    expected = {
+        path[len(B1_SOURCE_MOUNT):] for path in volumes if path.startswith(B1_SOURCE_MOUNT)
+    }
+    if not expected:
+        add("image_volume_declaration_unreadable", str(sorted(volumes)))
+        return fails
+    lines = [ln.strip() for ln in launcher.splitlines()]
+    mkdirs = [ln for ln in lines if ln.startswith("mkdir -p") and '"$REPO_ROOT/' in ln]
+    if len(mkdirs) != 1:
+        add("volume_mountpoint_mkdir_inventory_drift", str(len(mkdirs)))
+        return fails
+    operands = set(re.findall(r'"\$REPO_ROOT/([^"]+)"', mkdirs[0]))
+    if operands != expected:
+        add(
+            "volume_mountpoint_set_drift",
+            f"{sorted(operands)} != {sorted(expected)}",
+        )
+    # It must run in b1_prepare, which both targets call before any driver.
+    prepare = [ln.strip() for ln in _b1_target_region(launcher, "b1_prepare").splitlines()]
+    if mkdirs[0] not in prepare:
+        add("volume_mountpoint_mkdir_outside_prepare", mkdirs[0])
+    for target in ("b1", "b1_product"):
+        region = [ln.strip() for ln in _b1_target_region(launcher, target).splitlines()]
+        prepared = next((i for i, ln in enumerate(region) if ln.startswith("b1_prepare")), None)
+        started = next((i for i, ln in enumerate(region) if ln.startswith("b1_run_driver")), None)
+        if prepared is None or started is None or prepared > started:
+            add("volume_mountpoint_created_too_late", f"{target} {prepared} {started}")
+    return fails
+
+
 # Docker bandwidth/cpuset controls, which GC-1 rev 0.5 removed as the
 # allocation primitive. Their ABSENCE is pinned statically here and nowhere
 # else: there is deliberately no runtime check that a role's cgroup carries no
@@ -4801,6 +4864,7 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
                     add(f"bandwidth_control_in_{label}", f"{control} :: {stripped[:80]}")
 
     fails.extend(_b1_affinity_failures(launcher))
+    fails.extend(_b1_mountpoint_failures(launcher))
     return fails
 
 
@@ -4852,6 +4916,13 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("gateway_driver_affinity_overlap", "launcher", "affinity_overlap"),
     ("postgres_driver_affinity_overlap", "launcher", "affinity_overlap"),
     ("affinity_outside_host_set", "launcher", "affinity_index_drift"),
+    # --- the image's VOLUME mountpoints, under the read-only source bind ---
+    ("volume_mountpoint_mkdir_removed", "launcher", "volume_mountpoint_mkdir_inventory_drift"),
+    ("volume_mountpoint_set_drifts_from_the_image", "launcher", "volume_mountpoint_set_drift"),
+    ("volume_mountpoint_mkdir_moved_out_of_prepare", "launcher",
+     "volume_mountpoint_mkdir_outside_prepare"),
+    ("launcher_stops_preparing_before_the_driver", "launcher",
+     "volume_mountpoint_created_too_late"),
     ("cfs_quota_reintroduced_in_launcher", "launcher", "bandwidth_control_in_launcher"),
     ("cfs_quota_reintroduced_in_fixture", "fixture", "bandwidth_control_in_fixture"),
     ("cpuset_reintroduced_in_fixture", "fixture", "bandwidth_control_in_fixture"),
@@ -4963,6 +5034,25 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
     elif case_id == "affinity_outside_host_set":
         launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
                                     'driver_cpus="$(b1_canonical_cpu_list "${cpus[9]}")"', 1)
+    elif case_id in (
+        "volume_mountpoint_mkdir_removed",
+        "volume_mountpoint_mkdir_moved_out_of_prepare",
+    ):
+        line = next(
+            ln for ln in launcher.splitlines()
+            if ln.strip().startswith('mkdir -p "$REPO_ROOT/')
+        )
+        launcher = launcher.replace(line + "\n", "", 1)
+        if case_id == "volume_mountpoint_mkdir_moved_out_of_prepare":
+            # Present, correct, and too late: it now runs in the cleanup path.
+            launcher = launcher.replace("b1_cleanup() {\n", f"b1_cleanup() {{\n{line}\n", 1)
+    elif case_id == "volume_mountpoint_set_drifts_from_the_image":
+        # Drop the last VOLUME the image declares, so the launcher prepares a
+        # proper subset of the mountpoints Docker will try to create.
+        dropped = _b1_image_volume_paths()[-1][len(B1_SOURCE_MOUNT):]
+        launcher = launcher.replace(f' "$REPO_ROOT/{dropped}"', "", 1)
+    elif case_id == "launcher_stops_preparing_before_the_driver":
+        launcher = launcher.replace("  b1_prepare || return 1\n", "", 1)
     elif case_id == "cfs_quota_reintroduced_in_launcher":
         launcher = launcher.replace('    --network host \\\n',
                                     '    --network host \\\n    --cpu-quota 200000 \\\n', 1)

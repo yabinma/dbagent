@@ -3005,11 +3005,11 @@ PRODUCT_TOTAL_REQUESTS = 30000
 
 @pytest.mark.b1_live
 def test_b1_ci_scale_reference_profile(b1_ci_scale_run):
-    """FP-GC1-1: the gating CI-scale bar under the declared CPU quotas.
+    """FP-GC1-1: the gating CI-scale bar under the declared CPU affinity.
 
     Renamed from ``test_b1_ingest_burst_reference_profile``, not duplicated:
     this is the same seven-clause B1 shape, restated as fixed numbers for the
-    2.00/1.00/0.50-CPU four-vCPU allocation. It is explicitly not the product
+    2/1/1 four-CPU affinity allocation. It is explicitly not the product
     promise and predicts nothing about the later write-path slice.
     """
     r = b1_ci_scale_run["result"]

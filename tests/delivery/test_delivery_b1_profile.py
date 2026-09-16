@@ -1136,7 +1136,7 @@ LIVE_RUN_IMPL = "_run_b1_reference"
 B1_INVENTORY: list[tuple[Path, str, frozenset[str], frozenset[type] | None, bool]] = [
     # --- FP-IG-7 / FP-GC1-1 CI-scale reference: 7 B1 clauses + max_in_flight = 8 ---
     # Renamed, not retired, by the GC-1 slice: same clauses, restated against
-    # the CI-scale bar literals for the declared 2.00/1.00/0.50-CPU allocation.
+    # the CI-scale bar literals for the declared 2/1/1 CPU affinity allocation.
     (REF_TEST, CI_SCALE_REF_TEST, frozenset({"platform_online"}), frozenset({ast.Eq}), True),
     (REF_TEST, CI_SCALE_REF_TEST, frozenset({"served", "errors", "offered"}), frozenset({ast.Eq}), True),
     (REF_TEST, CI_SCALE_REF_TEST, frozenset({"errors"}), frozenset({ast.Eq}), True),
