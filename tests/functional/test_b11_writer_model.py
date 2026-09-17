@@ -52,6 +52,15 @@ GO_GUARD_FUNC = "func TestB11GoCallSitesAreRealCalls("
 
 CONFTEST_NAME = "conftest.py"
 BENCH_NAME = "test_pg_scale.py"
+# GC-3 (design/slices/gc-3-reference-topology/design.md §3.4/§3.8): the tracked
+# model-keyed B1 reference-topology decision carrier lives in this directory by
+# design -- the B1 launcher's `route` command reads it there and the benchmark
+# driver sees it through its existing read-only /workspace mount. It is
+# generated evidence, not a B11 tier source: it is never imported, never
+# executed, and configures no database. A1 names it explicitly so the tier
+# inventory stays a closed set that still rejects every OTHER new file.
+GC3_DECISION_NAME = "b1_topology_decision.json"
+GC3_DECISION = BENCH_DIR / GC3_DECISION_NAME
 LOADER_NAME = "load_b11_writer_model"
 B11_TEST_NAME = "test_b11_audit_llm_insert_throughput"
 # The one function the executor may drive, and the two production writers its
@@ -2634,7 +2643,7 @@ def check_W4(src: str) -> None:
 
 
 def check_A1(bench_dir: Path) -> None:
-    expected = {CONFTEST_NAME, BENCH_NAME, "thresholds.yaml"}
+    expected = {CONFTEST_NAME, BENCH_NAME, "thresholds.yaml", GC3_DECISION_NAME}
     names = {
         p.name
         for p in bench_dir.iterdir()
@@ -3450,6 +3459,12 @@ def _seed_repo(root: Path) -> None:
     (bench / BENCH_NAME).write_text(CLEAN_BENCH, encoding="utf-8")
     (bench / "thresholds.yaml").write_text(
         THRESHOLDS.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    # The miniature repository carries the same tier inventory as the real one,
+    # so the A1 "extra_tier_file" control still fires for the file it adds and
+    # never for a file this seed forgot to write.
+    (bench / GC3_DECISION_NAME).write_text(
+        GC3_DECISION.read_text(encoding="utf-8"), encoding="utf-8"
     )
     for rel in sorted(EXPECTED_PACKAGING_FILES) + list(BENCHMARK_WORKFLOWS) + [
         GO_GUARD

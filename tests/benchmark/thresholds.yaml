@@ -29,11 +29,25 @@ benchmarks:
     four-vCPU ubuntu-latest reference host, and the role mapping over those two pairs is the
     topology one exact `cpuModel` earned from two complete same-head discovery artifacts through
     the tracked carrier tests/benchmark/b1_topology_decision.json (schema 2, keyed by exact
-    cpuModel). Per-model decision table at this revision: no model has a decision entry yet -- the
-    carrier is not generated, the 28-arm discovery sweep
-    `scripts/integration-test.sh b1_topology_probe` has not yet produced two complete artifacts of
-    one exact model at this head, and therefore no topology, role cardinality or placement schema
-    is claimed for any model here. A `selected` row names its topology id, its topology-derived
+    cpuModel). Per-model decision table at this revision, every entry decided from two complete
+    28-arm discovery artifacts of its own exact model at head
+    51e8a3175a4c247ab6afa47a5588bcbb96fafa99, produced by the manual sweep
+    `scripts/integration-test.sh b1_topology_probe`:
+    `AMD EPYC 7763 64-Core Processor` -- status unhostable; no topology, no role cardinality and
+    no placement schema are claimed for it; it is recorded, non-gating, under reason
+    `topology_unratified_sku:AMD EPYC 7763 64-Core Processor`, and starts no live CI-scale
+    workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35184858860
+    and https://github.com/yabinma/dbagent/actions/runs/35186707903.
+    `AMD EPYC 9V74 80-Core Processor` -- status unhostable; no topology, no role cardinality and
+    no placement schema are claimed for it; it is recorded, non-gating, under reason
+    `topology_unratified_sku:AMD EPYC 9V74 80-Core Processor`, and starts no live CI-scale
+    workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35184851198
+    and https://github.com/yabinma/dbagent/actions/runs/35186725808.
+    No row in this revision is `selected`: in each of those two pairs, no topology class met
+    every unchanged CI-scale comparison in all eight of its records, so no class is ratifiable
+    for either model. Those are two per-model negative results against the unchanged bar below,
+    which is neither weakened nor re-derived by them, and they claim nothing about any other
+    exact model. A `selected` row names its topology id, its topology-derived
     gateway/PostgreSQL/driver cardinalities, its physical relationship over the two pairs, its
     all-role sibling witness, placement schema 3, the two discovery evidence URLs and its final
     gating run; an `unhostable` row names no topology and no cardinality and cites
