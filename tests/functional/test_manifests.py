@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import configparser
 import copy
+import json
 import os
 import re
 import subprocess
@@ -4470,13 +4471,27 @@ B1_ROUTE_CLAUSES: tuple[str, ...] = (
     "b1_expand_cpu_list \"$affinity\" | sort -n -u",
     'if [ "${#cpus[@]}" -lt 4 ]; then',
     'if [ "${#cpus[@]}" -lt 8 ]; then',
-    # closed schema-2 launch contracts, both profiles, affinity mechanism
+    # the closed schema-2 product-local launch contract, affinity mechanism.
+    # GC-3 (FP-GC3-4): the ordinary CI-scale contract is no longer written by
+    # this shell at all -- `contract-selected` renders the ratified schema-3
+    # document -- so its literals are deliberately absent here.
     '"schema": 2,',
     '"mechanism": "sched-affinity",',
-    '"profile": "ci-scale",',
-    '"referenceLogicalCpus": 4,',
     '"profile": "product-exclusive",',
     '"minimumHostLogicalCpus": 8,',
+    # the pre-placement route, its one closed read, and the ratified contract
+    'python3 "$B1_PROBE_PLANNER" route \\',
+    '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \\',
+    '--out "$B1_ROUTE_RECORD"',
+    "IFS=$'\\t' read -r route_disposition route_topology < <(",
+    'python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"',
+    'B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-'
+    '${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"',
+    'python3 "$B1_PROBE_PLANNER" contract-selected \\',
+    '--topology "$route_topology" \\',
+    '--pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \\',
+    '--run-id "$B1_RUN_ID" \\',
+    '--out "$B1_RUN_DIR/placement.json"',
     '"gateway": {"allowedCpus": "${gateway_cpus}"},',
     '"postgres": {"allowedCpus": "${postgres_cpus}"},',
     '"driver": {"allowedCpus": "${driver_cpus}"}',
@@ -4577,8 +4592,15 @@ B1_BANDWIDTH_CONTROLS = (
 )
 
 # Which `${cpus[N]}` index each role's generated set must take, per profile.
+#
+# GC-3 (FP-GC3-4) removed the ordinary CI-scale entry, and its absence is
+# enforced rather than assumed: the ordinary b1 target no longer allocates
+# roles at all. It routes the exact host CPU model to its ratified topology and
+# asks `contract-selected` to render that class over the two OBSERVED sibling
+# pairs, so a literal `${cpus[0..3]}` role assignment reappearing in that
+# region would be a second topology author and is a named failure below. The
+# product-local 4/3/1 pin is unchanged.
 B1_AFFINITY_SELECTION = {
-    "b1": {"gateway": (0, 1), "postgres": (2,), "driver": (3,)},
     "b1_product": {"gateway": (0, 1, 2, 3), "postgres": (4, 5, 6), "driver": (7,)},
 }
 _B1_CPU_INDEX_RE = re.compile(r"\$\{cpus\[(\d+)\]\}")
@@ -4739,10 +4761,15 @@ def _b1_cleanup_failures(launcher: str) -> list[str]:
             if mount in purge:
                 add("purge_mounts_more_than_the_run_dir", mount)
 
-    # (5) every consumer gates on BOTH flags ...
-    for target in ("b1", "b1_product"):
-        if B1_CLEANUP_GATE not in _uncommented(_b1_target_region(launcher, target)):
-            add("consumer_ignores_the_run_dir_failure", target)
+    # (5) every consumer gates on BOTH flags, on every path that can return
+    # success. GC-3 (FP-GC3-4) gave the ordinary target two such paths -- the
+    # recorded, no-live route and the gating route's live exit -- so the gate
+    # is counted, not merely looked for: one of two is a cleanup failure the
+    # recorded route would swallow.
+    for target, expected in (("b1", 2), ("b1_product", 1)):
+        observed = _uncommented(_b1_target_region(launcher, target)).count(B1_CLEANUP_GATE)
+        if observed != expected:
+            add("consumer_ignores_the_run_dir_failure", f"{target} {observed}/{expected}")
 
     # ... and the arm loop names the one that actually happened.
     arm = _uncommented(_b1_target_region(launcher, "b1_topology_probe_arm"))
@@ -4821,12 +4848,72 @@ def _b1_affinity_failures(launcher: str) -> list[str]:
                         f"affinity_overlap {target} {taken[index]}/{role} share cpus[{index}]"
                     )
                 taken[index] = role
-        bound = 4 if target == "b1" else 8
+        bound = 8
         outside = sorted(i for i in taken if not 0 <= i < bound)
         if outside:
             fails.append(f"affinity_index_drift {target} {outside} outside the first {bound}")
         if f'if [ "${{#cpus[@]}}" -lt {bound} ]; then' not in region:
             fails.append(f"affinity_host_floor_drift {target} lacks its -lt {bound} guard")
+    fails.extend(_b1_ordinary_route_order_failures(launcher))
+    return fails
+
+
+def _b1_ordinary_route_order_failures(launcher: str) -> list[str]:
+    """GC-3 FP-GC3-4: the ordinary b1 region's order, read once, top to bottom.
+
+    Four facts, each positional, because each of them is exactly what a
+    plausible refactor would move: the allowed CPU set is read ONCE and the
+    one-CPU floor is evaluated on it before anything else; the container-free
+    coverage phase runs before routing; the four-CPU floor is evaluated on that
+    SAME retained array only inside the selected `gating` branch; and the
+    driver-side role mapping is rendered by `contract-selected`, never by a
+    `${cpus[N]}` literal in shell.
+    """
+    fails: list[str] = []
+    region = _b1_target_region(launcher, "b1")
+    if not region:
+        return ["affinity_target_missing b1"]
+    lines = [ln.strip() for ln in region.splitlines()]
+
+    def first(predicate) -> "int | None":
+        return next((i for i, ln in enumerate(lines) if predicate(ln)), None)
+
+    for role in ("gateway", "postgres", "driver"):
+        if any(_B1_ROLE_SELECTION_RE.match(ln) and ln.startswith(role) for ln in lines):
+            fails.append(f"ordinary_b1_role_literal_survives {role}")
+    if _B1_CPU_INDEX_RE.search(region.replace('"${cpus[0]}"', "", 1)):
+        fails.append("ordinary_b1_indexes_the_cpu_array_more_than_once")
+    reads = [i for i, ln in enumerate(lines) if ln.startswith("mapfile -t cpus <")]
+    if len(reads) != 1:
+        fails.append(f"ordinary_b1_cpu_set_read_inventory_drift {len(reads)}")
+        return fails
+    one_cpu = first(lambda ln: ln == 'if [ "${#cpus[@]}" -lt 1 ]; then')
+    coverage = first(lambda ln: "driver-coverage.sh" in ln and ln.startswith("b1_run_driver"))
+    routed = first(
+        lambda ln: ln.startswith('python3 "$B1_PROBE_PLANNER" route') and ln.endswith("\\")
+    )
+    fields = first(lambda ln: 'route-fields --route "$B1_ROUTE_RECORD"' in ln)
+    four_cpu = first(lambda ln: ln == 'if [ "${#cpus[@]}" -lt 4 ]; then')
+    pairs = first(lambda ln: ln.startswith("mapfile -t sibling_pairs <"))
+    contract = first(lambda ln: "contract-selected" in ln)
+    live = first(lambda ln: "driver-live.sh" in ln and ln.startswith("b1_run_driver"))
+    order = {
+        "one_cpu_floor": one_cpu,
+        "coverage_phase": coverage,
+        "route": routed,
+        "route_fields": fields,
+        "four_cpu_floor": four_cpu,
+        "pair_discovery": pairs,
+        "contract_selected": contract,
+        "live_phase": live,
+    }
+    missing = sorted(name for name, index in order.items() if index is None)
+    if missing:
+        fails.append(f"ordinary_b1_route_step_missing {missing}")
+        return fails
+    positions = list(order.values())
+    if positions != sorted(positions) or reads[0] > one_cpu:
+        fails.append(f"ordinary_b1_route_order_drift {order}")
     return fails
 
 
@@ -5018,10 +5105,15 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
         REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
     ).read_text(encoding="utf-8")
     for clause in (
-        # The allocation is affinity cardinality, declared in Python.
-        'CI_SCALE_AFFINITY_CARDINALITY = {"gateway": 2, "postgres": 1, "driver": 1}',
+        # The allocation is affinity cardinality, declared in Python. GC-3
+        # (FP-GC3-4) made the CI-scale half a CLOSED MAP KEYED BY EXACT
+        # cpuModel -- checked entry by entry against the tracked carrier below
+        # -- while the product-local scalar is unchanged.
+        "CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL",
+        "CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL",
         'PRODUCT_AFFINITY_CARDINALITY = {"gateway": 4, "postgres": 3, "driver": 1}',
-        "B1_PLACEMENT_SCHEMA = 2",
+        "PRODUCT_PLACEMENT_SCHEMA = 2",
+        "B1_TOPOLOGY_PLACEMENT_SCHEMA = probe.CONTRACT_SCHEMA",
         'B1_PLACEMENT_MECHANISM = "sched-affinity"',
         # The gateway command runs under its declared set.
         'f"taskset -c {b1.format_cpu_list(gateway_cpus)} "',
@@ -5091,6 +5183,93 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
     fails.extend(_b1_affinity_failures(launcher))
     fails.extend(_b1_mountpoint_failures(launcher))
     fails.extend(_b1_cleanup_failures(launcher))
+    fails.extend(_b1_model_keyed_declaration_failures(fixture_src))
+    return fails
+
+
+# GC-3 (FP-GC3-3/4): the tracked model-keyed decision carrier. It is READ here,
+# never required: the two fail-closed carriers that demand its existence are
+# the delivery tests in tests/delivery/test_delivery_b1_profile.py. What this
+# guard enforces is AGREEMENT -- the Python declaration surface names exactly
+# the models the carrier selects, with exactly the topology-derived
+# cardinality and schema each of those entries carries. While the carrier is
+# absent, "exactly" means "no model", and a declaration map that named one
+# anyway would be a hand-written topology.
+GC3_DECISION_CARRIER = REPO_ROOT / "tests" / "benchmark" / "b1_topology_decision.json"
+GC3_SELECTED_PLACEMENT_SCHEMA = 3
+GC3_PRODUCT_PLACEMENT_SCHEMA = 2
+
+
+def _gc3_selected_entries() -> "dict[str, dict]":
+    """Every `selected` entry in the tracked carrier; empty while it is absent."""
+    if not GC3_DECISION_CARRIER.is_file():
+        return {}
+    decision = json.loads(GC3_DECISION_CARRIER.read_text(encoding="utf-8"))
+    models = (decision or {}).get("models") or {}
+    return {
+        model: entry for model, entry in models.items()
+        if isinstance(entry, dict) and entry.get("status") == "selected"
+    }
+
+
+def _source_assigns(src: str) -> "dict[str, ast.AST]":
+    """Module-level ``NAME = <expr>`` assignments, by name."""
+    out: "dict[str, ast.AST]" = {}
+    for node in ast.parse(src).body:
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) and node.value is not None
+            else []
+        )
+        for target in targets:
+            if isinstance(target, ast.Name):
+                out[target.id] = node.value
+    return out
+
+
+def _b1_model_keyed_declaration_failures(fixture_src: str) -> list[str]:
+    """The harness's per-model maps equal the carrier's selected entries."""
+    fails: list[str] = []
+    assigns = _source_assigns(fixture_src)
+    selected = _gc3_selected_entries()
+    for name in ("CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL",
+                 "CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"):
+        node = assigns.get(name)
+        if node is None:
+            fails.append(f"model_keyed_declaration_missing {name}")
+            continue
+        try:
+            declared = ast.literal_eval(node)
+        except ValueError:
+            fails.append(f"model_keyed_declaration_not_literal {name}")
+            continue
+        if not isinstance(declared, dict):
+            fails.append(f"model_keyed_declaration_not_a_map {name}")
+            continue
+        if sorted(declared) != sorted(selected):
+            fails.append(
+                f"model_keyed_declaration_key_drift {name} "
+                f"{sorted(declared)} != {sorted(selected)}"
+            )
+            continue
+        for model, entry in selected.items():
+            expected = (
+                entry.get("cardinality")
+                if name == "CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"
+                else GC3_SELECTED_PLACEMENT_SCHEMA
+            )
+            if declared[model] != expected:
+                fails.append(f"model_keyed_declaration_value_drift {name} {model!r}")
+    # A scalar CI-scale default is exactly what the per-model map replaces.
+    for retired in ("CI_SCALE_AFFINITY_CARDINALITY", "B1_PLACEMENT_SCHEMA"):
+        if retired in assigns:
+            fails.append(f"retired_scalar_declaration_survives {retired}")
+    # The two FIXED schemas either side of the per-model map.
+    product_schema = assigns.get("PRODUCT_PLACEMENT_SCHEMA")
+    if product_schema is None or ast.literal_eval(product_schema) != GC3_PRODUCT_PLACEMENT_SCHEMA:
+        fails.append("product_placement_schema_drift")
+    if "B1_TOPOLOGY_PLACEMENT_SCHEMA = probe.CONTRACT_SCHEMA" not in fixture_src:
+        fails.append("probe_placement_schema_drift")
     return fails
 
 
@@ -5179,17 +5358,60 @@ GC3_PROBE_LAUNCHER_CLAUSES: tuple[str, ...] = (
     'python3 "$B1_PROBE_PLANNER" collect \\',
     'if [ "$rc" -ne 0 ]; then return "$rc"; fi',
 )
-# The ordinary CI-scale route, unchanged by this slice. The 2/1/1 mapping over
-# the first four allowed CPUs is still pinned by _b1_affinity_failures; what is
-# added here is the new prerequisite, which narrows WHICH hosts may run it
-# without changing WHAT it allocates.
+# The ordinary CI-scale route as GC-3 (FP-GC3-4) leaves it: an unconditional
+# container-free coverage phase, then a model-routed live phase. The three
+# literal `${cpus[0..3]}` role assignments are RETIRED -- `_b1_affinity_failures`
+# now proves their absence and the step order instead -- and what is pinned here
+# is the routing flow itself, clause by clause.
 GC3_ORDINARY_B1_CLAUSES: tuple[str, ...] = (
+    # one allowed-CPU read, one CPU required, coverage before anything else
+    "mapfile -t cpus < <(b1_available_cpus)",
+    'if [ "${#cpus[@]}" -lt 1 ]; then',
+    'cat > "$B1_RUN_DIR/driver-coverage.sh" <<\'B1_CI_SCALE_COVERAGE\'',
+    'b1_run_driver driver-coverage.sh "${cpus[0]}"',
+    # the pre-placement route, over the tracked carrier, into a closed record
+    'B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-'
+    '${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"',
+    'python3 "$B1_PROBE_PLANNER" route \\',
+    '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \\',
+    '--out "$B1_ROUTE_RECORD"',
+    # exactly one closed read of the two branch values
+    "IFS=$'\\t' read -r route_disposition route_topology < <(",
+    'python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"',
+    # a recorded route stops here: no pair discovery, no contract, no workload
+    'if [ "$route_disposition" = "recorded" ] && [ "$route_topology" = "none" ]; then',
+    # a gating route: four CPUs over the SAME array, then complete pairs
+    'if [ "${#cpus[@]}" -lt 4 ]; then',
     'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")',
     'if [ "${#sibling_pairs[@]}" -lt 2 ]; then',
-    'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
-    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
-    'driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+    # the planner renders the ratified class; the shell authors no mapping
+    'python3 "$B1_PROBE_PLANNER" contract-selected \\',
+    '--topology "$route_topology" \\',
+    '--pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \\',
+    '--out "$B1_RUN_DIR/placement.json"',
+    'b1_run_driver driver-live.sh "$driver_cpus"',
 )
+#: The recorded, non-gating dispositions this route may emit, and the distinct
+#: fail-closed reasons a missing or corrupt carrier emits. They are declared in
+#: the planner, so they are pinned there -- the launcher never spells one.
+#: The closed seven-class candidate set, declared here independently of the
+#: planner: a topology id appearing as a LITERAL in the launcher would mean the
+#: shell had become a second topology author.
+GC3_TOPOLOGY_IDS = (
+    "driver-isolated",
+    "gateway-core",
+    "gateway-isolated",
+    "gateway-split",
+    "postgres-core",
+    "postgres-isolated",
+    "postgres-split",
+)
+GC3_ROUTE_REASONS = {
+    "unratified": "topology_unratified_sku:",
+    "unavailable": "topology_cpu_model_unavailable",
+    "missing": "gc3_decision_missing",
+    "invalid": "gc3_decision_invalid",
+}
 
 
 def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
@@ -5356,6 +5578,86 @@ def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> 
     for escape in ("pytest.mark.skip", "pytest.mark.xfail", "pytest.skip(", "--deselect"):
         if escape in live_src:
             add("probe_live_module_escape", escape)
+
+    # (6) GC-3 FP-GC3-4: the ordinary route's own contract.
+    fails.extend(_gc3_ordinary_route_failures(launcher, helper_path))
+    return fails
+
+
+def _gc3_ordinary_route_failures(launcher: str, helper_path: Path) -> list[str]:
+    """The recorded/gating split, as named failures, from the shell's own text."""
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    region = _b1_target_region(launcher, "b1")
+    if not region:
+        add("ordinary_b1_target_missing")
+        return fails
+    # One allowed-CPU read, coverage before routing, the selected-only
+    # four-CPU floor, and no `${cpus[N]}` role literal: the same positional
+    # rules `_b1_affinity_failures` enforces, asserted here too because this
+    # is FP-GC3-4's own function test.
+    fails.extend(_b1_ordinary_route_order_failures(launcher))
+
+    # The four recorded/failure reasons are the PLANNER's vocabulary. The shell
+    # spells none of them: it branches on two closed words and nothing else.
+    helper_src = helper_path.read_text(encoding="utf-8") if helper_path.is_file() else ""
+    for label, reason in sorted(GC3_ROUTE_REASONS.items()):
+        if reason not in helper_src:
+            add("route_reason_not_declared", f"{label} {reason!r}")
+        if reason in launcher:
+            add("route_reason_spelled_in_shell", f"{label} {reason!r}")
+
+    # The shell reads the two branch values exactly once, and never parses the
+    # carrier, re-reads the host model, or reconstructs a topology itself.
+    if region.count("route-fields") != 1:
+        add("route_fields_read_inventory_drift", str(region.count("route-fields")))
+    route_calls = [
+        ln for ln in region.splitlines()
+        if ln.strip().startswith('python3 "$B1_PROBE_PLANNER" route')
+        and "route-fields" not in ln
+    ]
+    if len(route_calls) != 1:
+        add("route_call_inventory_drift", str(len(route_calls)))
+    for forbidden in ("jq ", "/proc/cpuinfo", "model name", "python3 -c"):
+        if forbidden in region:
+            add("route_parsed_in_shell", forbidden)
+    carrier_reads = [
+        ln.strip() for ln in region.splitlines() if "b1_topology_decision.json" in ln
+    ]
+    if len(carrier_reads) != 1 or not carrier_reads[0].startswith("--decision "):
+        add("carrier_read_outside_route", str(carrier_reads))
+    for topology in GC3_TOPOLOGY_IDS:
+        if topology in launcher:
+            add("topology_literal_in_launcher", topology)
+    if "$B1_ROUTE_RECORD" in region and 'cp "$B1_ROUTE_RECORD"' in region:
+        add("route_record_copied_into_the_run_dir")
+    if "B1_RUN_DIR/route" in region:
+        add("route_record_copied_into_the_run_dir")
+
+    # The recorded branch: cleanup, then `return 0`, with no live work of any
+    # kind between the branch and its return.
+    marker = 'if [ "$route_disposition" = "recorded" ] && [ "$route_topology" = "none" ]; then'
+    if marker not in region:
+        add("recorded_branch_missing")
+        return fails
+    branch = region.split(marker, 1)[1].split("\n  fi", 1)[0]
+    if "b1_cleanup" not in branch:
+        add("recorded_branch_does_not_clean_up")
+    if "return 0" not in branch:
+        add("recorded_branch_does_not_return_zero")
+    for live_work in ("b1_run_driver driver-live.sh", "contract-selected",
+                      "b1_complete_sibling_pairs", "placement.json", "-m pytest"):
+        if live_work in branch:
+            add("recorded_branch_starts_live_work", live_work)
+    # ...and every live step happens strictly after that branch closes.
+    tail = region.split(marker, 1)[1].split("\n  fi", 1)[1]
+    for live_work in ("b1_run_driver driver-live.sh", "contract-selected",
+                      "b1_complete_sibling_pairs"):
+        if live_work not in tail:
+            add("gating_step_missing", live_work)
     return fails
 
 
@@ -5509,6 +5811,267 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
     assert unregistered != markers_toml
     assert "probe_marker_not_registered" in _reasons(markers=unregistered)
 
+    # --- GC-3 FP-GC3-4: the ordinary route, one mutation at a time ----------
+    coverage_after_route = launcher.replace(
+        '  b1_run_driver driver-coverage.sh "${cpus[0]}"\n',
+        "", 1).replace(
+        '  b1_run_driver driver-live.sh "$driver_cpus"\n',
+        '  b1_run_driver driver-coverage.sh "${cpus[0]}"\n'
+        '  b1_run_driver driver-live.sh "$driver_cpus"\n', 1)
+    assert coverage_after_route != launcher
+    assert "ordinary_b1_route_order_drift" in _reasons(text=coverage_after_route)
+
+    coverage_made_conditional = launcher.replace(
+        '  b1_run_driver driver-coverage.sh "${cpus[0]}"',
+        '  [ "${SKIP_COVERAGE:-0}" = "1" ] || b1_run_driver driver-coverage.sh "${cpus[0]}"', 1)
+    assert coverage_made_conditional != launcher
+    assert "ordinary_b1_route_step_missing" in _reasons(text=coverage_made_conditional)
+
+    second_cpu_read = launcher.replace(
+        '  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}',
+        '  mapfile -t cpus < <(b1_available_cpus)\n'
+        '  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}', 1)
+    assert second_cpu_read != launcher
+    assert "ordinary_b1_cpu_set_read_inventory_drift" in _reasons(text=second_cpu_read)
+
+    guard_moved_before_coverage = launcher.replace(
+        '  if [ "${#cpus[@]}" -lt 4 ]; then\n', "", 1).replace(
+        '  if [ "${#cpus[@]}" -lt 1 ]; then\n',
+        '  if [ "${#cpus[@]}" -lt 4 ]; then\n'
+        '    echo "moved" >&2\n'
+        '    return 1\n'
+        '  fi\n'
+        '  if [ "${#cpus[@]}" -lt 1 ]; then\n', 1)
+    assert guard_moved_before_coverage != launcher
+    assert "ordinary_b1_route_order_drift" in _reasons(text=guard_moved_before_coverage)
+
+    live_on_a_recorded_route = launcher.replace(
+        '    echo "integration-test.sh: b1 recorded a non-gating route; no live workload ran.',
+        '    b1_run_driver driver-live.sh "${cpus[0]}"\n'
+        '    echo "integration-test.sh: b1 recorded a non-gating route; no live workload ran.', 1)
+    assert live_on_a_recorded_route != launcher
+    assert "recorded_branch_starts_live_work" in _reasons(text=live_on_a_recorded_route)
+
+    reason_decided_in_shell = launcher.replace(
+        '    b1_cleanup\n    trap - EXIT TERM INT\n'
+        '    if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi\n'
+        "    return 0\n",
+        '    echo "topology_cpu_model_unavailable"\n'
+        "    b1_cleanup\n    trap - EXIT TERM INT\n"
+        '    if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi\n'
+        "    return 0\n", 1)
+    assert reason_decided_in_shell != launcher
+    assert "route_reason_spelled_in_shell" in _reasons(text=reason_decided_in_shell)
+
+    topology_literal = launcher.replace(
+        '    --topology "$route_topology" \\',
+        '    --topology "postgres-core" \\', 1)
+    assert topology_literal != launcher
+    assert "topology_literal_in_launcher" in _reasons(text=topology_literal)
+
+    carrier_parsed_in_shell = launcher.replace(
+        '  b1_run_driver driver-coverage.sh "${cpus[0]}"',
+        '  jq -r .models "$REPO_ROOT/tests/benchmark/b1_topology_decision.json"\n'
+        '  b1_run_driver driver-coverage.sh "${cpus[0]}"', 1)
+    assert carrier_parsed_in_shell != launcher
+    assert {"route_parsed_in_shell", "carrier_read_outside_route"} & _reasons(
+        text=carrier_parsed_in_shell
+    )
+
+    second_route_read = launcher.replace(
+        '  if [ "${#cpus[@]}" -lt 4 ]; then',
+        '  python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"\n'
+        '  if [ "${#cpus[@]}" -lt 4 ]; then', 1)
+    assert second_route_read != launcher
+    assert "route_fields_read_inventory_drift" in _reasons(text=second_route_read)
+
+    route_copied_into_the_run_dir = launcher.replace(
+        '  if [ "${#cpus[@]}" -lt 4 ]; then',
+        '  cp "$B1_ROUTE_RECORD" "$B1_RUN_DIR/route.json"\n'
+        '  if [ "${#cpus[@]}" -lt 4 ]; then', 1)
+    assert route_copied_into_the_run_dir != launcher
+    assert "route_record_copied_into_the_run_dir" in _reasons(text=route_copied_into_the_run_dir)
+
+    # The per-model declaration surface may not name a model the carrier does
+    # not select -- that is a hand-written topology, whatever it claims.
+    fixture_src = (
+        REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
+    ).read_text(encoding="utf-8")
+    assert _b1_model_keyed_declaration_failures(fixture_src) == []
+    invented_model = fixture_src.replace(
+        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {}',
+        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = '
+        '{"Invented CPU": {"gateway": 2, "postgres": 1, "driver": 1}}', 1)
+    assert invented_model != fixture_src
+    assert any(
+        f.startswith("model_keyed_declaration_key_drift")
+        for f in _b1_model_keyed_declaration_failures(invented_model)
+    )
+    scalar_restored = fixture_src.replace(
+        "PRODUCT_AFFINITY_CARDINALITY = {",
+        'CI_SCALE_AFFINITY_CARDINALITY = {"gateway": 2, "postgres": 1, "driver": 1}\n'
+        "PRODUCT_AFFINITY_CARDINALITY = {", 1)
+    assert scalar_restored != fixture_src
+    assert any(
+        f.startswith("retired_scalar_declaration_survives")
+        for f in _b1_model_keyed_declaration_failures(scalar_restored)
+    )
+    product_schema_moved = fixture_src.replace(
+        "PRODUCT_PLACEMENT_SCHEMA = 2", "PRODUCT_PLACEMENT_SCHEMA = 3", 1)
+    assert product_schema_moved != fixture_src
+    assert "product_placement_schema_drift" in _b1_model_keyed_declaration_failures(
+        product_schema_moved
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# GC-3 FP-GC3-4, review round 1 C1: the launcher's OWN pair string must be a
+# legal input to `contract-selected`.
+#
+# The unit tests around the selected contract feed hand-written canonical CPU
+# lists ("0-1", "2-3"), so every one of them stays green whatever
+# `b1_complete_sibling_pairs` actually prints. This test closes that gap the
+# only way it can be closed: it runs the launcher's own helper functions, under
+# bash, against a fabricated sysfs tree, and pipes what they emit -- unmodified,
+# through the same `--pairs` array the gating branch builds -- into the real
+# CLI. It is named for the composition, and it fails when the composition is
+# broken, which is exactly what a space-separated "lo hi" pair did.
+# ---------------------------------------------------------------------------
+
+B1_SIBLING_HELPERS = (
+    "b1_expand_cpu_list",
+    "b1_canonical_cpu_list",
+    "b1_thread_siblings",
+    "b1_complete_sibling_pairs",
+)
+#: (fabricated sibling groups, allowed CPUs, expected pair renderings). The
+#: second case is the i7 replica's sparse shape: the same RELATIONSHIP over
+#: non-contiguous CPU ids, which a `lo-hi` range cannot express.
+B1_SIBLING_FIXTURES = (
+    ({0: "0-1", 1: "0-1", 2: "2-3", 3: "2-3"}, (0, 1, 2, 3), ["0-1", "2-3"]),
+    ({0: "0,8", 8: "0,8", 1: "1,9", 9: "1,9"}, (0, 1, 8, 9), ["0,8", "1,9"]),
+)
+
+
+def _b1_function_source(launcher: str, name: str) -> str:
+    """One shell function, header through its own closing brace."""
+    lines = launcher.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines) if ln == f"{name}() {{"), None
+    )
+    assert start is not None, f"{name} is not defined in the launcher"
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end + 1])
+
+
+def _b1_emitted_sibling_pairs(tmp_path, groups: dict, allowed, *, launcher=None) -> list[str]:
+    """Run the launcher's real helpers over a fabricated sysfs tree."""
+    root = tmp_path / "sys-cpu"
+    for cpu, rendered in groups.items():
+        target = root / f"cpu{cpu}" / "topology"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "thread_siblings_list").write_text(rendered + "\n", encoding="utf-8")
+    launcher = _b1_launcher_source() if launcher is None else launcher
+    program = "\n".join(
+        [
+            "set -uo pipefail",
+            f'B1_CPU_TOPOLOGY_ROOT="{root}"',
+            *[_b1_function_source(launcher, name) for name in B1_SIBLING_HELPERS],
+            "declare -a sibling_pairs=()",
+            'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs '
+            + " ".join(str(cpu) for cpu in allowed)
+            + ")",
+            'printf "%s\\n" "${sibling_pairs[@]}"',
+        ]
+    )
+    proc = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    return [ln for ln in proc.stdout.splitlines() if ln]
+
+
+def test_gc3_launcher_sibling_pairs_are_accepted_by_contract_selected(tmp_path):
+    """FP-GC3-4: what the shell emits is what `contract-selected` consumes.
+
+    Red-before evidence (review round 1, C1): with
+    ``printf '%s %s\\n' "$lo" "$hi"`` the helper emitted ``0 1``, and this test
+    failed with ``b1_topology_probe: non-decimal CPU id in '0 1' ('0 1')`` --
+    while every hand-written-``0-1`` unit test stayed green.
+    """
+    helper = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe.py"
+    run_id = "0123456789abcdef0123456789abcdef"
+    for index, (groups, allowed, expected) in enumerate(B1_SIBLING_FIXTURES):
+        emitted = _b1_emitted_sibling_pairs(tmp_path / f"case{index}", groups, allowed)
+        # The CLI call comes FIRST, deliberately: the defect this test exists
+        # for is not "the rendering changed", it is "the gating command cannot
+        # consume its own argument", and that is what the failure should say.
+        out = tmp_path / f"placement-{index}.json"
+        proc = subprocess.run(
+            [
+                sys.executable, str(helper), "contract-selected",
+                "--topology", "gateway-core",
+                "--pairs", emitted[0], emitted[1],
+                "--run-id", run_id, "--out", str(out),
+            ],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, (
+            f"the launcher emits {emitted!r}, which contract-selected refuses: "
+            f"{proc.stderr.strip()}"
+        )
+        assert emitted == expected, (groups, emitted)
+        # No whitespace anywhere: `--pairs` takes two words, and a pair that
+        # carried a space would either split into two arguments or arrive as a
+        # CPU list the parser cannot read.
+        for pair in emitted:
+            assert pair == pair.strip() and not any(c.isspace() for c in pair), pair
+        contract = json.loads(out.read_text(encoding="utf-8"))
+        assert contract["schema"] == 3 and contract["profile"] == "ci-scale"
+        assert contract["topology"] == "gateway-core"
+        # gateway-core over the two observed pairs: the gateway owns the whole
+        # first physical core, PostgreSQL and the driver share the second.
+        first, second = sorted(expected), sorted(expected)
+        low = sorted(int(c) for c in re.findall(r"\d+", emitted[0]))
+        high = sorted(int(c) for c in re.findall(r"\d+", emitted[1]))
+        assert contract["roles"]["gateway"]["allowedCpus"] == emitted[0]
+        assert contract["roles"]["postgres"]["allowedCpus"] == str(high[0])
+        assert contract["roles"]["driver"]["allowedCpus"] == str(high[1])
+        # ...and the CLI's stdout is the driver CPU list the shell runs on.
+        assert proc.stdout.strip() == str(high[1])
+        assert low == sorted(int(c) for c in re.findall(r"\d+", emitted[0]))
+    # The retired encoding, asserted absent at its source: a space-separated
+    # pair is not a CPU list and must never come back.
+    helper_src = _b1_function_source(_b1_launcher_source(), "b1_complete_sibling_pairs")
+    assert "'%s %s\\n'" not in helper_src, helper_src
+    assert "b1_canonical_cpu_list" in helper_src, helper_src
+
+    # Negative control, run every time: restore the retired `printf '%s %s'`
+    # in a COPY of the launcher, emit from it, and require the CLI to refuse
+    # what it produced. Without this the assertion above is a spelling check;
+    # with it, the pin is named for the composition it actually protects.
+    groups, allowed, _expected = B1_SIBLING_FIXTURES[0]
+    reverted = _b1_launcher_source().replace(
+        'printf \'%s\\n\' "$(b1_canonical_cpu_list "$lo" "$hi")"',
+        'printf \'%s %s\\n\' "$lo" "$hi"', 1)
+    assert reverted != _b1_launcher_source()
+    emitted = _b1_emitted_sibling_pairs(
+        tmp_path / "reverted", groups, allowed, launcher=reverted
+    )
+    assert emitted == ["0 1", "2 3"], emitted
+    refused = subprocess.run(
+        [
+            sys.executable, str(helper), "contract-selected",
+            "--topology", "gateway-core", "--pairs", emitted[0], emitted[1],
+            "--run-id", run_id, "--out", str(tmp_path / "never-written.json"),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
+    )
+    assert refused.returncode == 1, refused.stdout
+    assert "non-decimal CPU id" in refused.stderr, refused.stderr
+    assert not (tmp_path / "never-written.json").exists()
+
 
 _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     # (id, kind, expected reason) -- the mutator is resolved below by id.
@@ -5535,7 +6098,7 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("launcher_stops_reading_its_own_affinity", "launcher", "route_clause_missing"),
     ("schema_reverted_to_1", "launcher", "route_clause_missing"),
     ("mechanism_reverted_to_quota", "launcher", "route_clause_missing"),
-    ("ci_affinity_cardinality_changed", "launcher", "affinity_cardinality_drift"),
+    ("ordinary_b1_role_literal_reintroduced", "launcher", "ordinary_b1_role_literal_survives"),
     ("product_affinity_cardinality_changed", "launcher", "affinity_cardinality_drift"),
     ("gateway_postgres_affinity_overlap", "launcher", "affinity_overlap"),
     ("gateway_driver_affinity_overlap", "launcher", "affinity_overlap"),
@@ -5567,7 +6130,10 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("coverage_per_file_report_dropped", "launcher", "coverage_report_inventory_drift"),
     ("coverage_data_file_moved_to_the_source_mount", "launcher", "coverage_data_path_drift"),
     ("pytest_cache_moved_to_the_source_mount", "launcher", "pytest_cache_path_drift"),
-    ("launcher_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
+    # GC-3 (FP-GC3-4): the single driver script became two, so masking is two
+    # independent mutations -- one per phase -- and each must go red on its own.
+    ("coverage_phase_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
+    ("live_phase_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
     ("launcher_continues_on_error", "launcher", "rejected_escape_in_launcher"),
     ("marker_registration_removed", "markers", "marker_not_registered"),
     ("pytest_markers_allowlist_removed", "admission", "markers_not_admitted"),
@@ -5637,7 +6203,8 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
     elif case_id == "docker_socket_unmounted":
         launcher = launcher.replace('    -v "$B1_SOCKET":/var/run/docker.sock \\\n', "", 1)
     elif case_id == "profile_renamed_in_the_contract":
-        launcher = launcher.replace('"profile": "ci-scale",', '"profile": "ci-scale-v2",', 1)
+        launcher = launcher.replace('"profile": "product-exclusive",',
+                                    '"profile": "product-exclusive-v2",', 1)
     elif case_id == "run_id_shortened":
         launcher = launcher.replace('if [ "${#B1_RUN_ID}" -ne 32 ]; then',
                                     'if [ "${#B1_RUN_ID}" -ne 8 ]; then', 1)
@@ -5673,25 +6240,29 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
         launcher = launcher.replace('"schema": 2,', '"schema": 1,')
     elif case_id == "mechanism_reverted_to_quota":
         launcher = launcher.replace('"mechanism": "sched-affinity",', '"mechanism": "cfs-quota",')
-    elif case_id == "ci_affinity_cardinality_changed":
+    elif case_id == "ordinary_b1_role_literal_reintroduced":
+        # GC-3: the ordinary target allocates nothing. A literal role
+        # assignment reappearing in it is a second topology author.
         launcher = launcher.replace(
-            'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
-            'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}")"', 1)
+            '  b1_run_driver driver-live.sh "$driver_cpus"',
+            '  gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"\n'
+            '  b1_run_driver driver-live.sh "$driver_cpus"', 1)
     elif case_id == "product_affinity_cardinality_changed":
         launcher = launcher.replace(
             'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}" "${cpus[6]}")"',
             'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}")"', 1)
     elif case_id == "gateway_postgres_affinity_overlap":
-        launcher = launcher.replace('postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
-                                    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[1]}")"', 1)
+        launcher = launcher.replace(
+            'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}" "${cpus[6]}")"',
+            'postgres_cpus="$(b1_canonical_cpu_list "${cpus[3]}" "${cpus[5]}" "${cpus[6]}")"', 1)
     elif case_id == "gateway_driver_affinity_overlap":
-        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[7]}")"',
                                     'driver_cpus="$(b1_canonical_cpu_list "${cpus[0]}")"', 1)
     elif case_id == "postgres_driver_affinity_overlap":
         launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[7]}")"',
                                     'driver_cpus="$(b1_canonical_cpu_list "${cpus[6]}")"', 1)
     elif case_id == "affinity_outside_host_set":
-        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
+        launcher = launcher.replace('driver_cpus="$(b1_canonical_cpu_list "${cpus[7]}")"',
                                     'driver_cpus="$(b1_canonical_cpu_list "${cpus[9]}")"', 1)
     elif case_id in (
         "volume_mountpoint_mkdir_removed",
@@ -5778,9 +6349,12 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
     elif case_id == "pytest_cache_moved_to_the_source_mount":
         launcher = launcher.replace("-o cache_dir=/run/dbagent-b1/pytest-cache",
                                     "-o cache_dir=/workspace/.pytest_cache")
-    elif case_id == "launcher_masks_a_failure":
-        launcher = launcher.replace('  b1_run_driver driver.sh "$driver_cpus"',
-                                    '  b1_run_driver driver.sh "$driver_cpus" || true', 1)
+    elif case_id == "coverage_phase_masks_a_failure":
+        launcher = launcher.replace('  b1_run_driver driver-coverage.sh "${cpus[0]}"',
+                                    '  b1_run_driver driver-coverage.sh "${cpus[0]}" || true', 1)
+    elif case_id == "live_phase_masks_a_failure":
+        launcher = launcher.replace('  b1_run_driver driver-live.sh "$driver_cpus"',
+                                    '  b1_run_driver driver-live.sh "$driver_cpus" || true', 1)
     elif case_id == "launcher_continues_on_error":
         launcher = launcher + "\ncontinue-on-error\n"
     elif case_id == "marker_registration_removed":
@@ -5949,7 +6523,16 @@ def test_b1_entry_matches_its_declared_contract():
         "exact, pairwise-disjoint set of logical",
         "reported diagnostics only and decide nothing",
         "`unavailable`",
-        "the first four CPUs available to the launcher, split 2/1/1",
+        # GC-3 (FP-GC3-4): the CI-scale allocation is decided per exact CPU
+        # model over the two complete SMT sibling pairs, not taken from the
+        # first four CPU ids. The replacement phrase and the recorded-route
+        # policy are pinned; the retired phrase is pinned ABSENT below.
+        "first two complete SMT sibling pairs available to the launcher",
+        "tests/benchmark/b1_topology_decision.json",
+        "topology_unratified_sku:<model>",
+        "topology_cpu_model_unavailable",
+        "gc3_decision_missing",
+        "gc3_decision_invalid",
         "500 req/s offered for 30 s = 15000",
         "MAX_IN_FLIGHT=500",
         "served_rate>=CI_SCALE_SUSTAINED_FLOOR=450",
@@ -5996,5 +6579,9 @@ def test_b1_entry_matches_its_declared_contract():
         "CPU=2.00/1.00/0.50",
         "cpu.max pair",
         "cgroup v2 CPU quota",
+        # GC-3 (FP-GC3-4): the retired first-four/2-1-1 CI-scale claim. The
+        # launcher no longer allocates that way for ANY model, so leaving the
+        # phrase would publish a topology nothing measured.
+        "the first four CPUs available to the launcher, split 2/1/1",
     ):
         assert forbidden not in notes, f"B1 notes must not say {forbidden!r}"

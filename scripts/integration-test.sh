@@ -102,8 +102,16 @@ usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_t
 
   all  (default)  go + py + b1 + b1_product -- the local acceptance route
   b1              the resource-declared CI-scale B1 benchmark (gating; the
-                  same target ci.yml runs), under a 2/1/1 CPU affinity
-                  allocation over the first four available CPUs
+                  same target ci.yml runs). It ALWAYS runs its container-free
+                  coverage phase first, on one allowed CPU. It then reads this
+                  host's exact CPU model and routes on the tracked decision
+                  carrier tests/benchmark/b1_topology_decision.json: a model
+                  with a ratified topology runs the live gate under exactly
+                  that topology, over the first two complete SMT sibling pairs;
+                  any other model records a named non-gating reason and starts
+                  no workload. There is no fixed 2/1/1 layout any more, and no
+                  first-four-CPUs fallback. A missing or corrupt carrier fails
+                  the target rather than reading as an unratified model.
   b1_product      the recorded, non-gating 1000 req/s product-promise run on
                   measured-role-exclusive cores; needs >= 8 logical CPUs
   b1_topology_probe
@@ -490,6 +498,11 @@ B1_RUN_DIR_FAILED=0
 # every arm of the 28-arm discovery sweep. Rebuilding per arm would put a
 # multi-minute, uncontrolled compile on the measured host between measurements.
 B1_IMAGE_BUILT=0
+# GC-3 (FP-GC3-4): the ordinary route's own record. The launcher writes it,
+# prints its percent-encoded canonical form once, and never copies it into
+# B1_RUN_DIR -- the live witness joins decision to fingerprint through the
+# tracked carrier on the read-only source mount instead.
+B1_ROUTE_RECORD=""
 
 # The daemon endpoint is a host fact, not a profile input: CI's rootful daemon
 # listens on /var/run/docker.sock, a rootless developer daemon does not. The
@@ -538,9 +551,14 @@ b1_canonical_cpu_list() {
 # The launcher's own available CPUs, sorted, before any role is narrowed.
 # `taskset -pc $$` is sched_getaffinity(0) for this shell: on a four-vCPU
 # runner it is the whole machine, on a many-core host it is whatever this
-# process was allowed, and only its first four (or eight) entries are ever
-# allocated. That is what makes a local run reproduce the four-core shape
-# instead of expanding with the host.
+# process was allowed. That is what makes a local run reproduce the four-core
+# shape instead of expanding with the host.
+#
+# GC-3 (FP-GC3-4): ordinary b1 reads this array EXACTLY ONCE and keeps it. Its
+# roles are no longer the first four entries -- they are the selected
+# topology's mapping over the first two COMPLETE SMT SIBLING PAIRS inside this
+# set, rendered by `contract-selected`. The product route still takes the
+# first eight entries as 4/3/1 and is unchanged.
 b1_available_cpus() {
   local affinity
   affinity="$(taskset -pc $$ 2>/dev/null | sed 's/.*: *//')"
@@ -557,12 +575,21 @@ b1_thread_siblings() {
   tr -d ' \n' < "$path"
 }
 
-# The complete two-thread sibling pairs inside the allowed set, one "lo hi" per
-# line, ordered by minimum CPU id. A pair is admitted only when the kernel list
-# holds exactly two CPUs, both are allowed, each member names the identical
-# two-member set, and the set was not already taken. Everything else is simply
-# not a pair -- there is no repair and no partial admission, because a wrong
-# answer here would silently move the measured topology.
+# The complete two-thread sibling pairs inside the allowed set, ONE CANONICAL
+# LINUX CPU LIST PER LINE ("0-1", or "0,8" on a host whose siblings are not
+# adjacent ids), ordered by minimum CPU id. A pair is admitted only when the
+# kernel list holds exactly two CPUs, both are allowed, each member names the
+# identical two-member set, and the set was not already taken. Everything else
+# is simply not a pair -- there is no repair and no partial admission, because
+# a wrong answer here would silently move the measured topology.
+#
+# The RENDERING is a contract, not a display choice. Each line is passed
+# unchanged as one `--pairs` word to `b1_topology_probe.py contract-selected`,
+# whose parser accepts canonical Linux CPU-list syntax and nothing else; the
+# space-separated "lo hi" this used to print was not a CPU list at all, so the
+# gating branch could not render its own ratified topology (review round 1 C1).
+# `b1_canonical_cpu_list` is the one renderer in this file, and the product
+# route and the probe planner already speak it.
 b1_complete_sibling_pairs() {
   local -a allowed=("$@")
   local cpu raw lo hi taken=" " allowed_list=" ${allowed[*]} "
@@ -578,7 +605,7 @@ b1_complete_sibling_pairs() {
     [ "$(b1_expand_cpu_list "$(b1_thread_siblings "$hi")" | sort -n -u | tr '\n' ',')" = "$lo,$hi," ] || continue
     case "$taken" in *" $lo-$hi "*) continue ;; esac
     taken="$taken$lo-$hi "
-    printf '%s %s\n' "$lo" "$hi"
+    printf '%s\n' "$(b1_canonical_cpu_list "$lo" "$hi")"
   done
 }
 
@@ -754,59 +781,46 @@ b1_run_driver() {
     taskset -c "$cpuset" bash "$B1_RUN_MOUNT/$script"
 }
 
+# The ordinary CI-scale route: an UNCONDITIONAL container-free coverage phase,
+# then a model-routed live phase.
+#
+# GC-3 (FP-GC3-4) split the old single driver script in two, and the order is
+# the contract. Coverage runs first, on one allowed CPU, with no placement
+# contract, no gateway or PostgreSQL sibling and no host-model or carrier read
+# at all -- so the same aggregate and four per-file --fail-under=81 reports are
+# observed locally, on every randomly assigned CI runner model, and even before
+# a missing carrier makes the target fail. Its driver container is test
+# infrastructure, not the CI-scale workload.
+#
+# Only afterwards is the exact host CPU model read -- once, by the shared
+# reader in the planner, before pair discovery, before a placement contract and
+# before any live process -- and looked up in the tracked decision carrier. A
+# `selected` model runs the unchanged failure-producing gate under its own
+# ratified topology; every other model records an explicit non-gating reason
+# and starts no workload. No topology literal, role mapping, carrier parse,
+# second model read or second allowed-CPU read exists in this shell.
 b1() {
   assert_matches_ci 'bash scripts/integration-test.sh b1' || return 1
   local -a cpus=()
   mapfile -t cpus < <(b1_available_cpus)
-  if [ "${#cpus[@]}" -lt 4 ]; then
-    echo "integration-test.sh: b1 needs at least 4 available logical CPUs, this host offers ${#cpus[@]}" >&2
+  if [ "${#cpus[@]}" -lt 1 ]; then
+    echo "integration-test.sh: b1 needs a usable scheduler-affinity operation (taskset)" >&2
     return 1
   fi
-  # GC-3 (FP-GC3-1): the CI-scale reference deployment is defined over two
-  # complete two-thread SMT sibling pairs, because a CPU id proves nothing
-  # about a physical core -- `0-1` is one core on the 7763 guest and two
-  # different cores on the i7 replica. A host without two complete pairs
-  # cannot host this measurement; it gets a named prerequisite failure and
-  # never four unrelated CPUs. This is NOT a skip: the target returns nonzero.
-  local -a sibling_pairs=()
-  mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")
-  if [ "${#sibling_pairs[@]}" -lt 2 ]; then
-    echo "integration-test.sh: b1 needs two complete two-thread SMT sibling pairs inside its allowed CPU set ($(b1_canonical_cpu_list "${cpus[@]}")); this host offers ${#sibling_pairs[@]}" >&2
-    return 1
-  fi
-  # CI-scale 2/1/1 over the first four available CPUs (FP-GC1-1).
-  local gateway_cpus postgres_cpus driver_cpus
-  gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"
-  postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"
-  driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"
   b1_prepare || return 1
-  cat > "$B1_RUN_DIR/placement.json" <<B1_CI_SCALE_CONTRACT
-{
-  "schema": 2,
-  "runId": "${B1_RUN_ID}",
-  "profile": "ci-scale",
-  "referenceLogicalCpus": 4,
-  "mechanism": "sched-affinity",
-  "roles": {
-    "gateway": {"allowedCpus": "${gateway_cpus}"},
-    "postgres": {"allowedCpus": "${postgres_cpus}"},
-    "driver": {"allowedCpus": "${driver_cpus}"}
-  }
-}
-B1_CI_SCALE_CONTRACT
-  # Container-free coverage phase, then the untraced live phase. No live
-  # fixture and no full-window self-witness ever runs under the tracer: its
-  # unmeasured overhead would consume the driver's single declared CPU.
+  # Container-free coverage phase. No live fixture and no full-window
+  # self-witness ever runs under the tracer: its unmeasured overhead would
+  # consume the driver's single declared CPU.
   #
-  # Coverage is reported over the three files this slice changes -- first as
+  # Coverage is reported over the four files this slice changes -- first as
   # one aggregate, then file by file, all at --fail-under=81. The aggregate is
-  # scoped to the same three files on purpose: an unscoped report also counts
+  # scoped to the same four files on purpose: an unscoped report also counts
   # gateway/ingest.py, rca_common and the e2e profile copy, which this
   # harness-unit selection imports but is not the instrument for (the
   # unit-gateway job owns those, at its own --cov-fail-under=81). Counting them
   # here would make the number a statement about product code that no test in
   # this phase exercises.
-  cat > "$B1_RUN_DIR/driver.sh" <<'B1_CI_SCALE_DRIVER'
+  cat > "$B1_RUN_DIR/driver-coverage.sh" <<'B1_CI_SCALE_COVERAGE'
 set -uo pipefail
 cd /workspace
 env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage run --branch --data-file=/run/dbagent-b1/coverage/.coverage -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
@@ -815,10 +829,104 @@ env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_
 env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/test_b1_ingest_burst.py || exit $?
 env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/scripts/b1-affinity-helper.py || exit $?
 env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
-B1_CI_SCALE_DRIVER
-  b1_run_driver driver.sh "$driver_cpus"
+B1_CI_SCALE_COVERAGE
+  b1_run_driver driver-coverage.sh "${cpus[0]}"
   local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    b1_cleanup
+    trap - EXIT TERM INT
+    return "$rc"
+  fi
+
+  # Pre-placement routing. `route` reads and canonicalises the host model once
+  # through the same reader the discovery artifact records its identity with,
+  # validates the whole schema-2 carrier, performs one exact key lookup and
+  # writes the closed record. It exits 0 for a gating or a recorded route and
+  # nonzero only for a missing or corrupt carrier -- infrastructure corruption
+  # is not an unratified SKU.
+  local route_disposition route_topology
+  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
+  python3 "$B1_PROBE_PLANNER" route \
+    --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \
+    --out "$B1_ROUTE_RECORD"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    b1_cleanup
+    trap - EXIT TERM INT
+    return "$rc"
+  fi
+  # The shell's ONLY branch values, from one closed read. It never parses JSON,
+  # rereads the carrier, chooses a model or reconstructs a topology.
+  IFS=$'\t' read -r route_disposition route_topology < <(
+    python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"
+  )
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$route_disposition" ]; then
+    echo "integration-test.sh: b1 could not read the route record $B1_ROUTE_RECORD" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  if [ "$route_disposition" = "recorded" ] && [ "$route_topology" = "none" ]; then
+    echo "integration-test.sh: b1 recorded a non-gating route; no live workload ran. See $B1_ROUTE_RECORD"
+    b1_cleanup
+    trap - EXIT TERM INT
+    if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
+    return 0
+  fi
+  if [ "$route_disposition" != "gating" ] || [ -z "$route_topology" ] || [ "$route_topology" = "none" ]; then
+    echo "integration-test.sh: b1 read an unusable route ($route_disposition/$route_topology)" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+
+  # A ratified model. Only now does the target need four allowed CPUs, and
+  # only over the SAME array coverage's one-CPU floor was evaluated on.
+  if [ "${#cpus[@]}" -lt 4 ]; then
+    echo "integration-test.sh: b1 needs at least 4 available logical CPUs, this host offers ${#cpus[@]}" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  # GC-3 (FP-GC3-1): the CI-scale reference deployment is defined over two
+  # complete two-thread SMT sibling pairs, because a CPU id proves nothing
+  # about a physical core -- `0-1` is one core on a hosted four-vCPU guest
+  # and two different cores on the i7 replica. A host without two complete pairs
+  # cannot host this measurement; it gets a named prerequisite failure and
+  # never four unrelated CPUs. This is NOT a skip: the target returns nonzero.
+  local -a sibling_pairs=()
+  mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")
+  if [ "${#sibling_pairs[@]}" -lt 2 ]; then
+    echo "integration-test.sh: b1 needs two complete two-thread SMT sibling pairs inside its allowed CPU set ($(b1_canonical_cpu_list "${cpus[@]}")); this host offers ${#sibling_pairs[@]}" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  # The planner is the single topology authority here too: the shell supplies
+  # the observed pairs and the route-selected class, and gets back the written
+  # schema-3 contract's driver CPU list. No role mapping, cardinality, profile
+  # or model value crosses this boundary.
+  local driver_cpus
+  driver_cpus="$(python3 "$B1_PROBE_PLANNER" contract-selected \
+    --topology "$route_topology" \
+    --pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \
+    --run-id "$B1_RUN_ID" \
+    --out "$B1_RUN_DIR/placement.json")"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$driver_cpus" ]; then
+    echo "integration-test.sh: b1 could not render the selected topology $route_topology" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  cat > "$B1_RUN_DIR/driver-live.sh" <<'B1_CI_SCALE_LIVE'
+set -uo pipefail
+cd /workspace
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
+B1_CI_SCALE_LIVE
+  b1_run_driver driver-live.sh "$driver_cpus"
+  rc=$?
   b1_cleanup
   trap - EXIT TERM INT
   if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi

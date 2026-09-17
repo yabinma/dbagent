@@ -9,9 +9,13 @@ authority for:
   under (``TOPOLOGY_CLASSES``), and the 28 arms one discovery run measures;
 * the closed schema-3 launch contract each arm is launched with;
 * the closed ``met``/``missed`` vocabulary a discovery arm records;
-* the closed discovery artifact, and what makes one ``invalid``; and
-* the immutable selector that turns two independent complete EPYC 7763
-  artifacts into exactly one ``selected`` or ``unhostable`` decision.
+* the closed discovery artifact, and what makes one ``invalid``;
+* the immutable selector that turns two independent complete artifacts of ONE
+  exact CPU model into exactly one ``selected`` or ``unhostable`` decision for
+  that model, merged into the model-keyed schema-2 carrier; and
+* the pre-placement ``route`` / ``route-fields`` / ``contract-selected``
+  commands the ordinary ``b1`` launcher branches on, after its unconditional
+  container-free coverage phase and before any live process exists.
 
 It is deliberately importable with nothing but the standard library, because
 the shell launcher runs the planner and the collector on the *host* -- outside
@@ -34,6 +38,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 
 
@@ -57,12 +62,21 @@ ARTIFACT_SCHEMA = 1
 TOPOLOGY_SET_VERSION = 1
 
 PROBE_PROFILE_NAME = "ci-scale-probe"
+#: The ordinary CI-scale gate's profile. Under GC-3 its launch contract is
+#: schema 3 as well -- it carries the ratified topology of the exact host model
+#: -- but it has no round or orientation: it is not a discovery arm.
+SELECTED_PROFILE_NAME = "ci-scale"
 PROBE_JOB = "b1-topology-probe"
 PLACEMENT_MECHANISM = "sched-affinity"
 REFERENCE_LOGICAL_CPUS = 4
-#: The exact SKU this slice's decision is admitted from. A different model may
-#: still produce a complete artifact; it simply cannot ratify a topology.
-REFERENCE_CPU_MODEL = "AMD EPYC 7763 64-Core Processor"
+#: There is deliberately NO reference-SKU literal here. The standard
+#: `ubuntu-latest` four-vCPU pool rotates among exact CPU model strings, so
+#: evidence, ratification and routing are keyed by the exact canonical model an
+#: artifact or a host reports, and a pair is admitted only when the two
+#: artifacts' own validated model strings are equal to each other. There is no
+#: allowlist of manufacturer, family or SKU text, and no prefix, vendor or
+#: case-fold fallback: an unknown spelling is an unratified model, never a
+#: borrowed decision.
 ROLES = ("gateway", "postgres", "driver")
 ROUNDS = (0, 1)
 ORIENTATIONS = (0, 1)
@@ -116,6 +130,7 @@ CI_SCALE_MAX_IN_FLIGHT = 500
 #: Closed artifact/record failure codes.
 FAILURE_CODES = (
     "unsupported_topology",
+    "cpu_model_unavailable",
     "arm_failed",
     "missing_arm",
     "duplicate_arm",
@@ -131,10 +146,60 @@ ARTIFACT_INVALID = "invalid"
 
 DECISION_SELECTED = "selected"
 DECISION_UNHOSTABLE = "unhostable"
-DECISION_SCHEMA = 1
+#: Schema 2 is the model-keyed carrier: one `models` map whose keys are exact
+#: canonical CPU model strings and whose values are that model's own decision.
+#: It is not a migration of schema 1 (one flat decision for one fixed SKU);
+#: nothing reads schema 1 and there is no compatibility fallback.
+DECISION_SCHEMA = 2
 #: The named, fail-closed reason the two delivery carriers report while the
 #: decision file does not exist. It never becomes a skip and never a default.
 DECISION_MISSING_REASON = "gc3_decision_missing"
+#: ...and the distinct reason for a carrier that exists but is corrupt.
+#: Infrastructure corruption is never an unratified SKU.
+DECISION_INVALID_REASON = "gc3_decision_invalid"
+#: The tracked carrier, relative to the repository root, and the exact path the
+#: driver container reads it at through its existing read-only source mount.
+DECISION_CARRIER_REL = "tests/benchmark/b1_topology_decision.json"
+
+#: A decision-eligible CPU model string. Nonempty, at most this many Unicode
+#: code points, no control character, and never the `unknown` sentinel the
+#: reader falls back to.
+CPU_MODEL_MAX_CODE_POINTS = 256
+CPU_MODEL_UNKNOWN = "unknown"
+
+# --- FP-GC3-4: the pre-placement route -------------------------------------
+#: The route record's own schema.
+ROUTE_SCHEMA = 1
+ROUTE_STATE_SELECTED = "selected"
+ROUTE_STATE_UNHOSTABLE = "unhostable"
+ROUTE_STATE_ABSENT = "absent"
+ROUTE_STATE_UNAVAILABLE = "unavailable"
+ROUTE_STATE_INVALID = "invalid"
+ROUTE_STATES = (
+    ROUTE_STATE_SELECTED,
+    ROUTE_STATE_UNHOSTABLE,
+    ROUTE_STATE_ABSENT,
+    ROUTE_STATE_UNAVAILABLE,
+    ROUTE_STATE_INVALID,
+)
+ROUTE_GATING = "gating"
+ROUTE_RECORDED = "recorded"
+ROUTE_FAILURE = "failure"
+ROUTE_DISPOSITIONS = (ROUTE_GATING, ROUTE_RECORDED, ROUTE_FAILURE)
+#: The recorded, non-gating reason for an exact model that has no ratified
+#: topology -- because its entry says `unhostable`, or because it has no entry
+#: at all. Another model's entry is never a fallback.
+ROUTE_UNRATIFIED_REASON_PREFIX = "topology_unratified_sku:"
+#: ...and the distinct recorded reason for a model that could not be read or
+#: does not meet the model-string rules above.
+ROUTE_MODEL_UNAVAILABLE_REASON = "topology_cpu_model_unavailable"
+ROUTE_KEYS = (
+    "schema", "profile", "cpuModel", "decisionState", "disposition", "reason",
+    "topology", "cardinality", "placementSchema",
+)
+ROUTE_NONE = "none"
+#: The one line `route` prints on stdout, retained in the benchmark step log.
+ROUTE_STDOUT_PREFIX = "B1 topology_route="
 
 _RUN_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -321,8 +386,8 @@ def parse_sibling_map(rendered: str) -> dict[int, frozenset[int]]:
 #
 # Positions are (a, b) = the first complete sibling pair and (c, d) = the
 # second, so every class below is a *relationship*, not a CPU-id literal: the
-# same seven classes mean the same thing on the 7763 runner (pairs 0-1, 2-3)
-# and on an i7 replica (pairs 0,8 and 1,9).
+# same seven classes mean the same thing on a hosted four-vCPU runner (pairs
+# 0-1 and 2-3) and on an i7 replica (pairs 0,8 and 1,9).
 # ---------------------------------------------------------------------------
 
 POSITIONS = ("a", "b", "c", "d")
@@ -502,6 +567,11 @@ PROBE_CONTRACT_KEYS = frozenset(
         "mechanism", "topology", "round", "orientation", "roles",
     }
 )
+#: The ordinary CI-scale gate's schema-3 contract: the same document without a
+#: round or an orientation, because it is one ratified placement and not a
+#: discovery arm. Orientation 0 is the only rendering `contract-selected` emits.
+SELECTED_CONTRACT_KEYS = PROBE_CONTRACT_KEYS - {"round", "orientation"}
+SELECTED_ORIENTATION = 0
 
 
 def arm_contract(arm: dict, run_id: str) -> dict:
@@ -522,6 +592,74 @@ def arm_contract(arm: dict, run_id: str) -> dict:
     }
 
 
+def selected_contract(topology: str, pairs, run_id: str) -> dict:
+    """The ordinary CI-scale schema-3 contract for one ratified topology.
+
+    ``pairs`` are the two complete sibling pairs the launcher observed; the
+    class map is applied at the fixed orientation 0. The shell supplies the
+    observed pairs and the route-selected class and nothing else -- it never
+    becomes a second topology author, and no role mapping, cardinality,
+    profile or model value can be passed in.
+    """
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        raise TopologyProbeError(f"runId must be 32 lowercase hex characters; got {run_id!r}")
+    _topology_class(topology)
+    normalized: list[tuple[int, int]] = []
+    for pair in pairs:
+        cpus = sorted(parse_cpu_list(pair) if isinstance(pair, str) else set(pair))
+        if len(cpus) != 2:
+            raise TopologyProbeError(f"sibling pair {pair!r} is not two CPUs")
+        normalized.append((cpus[0], cpus[1]))
+    if len(normalized) != 2:
+        raise TopologyProbeError(f"expected exactly two sibling pairs; got {pairs!r}")
+    normalized.sort()
+    pair0, pair1 = normalized
+    reference = frozenset((*pair0, *pair1))
+    if len(reference) != REFERENCE_LOGICAL_CPUS:
+        raise TopologyProbeError(
+            f"sibling pairs {pairs!r} are not disjoint; they cover {sorted(reference)}"
+        )
+    mapping = topology_mapping(topology, pair0, pair1, SELECTED_ORIENTATION)
+    return {
+        "schema": CONTRACT_SCHEMA,
+        "runId": run_id,
+        "profile": SELECTED_PROFILE_NAME,
+        "referenceLogicalCpus": REFERENCE_LOGICAL_CPUS,
+        "referenceCpus": format_cpu_list(reference),
+        "mechanism": PLACEMENT_MECHANISM,
+        "topology": topology,
+        "roles": {role: {"allowedCpus": format_cpu_list(mapping[role])} for role in ROLES},
+    }
+
+
+def parse_contract(payload: object, *, pairs=None) -> dict:
+    """Validate either schema-3 contract -- one arm's, or the ratified gate's.
+
+    The profile selects the shape: the discovery profile carries a round and an
+    orientation, the ordinary CI-scale profile carries neither and is always
+    rendered at orientation 0. Every other rule -- closed keys, canonical CPU
+    lists, role cardinalities, disjointness, the zero-or-one unassigned CPU and
+    the independently reconstructed mapping -- is the same code for both.
+    """
+    if not isinstance(payload, dict):
+        raise TopologyProbeError(f"launch contract is not a JSON object: {type(payload).__name__}")
+    profile = payload.get("profile")
+    if profile == SELECTED_PROFILE_NAME:
+        return parse_selected_contract(payload, pairs=pairs)
+    return parse_arm_contract(payload, pairs=pairs)
+
+
+def parse_selected_contract(payload: object, *, pairs=None) -> dict:
+    """Validate the ordinary CI-scale schema-3 contract."""
+    return _parse_topology_contract(
+        payload,
+        pairs=pairs,
+        profile=SELECTED_PROFILE_NAME,
+        keys=SELECTED_CONTRACT_KEYS,
+        carries_arm_position=False,
+    )
+
+
 def parse_arm_contract(payload: object, *, pairs=None) -> dict:
     """Validate a schema-3 probe contract and reconstruct its mapping.
 
@@ -537,17 +675,29 @@ def parse_arm_contract(payload: object, *, pairs=None) -> dict:
     it the check falls back to "some pairing of the reference set derives this",
     which is all a bare contract can support.
     """
+    return _parse_topology_contract(
+        payload,
+        pairs=pairs,
+        profile=PROBE_PROFILE_NAME,
+        keys=PROBE_CONTRACT_KEYS,
+        carries_arm_position=True,
+    )
+
+
+def _parse_topology_contract(
+    payload: object, *, pairs, profile: str, keys: frozenset, carries_arm_position: bool
+) -> dict:
     if not isinstance(payload, dict):
         raise TopologyProbeError(f"launch contract is not a JSON object: {type(payload).__name__}")
-    keys = set(payload)
-    if keys != PROBE_CONTRACT_KEYS:
+    got_keys = set(payload)
+    if got_keys != set(keys):
         raise TopologyProbeError(
             f"closed schema-{CONTRACT_SCHEMA} probe contract keys "
-            f"{sorted(PROBE_CONTRACT_KEYS)}; got {sorted(keys)}"
+            f"{sorted(keys)}; got {sorted(got_keys)}"
         )
     if payload["schema"] != CONTRACT_SCHEMA:
         raise TopologyProbeError(f"unsupported contract schema {payload['schema']!r}")
-    if payload["profile"] != PROBE_PROFILE_NAME:
+    if payload["profile"] != profile:
         raise TopologyProbeError(f"unsupported probe profile {payload['profile']!r}")
     if payload["mechanism"] != PLACEMENT_MECHANISM:
         raise TopologyProbeError(f"unsupported mechanism {payload['mechanism']!r}")
@@ -561,14 +711,20 @@ def parse_arm_contract(payload: object, *, pairs=None) -> dict:
         raise TopologyProbeError(f"runId must be 32 lowercase hex characters; got {run_id!r}")
     topology = payload["topology"]
     _topology_class(topology)
-    round_ = payload["round"]
-    orientation = payload["orientation"]
-    if isinstance(round_, bool) or round_ not in ROUNDS:
-        raise TopologyProbeError(f"round must be one of {list(ROUNDS)}; got {round_!r}")
-    if isinstance(orientation, bool) or orientation not in ORIENTATIONS:
-        raise TopologyProbeError(
-            f"orientation must be one of {list(ORIENTATIONS)}; got {orientation!r}"
-        )
+    if carries_arm_position:
+        round_ = payload["round"]
+        orientation = payload["orientation"]
+        if isinstance(round_, bool) or round_ not in ROUNDS:
+            raise TopologyProbeError(f"round must be one of {list(ROUNDS)}; got {round_!r}")
+        if isinstance(orientation, bool) or orientation not in ORIENTATIONS:
+            raise TopologyProbeError(
+                f"orientation must be one of {list(ORIENTATIONS)}; got {orientation!r}"
+            )
+    else:
+        # The ratified gate is one placement, not an arm: it is rendered at the
+        # fixed orientation 0 and carries no round.
+        round_ = None
+        orientation = SELECTED_ORIENTATION
     reference_raw = payload["referenceCpus"]
     reference = parse_cpu_list(reference_raw)
     if format_cpu_list(reference) != reference_raw:
@@ -611,11 +767,11 @@ def parse_arm_contract(payload: object, *, pairs=None) -> dict:
     return {
         "schema": CONTRACT_SCHEMA,
         "run_id": run_id,
-        "profile": PROBE_PROFILE_NAME,
+        "profile": profile,
         "mechanism": PLACEMENT_MECHANISM,
         "topology": topology,
         "round": round_,
-        "orientation": orientation,
+        "orientation": orientation if carries_arm_position else None,
         "reference_cpus": reference,
         "roles": {role: declared[role] for role in ROLES},
         "unassigned": unassigned,
@@ -954,6 +1110,14 @@ def collect_artifact(plan: dict, records: list, *, failure: dict | None = None) 
         seen_run_ids.add(record["runId"])
         valid.append(record)
 
+    # FP-GC3-3/4: an artifact whose own model string is unreadable or outside
+    # the closed validity rules cannot key a decision, so it is `invalid` with
+    # its own named code rather than a complete record under the `unknown`
+    # sentinel.
+    if not is_decision_eligible_cpu_model(base["cpuModel"]):
+        problems.append(f"cpuModel {base['cpuModel']!r} is not decision eligible")
+        code = code or "cpu_model_unavailable"
+
     planned_indexes = set(range(ARMS_PER_ARTIFACT))
     unknown = sorted(set(seen_index) - planned_indexes)
     if unknown:
@@ -1049,8 +1213,55 @@ def validate_artifact(payload: object) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def admit_evidence(first: dict, second: dict) -> None:
-    """The six admission properties of a pair of decision artifacts."""
+def validate_cpu_model(value: object) -> str:
+    """A decision-eligible exact CPU model string, or raise.
+
+    The rules are closed and contain no manufacturer, family or SKU text: a
+    model is eligible when it is a nonempty string of at most
+    ``CPU_MODEL_MAX_CODE_POINTS`` code points, carries no control character,
+    and is not the ``unknown`` sentinel the reader falls back to. Exact
+    normalized text is the only decision key -- there is no prefix, family,
+    vendor or case-fold fallback anywhere in this module.
+    """
+    if not isinstance(value, str):
+        raise TopologyProbeError(f"cpuModel is not a string: {value!r}")
+    if not value:
+        raise TopologyProbeError("cpuModel is empty")
+    if value == CPU_MODEL_UNKNOWN:
+        raise TopologyProbeError(
+            f"cpuModel {CPU_MODEL_UNKNOWN!r} is the unreadable-host sentinel; it is never a "
+            "decision key"
+        )
+    if len(value) > CPU_MODEL_MAX_CODE_POINTS:
+        raise TopologyProbeError(
+            f"cpuModel holds {len(value)} code points; at most {CPU_MODEL_MAX_CODE_POINTS}"
+        )
+    for char in value:
+        if ord(char) < 0x20 or ord(char) == 0x7F:
+            raise TopologyProbeError(f"cpuModel carries the control character {char!r}")
+    if value != " ".join(value.split()):
+        raise TopologyProbeError(f"cpuModel {value!r} is not whitespace-canonical")
+    return value
+
+
+def is_decision_eligible_cpu_model(value: object) -> bool:
+    """``validate_cpu_model`` as a predicate. No second set of rules."""
+    try:
+        validate_cpu_model(value)
+    except TopologyProbeError:
+        return False
+    return True
+
+
+def admit_evidence(first: dict, second: dict) -> str:
+    """The six admission properties of one model's pair, and that model.
+
+    The model is not compared against a literal: both artifacts must carry the
+    SAME validated canonical `cpuModel`, and that string becomes the decision
+    key. Evidence for one model therefore never satisfies, competes with,
+    changes the rank of or blocks another model.
+    """
+    models: list[str] = []
     for artifact in (first, second):
         validate_artifact(artifact)
         if artifact["logicalCpuCount"] != REFERENCE_LOGICAL_CPUS:
@@ -1058,10 +1269,10 @@ def admit_evidence(first: dict, second: dict) -> None:
                 f"artifact reports {artifact['logicalCpuCount']!r} logical CPUs; the reference "
                 f"runner has {REFERENCE_LOGICAL_CPUS}"
             )
-        if artifact["cpuModel"] != REFERENCE_CPU_MODEL:
+        models.append(validate_cpu_model(artifact["cpuModel"]))
+        if artifact["githubJob"] != PROBE_JOB:
             raise TopologyProbeError(
-                f"artifact cpuModel {artifact['cpuModel']!r} is not {REFERENCE_CPU_MODEL!r}; it is "
-                "retained as a diagnostic and cannot ratify a topology"
+                f"artifact githubJob {artifact['githubJob']!r} is not {PROBE_JOB!r}"
             )
         pairs = artifact["siblingPairs"]
         if not isinstance(pairs, list) or len(pairs) != 2:
@@ -1088,6 +1299,12 @@ def admit_evidence(first: dict, second: dict) -> None:
         raise TopologyProbeError(
             f"artifacts were produced at different heads: {first['headSha']} vs {second['headSha']}"
         )
+    if models[0] != models[1]:
+        raise TopologyProbeError(
+            f"artifacts report different CPU models ({models[0]!r} vs {models[1]!r}); one model's "
+            "evidence cannot ratify another model and the pair is not admissible"
+        )
+    return models[0]
 
 
 def eligible_topologies(artifact: dict) -> tuple[str, ...]:
@@ -1135,7 +1352,14 @@ def score_topology(artifacts: tuple[dict, dict], topology: str) -> tuple[float, 
 
 
 def select_topology(first: dict, second: dict) -> dict:
-    """The decision: exactly one selected class, or ``unhostable``."""
+    """One exact model's decision entry: exactly one selected class, or unhostable.
+
+    The entry is complete on its own -- status, the head both artifacts share,
+    the chosen topology, that topology's derived cardinality, the placement
+    schema the gate will be launched under, the ordered ratifiable list and the
+    exact score operands -- because a model's outcome may never be read out of
+    another model's entry or out of a slice-wide default.
+    """
     admit_evidence(first, second)
     artifacts = (first, second)
     ratifiable = tuple(
@@ -1143,75 +1367,376 @@ def select_topology(first: dict, second: dict) -> dict:
         for topology in eligible_topologies(first)
         if topology in eligible_topologies(second)
     )
-    decision = {
-        "schema": DECISION_SCHEMA,
-        "topologySetVersion": TOPOLOGY_SET_VERSION,
-        "headSha": first["headSha"],
+    entry = {
+        "status": DECISION_UNHOSTABLE,
+        "evidenceHeadSha": first["headSha"],
+        "selected": None,
+        "cardinality": None,
+        "placementSchema": None,
         "ratifiable": list(ratifiable),
-        "evidence": [
-            {
-                "githubRunId": artifact["githubRunId"],
-                "githubRunAttempt": artifact["githubRunAttempt"],
-                "githubJob": artifact["githubJob"],
-                "cpuModel": artifact["cpuModel"],
-            }
-            for artifact in artifacts
-        ],
+        "score": None,
     }
     if not ratifiable:
-        decision["status"] = DECISION_UNHOSTABLE
-        decision["selected"] = None
-        decision["score"] = None
-        return decision
+        return entry
     scored = sorted(score_topology(artifacts, topology) for topology in ratifiable)
     winner = scored[0]
-    decision["status"] = DECISION_SELECTED
-    decision["selected"] = winner[3]
-    decision["score"] = {
+    entry["status"] = DECISION_SELECTED
+    entry["selected"] = winner[3]
+    entry["cardinality"] = topology_cardinality(winner[3])
+    entry["placementSchema"] = CONTRACT_SCHEMA
+    entry["score"] = {
         "maxP99Ms": winner[0],
         "maxInFlight": winner[1],
         "minServedRate": -winner[2],
     }
-    return decision
+    return entry
 
 
 def digest_of(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def build_decision(first_path: Path, second_path: Path) -> dict:
-    """The tracked decision carrier: the result plus both complete artifacts."""
-    first = json.loads(Path(first_path).read_text(encoding="utf-8"))
-    second = json.loads(Path(second_path).read_text(encoding="utf-8"))
-    decision = select_topology(first, second)
-    decision["artifacts"] = [
-        {
-            "githubRunId": artifact["githubRunId"],
-            "githubRunAttempt": artifact["githubRunAttempt"],
-            "url": f"https://github.com/yabinma/dbagent/actions/runs/{artifact['githubRunId']}",
-            "sha256": digest_of(path),
-            "artifact": artifact,
-        }
-        for artifact, path in ((first, first_path), (second, second_path))
+def _evidence_wrapper(artifact: dict, path: Path) -> dict:
+    """One embedded complete artifact: its run URL, its digest and its bytes."""
+    url = f"https://github.com/yabinma/dbagent/actions/runs/{artifact['githubRunId']}"
+    if not _HTTPS_RUN_URL_RE.match(url):
+        raise TopologyProbeError(f"evidence URL {url!r} is not an https GitHub run URL")
+    return {"sourceUrl": url, "sha256": digest_of(path), "artifact": artifact}
+
+
+def _ordered_pair(paths) -> tuple[Path, Path]:
+    """The pair, ordered by numeric GitHub run id then run attempt."""
+    entries = []
+    for path in paths:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TopologyProbeError(f"{path}: artifact is not an object")
+        run_id = payload.get("githubRunId")
+        attempt = payload.get("githubRunAttempt")
+        if not (isinstance(run_id, str) and _DECIMAL_RE.match(run_id)):
+            raise TopologyProbeError(f"{path}: githubRunId {run_id!r} is not decimal text")
+        if not (isinstance(attempt, str) and _DECIMAL_RE.match(attempt)):
+            raise TopologyProbeError(f"{path}: githubRunAttempt {attempt!r} is not decimal text")
+        entries.append((int(run_id), int(attempt), Path(path)))
+    entries.sort()
+    return entries[0][2], entries[1][2]
+
+
+def build_decision(pair_paths, base_path=None) -> dict:
+    """Merge one model's pair into the model-keyed carrier.
+
+    One invocation admits exactly one exact model. Every entry already in the
+    base carrier is validated and independently recomputed before it is
+    preserved, a second nonidentical decision for an already decided model is
+    refused, and a rejected model-X invocation therefore cannot mutate,
+    reorder or erase model Y's entry.
+    """
+    first_path, second_path = _ordered_pair(pair_paths)
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    second = json.loads(second_path.read_text(encoding="utf-8"))
+    model = admit_evidence(first, second)
+    entry = select_topology(first, second)
+    entry["artifacts"] = [
+        _evidence_wrapper(first, first_path),
+        _evidence_wrapper(second, second_path),
     ]
-    for entry in decision["artifacts"]:
-        if not _HTTPS_RUN_URL_RE.match(entry["url"]):
-            raise TopologyProbeError(f"evidence URL {entry['url']!r} is not an https GitHub run URL")
+    models: dict[str, dict] = {}
+    if base_path is not None:
+        base = json.loads(Path(base_path).read_text(encoding="utf-8"))
+        validate_decision(base)
+        models = dict(base["models"])
+    if model in models and models[model] != entry:
+        raise TopologyProbeError(
+            f"{model!r} already has a decision in the base carrier and this pair derives a "
+            "different one; a decided model is never silently re-decided"
+        )
+    models[model] = entry
+    decision = {
+        "schema": DECISION_SCHEMA,
+        "topologySetVersion": TOPOLOGY_SET_VERSION,
+        "models": models,
+    }
+    validate_decision(decision)
     return decision
 
 
 def recompute_decision(decision: dict) -> dict:
-    """Re-run the selector over a carrier's own embedded artifacts, offline."""
-    embedded = decision.get("artifacts")
-    if not isinstance(embedded, list) or len(embedded) != 2:
-        raise TopologyProbeError("a decision embeds exactly two complete artifacts")
-    for entry in embedded:
-        canonical = canonical_json(entry["artifact"])
-        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != entry["sha256"]:
+    """Re-run the selector over every entry's own embedded artifacts, offline."""
+    if not isinstance(decision, dict):
+        raise TopologyProbeError(f"decision is not an object: {type(decision).__name__}")
+    models = decision.get("models")
+    if not isinstance(models, dict) or not models:
+        raise TopologyProbeError("a decision carries a nonempty models map")
+    out: dict[str, dict] = {}
+    for model, entry in models.items():
+        validate_cpu_model(model)
+        if not isinstance(entry, dict):
+            raise TopologyProbeError(f"{model!r}: entry is not an object")
+        embedded = entry.get("artifacts")
+        if not isinstance(embedded, list) or len(embedded) != 2:
+            raise TopologyProbeError(f"{model!r}: an entry embeds exactly two complete artifacts")
+        seen_runs: set[str] = set()
+        for wrapper in embedded:
+            if not isinstance(wrapper, dict) or set(wrapper) != {"sourceUrl", "sha256", "artifact"}:
+                raise TopologyProbeError(
+                    f"{model!r}: evidence wrapper keys are exactly "
+                    f"['artifact', 'sha256', 'sourceUrl']; got {sorted(wrapper)}"
+                    if isinstance(wrapper, dict) else f"{model!r}: evidence wrapper is not an object"
+                )
+            artifact = wrapper["artifact"]
+            if not isinstance(artifact, dict):
+                raise TopologyProbeError(f"{model!r}: embedded artifact is not an object")
+            run_id = artifact.get("githubRunId")
+            if run_id in seen_runs:
+                raise TopologyProbeError(f"{model!r}: duplicate evidence for run {run_id!r}")
+            seen_runs.add(run_id)
+            if not _HTTPS_RUN_URL_RE.match(str(wrapper["sourceUrl"])):
+                raise TopologyProbeError(
+                    f"{model!r}: evidence URL {wrapper['sourceUrl']!r} is not an https GitHub "
+                    "run URL"
+                )
+            if str(run_id) not in str(wrapper["sourceUrl"]):
+                raise TopologyProbeError(
+                    f"{model!r}: evidence URL {wrapper['sourceUrl']!r} does not name run {run_id!r}"
+                )
+            canonical = canonical_json(artifact)
+            if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != wrapper["sha256"]:
+                raise TopologyProbeError(
+                    f"{model!r}: embedded artifact for run {run_id!r} does not match its digest"
+                )
+            if artifact.get("cpuModel") != model:
+                raise TopologyProbeError(
+                    f"{model!r}: embedded artifact reports cpuModel "
+                    f"{artifact.get('cpuModel')!r}; a model key is the artifacts' own model"
+                )
+        recomputed = select_topology(embedded[0]["artifact"], embedded[1]["artifact"])
+        recomputed["artifacts"] = list(embedded)
+        out[model] = recomputed
+    return out
+
+
+def validate_decision(payload: object) -> dict:
+    """The closed schema-2 carrier, recomputed from its own evidence, or raise."""
+    if not isinstance(payload, dict):
+        raise TopologyProbeError(f"decision is not an object: {type(payload).__name__}")
+    if set(payload) != {"schema", "topologySetVersion", "models"}:
+        raise TopologyProbeError(
+            f"closed decision keys ['models', 'schema', 'topologySetVersion']; "
+            f"got {sorted(payload)}"
+        )
+    if payload["schema"] != DECISION_SCHEMA:
+        raise TopologyProbeError(
+            f"unsupported decision schema {payload['schema']!r}; this slice reads only "
+            f"schema {DECISION_SCHEMA} and migrates nothing"
+        )
+    if payload["topologySetVersion"] != TOPOLOGY_SET_VERSION:
+        raise TopologyProbeError(
+            f"decision topologySetVersion {payload['topologySetVersion']!r} is not "
+            f"{TOPOLOGY_SET_VERSION}"
+        )
+    models = payload["models"]
+    if not isinstance(models, dict) or not models:
+        raise TopologyProbeError("a decision carries a nonempty models map")
+    recomputed = recompute_decision(payload)
+    for model, entry in models.items():
+        if set(entry) != DECISION_ENTRY_KEYS:
             raise TopologyProbeError(
-                f"embedded artifact for run {entry.get('githubRunId')!r} does not match its digest"
+                f"{model!r}: closed entry keys {sorted(DECISION_ENTRY_KEYS)}; got {sorted(entry)}"
             )
-    return select_topology(embedded[0]["artifact"], embedded[1]["artifact"])
+        if entry["status"] not in (DECISION_SELECTED, DECISION_UNHOSTABLE):
+            raise TopologyProbeError(f"{model!r}: unknown status {entry['status']!r}")
+        if entry != recomputed[model]:
+            raise TopologyProbeError(
+                f"{model!r}: the stored entry is not what the selector derives from its own "
+                "embedded artifacts"
+            )
+        if entry["status"] == DECISION_SELECTED:
+            if entry["selected"] not in TOPOLOGY_IDS:
+                raise TopologyProbeError(f"{model!r}: selected {entry['selected']!r}")
+            if entry["cardinality"] != topology_cardinality(entry["selected"]):
+                raise TopologyProbeError(f"{model!r}: cardinality is not topology-derived")
+            if entry["placementSchema"] != CONTRACT_SCHEMA:
+                raise TopologyProbeError(
+                    f"{model!r}: placementSchema {entry['placementSchema']!r}"
+                )
+        else:
+            for null_field in ("selected", "cardinality", "placementSchema", "score"):
+                if entry[null_field] is not None:
+                    raise TopologyProbeError(
+                        f"{model!r}: an unhostable entry carries no {null_field}"
+                    )
+            if entry["ratifiable"] != []:
+                raise TopologyProbeError(f"{model!r}: an unhostable entry ratifies nothing")
+        if not _SHA_RE.match(str(entry["evidenceHeadSha"])):
+            raise TopologyProbeError(f"{model!r}: evidenceHeadSha {entry['evidenceHeadSha']!r}")
+    return payload
+
+
+DECISION_ENTRY_KEYS = frozenset(
+    {
+        "status", "evidenceHeadSha", "selected", "cardinality", "placementSchema",
+        "ratifiable", "score", "artifacts",
+    }
+)
+
+
+def write_canonical(path: Path, payload: dict) -> None:
+    """Write canonical JSON atomically: a reader never sees a partial carrier."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp")
+    temporary.write_text(canonical_json(payload), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+# ---------------------------------------------------------------------------
+# FP-GC3-4 — the pre-placement route
+#
+# This is the ONLY place the exact host model is turned into a launcher
+# decision. It reads the model once through the same reader the probe records
+# its identity with, validates the whole carrier, performs one exact key
+# lookup, and writes a closed record. It takes no profile, model, topology,
+# status or reason argument: every value below comes from the carrier or from
+# the reader.
+# ---------------------------------------------------------------------------
+
+
+def _route_record(state: str, disposition: str, *, cpu_model, reason, entry=None) -> dict:
+    topology = cardinality = placement_schema = None
+    if entry is not None:
+        topology = entry["selected"]
+        cardinality = entry["cardinality"]
+        placement_schema = entry["placementSchema"]
+    return {
+        "schema": ROUTE_SCHEMA,
+        "profile": SELECTED_PROFILE_NAME,
+        "cpuModel": cpu_model,
+        "decisionState": state,
+        "disposition": disposition,
+        "reason": reason,
+        "topology": topology,
+        "cardinality": cardinality,
+        "placementSchema": placement_schema,
+    }
+
+
+def route_host(decision_path, *, cpu_model=None) -> dict:
+    """Classify this host against the model-keyed carrier. Never launches.
+
+    The reader runs first, but carrier validation still runs for a model that
+    could not be read: an unavailable reader may not hide a missing or corrupt
+    carrier, and infrastructure corruption is never reported as an unratified
+    SKU.
+    """
+    raw_model = host_cpu_model() if cpu_model is None else cpu_model
+    valid_model = is_decision_eligible_cpu_model(raw_model)
+    path = Path(decision_path)
+    if not path.is_file():
+        return _route_record(
+            ROUTE_STATE_INVALID, ROUTE_FAILURE,
+            cpu_model=raw_model if valid_model else None,
+            reason=DECISION_MISSING_REASON,
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        validate_decision(payload)
+    except (TopologyProbeError, ValueError, OSError):
+        return _route_record(
+            ROUTE_STATE_INVALID, ROUTE_FAILURE,
+            cpu_model=raw_model if valid_model else None,
+            reason=DECISION_INVALID_REASON,
+        )
+    if not valid_model:
+        return _route_record(
+            ROUTE_STATE_UNAVAILABLE, ROUTE_RECORDED,
+            cpu_model=None, reason=ROUTE_MODEL_UNAVAILABLE_REASON,
+        )
+    entry = payload["models"].get(raw_model)
+    if entry is None:
+        return _route_record(
+            ROUTE_STATE_ABSENT, ROUTE_RECORDED,
+            cpu_model=raw_model,
+            reason=f"{ROUTE_UNRATIFIED_REASON_PREFIX}{raw_model}",
+        )
+    if entry["status"] == DECISION_UNHOSTABLE:
+        return _route_record(
+            ROUTE_STATE_UNHOSTABLE, ROUTE_RECORDED,
+            cpu_model=raw_model,
+            reason=f"{ROUTE_UNRATIFIED_REASON_PREFIX}{raw_model}",
+        )
+    return _route_record(
+        ROUTE_STATE_SELECTED, ROUTE_GATING,
+        cpu_model=raw_model, reason=None, entry=entry,
+    )
+
+
+def validate_route(payload: object) -> dict:
+    """The closed schema-1 route record, or raise."""
+    if not isinstance(payload, dict):
+        raise TopologyProbeError(f"route record is not an object: {type(payload).__name__}")
+    if tuple(sorted(payload)) != tuple(sorted(ROUTE_KEYS)):
+        raise TopologyProbeError(
+            f"closed route keys {sorted(ROUTE_KEYS)}; got {sorted(payload)}"
+        )
+    if payload["schema"] != ROUTE_SCHEMA:
+        raise TopologyProbeError(f"unsupported route schema {payload['schema']!r}")
+    if payload["profile"] != SELECTED_PROFILE_NAME:
+        raise TopologyProbeError(f"route profile {payload['profile']!r}")
+    state, disposition = payload["decisionState"], payload["disposition"]
+    if state not in ROUTE_STATES:
+        raise TopologyProbeError(f"unknown decisionState {state!r}")
+    if disposition not in ROUTE_DISPOSITIONS:
+        raise TopologyProbeError(f"unknown disposition {disposition!r}")
+    expected = {
+        ROUTE_STATE_SELECTED: ROUTE_GATING,
+        ROUTE_STATE_UNHOSTABLE: ROUTE_RECORDED,
+        ROUTE_STATE_ABSENT: ROUTE_RECORDED,
+        ROUTE_STATE_UNAVAILABLE: ROUTE_RECORDED,
+        ROUTE_STATE_INVALID: ROUTE_FAILURE,
+    }[state]
+    if disposition != expected:
+        raise TopologyProbeError(f"{state} routes to {expected}, not {disposition}")
+    model = payload["cpuModel"]
+    if state == ROUTE_STATE_UNAVAILABLE and model is not None:
+        raise TopologyProbeError("an unavailable model is recorded as null")
+    if state in (ROUTE_STATE_SELECTED, ROUTE_STATE_UNHOSTABLE, ROUTE_STATE_ABSENT):
+        validate_cpu_model(model)
+    if state == ROUTE_STATE_SELECTED:
+        if payload["reason"] is not None:
+            raise TopologyProbeError("a gating route carries no reason")
+        if payload["topology"] not in TOPOLOGY_IDS:
+            raise TopologyProbeError(f"route topology {payload['topology']!r}")
+        if payload["cardinality"] != topology_cardinality(payload["topology"]):
+            raise TopologyProbeError("route cardinality is not topology-derived")
+        if payload["placementSchema"] != CONTRACT_SCHEMA:
+            raise TopologyProbeError(f"route placementSchema {payload['placementSchema']!r}")
+    else:
+        for null_field in ("topology", "cardinality", "placementSchema"):
+            if payload[null_field] is not None:
+                raise TopologyProbeError(f"a {state} route carries no {null_field}")
+        reason = payload["reason"]
+        if state in (ROUTE_STATE_UNHOSTABLE, ROUTE_STATE_ABSENT):
+            if reason != f"{ROUTE_UNRATIFIED_REASON_PREFIX}{model}":
+                raise TopologyProbeError(f"{state} reason {reason!r}")
+        elif state == ROUTE_STATE_UNAVAILABLE:
+            if reason != ROUTE_MODEL_UNAVAILABLE_REASON:
+                raise TopologyProbeError(f"{state} reason {reason!r}")
+        elif reason not in (DECISION_MISSING_REASON, DECISION_INVALID_REASON):
+            raise TopologyProbeError(f"{state} reason {reason!r}")
+    return payload
+
+
+def route_fields(payload: dict) -> str:
+    """The two closed branch values the shell reads, tab separated."""
+    validate_route(payload)
+    if payload["disposition"] == ROUTE_FAILURE:
+        raise TopologyProbeError(
+            f"route disposition {ROUTE_FAILURE} has no launcher branch; the target has already "
+            "returned nonzero"
+        )
+    if payload["disposition"] == ROUTE_GATING:
+        return f"{ROUTE_GATING}\t{payload['topology']}"
+    return f"{ROUTE_RECORDED}\t{ROUTE_NONE}"
 
 
 # ---------------------------------------------------------------------------
@@ -1358,9 +1883,52 @@ def _collect_command(args) -> int:
 
 
 def _decide_command(args) -> int:
-    decision = build_decision(Path(args.first), Path(args.second))
-    Path(args.out).write_text(canonical_json(decision), encoding="utf-8")
-    print(f"b1_topology_probe: {decision['status']} {decision['selected']}")
+    decision = build_decision(args.pair, args.base)
+    write_canonical(Path(args.out), decision)
+    for model, entry in sorted(decision["models"].items()):
+        print(f"b1_topology_probe: {model} {entry['status']} {entry['selected']}")
+    return 0
+
+
+def _route_command(args) -> int:
+    """FP-GC3-4: classify the host before pair discovery or any live process."""
+    record = route_host(args.decision)
+    validate_route(record)
+    rendered = canonical_json(record)
+    write_canonical(Path(args.out), record)
+    print(f"{ROUTE_STDOUT_PREFIX}{urllib.parse.quote(rendered, safe='')}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"B1 topology route: cpuModel={record['cpuModel']} "
+                f"decisionState={record['decisionState']} "
+                f"disposition={record['disposition']} reason={record['reason']}\n"
+            )
+    if record["disposition"] == ROUTE_FAILURE:
+        print(
+            f"b1_topology_probe: {record['reason']} ({record['decisionState']})", file=sys.stderr
+        )
+        return 1
+    return 0
+
+
+def _route_fields_command(args) -> int:
+    """The one closed read the shell performs: `<disposition><TAB><topology>`."""
+    raw = Path(args.route).read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    if canonical_json(payload) != raw:
+        raise TopologyProbeError(f"{args.route} is not canonical")
+    print(route_fields(payload))
+    return 0
+
+
+def _contract_selected_command(args) -> int:
+    """Render the ratified topology over the observed pairs, at orientation 0."""
+    contract = selected_contract(args.topology, args.pairs, args.run_id)
+    parse_selected_contract(contract, pairs=args.pairs)
+    Path(args.out).write_text(canonical_json(contract), encoding="utf-8")
+    print(contract["roles"]["driver"]["allowedCpus"])
     return 0
 
 
@@ -1389,13 +1957,37 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--exit-code", dest="exit_code", type=int, default=0)
     collect.set_defaults(handler=_collect_command)
 
-    # The decision generator: exactly two input paths and one output path. It
-    # has no candidate, threshold or tie-break option by construction.
+    # The decision generator: exactly one output path, exactly one two-value
+    # pair, and an optional base carrier to merge another model's entry into.
+    # It has no candidate, threshold, tie-break, model or topology option by
+    # construction, and takes no positional argument at all.
     decide = sub.add_parser("decide", help="select one topology, or record unhostable")
-    decide.add_argument("first")
-    decide.add_argument("second")
-    decide.add_argument("out")
+    decide.add_argument("--out", required=True)
+    decide.add_argument("--base", default=None)
+    decide.add_argument("--pair", required=True, nargs=2, dest="pair")
     decide.set_defaults(handler=_decide_command)
+
+    # FP-GC3-4: the pre-placement route. It accepts no profile, model,
+    # topology, status or reason argument -- every result value comes from the
+    # shared host reader and the closed carrier.
+    route = sub.add_parser("route", help="classify this host against the model-keyed carrier")
+    route.add_argument("--decision", required=True)
+    route.add_argument("--out", required=True)
+    route.set_defaults(handler=_route_command)
+
+    route_fields_parser = sub.add_parser("route-fields", help="print two closed branch values")
+    route_fields_parser.add_argument("--route", required=True)
+    route_fields_parser.set_defaults(handler=_route_fields_command)
+
+    # The ratified launch contract. It accepts a closed topology id, the two
+    # observed sibling pairs and a run id -- never a role mapping, a
+    # cardinality, a profile or a model.
+    contract_selected = sub.add_parser("contract-selected", help="write the ratified contract")
+    contract_selected.add_argument("--topology", required=True)
+    contract_selected.add_argument("--pairs", required=True, nargs=2)
+    contract_selected.add_argument("--run-id", required=True, dest="run_id")
+    contract_selected.add_argument("--out", required=True)
+    contract_selected.set_defaults(handler=_contract_selected_command)
     return parser
 
 
@@ -1404,7 +1996,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     try:
         return args.handler(args)
-    except TopologyProbeError as exc:
+    except (TopologyProbeError, OSError, ValueError) as exc:
         print(f"b1_topology_probe: {exc}", file=sys.stderr)
         return 1
 

@@ -107,13 +107,21 @@ B1_SIBLING_HOST = "127.0.0.1"
 # clean break: schema 2 carries CPU lists and a named mechanism, and carries no
 # quota or period key at all. Schema 1 is rejected outright -- shell and
 # fixture ship together and nothing stored is migrated.
-B1_PLACEMENT_SCHEMA = 2
+#
+# GC-3 (FP-GC3-4/5) splits the two lines apart for good. The PRODUCT-local
+# contract stays schema 2, byte-for-byte; both CI-scale contracts -- the
+# discovery arm and the ratified gate -- are schema 3, which carries the
+# topology ID, the reference CPU set and the intentionally unassigned CPU as
+# GATING fields. Schema 3 is not a migration of schema 2: it is a different
+# document, and there is no scalar "the B1 placement schema" any more.
+PRODUCT_PLACEMENT_SCHEMA = 2
 B1_PLACEMENT_MECHANISM = "sched-affinity"
-# GC-3 (FP-GC3-1): schema 3 is the topology-carrying contract. It is not a
-# migration of schema 2 -- it is a different document, with a topology ID, the
-# reference CPU set and the intentionally unassigned CPU as gating fields. The
-# product-local contract stays at schema 2 and is untouched by this slice.
 B1_TOPOLOGY_PLACEMENT_SCHEMA = probe.CONTRACT_SCHEMA
+#: The tracked model-keyed decision carrier, at the exact path the driver
+#: container reads it at through its existing read-only source mount. The host
+#: route record is deliberately NOT copied into B1_RUN_DIR: the live witness
+#: joins decision to fingerprint through this one shared file.
+B1_DECISION_CARRIER = Path("/workspace/tests/benchmark/b1_topology_decision.json")
 
 CI_SCALE_PROFILE_NAME = "ci-scale"
 PRODUCT_PROFILE_NAME = "product-exclusive"
@@ -121,9 +129,26 @@ PRODUCT_PROFILE_NAME = "product-exclusive"
 # below and never altered: a discovery arm measures the same burst the gate
 # measures, under a different placement.
 CI_SCALE_PROBE_PROFILE_NAME = probe.PROBE_PROFILE_NAME
-# Exact per-role affinity cardinalities. CI-scale takes the launcher's first
-# four available CPUs as 2/1/1; product takes the first eight as 4/3/1.
-CI_SCALE_AFFINITY_CARDINALITY = {"gateway": 2, "postgres": 1, "driver": 1}
+# Exact per-role affinity cardinalities.
+#
+# GC-3 (FP-GC3-4): the CI-scale allocation is no longer one fixed 2/1/1 over
+# "the first four available CPUs". It is decided per exact CPU model by the
+# tracked carrier, so the declaration surface here is a CLOSED MAP KEYED BY
+# EXACT `cpuModel`, generated entry by entry from each `selected` entry's own
+# topology, and every entry's cardinality is that topology's derived
+# cardinality. A model with no entry has no cardinality here and no live gate;
+# nothing is copied into a scalar default, and one model's entry is never
+# another model's fallback.
+#
+# EMPTY at this head ON PURPOSE: no model has yet earned two complete same-head
+# discovery artifacts, so the carrier does not exist and no CI-scale topology
+# is ratified for any model. The delivery and manifest guards pin this map
+# against the carrier's own `selected` entries, whatever their number.
+CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {}
+#: ...and the placement schema each selected model's ordinary gate launches
+#: under. Always schema 3 for a selected model; the fixed probe schema is 3 and
+#: the fixed product schema is `PRODUCT_PLACEMENT_SCHEMA`.
+CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL: "dict[str, int]" = {}
 PRODUCT_AFFINITY_CARDINALITY = {"gateway": 4, "postgres": 3, "driver": 1}
 CI_SCALE_REFERENCE_LOGICAL_CPUS = 4
 PRODUCT_MINIMUM_HOST_LOGICAL_CPUS = 8
@@ -271,15 +296,13 @@ class B1Profile:
 
     @property
     def affinity_cardinality(self) -> dict[str, int]:
-        if self.name == CI_SCALE_PROFILE_NAME:
-            return dict(CI_SCALE_AFFINITY_CARDINALITY)
         if self.name == PRODUCT_PROFILE_NAME:
             return dict(PRODUCT_AFFINITY_CARDINALITY)
-        # GC-3: the discovery profile has no fixed cardinality -- it is derived
-        # from the arm's topology class and carried on the declaration. Failing
-        # closed here is deliberate: a caller that asks the profile is asking
-        # the wrong object and must not silently receive another profile's
-        # allocation.
+        # GC-3: neither CI-scale profile has a fixed cardinality -- both are
+        # derived from the schema-3 contract's topology class and carried on
+        # the declaration. Failing closed here is deliberate: a caller that
+        # asks the profile is asking the wrong object and must not silently
+        # receive another profile's -- or another model's -- allocation.
         raise B1PlacementError(
             f"profile {self.name!r} has a topology-derived affinity cardinality; read it "
             f"from the parsed launch contract, not from the profile"
@@ -370,6 +393,19 @@ class B1PlacementDeclaration:
         return self.schema == B1_TOPOLOGY_PLACEMENT_SCHEMA
 
     @property
+    def witness_orientation(self) -> int:
+        """The orientation the physical relationship is reconstructed at.
+
+        A discovery arm names its own orientation: the sweep measures both, so
+        the witness must hold the arm to the one it was launched under. The
+        ratified gate names none -- `contract-selected` renders exactly the
+        fixed orientation 0 over the min-id-ordered observed pairs -- so the
+        witness reconstructs at that same fixed orientation. Neither case lets
+        the run choose whichever orientation happens to match.
+        """
+        return probe.SELECTED_ORIENTATION if self.orientation is None else self.orientation
+
+    @property
     def cardinality(self) -> dict[str, int]:
         """The exact per-role cardinality this contract is held to.
 
@@ -413,21 +449,23 @@ class B1PlacementDeclaration:
         profile = payload.get("profile")
         if profile not in B1_PROFILES:
             raise B1PlacementError(f"unknown placement profile {profile!r}")
-        if profile == CI_SCALE_PROBE_PROFILE_NAME:
+        # GC-3 (FP-GC3-4): BOTH CI-scale profiles arrive as schema-3
+        # topology contracts -- the discovery arm and the ratified gate alike.
+        # The product-local profile keeps the schema-2 document below.
+        if profile in B1_CI_SCALE_PROFILES:
             return cls._from_topology_contract(payload)
-        ci_scale = profile == CI_SCALE_PROFILE_NAME
-        capacity_key = "referenceLogicalCpus" if ci_scale else "minimumHostLogicalCpus"
+        capacity_key = "minimumHostLogicalCpus"
         expected_keys = {"schema", "runId", "profile", "mechanism", "roles", capacity_key}
         got_keys = set(payload)
         if got_keys != expected_keys:
             raise B1PlacementError(
-                f"closed schema-{B1_PLACEMENT_SCHEMA} contract keys {sorted(expected_keys)}; "
+                f"closed schema-{PRODUCT_PLACEMENT_SCHEMA} contract keys {sorted(expected_keys)}; "
                 f"got {sorted(got_keys)}"
             )
-        if payload["schema"] != B1_PLACEMENT_SCHEMA:
+        if payload["schema"] != PRODUCT_PLACEMENT_SCHEMA:
             raise B1PlacementError(
                 f"unsupported placement schema {payload['schema']!r}; this harness declares "
-                f"scheduler affinity and only understands schema {B1_PLACEMENT_SCHEMA}"
+                f"scheduler affinity and only understands schema {PRODUCT_PLACEMENT_SCHEMA}"
             )
         if payload["mechanism"] != B1_PLACEMENT_MECHANISM:
             raise B1PlacementError(
@@ -444,11 +482,7 @@ class B1PlacementDeclaration:
                 f"runId must be {B1_RUN_ID_LENGTH} lowercase hex characters; got {run_id!r}"
             )
         capacity = payload[capacity_key]
-        if ci_scale and capacity != CI_SCALE_REFERENCE_LOGICAL_CPUS:
-            raise B1PlacementError(
-                f"referenceLogicalCpus is pinned at {CI_SCALE_REFERENCE_LOGICAL_CPUS}; got {capacity!r}"
-            )
-        if not ci_scale and capacity != PRODUCT_MINIMUM_HOST_LOGICAL_CPUS:
+        if capacity != PRODUCT_MINIMUM_HOST_LOGICAL_CPUS:
             raise B1PlacementError(
                 f"minimumHostLogicalCpus is pinned at {PRODUCT_MINIMUM_HOST_LOGICAL_CPUS}; "
                 f"got {capacity!r}"
@@ -491,13 +525,13 @@ class B1PlacementDeclaration:
                 f"contract union has {len(union)}"
             )
         return cls(
-            schema=B1_PLACEMENT_SCHEMA,
+            schema=PRODUCT_PLACEMENT_SCHEMA,
             run_id=run_id,
             profile=profile,
             mechanism=B1_PLACEMENT_MECHANISM,
             allowed_cpus=tuple(allowed_pairs),
-            reference_logical_cpus=capacity if ci_scale else None,
-            minimum_host_logical_cpus=None if ci_scale else capacity,
+            reference_logical_cpus=None,
+            minimum_host_logical_cpus=capacity,
         )
 
     @classmethod
@@ -512,7 +546,7 @@ class B1PlacementDeclaration:
         different ideas of what an arm is.
         """
         try:
-            parsed = probe.parse_arm_contract(payload)
+            parsed = probe.parse_contract(payload)
         except probe.TopologyProbeError as exc:
             raise B1PlacementError(str(exc)) from exc
         return cls(
@@ -701,7 +735,8 @@ class B1PlacementWitness:
         """FP-GC3-5: the physical relationship, proven from effective state.
 
         CPU identities alone prove nothing about cores: `0-1` is one physical
-        core on the 7763 guest and two different cores on the i7 replica. This
+        core on a hosted four-vCPU guest and two different cores on the i7
+        replica. This
         reconstructs the declared topology class from the sibling files and the
         *effective* role sets, and refuses the run when the two disagree.
         """
@@ -767,7 +802,7 @@ class B1PlacementWitness:
         pair0, pair1 = sorted(tuple(sorted(group)) for group in seen)
         try:
             derived = probe.topology_mapping(
-                decl.topology, pair0, pair1, decl.orientation
+                decl.topology, pair0, pair1, decl.witness_orientation
             )
         except probe.TopologyProbeError as exc:
             return out + [f"{when}: topology: {exc}"]
@@ -776,7 +811,7 @@ class B1PlacementWitness:
                 out.append(
                     f"{when}: topology: {role} effectively holds "
                     f"{b1.format_cpu_list(observed[role])}, class {decl.topology} orientation "
-                    f"{decl.orientation} over pairs {list(pair0)}/{list(pair1)} derives "
+                    f"{decl.witness_orientation} over pairs {list(pair0)}/{list(pair1)} derives "
                     f"{b1.format_cpu_list(derived[role])}"
                 )
         return out
@@ -2449,7 +2484,7 @@ def _read_launch_contract(path: Path = B1_LAUNCH_CONTRACT) -> object:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise B1PlacementError(
-            f"no schema-{B1_PLACEMENT_SCHEMA} launch contract at {path}; the b1/b1_product "
+            f"no closed launch contract at {path}; the b1/b1_product "
             f"shell target writes it before starting the driver"
         ) from exc
     try:
@@ -3712,46 +3747,146 @@ def test_b1_ci_scale_reference_profile(b1_ci_scale_run):
 
 
 @pytest.mark.b1_live
-def test_b1_ci_scale_fingerprint_proves_placement(b1_ci_scale_run):
-    """FP-GC1-4: the CI-scale run carries its complete effective affinity.
+def test_b1_ci_scale_fingerprint_proves_reference_topology(b1_ci_scale_run):
+    """FP-GC3-5: the CI-scale run carries its complete effective REFERENCE TOPOLOGY.
 
-    The gating half is the three `*_allowed_cpus` sets -- exact, and pairwise
-    disjoint. Everything after them is a reported cgroup/host diagnostic and is
-    checked only for presence and shape: those values describe ambient policy,
-    not this run's allocation, and an `unavailable` among them is a truthful
-    record rather than a failure.
+    This replaces and renames the GC-1/GC-2 witness
+    ``test_b1_ci_scale_fingerprint_proves_placement``. The exact affinity sets
+    it proved are still proved here; what is new -- and what the rename is
+    about -- is that the PHYSICAL relationship is now part of the same gate.
+    The gating half is therefore the schema-3 prefix: the topology ID, the
+    reference CPU set, the intentionally unassigned CPU, the three exact
+    pairwise-disjoint ``*_allowed_cpus`` sets and all three role sibling maps.
+    None of them may be ``unavailable``.
+
+    The second leg is the decision join. The launcher routed this run by
+    reading the host's exact ``cpuModel`` and looking it up in the tracked
+    carrier; this node reads that SAME carrier -- through the driver's existing
+    read-only source mount, never a copied host route record -- and requires
+    the entry for the model observed INSIDE the measured container to be
+    `selected` with exactly this topology. Route -> decision -> live
+    fingerprint is transitive through one file, with no second selector.
+
+    Everything after ``driver_thread_siblings_pct`` is a reported
+    cgroup/host diagnostic and is checked only for presence and shape: those
+    values describe ambient policy, not this run's allocation, and an
+    ``unavailable`` among them is a truthful record rather than a failure.
     """
     line = b1_ci_scale_run["fingerprint"]
     declaration = b1_ci_scale_run["declaration"]
     placement = b1_ci_scale_run["placement"]
     assert "placement_ok=1" in line, line
     assert _parse_b1_env_field(line, "placement_profile") == CI_SCALE_PROFILE_NAME
-    assert _parse_b1_env_field(line, "placement_schema") == str(B1_PLACEMENT_SCHEMA)
+    assert _parse_b1_env_field(line, "placement_schema") == str(B1_TOPOLOGY_PLACEMENT_SCHEMA)
     assert _parse_b1_env_field(line, "placement_run_id") == declaration.run_id
     assert _parse_b1_env_field(line, "measurement_authority") == (
         b1_ci_scale_run["measurement_authority"]
     )
-    # Exact declared sets, at the declared cardinalities, read back from the
-    # kernel at window close.
+    # The topology claim is gating: the ID is one of the closed seven, the
+    # reference set is the four CPUs the launcher discovered as two complete
+    # SMT pairs, and the unassigned field is exact.
+    assert declaration.carries_topology
+    topology = _parse_b1_env_field(line, "reference_topology")
+    assert topology in probe.TOPOLOGY_IDS, topology
+    assert topology == declaration.topology
+    assert _parse_b1_env_field(line, "reference_cpus") == b1.format_cpu_list(
+        declaration.reference_cpus
+    )
+    expected_unassigned = (
+        b1.format_cpu_list(declaration.unassigned_cpus)
+        if declaration.unassigned_cpus else B1_UNASSIGNED_NONE
+    )
+    assert _parse_b1_env_field(line, "unassigned_cpus") == expected_unassigned
+    assert len(declaration.unassigned_cpus) == probe.topology_unassigned_cardinality(topology)
+    # Exact declared sets, at the topology-derived cardinalities, read back
+    # from the kernel at window close.
+    cardinality = probe.topology_cardinality(topology)
+    assert cardinality == declaration.cardinality
     observed: dict[str, frozenset[int]] = {}
-    for role, cardinality in CI_SCALE_AFFINITY_CARDINALITY.items():
+    for role in B1_ROLES:
         effective = placement[role].allowed_cpus
         observed[role] = effective
         assert effective == declaration.allowed(role), role
-        assert len(effective) == cardinality, (role, sorted(effective))
+        assert len(effective) == cardinality[role], (role, sorted(effective))
         assert _parse_b1_env_field(line, f"{role}_allowed_cpus") == b1.format_cpu_list(effective)
         assert _parse_b1_env_field(line, f"{role}_allowed_cpus") != DIAGNOSTIC_UNAVAILABLE
     assert not observed["gateway"] & observed["postgres"]
     assert not observed["gateway"] & observed["driver"]
     assert not observed["postgres"] & observed["driver"]
-    assert len(observed["gateway"] | observed["postgres"] | observed["driver"]) == 4
+    union = observed["gateway"] | observed["postgres"] | observed["driver"]
+    assert union | declaration.unassigned_cpus == declaration.reference_cpus
+    assert not union & declaration.unassigned_cpus
+    assert len(declaration.reference_cpus) == CI_SCALE_REFERENCE_LOGICAL_CPUS
     # The opening probe agreed with the closing one.
     for role in B1_ROLES:
         assert b1_ci_scale_run["placement_open"][role].allowed_cpus == observed[role]
-    # Gating fields precede every diagnostic, in the pinned order.
-    positions = [line.index(f"{name}=") for name in B1_GATING_PLACEMENT_FIELDS]
-    assert positions == sorted(positions), B1_GATING_PLACEMENT_FIELDS
-    assert max(positions) < min(line.index(f"{name}=") for name in B1_DIAGNOSTIC_PLACEMENT_FIELDS)
+    # All three role sibling maps are GATING under schema 3: present, decodable,
+    # covering exactly that role's effective set, and never `unavailable`.
+    groups = b1_ci_scale_run["sibling_groups"]
+    assert set(groups) == set(declaration.reference_cpus)
+    for cpu, members in groups.items():
+        assert len(members) == 2, (cpu, sorted(members))
+        assert cpu in members
+        for member in members:
+            assert groups[member] == members, (cpu, member)
+    for role in B1_ROLES:
+        rendered = _parse_b1_env_field(line, f"{role}_thread_siblings_pct")
+        assert rendered != DIAGNOSTIC_UNAVAILABLE, role
+        decoded = urllib.parse.unquote(rendered)
+        assert _percent_encode_diagnostic(decoded) == rendered, decoded
+        mapped = probe.parse_sibling_map(decoded)
+        assert set(mapped) == set(observed[role]), (role, sorted(mapped))
+        for cpu, members in mapped.items():
+            assert members == groups[cpu], (role, cpu)
+    # ...and the relationship they describe is the declared topology, rebuilt
+    # from the effective state rather than copied from the contract.
+    pair0, pair1 = probe.normalize_pairs(
+        sorted({tuple(sorted(members)) for members in groups.values()}),
+        declaration.reference_cpus,
+    )
+    assert declaration.witness_orientation == probe.SELECTED_ORIENTATION
+    reconstructed = probe.topology_mapping(
+        topology, pair0, pair1, declaration.witness_orientation
+    )
+    for role in B1_ROLES:
+        assert reconstructed[role] == observed[role], (
+            topology, role, sorted(observed[role]), sorted(reconstructed[role])
+        )
+    assert reconstructed["unassigned"] == declaration.unassigned_cpus
+    # Gating fields precede every diagnostic, in the pinned schema-3 order.
+    positions = [line.index(f"{name}=") for name in B1_TOPOLOGY_GATING_PLACEMENT_FIELDS]
+    assert positions == sorted(positions), B1_TOPOLOGY_GATING_PLACEMENT_FIELDS
+    assert max(positions) < min(
+        line.index(f"{name}=") for name in B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS
+    )
+
+    # --- the decision join (FP-GC3-4/5) ------------------------------------
+    # The mounted carrier is the ONLY input: no host route record is copied
+    # into the run directory and the closed placement contract carries no
+    # `cpuModel` key, so this leg cannot be satisfied by the launcher's own
+    # claim about the host.
+    assert "cpuModel" not in _read_launch_contract()
+    assert B1_DECISION_CARRIER.is_file(), (
+        f"{probe.DECISION_MISSING_REASON}: {B1_DECISION_CARRIER} is not mounted; a CI-scale "
+        f"gate exists only for a model the tracked carrier has ratified"
+    )
+    carrier = json.loads(B1_DECISION_CARRIER.read_text(encoding="utf-8"))
+    probe.validate_decision(carrier)
+    measured_model = probe.validate_cpu_model(_host_fingerprint()["cpu_model"])
+    entry = carrier["models"].get(measured_model)
+    assert entry is not None, (
+        f"the measured container reports {measured_model!r}, which has no entry in "
+        f"{B1_DECISION_CARRIER}; another model's entry is never a fallback"
+    )
+    assert entry["status"] == probe.DECISION_SELECTED, (measured_model, entry["status"])
+    assert entry["selected"] == topology, (measured_model, entry["selected"], topology)
+    assert entry["cardinality"] == cardinality
+    assert entry["placementSchema"] == B1_TOPOLOGY_PLACEMENT_SCHEMA
+    assert CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL[measured_model] == cardinality
+    assert CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL[measured_model] == (
+        B1_TOPOLOGY_PLACEMENT_SCHEMA
+    )
+
     # Reported-only diagnostics: present, and either a legal value or
     # `unavailable`. Their content never decides anything here.
     for role in B1_ROLES:
@@ -3766,21 +3901,17 @@ def test_b1_ci_scale_fingerprint_proves_placement(b1_ci_scale_run):
                  "gateway_cpu_cores_used"):
         assert f"{name}=" in line, name
     assert "cpu_cores_used=" not in line.replace("gateway_cpu_cores_used=", "")
-    # GC-2 (FP-GC2-5): the three added attribution fields are present, in the
-    # pinned order, and legally encoded. Their values decide nothing here --
-    # only that a value which is present can be decoded back exactly.
-    diagnostic_positions = [line.index(f"{name}=") for name in B1_DIAGNOSTIC_PLACEMENT_FIELDS]
+    diagnostic_positions = [
+        line.index(f"{name}=") for name in B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS
+    ]
     assert diagnostic_positions == sorted(diagnostic_positions), (
-        B1_DIAGNOSTIC_PLACEMENT_FIELDS
+        B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS
     )
     usage = _parse_b1_env_field(line, "postgres_usage_usec")
     assert usage == DIAGNOSTIC_UNAVAILABLE or int(usage) >= 0, usage
-    siblings = _parse_b1_env_field(line, "gateway_thread_siblings_pct")
-    if siblings != DIAGNOSTIC_UNAVAILABLE:
-        decoded = urllib.parse.unquote(siblings)
-        assert _percent_encode_diagnostic(decoded) == siblings, decoded
-        mapped = {int(entry.split(":", 1)[0]) for entry in decoded.split("+")}
-        assert mapped == set(observed["gateway"]), (sorted(mapped), sorted(observed["gateway"]))
+    # The gateway sibling map appears exactly once on a schema-3 line, in the
+    # gating prefix; it is not repeated among the diagnostics.
+    assert line.count("gateway_thread_siblings_pct=") == 1, line
     spectre = _parse_b1_env_field(line, "spectre_v2_pct")
     if spectre != DIAGNOSTIC_UNAVAILABLE:
         decoded_spectre = urllib.parse.unquote(spectre)
@@ -3863,7 +3994,7 @@ def test_b1_product_fingerprint_proves_exclusive_placement(b1_product_run):
     declaration = b1_product_run["declaration"]
     assert "placement_ok=1" in line, line
     assert _parse_b1_env_field(line, "placement_profile") == PRODUCT_PROFILE_NAME
-    assert _parse_b1_env_field(line, "placement_schema") == str(B1_PLACEMENT_SCHEMA)
+    assert _parse_b1_env_field(line, "placement_schema") == str(PRODUCT_PLACEMENT_SCHEMA)
     assert _parse_b1_env_field(line, "measurement_authority") == AUTHORITY_PRODUCT_LOCAL
     for role, cardinality in PRODUCT_AFFINITY_CARDINALITY.items():
         effective = placement[role].allowed_cpus
@@ -6065,18 +6196,12 @@ class _FakeClient:
 def _declaration_payload(profile=CI_SCALE_PROFILE_NAME, **overrides):
     run_id = "0123456789abcdef0123456789abcdef"
     if profile == CI_SCALE_PROFILE_NAME:
-        payload = {
-            "schema": 2,
-            "runId": run_id,
-            "profile": profile,
-            "referenceLogicalCpus": 4,
-            "mechanism": "sched-affinity",
-            "roles": {
-                "gateway": {"allowedCpus": "0-1"},
-                "postgres": {"allowedCpus": "2"},
-                "driver": {"allowedCpus": "3"},
-            },
-        }
+        # GC-3 (FP-GC3-4): the ordinary CI-scale contract is the ratified
+        # schema-3 document `contract-selected` writes. `gateway-core` over the
+        # pairs (0,1)/(2,3) renders the same CPU sets the schema-2 contract
+        # carried, so every non-schema assertion below is unchanged -- what
+        # changed is that the document now also states the RELATIONSHIP.
+        payload = probe.selected_contract("gateway-core", ("0-1", "2-3"), run_id)
     else:
         payload = {
             "schema": 2,
@@ -6424,15 +6549,20 @@ def test_b1_placement_declarations_are_closed_and_pinned(tmp_path):
     assert PRODUCT_PROFILE.sustained_floor == PRODUCT_SUSTAINED_FLOOR == 200
     assert PRODUCT_PROFILE.max_in_flight == PRODUCT_MAX_IN_FLIGHT == 1000
     assert PRODUCT_PROFILE.prologue_requests == b1.PROLOGUE_REQUESTS == 150
-    # The allocation is affinity cardinality, not a CPU quota.
-    assert CI_SCALE_PROFILE.affinity_cardinality == {"gateway": 2, "postgres": 1, "driver": 1}
+    # The allocation is affinity cardinality, not a CPU quota. GC-3 (FP-GC3-4)
+    # moved the CI-scale cardinality out of the profile: it is derived from the
+    # ratified topology on the parsed contract, so the profile refuses to
+    # answer at all rather than hand back a fixed 2/1/1 default.
+    with pytest.raises(B1PlacementError, match="topology-derived"):
+        CI_SCALE_PROFILE.affinity_cardinality
     assert PRODUCT_PROFILE.affinity_cardinality == {"gateway": 4, "postgres": 3, "driver": 1}
-    assert CI_SCALE_PROFILE.declared_cpu_total == 4
     assert PRODUCT_PROFILE.declared_cpu_total == 8
 
     ci = B1PlacementDeclaration.from_contract(_declaration_payload())
     assert ci.profile == CI_SCALE_PROFILE_NAME
-    assert ci.schema == 2 and ci.mechanism == "sched-affinity"
+    assert ci.schema == B1_TOPOLOGY_PLACEMENT_SCHEMA == 3 and ci.mechanism == "sched-affinity"
+    assert ci.cardinality == {"gateway": 2, "postgres": 1, "driver": 1}
+    assert ci.declared_cpu_total == 4
     assert ci.reference_logical_cpus == 4 and ci.minimum_host_logical_cpus is None
     assert ci.allowed("gateway") == frozenset({0, 1})
     assert ci.allowed("postgres") == frozenset({2})
@@ -6450,14 +6580,15 @@ def test_b1_placement_declarations_are_closed_and_pinned(tmp_path):
     assert prod.allowed("gateway") == frozenset({0, 1, 2, 3})
     assert prod.allowed("driver") == frozenset({7})
     assert prod.declared_union == frozenset(range(8))
-    # A many-core replica keeps the shape, only the CPU identities move.
-    shifted = _declaration_payload()
-    shifted["roles"] = {
-        "gateway": {"allowedCpus": "4-5"},
-        "postgres": {"allowedCpus": "6"},
-        "driver": {"allowedCpus": "9"},
-    }
-    assert B1PlacementDeclaration.from_contract(shifted).allowed("driver") == frozenset({9})
+    # A many-core replica keeps the RELATIONSHIP, only the CPU identities move:
+    # `gateway-core` over the sibling pairs (4,5) and (6,9) is the same class.
+    shifted = probe.selected_contract(
+        "gateway-core", ("4-5", "6,9"), "0123456789abcdef0123456789abcdef"
+    )
+    shifted_decl = B1PlacementDeclaration.from_contract(shifted)
+    assert shifted_decl.allowed("driver") == frozenset({9})
+    assert shifted_decl.allowed("gateway") == frozenset({4, 5})
+    assert shifted_decl.topology == "gateway-core"
 
     def refuse(payload):
         with pytest.raises(B1PlacementError):
@@ -6465,9 +6596,12 @@ def test_b1_placement_declarations_are_closed_and_pinned(tmp_path):
 
     refuse("not-an-object")
     refuse(_declaration_payload(profile="other"))
-    # Schema 1 is rejected outright; nothing is migrated.
+    # Schema 1 is rejected outright; nothing is migrated. So is the retired
+    # schema-2 CI-scale document: this profile is schema 3 now, and there is no
+    # compatibility reader for the allocation it used to carry.
     refuse(_declaration_payload(schema=1))
-    refuse(_declaration_payload(schema=3))
+    refuse(_declaration_payload(schema=2))
+    refuse(_declaration_payload(PRODUCT_PROFILE_NAME, schema=3))
     refuse(_declaration_payload(mechanism="cfs-quota"))
     refuse(_declaration_payload(mechanism="cpuset"))
     refuse(_declaration_payload(referenceLogicalCpus=8))
@@ -6584,7 +6718,11 @@ def test_b1_placement_validator_rejects_each_role_drift():
     """FP-GC1-4: every affinity drift is named, one at a time, open and close."""
     ci_decl = B1PlacementDeclaration.from_contract(_declaration_payload())
     host = frozenset(range(4))
-    witness = B1PlacementWitness(ci_decl, host_cpus=host)
+    # GC-3: the ordinary CI-scale declaration is schema 3, so the physical
+    # sibling reading is GATING and the witness is given the observed groups.
+    witness = B1PlacementWitness(
+        ci_decl, host_cpus=host, sibling_groups=_gc3_sibling_groups()
+    )
     workers = {12, 13, 14, 15}
     roles = _ci_scale_roles()
     assert witness.failures(roles, gateway_worker_pids=workers) == []
@@ -7084,6 +7222,19 @@ def test_b1_product_verdicts_record_met_and_missed_without_truth_gating():
 _GC3_PAIRS = ((0, 1), (2, 3))
 _GC3_REFERENCE = "0-3"
 _GC3_SHA = "a" * 40
+# Two exact model strings used as FIXTURE DATA, and DELIBERATELY FICTIONAL.
+# Nothing in `b1_topology_probe` compares a model against a literal -- the pair
+# admission rule is "both artifacts carry the same validated model" -- so a
+# real SKU here would only invite a reader to think one was privileged, and
+# would make a grep for a real SKU in this file ambiguous. They still satisfy
+# `validate_cpu_model`'s closed text rules (nonempty, not the `unknown`
+# sentinel, within the code-point ceiling, no control character,
+# whitespace-canonical), because the tests below depend on them being
+# decision-eligible; and they carry mixed case and a trailing size suffix so
+# the no-fallback cases can build a genuine case-fold variant and a genuine
+# proper prefix out of them.
+_GC3_MODEL = "TEST-MODEL-A Fictional 4-Core Processor"
+_GC3_OTHER_MODEL = "TEST-MODEL-B Fictional 8-Core Processor"
 
 
 def _gc3_sysfs(tmp_path: Path, groups: "dict[int, str]") -> Path:
@@ -7123,7 +7274,8 @@ def _gc3_operands(**overrides) -> dict:
     return operands
 
 
-def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None, **overrides) -> dict:
+def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None,
+                cpu_model: str = _GC3_MODEL, **overrides) -> dict:
     arm = probe.enumerate_arms(*pairs)[index]
     groups = _gc3_sibling_groups(pairs)
     values = _gc3_operands() if operands is None else dict(operands)
@@ -7152,7 +7304,7 @@ def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None, *
         "postgresUsageUsec": 14220078,
         "gatewayCpuCoresUsed": 0.38,
         "measurementAuthority": AUTHORITY_CI_SCALE_REFERENCE,
-        "cpuModel": probe.REFERENCE_CPU_MODEL,
+        "cpuModel": cpu_model,
         "logicalCpuCount": 4,
         "siblingPairs": [probe.format_cpu_list(pair) for pair in pairs],
         "headSha": _GC3_SHA,
@@ -7165,7 +7317,7 @@ def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None, *
     return record
 
 
-def _gc3_plan(run_id: str = "1") -> dict:
+def _gc3_plan(run_id: str = "1", *, cpu_model: str = _GC3_MODEL) -> dict:
     return {
         "topologySetVersion": probe.TOPOLOGY_SET_VERSION,
         "identity": {
@@ -7173,7 +7325,7 @@ def _gc3_plan(run_id: str = "1") -> dict:
             "githubRunId": run_id,
             "githubRunAttempt": "1",
             "githubJob": probe.PROBE_JOB,
-            "cpuModel": probe.REFERENCE_CPU_MODEL,
+            "cpuModel": cpu_model,
             "logicalCpuCount": 4,
             "referenceCpus": _GC3_REFERENCE,
             "siblingPairs": [probe.format_cpu_list(pair) for pair in _GC3_PAIRS],
@@ -7183,14 +7335,32 @@ def _gc3_plan(run_id: str = "1") -> dict:
     }
 
 
-def _gc3_artifact(run_id: str = "1", *, per_arm=None) -> dict:
+def _gc3_artifact(run_id: str = "1", *, per_arm=None, cpu_model: str = _GC3_MODEL) -> dict:
     records = []
     for index in range(probe.ARMS_PER_ARTIFACT):
         operands = per_arm(index) if per_arm else None
-        record = _gc3_record(index, salt=int(run_id), operands=operands)
+        record = _gc3_record(index, salt=int(run_id), operands=operands, cpu_model=cpu_model)
         record["githubRunId"] = run_id
         records.append(record)
-    return probe.collect_artifact(_gc3_plan(run_id), records)
+    return probe.collect_artifact(_gc3_plan(run_id, cpu_model=cpu_model), records)
+
+
+def _gc3_carrier(tmp_path: Path, *pairs, out_name: str = "b1_topology_decision.json") -> Path:
+    """Generate a model-keyed carrier through the CLI, one `--pair` per model."""
+    out = tmp_path / out_name
+    base = None
+    for index, (first, second) in enumerate(pairs):
+        first_path = tmp_path / f"artifact-{index}-a.json"
+        second_path = tmp_path / f"artifact-{index}-b.json"
+        probe.write_artifact(first_path, first)
+        probe.write_artifact(second_path, second)
+        argv = ["decide", "--out", str(out)]
+        if base is not None:
+            argv += ["--base", str(base)]
+        argv += ["--pair", str(first_path), str(second_path)]
+        assert probe.main(argv) == 0
+        base = out
+    return out
 
 
 def test_gc3_thread_sibling_reader_accepts_only_two_symmetric_pairs(tmp_path):
@@ -7466,12 +7636,58 @@ def test_gc3_schema3_contract_rejects_mapping_and_topology_drift():
             {**contract, "topology": "gateway-hyperthread"}
         )
 
-    # The schema-2 profiles are untouched and stay schema 2.
-    ci_scale = B1PlacementDeclaration.from_contract(_declaration_payload())
-    assert ci_scale.schema == B1_PLACEMENT_SCHEMA == 2
-    assert not ci_scale.carries_topology
-    assert ci_scale.cardinality == CI_SCALE_AFFINITY_CARDINALITY
-    assert ci_scale.topology is None and ci_scale.unassigned_cpus == frozenset()
+    # --- the ordinary ratified gate's contract (FP-GC3-4) ------------------
+    # `contract-selected` renders one class over the OBSERVED pairs at the
+    # fixed orientation 0, writes the ordinary `ci-scale` schema-3 document
+    # (no round, no orientation) and prints only the driver CPU list.
+    selected = probe.selected_contract("postgres-core", ("0-1", "2-3"), _gc3_run_id(7))
+    assert set(selected) == probe.SELECTED_CONTRACT_KEYS
+    assert "round" not in selected and "orientation" not in selected
+    assert selected["schema"] == 3 and selected["profile"] == probe.SELECTED_PROFILE_NAME
+    expected_map = probe.topology_mapping("postgres-core", (0, 1), (2, 3), 0)
+    for role in probe.ROLES:
+        assert selected["roles"][role]["allowedCpus"] == probe.format_cpu_list(
+            expected_map[role]
+        )
+    reparsed = probe.parse_selected_contract(selected, pairs=("0-1", "2-3"))
+    assert reparsed["topology"] == "postgres-core"
+    assert reparsed["round"] is None and reparsed["orientation"] is None
+    assert probe.parse_contract(selected, pairs=("0-1", "2-3"))["roles"] == reparsed["roles"]
+    # Sparse, non-contiguous sibling ids -- the i7 replica shape -- render the
+    # same RELATIONSHIP over different CPU ids.
+    sparse = probe.selected_contract("gateway-core", ("1,9", "0,8"), _gc3_run_id(8))
+    assert sparse["referenceCpus"] == "0-1,8-9"
+    assert sparse["roles"]["gateway"]["allowedCpus"] == "0,8"
+    probe.parse_selected_contract(sparse, pairs=("0,8", "1,9"))
+    # It authors nothing else: an unknown class, a bad run id, overlapping or
+    # single-CPU pairs are refused rather than repaired.
+    for topology, pairs, run_id, pattern in (
+        ("gateway-hyperthread", ("0-1", "2-3"), _gc3_run_id(9), "unknown topology"),
+        ("gateway-core", ("0-1", "2-3"), "short", "32 lowercase hex"),
+        ("gateway-core", ("0-1", "1-2"), _gc3_run_id(9), "not disjoint"),
+        ("gateway-core", ("0", "2-3"), _gc3_run_id(9), "not two CPUs"),
+        ("gateway-core", ("0-1",), _gc3_run_id(9), "exactly two sibling pairs"),
+    ):
+        with pytest.raises(probe.TopologyProbeError, match=pattern):
+            probe.selected_contract(topology, pairs, run_id)
+    # A selected contract that carries an arm position is not this document.
+    with pytest.raises(probe.TopologyProbeError, match="closed schema-3"):
+        probe.parse_selected_contract({**selected, "round": 0, "orientation": 0})
+    # ...and an arm contract is not the gate's document either.
+    with pytest.raises(probe.TopologyProbeError, match="profile"):
+        probe.parse_selected_contract(contract)
+    # The declaration the harness builds from it is the ordinary CI-scale one,
+    # at schema 3, with a topology-derived cardinality and no fixed default.
+    selected_decl = B1PlacementDeclaration.from_contract(selected)
+    assert selected_decl.profile == CI_SCALE_PROFILE_NAME
+    assert selected_decl.schema == B1_TOPOLOGY_PLACEMENT_SCHEMA == 3
+    assert selected_decl.carries_topology
+    assert selected_decl.topology == "postgres-core"
+    assert selected_decl.cardinality == {"gateway": 1, "postgres": 2, "driver": 1}
+    assert selected_decl.probe_round is None and selected_decl.orientation is None
+    assert selected_decl.reference_cpus == frozenset(range(4))
+
+    # --- product-local schema-2 separation ---------------------------------
     product = B1PlacementDeclaration.from_contract(
         _declaration_payload(
             profile=PRODUCT_PROFILE_NAME,
@@ -7483,11 +7699,31 @@ def test_gc3_schema3_contract_rejects_mapping_and_topology_drift():
             },
         )
     )
-    assert product.schema == 2 and not product.carries_topology
+    assert product.schema == PRODUCT_PLACEMENT_SCHEMA == 2
+    assert not product.carries_topology
     assert product.cardinality == PRODUCT_AFFINITY_CARDINALITY
-    # The discovery profile refuses to answer for a fixed cardinality.
-    with pytest.raises(B1PlacementError, match="topology-derived"):
-        CI_SCALE_PROBE_PROFILE.affinity_cardinality
+    assert product.topology is None and product.unassigned_cpus == frozenset()
+    # Neither CI-scale profile answers for a fixed cardinality any more: both
+    # read it from the parsed contract's topology.
+    for ci_profile in (CI_SCALE_PROFILE, CI_SCALE_PROBE_PROFILE):
+        with pytest.raises(B1PlacementError, match="topology-derived"):
+            ci_profile.affinity_cardinality
+    # The RETIRED schema-2 CI-scale document -- the fixed 2/1/1 over the first
+    # four allowed CPUs GC-1 shipped -- is refused outright. There is no
+    # compatibility reader and no migration.
+    with pytest.raises(B1PlacementError):
+        B1PlacementDeclaration.from_contract({
+            "schema": PRODUCT_PLACEMENT_SCHEMA,
+            "runId": "0123456789abcdef0123456789abcdef",
+            "profile": CI_SCALE_PROFILE_NAME,
+            "referenceLogicalCpus": 4,
+            "mechanism": B1_PLACEMENT_MECHANISM,
+            "roles": {
+                "gateway": {"allowedCpus": "0-1"},
+                "postgres": {"allowedCpus": "2"},
+                "driver": {"allowedCpus": "3"},
+            },
+        })
     # ...and its workload is the CI-scale workload, copied, not restated.
     for field in ("rate", "seconds", "total_requests", "prologue_requests",
                   "max_in_flight", "p99_ms", "sustained_floor"):
@@ -7612,8 +7848,28 @@ def test_gc3_probe_collector_rejects_partial_or_mixed_artifacts(tmp_path):
     assert artifact["status"] == probe.ARTIFACT_COMPLETE
     assert len(artifact["arms"]) == 28
     assert probe.validate_artifact(artifact) is artifact
-    assert artifact["cpuModel"] == probe.REFERENCE_CPU_MODEL
+    assert artifact["cpuModel"] == _GC3_MODEL
     assert artifact["siblingPairs"] == ["0-1", "2-3"]
+
+    # FP-GC3-3/4: an artifact whose own model string cannot key a decision is
+    # `invalid` with its own named code, never a complete record under the
+    # `unknown` sentinel. There is no allowlist here -- only the closed
+    # validity rules -- so any OTHER exact model is complete and admissible.
+    for illegal_model in (probe.CPU_MODEL_UNKNOWN, "", "x" * 300, "bad\x01model"):
+        broken = probe.collect_artifact(
+            _gc3_plan(cpu_model=illegal_model),
+            [_gc3_record(index, cpu_model=illegal_model)
+             for index in range(probe.ARMS_PER_ARTIFACT)],
+        )
+        assert broken["status"] == probe.ARTIFACT_INVALID, illegal_model
+        assert broken["failureCode"] == "cpu_model_unavailable", illegal_model
+    other_model = probe.collect_artifact(
+        _gc3_plan(cpu_model=_GC3_OTHER_MODEL),
+        [_gc3_record(index, cpu_model=_GC3_OTHER_MODEL)
+         for index in range(probe.ARMS_PER_ARTIFACT)],
+    )
+    assert other_model["status"] == probe.ARTIFACT_COMPLETE
+    assert other_model["cpuModel"] == _GC3_OTHER_MODEL
 
     # Canonical, sorted, newline-terminated, and byte-reproducible on disk.
     path = tmp_path / "artifact.json"
@@ -7745,7 +8001,7 @@ def test_gc3_probe_collector_rejects_partial_or_mixed_artifacts(tmp_path):
     written = json.loads(contract_path.read_text(encoding="utf-8"))
     assert written["topology"] == "gateway-core" and written["roles"]["driver"]["allowedCpus"] == "3"
     context = read_probe_context(context_path)
-    assert context["index"] == 2 and context["cpuModel"] == probe.REFERENCE_CPU_MODEL
+    assert context["index"] == 2 and context["cpuModel"] == _GC3_MODEL
     assert probe.main([
         "contract", "--plan", str(plan_path), "--arm", "99", "--run-id", _gc3_run_id(2),
         "--out", str(contract_path), "--context", str(context_path),
@@ -7775,18 +8031,27 @@ def test_gc3_probe_collector_rejects_partial_or_mixed_artifacts(tmp_path):
         read_probe_context(tmp_path / "absent.json")
 
 
-def test_gc3_selector_requires_two_complete_7763_artifacts(tmp_path):
-    """FP-GC3-3: eight green records across two independent runs, or nothing."""
+def test_gc3_selector_partitions_artifacts_by_cpu_model(tmp_path):
+    """FP-GC3-3: each exact model earns its own decision, from its own evidence.
+
+    Eight integrity-green records across two distinct-run, same-head artifacts
+    OF ONE EXACT MODEL, or that model gets nothing. Evidence never crosses a
+    model key: model X cannot satisfy, outrank, unblock or block model Y, and
+    an unpaired model neither delays nor contaminates a paired one.
+    """
     first = _gc3_artifact("11")
     second = _gc3_artifact("22")
-    probe.admit_evidence(first, second)
+    assert probe.admit_evidence(first, second) == _GC3_MODEL
 
     # Every class is green in this fixture, so every class is ratifiable and
     # the fixed ranking decides -- here by lexical id, the last tie-break.
-    decision = probe.select_topology(first, second)
-    assert decision["status"] == probe.DECISION_SELECTED
-    assert list(decision["ratifiable"]) == list(probe.TOPOLOGY_IDS)
-    assert decision["selected"] == probe.TOPOLOGY_IDS[0]
+    entry = probe.select_topology(first, second)
+    assert entry["status"] == probe.DECISION_SELECTED
+    assert list(entry["ratifiable"]) == list(probe.TOPOLOGY_IDS)
+    assert entry["selected"] == probe.TOPOLOGY_IDS[0]
+    assert entry["evidenceHeadSha"] == _GC3_SHA
+    assert entry["cardinality"] == probe.topology_cardinality(entry["selected"])
+    assert entry["placementSchema"] == probe.CONTRACT_SCHEMA == 3
 
     # One missed performance status in ONE arm of ONE artifact removes the whole
     # class: eight green records, not seven.
@@ -7803,7 +8068,8 @@ def test_gc3_selector_requires_two_complete_7763_artifacts(tmp_path):
 
     # The ranking, in order: lowest max p99, then lowest max in-flight, then
     # highest min served rate, then lexical id.
-    def ranked(p99_by_class, in_flight_by_class=None, rate_by_class=None):
+    def ranked(p99_by_class, in_flight_by_class=None, rate_by_class=None,
+               cpu_model=_GC3_MODEL, runs=("44", "55")):
         def per_arm(index):
             arm = probe.enumerate_arms(*_GC3_PAIRS)[index]
             return _gc3_operands(
@@ -7811,8 +8077,8 @@ def test_gc3_selector_requires_two_complete_7763_artifacts(tmp_path):
                 maxInFlight=(in_flight_by_class or {}).get(arm["topology"], 40),
                 servedRate=(rate_by_class or {}).get(arm["topology"], 500.0),
             )
-        left = _gc3_artifact("44", per_arm=per_arm)
-        right = _gc3_artifact("55", per_arm=per_arm)
+        left = _gc3_artifact(runs[0], per_arm=per_arm, cpu_model=cpu_model)
+        right = _gc3_artifact(runs[1], per_arm=per_arm, cpu_model=cpu_model)
         return probe.select_topology(left, right)
 
     assert ranked({"postgres-core": 5.0})["selected"] == "postgres-core"
@@ -7823,16 +8089,20 @@ def test_gc3_selector_requires_two_complete_7763_artifacts(tmp_path):
     same = ranked({"postgres-core": 5.0})
     assert same["selected"] == "postgres-core"
 
-    # Unhostable: no class is green in both artifacts.
+    # Unhostable: no class is green in both artifacts. Every derived field is
+    # null and nothing is ratified -- for THIS model only.
     def all_slow(index):
         return _gc3_operands(p99Ms=2387.1, maxInFlight=500)
 
     lost = _gc3_artifact("66", per_arm=all_slow)
     unhostable = probe.select_topology(lost, _gc3_artifact("77", per_arm=all_slow))
     assert unhostable["status"] == probe.DECISION_UNHOSTABLE
-    assert unhostable["selected"] is None and unhostable["ratifiable"] == []
+    assert unhostable["ratifiable"] == []
+    for null_field in ("selected", "cardinality", "placementSchema", "score"):
+        assert unhostable[null_field] is None, null_field
 
-    # Admission: two distinct runs, one head, one SKU, one physical topology.
+    # Admission: two distinct runs, one head, ONE MODEL SHARED BY BOTH, one
+    # physical topology, and the pinned discovery job.
     with pytest.raises(probe.TopologyProbeError, match="two independent runs"):
         probe.admit_evidence(first, _gc3_artifact("11"))
     other_head = json.loads(json.dumps(second))
@@ -7841,15 +8111,23 @@ def test_gc3_selector_requires_two_complete_7763_artifacts(tmp_path):
         arm["headSha"] = "b" * 40
     with pytest.raises(probe.TopologyProbeError, match="different heads"):
         probe.admit_evidence(first, other_head)
-    wrong_sku = json.loads(json.dumps(second))
-    wrong_sku["cpuModel"] = "Intel(R) Core(TM) i7-11800H @ 2.30GHz"
-    for arm in wrong_sku["arms"]:
-        arm["cpuModel"] = wrong_sku["cpuModel"]
-    with pytest.raises(probe.TopologyProbeError, match="cannot ratify"):
-        probe.admit_evidence(first, wrong_sku)
+    other_model = _gc3_artifact("88", cpu_model=_GC3_OTHER_MODEL)
+    with pytest.raises(probe.TopologyProbeError, match="different CPU models"):
+        probe.admit_evidence(first, other_model)
+    # ...and the model itself must be decision eligible. There is no allowlist:
+    # any exact, canonical, nonsentinel string is a key.
+    assert probe.validate_cpu_model(_GC3_OTHER_MODEL) == _GC3_OTHER_MODEL
+    assert probe.is_decision_eligible_cpu_model("Totally Made Up CPU 9000")
+    for bad in (probe.CPU_MODEL_UNKNOWN, "", "x" * 300, "two  spaces", " padded",
+                "carriage\rreturn", 7, None):
+        assert not probe.is_decision_eligible_cpu_model(bad), bad
+        with pytest.raises(probe.TopologyProbeError):
+            probe.validate_cpu_model(bad)
     wrong_count = {**second, "logicalCpuCount": 8}
     with pytest.raises(probe.TopologyProbeError):
         probe.admit_evidence(first, wrong_count)
+    with pytest.raises(probe.TopologyProbeError, match="githubJob"):
+        probe.admit_evidence(first, {**second, "githubJob": "benchmark"})
     for pairs, pattern in (
         (["0-1"], "not two pairs"),
         (["0-2", "0-1"], "overlap"),
@@ -7859,37 +8137,321 @@ def test_gc3_selector_requires_two_complete_7763_artifacts(tmp_path):
         with pytest.raises(probe.TopologyProbeError):
             probe.admit_evidence(first, {**second, "siblingPairs": pairs})
 
-    # The tracked carrier: both artifacts embedded, digested, recomputable.
-    first_path = tmp_path / "first.json"
-    second_path = tmp_path / "second.json"
-    probe.write_artifact(first_path, first)
-    probe.write_artifact(second_path, second)
-    out = tmp_path / "b1_topology_decision.json"
-    assert probe.main(["decide", str(first_path), str(second_path), str(out)]) == 0
-    carrier = json.loads(out.read_text(encoding="utf-8"))
-    assert carrier["status"] == probe.DECISION_SELECTED
-    assert len(carrier["artifacts"]) == 2
-    for entry in carrier["artifacts"]:
-        assert entry["url"].startswith("https://github.com/")
-        assert entry["sha256"] == probe.digest_of(
-            first_path if entry["githubRunId"] == "11" else second_path
-        )
-    recomputed = probe.recompute_decision(carrier)
-    assert recomputed["selected"] == carrier["selected"]
-    # A tampered embedded artifact fails its own digest.
+    # --- the model-keyed carrier (FP-GC3-3) --------------------------------
+    carrier_path = _gc3_carrier(tmp_path, (first, second))
+    carrier = json.loads(carrier_path.read_text(encoding="utf-8"))
+    assert carrier_path.read_text(encoding="utf-8") == probe.canonical_json(carrier)
+    assert carrier["schema"] == probe.DECISION_SCHEMA == 2
+    assert carrier["topologySetVersion"] == probe.TOPOLOGY_SET_VERSION
+    assert list(carrier["models"]) == [_GC3_MODEL]
+    stored = carrier["models"][_GC3_MODEL]
+    assert stored["status"] == probe.DECISION_SELECTED
+    assert stored["selected"] == entry["selected"]
+    assert len(stored["artifacts"]) == 2
+    for wrapper in stored["artifacts"]:
+        assert set(wrapper) == {"sourceUrl", "sha256", "artifact"}
+        assert wrapper["sourceUrl"].startswith("https://github.com/")
+        assert str(wrapper["artifact"]["githubRunId"]) in wrapper["sourceUrl"]
+        assert wrapper["sha256"] == hashlib.sha256(
+            probe.canonical_json(wrapper["artifact"]).encode("utf-8")
+        ).hexdigest()
+    # The pair is embedded in run-id order, whichever order the CLI was given.
+    assert [w["artifact"]["githubRunId"] for w in stored["artifacts"]] == ["11", "22"]
+    probe.validate_decision(carrier)
+    assert probe.recompute_decision(carrier)[_GC3_MODEL] == stored
+
+    # A second model merges through --base without touching the first entry.
+    third = _gc3_artifact("99", per_arm=all_slow, cpu_model=_GC3_OTHER_MODEL)
+    fourth = _gc3_artifact("12", per_arm=all_slow, cpu_model=_GC3_OTHER_MODEL)
+    merged_path = _gc3_carrier(
+        tmp_path / "merged", (first, second), (third, fourth)
+    )
+    merged = json.loads(merged_path.read_text(encoding="utf-8"))
+    assert sorted(merged["models"]) == sorted([_GC3_MODEL, _GC3_OTHER_MODEL])
+    assert merged["models"][_GC3_MODEL] == stored, "model X's entry was rewritten"
+    assert merged["models"][_GC3_OTHER_MODEL]["status"] == probe.DECISION_UNHOSTABLE
+    probe.validate_decision(merged)
+    # One model's unhostable result neither weakens nor erases the other's.
+    assert merged["models"][_GC3_MODEL]["status"] == probe.DECISION_SELECTED
+
+    # A rejected model-X invocation leaves a valid model-Y carrier untouched.
+    unpaired = tmp_path / "unpaired.json"
+    probe.write_artifact(unpaired, other_model)
+    before = merged_path.read_text(encoding="utf-8")
+    assert probe.main([
+        "decide", "--out", str(merged_path), "--base", str(merged_path),
+        "--pair", str(unpaired), str(unpaired),
+    ]) == 1
+    assert merged_path.read_text(encoding="utf-8") == before
+
+    # A second, DIFFERENT decision for an already decided model is refused.
+    faster = tmp_path / "faster"
+    faster.mkdir()
+    left = _gc3_artifact("13", per_arm=lambda i: _gc3_operands(p99Ms=1.0))
+    right = _gc3_artifact("14", per_arm=lambda i: _gc3_operands(p99Ms=1.0))
+    probe.write_artifact(faster / "a.json", left)
+    probe.write_artifact(faster / "b.json", right)
+    assert probe.main([
+        "decide", "--out", str(faster / "out.json"), "--base", str(merged_path),
+        "--pair", str(faster / "a.json"), str(faster / "b.json"),
+    ]) == 1
+    assert not (faster / "out.json").exists()
+
+    # ...while re-deriving the SAME decision is idempotent.
+    again = tmp_path / "again.json"
+    probe.write_artifact(tmp_path / "first.json", first)
+    probe.write_artifact(tmp_path / "second.json", second)
+    assert probe.main([
+        "decide", "--out", str(again), "--base", str(merged_path),
+        "--pair", str(tmp_path / "first.json"), str(tmp_path / "second.json"),
+    ]) == 0
+    assert json.loads(again.read_text(encoding="utf-8")) == merged
+
+    # Tampering: a forged result, a forged digest, a forged model key and a
+    # cross-model embedded artifact are all refused by recomputation.
     tampered = json.loads(json.dumps(carrier))
-    tampered["artifacts"][0]["artifact"]["arms"][0]["operands"]["p99Ms"] = 1.0
+    tampered["models"][_GC3_MODEL]["artifacts"][0]["artifact"]["arms"][0]["operands"][
+        "p99Ms"
+    ] = 1.0
     with pytest.raises(probe.TopologyProbeError, match="does not match its digest"):
-        probe.recompute_decision(tampered)
-    with pytest.raises(probe.TopologyProbeError, match="exactly two"):
-        probe.recompute_decision({"artifacts": carrier["artifacts"][:1]})
-    # ...and a hand-written selected id is not what the selector derives.
+        probe.validate_decision(tampered)
     forged = json.loads(json.dumps(carrier))
-    forged["selected"] = "postgres-core"
-    assert probe.recompute_decision(forged)["selected"] != forged["selected"]
+    forged["models"][_GC3_MODEL]["selected"] = "postgres-core"
+    with pytest.raises(probe.TopologyProbeError, match="not what the selector derives"):
+        probe.validate_decision(forged)
+    handmade = json.loads(json.dumps(carrier))
+    handmade["models"][_GC3_MODEL]["cardinality"] = {"gateway": 3, "postgres": 1, "driver": 1}
+    with pytest.raises(probe.TopologyProbeError):
+        probe.validate_decision(handmade)
+    rekeyed = json.loads(json.dumps(carrier))
+    rekeyed["models"] = {_GC3_OTHER_MODEL: rekeyed["models"][_GC3_MODEL]}
+    with pytest.raises(probe.TopologyProbeError, match="a model key is the artifacts' own model"):
+        probe.validate_decision(rekeyed)
+    halved = json.loads(json.dumps(carrier))
+    halved["models"][_GC3_MODEL]["artifacts"] = halved["models"][_GC3_MODEL]["artifacts"][:1]
+    with pytest.raises(probe.TopologyProbeError, match="exactly two"):
+        probe.validate_decision(halved)
+    duplicated = json.loads(json.dumps(carrier))
+    duplicated["models"][_GC3_MODEL]["artifacts"][1] = json.loads(
+        json.dumps(duplicated["models"][_GC3_MODEL]["artifacts"][0])
+    )
+    with pytest.raises(probe.TopologyProbeError, match="duplicate evidence"):
+        probe.validate_decision(duplicated)
+    unhttps = json.loads(json.dumps(carrier))
+    unhttps["models"][_GC3_MODEL]["artifacts"][0]["sourceUrl"] = "http://example.invalid/runs/11"
+    with pytest.raises(probe.TopologyProbeError, match="https GitHub run URL"):
+        probe.validate_decision(unhttps)
+    for broken, pattern in (
+        ({**carrier, "schema": 1}, "unsupported decision schema"),
+        ({**carrier, "topologySetVersion": 2}, "topologySetVersion"),
+        ({**carrier, "models": {}}, "nonempty models map"),
+        ({"schema": 2, "models": carrier["models"]}, "closed decision keys"),
+    ):
+        with pytest.raises(probe.TopologyProbeError, match=pattern):
+            probe.validate_decision(broken)
+    shaped = json.loads(json.dumps(carrier))
+    shaped["models"][_GC3_MODEL].pop("score")
+    with pytest.raises(probe.TopologyProbeError):
+        probe.validate_decision(shaped)
+    # The retired flat schema-1 shape is not a carrier at all.
+    with pytest.raises(probe.TopologyProbeError):
+        probe.validate_decision({
+            "schema": 1, "topologySetVersion": 1, "status": "selected",
+            "headSha": _GC3_SHA, "ratifiable": [], "selected": "gateway-core",
+            "evidence": [], "artifacts": [],
+        })
 
     # Scoring refuses a class it has fewer than eight records for.
     with pytest.raises(probe.TopologyProbeError, match="need 8"):
         probe.score_topology((first,), "gateway-core")
     # The CLI reports an invalid pair rather than writing a decision.
-    assert probe.main(["decide", str(first_path), str(first_path), str(out)]) == 1
+    missing_out = tmp_path / "never-written.json"
+    assert probe.main([
+        "decide", "--out", str(missing_out),
+        "--pair", str(tmp_path / "first.json"), str(tmp_path / "first.json"),
+    ]) == 1
+    assert not missing_out.exists()
+
+
+def test_gc3_cpu_model_route_is_ratified_or_recorded(tmp_path, monkeypatch):
+    """FP-GC3-4: the exact host model routes to its gate, or to a named record.
+
+    Every branch below is decided by the carrier and the shared host reader
+    alone. `route` takes no profile, model, topology, status or reason
+    argument, and the launcher gets exactly two closed branch values out of
+    `route-fields`: it never parses the carrier, chooses a model or
+    reconstructs a topology in shell.
+    """
+    selected_pair = (_gc3_artifact("11"), _gc3_artifact("22"))
+
+    def all_slow(index):
+        return _gc3_operands(p99Ms=2387.1, maxInFlight=500)
+
+    unhostable_pair = (
+        _gc3_artifact("31", per_arm=all_slow, cpu_model=_GC3_OTHER_MODEL),
+        _gc3_artifact("32", per_arm=all_slow, cpu_model=_GC3_OTHER_MODEL),
+    )
+    carrier = _gc3_carrier(tmp_path, selected_pair, unhostable_pair)
+    decision = json.loads(carrier.read_text(encoding="utf-8"))
+    chosen = decision["models"][_GC3_MODEL]["selected"]
+
+    def route(model, *, path=carrier):
+        monkeypatch.setattr(probe, "host_cpu_model", lambda: model)
+        return probe.route_host(path)
+
+    def run_cli(model, *, path=carrier, out=None, summary=None):
+        monkeypatch.setattr(probe, "host_cpu_model", lambda: model)
+        destination = out or (tmp_path / "route.json")
+        if summary is not None:
+            monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        else:
+            monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        status = probe.main([
+            "route", "--decision", str(path), "--out", str(destination)
+        ])
+        return status, destination
+
+    # (1) selected -> gating, with this model's own topology/cardinality/schema.
+    record = route(_GC3_MODEL)
+    probe.validate_route(record)
+    assert record == {
+        "schema": 1,
+        "profile": "ci-scale",
+        "cpuModel": _GC3_MODEL,
+        "decisionState": "selected",
+        "disposition": "gating",
+        "reason": None,
+        "topology": chosen,
+        "cardinality": probe.topology_cardinality(chosen),
+        "placementSchema": 3,
+    }
+    assert record["topology"] == decision["models"][_GC3_MODEL]["selected"]
+    assert record["cardinality"] == decision["models"][_GC3_MODEL]["cardinality"]
+    assert record["placementSchema"] == decision["models"][_GC3_MODEL]["placementSchema"]
+    assert probe.route_fields(record) == f"gating\t{chosen}"
+
+    # (2) unhostable -> recorded, named for THAT model, no topology at all.
+    record = route(_GC3_OTHER_MODEL)
+    probe.validate_route(record)
+    assert record["decisionState"] == "unhostable"
+    assert record["disposition"] == "recorded"
+    assert record["reason"] == f"topology_unratified_sku:{_GC3_OTHER_MODEL}"
+    assert record["topology"] is None and record["cardinality"] is None
+    assert record["placementSchema"] is None
+    assert probe.route_fields(record) == "recorded\tnone"
+
+    # (3) a valid model with no entry -> the same recorded reason. Another
+    # model's entry is never a fallback, and neither is a prefix or a family.
+    family_prefix = _GC3_MODEL.split(" 4-Core", 1)[0]
+    assert family_prefix != _GC3_MODEL and _GC3_MODEL.startswith(family_prefix)
+    assert _GC3_MODEL.upper() != _GC3_MODEL
+    for absent in ("Totally Made Up CPU 9000", _GC3_MODEL[:-1], _GC3_MODEL.upper(),
+                   family_prefix):
+        record = route(absent)
+        probe.validate_route(record)
+        assert record["decisionState"] == "absent", absent
+        assert record["disposition"] == "recorded"
+        assert record["reason"] == f"topology_unratified_sku:{absent}"
+        assert record["topology"] is None
+        assert probe.route_fields(record) == "recorded\tnone"
+
+    # (4) an unreadable or illegal model -> its own distinct recorded reason,
+    # with a null key: the `unknown` sentinel never becomes a lookup key.
+    for unreadable in (probe.CPU_MODEL_UNKNOWN, "", "x" * 300, "bad\x01model"):
+        record = route(unreadable)
+        probe.validate_route(record)
+        assert record["cpuModel"] is None, unreadable
+        assert record["decisionState"] == "unavailable"
+        assert record["disposition"] == "recorded"
+        assert record["reason"] == "topology_cpu_model_unavailable"
+        assert probe.route_fields(record) == "recorded\tnone"
+
+    # (5) a missing or corrupt carrier is a FAILURE, never an unratified SKU --
+    # and an unreadable model cannot hide it.
+    absent_carrier = tmp_path / "no-such-carrier.json"
+    for model in (_GC3_MODEL, probe.CPU_MODEL_UNKNOWN):
+        record = route(model, path=absent_carrier)
+        probe.validate_route(record)
+        assert record["decisionState"] == "invalid"
+        assert record["disposition"] == "failure"
+        assert record["reason"] == probe.DECISION_MISSING_REASON == "gc3_decision_missing"
+        with pytest.raises(probe.TopologyProbeError, match="no launcher branch"):
+            probe.route_fields(record)
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{ not json", encoding="utf-8")
+    forged = tmp_path / "forged.json"
+    tampered = json.loads(json.dumps(decision))
+    tampered["models"][_GC3_MODEL]["selected"] = "postgres-core"
+    forged.write_text(probe.canonical_json(tampered), encoding="utf-8")
+    for path in (corrupt, forged):
+        record = route(_GC3_MODEL, path=path)
+        probe.validate_route(record)
+        assert record["decisionState"] == "invalid"
+        assert record["disposition"] == "failure"
+        assert record["reason"] == probe.DECISION_INVALID_REASON == "gc3_decision_invalid"
+
+    # (6) the CLI: canonical record on disk, exactly one stdout line that
+    # decodes back to those same bytes, a step-summary row, and the exit map.
+    summary = tmp_path / "summary.md"
+    status, written = run_cli(_GC3_MODEL, out=tmp_path / "gating.json", summary=summary)
+    assert status == 0
+    raw = written.read_text(encoding="utf-8")
+    assert raw == probe.canonical_json(json.loads(raw))
+    assert json.loads(raw)["disposition"] == "gating"
+    assert f"cpuModel={_GC3_MODEL}" in summary.read_text(encoding="utf-8")
+    status, recorded_path = run_cli(_GC3_OTHER_MODEL, out=tmp_path / "recorded.json")
+    assert status == 0
+    assert json.loads(recorded_path.read_text(encoding="utf-8"))["disposition"] == "recorded"
+    status, failed_path = run_cli(_GC3_MODEL, path=absent_carrier, out=tmp_path / "failed.json")
+    assert status == 1
+    assert json.loads(failed_path.read_text(encoding="utf-8"))["disposition"] == "failure"
+
+    # (7) route-fields: the two closed combinations, and nothing else.
+    assert probe.main(["route-fields", "--route", str(written)]) == 0
+    assert probe.main(["route-fields", "--route", str(recorded_path)]) == 0
+    assert probe.main(["route-fields", "--route", str(failed_path)]) == 1
+    noncanonical = tmp_path / "noncanonical.json"
+    noncanonical.write_text(json.dumps(json.loads(raw)), encoding="utf-8")
+    assert probe.main(["route-fields", "--route", str(noncanonical)]) == 1
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{ not json", encoding="utf-8")
+    assert probe.main(["route-fields", "--route", str(malformed)]) == 1
+    assert probe.main(["route-fields", "--route", str(tmp_path / "absent.json")]) == 1
+
+    # A hand-edited route record cannot manufacture a gate.
+    for mutation, pattern in (
+        ({"disposition": "gating"}, "routes to"),
+        ({"decisionState": "selected"}, "routes to"),
+        ({"schema": 2}, "unsupported route schema"),
+        ({"profile": "ci-scale-probe"}, "route profile"),
+        ({"reason": "something else"}, "reason"),
+    ):
+        broken = {**json.loads(recorded_path.read_text(encoding="utf-8")), **mutation}
+        with pytest.raises(probe.TopologyProbeError, match=pattern):
+            probe.validate_route(broken)
+    invented = json.loads(raw)
+    invented["topology"] = "postgres-core"
+    with pytest.raises(probe.TopologyProbeError, match="cardinality is not topology-derived"):
+        probe.validate_route(invented)
+    with pytest.raises(probe.TopologyProbeError, match="closed route keys"):
+        probe.validate_route({**json.loads(raw), "extra": 1})
+    with pytest.raises(probe.TopologyProbeError, match="not an object"):
+        probe.validate_route(["nope"])
+
+    # (8) contract-selected renders the ROUTE's class over the OBSERVED pairs,
+    # and prints only the driver CPU list the launcher runs the driver on.
+    contract_path = tmp_path / "placement.json"
+    assert probe.main([
+        "contract-selected", "--topology", chosen, "--pairs", "0-1", "2-3",
+        "--run-id", _gc3_run_id(5), "--out", str(contract_path),
+    ]) == 0
+    written_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert written_contract["profile"] == "ci-scale" and written_contract["schema"] == 3
+    assert written_contract["topology"] == chosen
+    declaration = B1PlacementDeclaration.from_contract(written_contract)
+    assert declaration.topology == chosen
+    assert declaration.cardinality == probe.topology_cardinality(chosen)
+    assert probe.main([
+        "contract-selected", "--topology", "gateway-hyperthread", "--pairs", "0-1", "2-3",
+        "--run-id", _gc3_run_id(5), "--out", str(contract_path),
+    ]) == 1

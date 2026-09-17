@@ -24,8 +24,26 @@ benchmarks:
     and again at window close. Effective cpu.max, cpu.stat throttling counters, gateway CPU use and
     host-busy values are recorded as reported diagnostics only and decide nothing; an unreadable
     source is serialized as `unavailable` rather than as a zero.
-    CI-scale allocation: the first four CPUs available to the launcher, split 2/1/1 as gateway /
-    PostgreSQL / load driver, on the four-vCPU ubuntu-latest reference host. CI-scale profile:
+    CI-scale allocation, decided per exact CPU model (design/slices/gc-3-reference-topology):
+    the reference set is the first two complete SMT sibling pairs available to the launcher on the
+    four-vCPU ubuntu-latest reference host, and the role mapping over those two pairs is the
+    topology one exact `cpuModel` earned from two complete same-head discovery artifacts through
+    the tracked carrier tests/benchmark/b1_topology_decision.json (schema 2, keyed by exact
+    cpuModel). Per-model decision table at this revision: no model has a decision entry yet -- the
+    carrier is not generated, the 28-arm discovery sweep
+    `scripts/integration-test.sh b1_topology_probe` has not yet produced two complete artifacts of
+    one exact model at this head, and therefore no topology, role cardinality or placement schema
+    is claimed for any model here. A `selected` row names its topology id, its topology-derived
+    gateway/PostgreSQL/driver cardinalities, its physical relationship over the two pairs, its
+    all-role sibling witness, placement schema 3, the two discovery evidence URLs and its final
+    gating run; an `unhostable` row names no topology and no cardinality and cites
+    `topology_unratified_sku:<model>`. A valid exact model that is absent from the table follows
+    that same recorded, non-gating policy under the same reason; a model whose string cannot be
+    read or is outside the closed model-string rules records
+    `topology_cpu_model_unavailable`. Both recorded routes run the unconditional container-free
+    coverage phase first, start no live workload afterwards, and are not a pytest skip and not a
+    green benchmark. A missing or corrupt carrier is neither: it fails the target with
+    `gc3_decision_missing` or `gc3_decision_invalid`. CI-scale profile:
     open-loop 500 req/s offered for 30 s = 15000 offered requests, due-time latency,
     MAX_IN_FLIGHT=500, unmeasured prologue, no environment knob; it asserts placement_ok=1,
     offered==15000, served+errors==offered, errors==0, served==offered, due-time p99<150ms,
@@ -68,8 +86,10 @@ benchmarks:
     unchanged and are owned by the B1-LATENCY-BASIS-1 slice, which must collect five consecutive
     placement-valid CI-scale runs at one collection head before any ledger row, CPU request or CPU
     limit changes; no run of either tier here is admitted as a sizing observation.
-    Both tiers, the allocation split and the derivation are specified by
-    design/slices/gc-1-reference-topology/design.md and recorded in design/frozen-deviations.md.
+    Both tiers and the derivation are specified by
+    design/slices/gc-1-reference-topology/design.md and recorded in design/frozen-deviations.md;
+    the per-exact-cpuModel CI-scale topology decision and its recorded routes are specified by
+    design/slices/gc-3-reference-topology/design.md.
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms

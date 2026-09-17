@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import importlib.util
 import json
 import re
@@ -101,6 +102,12 @@ def _source_assigns(src: str) -> dict[str, ast.AST]:
             t = node.targets[0]
             if isinstance(t, ast.Name):
                 out[t.id] = node.value
+        # GC-3: the per-model declaration maps carry an annotation, so an
+        # Assign-only reader would silently report them as "missing" -- which
+        # is exactly the shape of a pin that passes for the wrong reason.
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name):
+                out[node.target.id] = node.value
     return out
 
 
@@ -1877,17 +1884,84 @@ GC1_PRODUCT_FIELDS = (
 )
 GC1_RETIRED_FINGERPRINT_KEYS = ("cpu_cores_used",)
 # The allocation is affinity cardinality, not a CPU quota.
+#
+# GC-3 (FP-GC3-4) retired the fixed `ci-scale` entry and the scalar
+# `GC1_PLACEMENT_SCHEMA`. The CI-scale allocation is now decided per exact CPU
+# model, so both are read from the tracked carrier entry by entry
+# (`_gc1_cardinalities_by_cpu_model`, `_gc1_schemas_by_cpu_model` below) and
+# compared with the Python declaration surface. The product-local entry and the
+# product schema are unchanged, and the probe schema is a fixed 3.
 GC1_AFFINITY_CARDINALITIES = {
-    "ci-scale": {"gateway": 2, "postgres": 1, "driver": 1},
     "product-exclusive": {"gateway": 4, "postgres": 3, "driver": 1},
 }
-GC1_PLACEMENT_SCHEMA = 2
+GC1_PRODUCT_PLACEMENT_SCHEMA = 2
+GC1_PROBE_PLACEMENT_SCHEMA = 3
+GC1_SELECTED_PLACEMENT_SCHEMA = 3
 GC1_PLACEMENT_MECHANISM = "sched-affinity"
 GC1_DIAGNOSTIC_UNAVAILABLE = "unavailable"
 # Docker bandwidth/cpuset controls, removed as the allocation primitive.
 GC1_BANDWIDTH_CONTROLS = ("--cpus", "--cpu-period", "--cpu-quota", "--cpuset-cpus",
                           "cpu_period=", "cpu_quota=", "cpuset_cpus=")
 GC1_MARKERS = ("b1_live", "b1_product", "b1_latency_basis", "b1_topology_probe")
+
+
+def _gc3_carrier_models() -> "dict[str, dict]":
+    """The tracked carrier's model map; empty while the carrier is absent.
+
+    Reading it here is deliberately non-fatal: the two GC-3 decision tests
+    below are the fail-closed carriers that REQUIRE the file, under the named
+    reason `gc3_decision_missing`. Everything else compares declaration
+    surfaces against whatever the carrier decided, and "nothing decided yet"
+    must therefore mean "nothing declared", not "anything goes".
+    """
+    if not GC3_DECISION.is_file():
+        return {}
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    models = (decision or {}).get("models") or {}
+    return models if isinstance(models, dict) else {}
+
+
+def _gc1_selected_models() -> "dict[str, dict]":
+    return {
+        model: entry for model, entry in _gc3_carrier_models().items()
+        if isinstance(entry, dict) and entry.get("status") == "selected"
+    }
+
+
+def _gc1_cardinality_map_failures(test_assigns: "dict[str, ast.AST]") -> list[str]:
+    """FP-GC3-4: the per-model declaration maps equal the carrier, exactly.
+
+    This is the replacement for the retired scalar
+    `GC1_AFFINITY_CARDINALITIES["ci-scale"]` / `GC1_PLACEMENT_SCHEMA` pins:
+    one entry per `selected` model, each carrying that model's own
+    topology-derived cardinality and schema 3, and no scalar default anywhere.
+    """
+    fails: list[str] = []
+    selected = _gc1_selected_models()
+    expectations = {
+        "CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL": {
+            model: entry.get("cardinality") for model, entry in selected.items()
+        },
+        "CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL": {
+            model: GC1_SELECTED_PLACEMENT_SCHEMA for model in selected
+        },
+    }
+    for name, expected in expectations.items():
+        node = test_assigns.get(name)
+        if node is None:
+            fails.append(f"{name} is missing from the harness")
+            continue
+        declared = ast.literal_eval(node)
+        if declared != expected:
+            fails.append(f"{name} is {declared!r}, the carrier decides {expected!r}")
+    for retired in ("CI_SCALE_AFFINITY_CARDINALITY", "B1_PLACEMENT_SCHEMA"):
+        if retired in test_assigns:
+            fails.append(f"the retired scalar {retired} survives")
+    if ast.literal_eval(
+        test_assigns["PRODUCT_AFFINITY_CARDINALITY"]
+    ) != GC1_AFFINITY_CARDINALITIES["product-exclusive"]:
+        fails.append("the product-local 4/3/1 cardinality moved")
+    return fails
 GC1_BASIS_MS_PER_REQUEST = 2.427
 GC1_BASIS_OWNER = "B1-LATENCY-BASIS-1"
 # Top-level directories the FP-GC1-6 guard may open. The gitignored
@@ -2108,13 +2182,16 @@ def test_b1_harness_surface_is_pinned_and_environment_independent_gc1():
     # and the allocation carries no bandwidth control anywhere.
     tree = ast.parse(test_src)
     for profile, cardinalities in GC1_AFFINITY_CARDINALITIES.items():
-        name = (
-            "CI_SCALE_AFFINITY_CARDINALITY" if profile == "ci-scale"
-            else "PRODUCT_AFFINITY_CARDINALITY"
-        )
+        name = "PRODUCT_AFFINITY_CARDINALITY"
         assert ast.literal_eval(test_assigns[name]) == cardinalities, name
-        assert sum(cardinalities.values()) == (4 if profile == "ci-scale" else 8), profile
-    assert ast.literal_eval(test_assigns["B1_PLACEMENT_SCHEMA"]) == GC1_PLACEMENT_SCHEMA
+        assert sum(cardinalities.values()) == 8, profile
+    # The CI-scale half is model-keyed and generated; it is checked against the
+    # carrier, entry by entry, in test_gc3_reference_topology_scope_and_
+    # decision_are_pinned rather than against a literal here.
+    assert _gc1_cardinality_map_failures(test_assigns) == []
+    assert ast.literal_eval(
+        test_assigns["PRODUCT_PLACEMENT_SCHEMA"]
+    ) == GC1_PRODUCT_PLACEMENT_SCHEMA
     assert ast.literal_eval(test_assigns["B1_PLACEMENT_MECHANISM"]) == GC1_PLACEMENT_MECHANISM
     assert _module_tuple(tree, "B1_ROLES") == GC1_ROLES
     for line in test_src.splitlines():
@@ -2142,8 +2219,8 @@ def test_b1_harness_surface_is_pinned_and_environment_independent_gc1():
 
     # Negative controls: one mutation at a time, each named.
     unmarked = test_src.replace(
-        "@pytest.mark.b1_live\ndef test_b1_ci_scale_fingerprint_proves_placement(",
-        "def test_b1_ci_scale_fingerprint_proves_placement(", 1)
+        "@pytest.mark.b1_live\ndef test_b1_ci_scale_fingerprint_proves_reference_topology(",
+        "def test_b1_ci_scale_fingerprint_proves_reference_topology(", 1)
     assert unmarked != test_src
     assert any("without b1_live" in f for f in _live_marker_failures(unmarked))
     unproducted = test_src.replace(
@@ -2435,8 +2512,8 @@ def test_gc1_preserves_and_routes_unqualified_cpu_basis():
 #
 # Every literal below is declared here, independently of the module it pins.
 # The pin is structural: it says what this slice did and did not change. It
-# infers no performance from source shape -- the EPYC 7763 CI record required
-# by FP-GC2-4 remains the only performance acceptance evidence.
+# infers no performance from source shape -- the hosted-runner CI record
+# required by FP-GC2-4 remains the only performance acceptance evidence.
 # ---------------------------------------------------------------------------
 
 GC2_INGEST_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "ingest.py"
@@ -2492,13 +2569,22 @@ GC2_DEFERRED_AUDIT_TOKENS = (
     "defer",
 )
 # CI-scale 2/1/1 and product 4/3/1, spelled as the launcher spells them.
+# GC-1's launcher allocation, as GC-3 leaves it. The three ordinary CI-scale
+# lines are RETIRED: that route no longer allocates roles at all -- it renders
+# the exact host model's ratified topology over the two observed sibling pairs
+# through `contract-selected`. The product-local 4/3/1 lines are unchanged, and
+# the retired CI-scale literals are pinned ABSENT in `_gc3_scope_failures`.
 GC2_LAUNCHER_AFFINITY_LINES = (
-    'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
-    'postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
-    'driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
     'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}" "${cpus[2]}" "${cpus[3]}")"',
     'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}" "${cpus[6]}")"',
     'driver_cpus="$(b1_canonical_cpu_list "${cpus[7]}")"',
+)
+GC2_LAUNCHER_ROUTED_LINES = (
+    'b1_run_driver driver-coverage.sh "${cpus[0]}"',
+    'python3 "$B1_PROBE_PLANNER" route \\',
+    'python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"',
+    'python3 "$B1_PROBE_PLANNER" contract-selected \\',
+    'b1_run_driver driver-live.sh "$driver_cpus"',
 )
 GC2_RAW_CLIENT_LIMIT = "client = build_httpx_client(max_connections=max_in_flight)"
 # The GC-2 investigation's own numbers. Neither may become a sizing carrier
@@ -2696,15 +2782,14 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
     launcher_src = GC2_LAUNCHER_PATH.read_text(encoding="utf-8")
     for line in GC2_LAUNCHER_AFFINITY_LINES:
         assert line in launcher_src, line
+    for line in GC2_LAUNCHER_ROUTED_LINES:
+        assert line in launcher_src, line
     profile_src = REF_PATH.read_text(encoding="utf-8")
     assert GC2_RAW_CLIENT_LIMIT in profile_src
     assert "MAX_IN_FLIGHT = BURST_RATE" in profile_src
     for profile, cardinalities in GC1_AFFINITY_CARDINALITIES.items():
-        name = (
-            "CI_SCALE_AFFINITY_CARDINALITY" if profile == "ci-scale"
-            else "PRODUCT_AFFINITY_CARDINALITY"
-        )
-        assert ast.literal_eval(test_assigns[name]) == cardinalities, name
+        assert ast.literal_eval(test_assigns["PRODUCT_AFFINITY_CARDINALITY"]) == cardinalities
+    assert _gc1_cardinality_map_failures(test_assigns) == []
 
     # (6) The chart basis is unchanged, and this slice's own investigation
     # numbers are in no tracked sizing carrier. Ledger emptiness is NOT
@@ -2793,16 +2878,32 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
 # The two tests in this block are the slice's fail-closed carriers: while
 # `tests/benchmark/b1_topology_decision.json` does not exist they BOTH fail
 # with the named reason `gc3_decision_missing`. That is deliberate and it is
-# the design's own statement of the probe head: the decision cannot be written
-# until two EPYC 7763 discovery artifacts have been measured at this exact
-# SHA, and absence must never read as a skip, a default or a placeholder.
+# the design's own statement of the probe head: no model has a decision until
+# SOME EXACT CPU MODEL has two complete discovery artifacts of its own, from
+# distinct GitHub runs at this exact SHA. There is no reference SKU here --
+# the standard four-vCPU pool rotates, every model accumulates its evidence
+# independently, and absence must never read as a skip, a default or a
+# placeholder.
 # ---------------------------------------------------------------------------
 
 GC3_DECISION_MISSING_REASON = "gc3_decision_missing"
+GC3_DECISION_INVALID_REASON = "gc3_decision_invalid"
+GC3_UNRATIFIED_REASON_PREFIX = "topology_unratified_sku:"
+GC3_MODEL_UNAVAILABLE_REASON = "topology_cpu_model_unavailable"
+#: The tracked carrier at the exact path the driver container reads it at,
+#: through the existing read-only source mount. It is the ONE file that joins
+#: the host route to the live fingerprint: the host route record is never
+#: copied into B1_RUN_DIR and the closed placement contract gains no cpuModel.
+GC3_MOUNTED_CARRIER = "/workspace/tests/benchmark/b1_topology_decision.json"
+GC3_WITNESS_TEST = "test_b1_ci_scale_fingerprint_proves_reference_topology"
+GC3_RETIRED_WITNESS_TEST = "test_b1_ci_scale_fingerprint_proves_placement"
 GC3_PROBE_PROFILE_NAME = "ci-scale-probe"
 GC3_CONTRACT_SCHEMA = 3
 GC3_SCHEMA2 = 2
-GC3_REFERENCE_CPU_MODEL = "AMD EPYC 7763 64-Core Processor"
+# GC-3 rev 0.6: no fixed reference SKU. The decision is keyed by whatever
+# exact canonical model string an artifact carries, and the two tests below pin
+# that the selector holds no manufacturer, family or SKU literal at all.
+GC3_DECISION_SCHEMA = 2
 GC3_REFERENCE_LOGICAL_CPUS = 4
 GC3_ARMS_PER_ARTIFACT = 28
 GC3_ORIENTATIONS = (0, 1)
@@ -2817,8 +2918,8 @@ GC3_TOPOLOGY_IDS = (
     "postgres-split",
 )
 # The abstract maps over the two sibling pairs (a, b) and (c, d). Relationships,
-# never CPU ids: `{a, b}` is one physical core on the 7763 guest and on the i7
-# replica alike, while the ids differ on both.
+# never CPU ids: `{a, b}` is one physical core on a hosted four-vCPU guest and
+# on the i7 replica alike, while the ids differ on both.
 GC3_TOPOLOGY_MAPS = {
     "gateway-core": {"gateway": ("a", "b"), "postgres": ("c",), "driver": ("d",),
                      "unassigned": ()},
@@ -3082,7 +3183,7 @@ def _gc3_candidate_space_failures() -> list[str]:
     if tuple(gc3.ORIENTATIONS) != GC3_ORIENTATIONS or tuple(gc3.ROUNDS) != GC3_ROUNDS:
         fails.append("orientations/rounds are not the closed pairs")
     # Two independent pairings, so the enumeration is a relationship rather than
-    # a CPU-id literal: the 7763 guest's (0,1)/(2,3) and an i7 replica's
+    # a CPU-id literal: a hosted guest's (0,1)/(2,3) and an i7 replica's
     # (0,8)/(1,9) must produce the same 28 relationships.
     for pair0, pair1 in (((0, 1), (2, 3)), ((0, 8), (1, 9))):
         arms = gc3.enumerate_arms(pair0, pair1)
@@ -3134,6 +3235,53 @@ def _gc3_candidate_space_failures() -> list[str]:
     return fails
 
 
+def _gc3_decide_parser_failures() -> list[str]:
+    """FP-GC3-3: the `decide` subparser's own argument surface, as built.
+
+    Exactly required `--out`, required two-value `--pair` and optional
+    `--base`; no positional path; and none of the forbidden override flags,
+    read off the parser rather than off its source.
+    """
+    import argparse
+
+    fails: list[str] = []
+    parser = gc3.build_parser()
+    subparsers = [
+        action for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+    if len(subparsers) != 1 or "decide" not in subparsers[0].choices:
+        return ["the decide subparser is missing"]
+    decide = subparsers[0].choices["decide"]
+    actions = {
+        action.dest: action for action in decide._actions if action.dest != "help"
+    }
+    options = {
+        option for action in actions.values() for option in action.option_strings
+    }
+    if options != {"--out", "--base", "--pair"}:
+        fails.append(f"the decide parser exposes {sorted(options)}")
+    positionals = sorted(
+        dest for dest, action in actions.items() if not action.option_strings
+    )
+    if positionals:
+        fails.append(f"the decide parser takes the positional(s) {positionals}")
+    out = actions.get("out")
+    if out is None or not out.required:
+        fails.append("--out is not required")
+    pair = actions.get("pair")
+    if pair is None or not pair.required or pair.nargs != 2:
+        fails.append(f"--pair is {getattr(pair, 'nargs', None)!r}, required two values")
+    base = actions.get("base")
+    if base is None or base.required or base.default is not None:
+        fails.append("--base is not an optional carrier to merge into")
+    for forbidden in ("--force", "--select", "--candidate", "--threshold", "--tie",
+                      "--topology", "--model", "--cpu-model", "--status"):
+        if forbidden in options:
+            fails.append(f"the decide parser exposes {forbidden}")
+    return fails
+
+
 def _gc3_selector_failures() -> list[str]:
     """FP-GC3-3: eligibility, ranking and the absence of any override."""
     fails: list[str] = []
@@ -3149,14 +3297,30 @@ def _gc3_selector_failures() -> list[str]:
     decide_block = body.split('sub.add_parser("decide"', 1)
     if len(decide_block) != 2:
         return ["the decide subcommand is missing"]
-    options = re.findall(r'decide\.add_argument\("([^"]+)"', decide_block[1])
-    if options != ["first", "second", "out"]:
+    # GC-3 rev 0.6: exactly required `--out`, required two-value `--pair`, and
+    # optional `--base`. No positional path, and no other option: one
+    # invocation admits one exact model and merges it into the carrier.
+    decide_source = decide_block[1].split("\n\n", 1)[0]
+    options = re.findall(r'decide\.add_argument\("([^"]+)"', decide_source)
+    if options != ["--out", "--base", "--pair"]:
         fails.append(f"the decide CLI takes {options}")
-    if any(option.startswith("-") for option in options):
-        fails.append("the decide CLI accepts an option")
+    if any(not option.startswith("--") for option in options):
+        fails.append("the decide CLI accepts a positional path")
+    if 'decide.add_argument("--out", required=True)' not in decide_source:
+        fails.append("--out is not required")
+    if 'decide.add_argument("--pair", required=True, nargs=2' not in decide_source:
+        fails.append("--pair is not a required two-value option")
+    if 'decide.add_argument("--base", default=None)' not in decide_source:
+        fails.append("--base is not an optional carrier to merge into")
     for forbidden in ("candidate", "threshold", "tie", "topology=", "--force", "--select"):
         if forbidden in decide_block[1]:
             fails.append(f"the decide CLI exposes {forbidden!r}")
+    # ...and the same claim about the BUILT parser, not its source text. The
+    # substring scan above runs over everything after the `decide` marker,
+    # which includes the routing subparsers defined below it; this reads the
+    # decide parser's own `option_strings`, so it neither misses a flag added
+    # through a loop nor fires on a later subcommand's legitimate option.
+    fails.extend(_gc3_decide_parser_failures())
     # CPU diagnostics may not enter the ranking.
     score = ast.get_source_segment(
         src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
@@ -3168,10 +3332,31 @@ def _gc3_selector_failures() -> list[str]:
     for diagnostic in ("postgresUsageUsec", "gatewayCpuCoresUsed", "cpu_ms", "usage_usec"):
         if diagnostic in score:
             fails.append(f"the ranking uses the CPU diagnostic {diagnostic}")
-    if gc3.REFERENCE_CPU_MODEL != GC3_REFERENCE_CPU_MODEL:
-        fails.append(f"reference model {gc3.REFERENCE_CPU_MODEL!r}")
+    # GC-3 rev 0.6: there is NO fixed reference SKU any more. Admission is
+    # "both artifacts carry the same validated exact model", and the model
+    # rules are closed text rules with no manufacturer, family or SKU literal.
+    if hasattr(gc3, "REFERENCE_CPU_MODEL"):
+        fails.append("the fixed REFERENCE_CPU_MODEL survives")
+    admit = ast.get_source_segment(
+        src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "admit_evidence")
+    ) or ""
+    if "models[0] != models[1]" not in admit:
+        fails.append("admission no longer requires the two artifacts to share a model")
+    for vendor in ("EPYC", "Xeon", "AMD", "Intel"):
+        if vendor in src:
+            fails.append(f"the selector carries the SKU literal {vendor!r}")
+    if gc3.DECISION_SCHEMA != GC3_DECISION_SCHEMA:
+        fails.append(f"decision schema {gc3.DECISION_SCHEMA}")
     if gc3.REFERENCE_LOGICAL_CPUS != GC3_REFERENCE_LOGICAL_CPUS:
         fails.append(f"reference logical CPUs {gc3.REFERENCE_LOGICAL_CPUS}")
+    if gc3.CPU_MODEL_UNKNOWN != "unknown":
+        fails.append(f"model sentinel {gc3.CPU_MODEL_UNKNOWN!r}")
+    for illegal in ("unknown", "", "x" * 300, "two  spaces", " padded", 7, None):
+        if gc3.is_decision_eligible_cpu_model(illegal):
+            fails.append(f"the model rules admit {illegal!r}")
+    if not gc3.is_decision_eligible_cpu_model("Some Exact Model 9000"):
+        fails.append("the model rules are an allowlist rather than text rules")
     return fails
 
 
@@ -3243,6 +3428,163 @@ def _gc3_probe_partition_failures(src: str) -> list[str]:
     ):
         if gating not in body:
             fails.append(f"{GC3_PROBE_NODE}: missing gating step {gating!r}")
+    return fails
+
+
+def _gc3_route_surface_failures() -> list[str]:
+    """FP-GC3-4/5: the routing CLI, the launcher flow and the mounted witness.
+
+    Three independent legs, checked from the sources themselves:
+
+    * the planner exposes exactly `route`, `route-fields` and
+      `contract-selected` with the argument and output contracts §3.5 fixes,
+      and none of them accepts a profile, model, topology, status, reason,
+      role mapping or cardinality value;
+    * the launcher reaches placement only through them -- unconditional
+      coverage, then `route`, then one `route-fields` read, then
+      `contract-selected` -- and spells no topology and no reason itself; and
+    * the renamed live witness is the one that joins decision to fingerprint,
+      through the mounted carrier and the model the MEASURED container reports.
+    """
+    fails: list[str] = []
+    helper = PROBE_HELPER.read_text(encoding="utf-8")
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    harness = REF_TEST.read_text(encoding="utf-8")
+    tree = ast.parse(helper)
+    builder = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_parser"), None
+    )
+    if builder is None:
+        return ["build_parser: missing"]
+    body = ast.get_source_segment(helper, builder) or ""
+    expected_options = {
+        "route": ["--decision", "--out"],
+        "route-fields": ["--route"],
+        "contract-selected": ["--topology", "--pairs", "--run-id", "--out"],
+    }
+    variables = {
+        "route": "route", "route-fields": "route_fields_parser",
+        "contract-selected": "contract_selected",
+    }
+    for command, options in expected_options.items():
+        block = body.split(f'sub.add_parser("{command}"', 1)
+        if len(block) != 2:
+            fails.append(f"the {command} subcommand is missing")
+            continue
+        variable = variables[command]
+        observed = re.findall(rf'{variable}\.add_argument\("([^"]+)"', block[1])
+        if observed != options:
+            fails.append(f"the {command} CLI takes {observed}")
+        if any(not option.startswith("--") for option in observed):
+            fails.append(f"the {command} CLI accepts a positional argument")
+    for forbidden in ("--profile", "--model", "--cpu-model", "--status", "--reason",
+                      "--cardinality", "--roles", "--orientation"):
+        if forbidden in body:
+            fails.append(f"the routing CLI exposes {forbidden}")
+    if 'contract_selected.add_argument("--pairs", required=True, nargs=2)' not in body:
+        fails.append("contract-selected does not take exactly two observed pairs")
+    # `contract-selected` renders the fixed orientation 0 and nothing else.
+    renderer = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "selected_contract")
+    rendered = ast.get_source_segment(helper, renderer) or ""
+    if "SELECTED_ORIENTATION" not in rendered:
+        fails.append("contract-selected does not render the fixed orientation")
+    parameters = {a.arg for a in renderer.args.args} | {a.arg for a in renderer.args.kwonlyargs}
+    if parameters != {"topology", "pairs", "run_id"}:
+        fails.append(f"selected_contract takes {sorted(parameters)}")
+    for statement in ast.walk(renderer):
+        if isinstance(statement, ast.Name) and statement.id == "orientation":
+            fails.append("contract-selected reads an orientation from its caller")
+
+    # The launcher: coverage before route, one closed read, no reason text and
+    # no topology literal of its own.
+    region = launcher.split("\nb1() {", 1)
+    if len(region) != 2:
+        return fails + ["the ordinary b1 target is missing"]
+    b1_region = region[1].split("\n# The product promise", 1)[0]
+    for clause in (
+        'b1_run_driver driver-coverage.sh "${cpus[0]}"',
+        'python3 "$B1_PROBE_PLANNER" route \\',
+        '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \\',
+        'python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"',
+        'python3 "$B1_PROBE_PLANNER" contract-selected \\',
+        '--topology "$route_topology" \\',
+        '--pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \\',
+        'b1_run_driver driver-live.sh "$driver_cpus"',
+    ):
+        if clause not in b1_region:
+            fails.append(f"the ordinary b1 route lost {clause!r}")
+    coverage_at = b1_region.find('b1_run_driver driver-coverage.sh')
+    route_at = b1_region.find('"$B1_PROBE_PLANNER" route ')
+    live_at = b1_region.find('b1_run_driver driver-live.sh')
+    if not -1 < coverage_at < route_at < live_at:
+        fails.append(
+            f"the ordinary b1 phases are out of order ({coverage_at}/{route_at}/{live_at})"
+        )
+    if b1_region.count("route-fields") != 1:
+        fails.append("the launcher reads route-fields more than once")
+    for reason in (GC3_DECISION_MISSING_REASON, GC3_DECISION_INVALID_REASON,
+                   GC3_UNRATIFIED_REASON_PREFIX, GC3_MODEL_UNAVAILABLE_REASON):
+        if reason not in helper:
+            fails.append(f"the planner no longer declares {reason!r}")
+        if reason in launcher:
+            fails.append(f"the launcher spells the route reason {reason!r}")
+    if "b1_topology_decision.json" in b1_region.replace(
+        '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \\', "", 1
+    ):
+        fails.append("the launcher reads the carrier outside route")
+
+    # The renamed witness: exactly one, under the new name, and it is the one
+    # that proves the mounted-carrier join.
+    harness_tree = ast.parse(harness)
+    witnesses = [
+        n for n in ast.walk(harness_tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == GC3_WITNESS_TEST
+    ]
+    if len(witnesses) != 1:
+        fails.append(f"{GC3_WITNESS_TEST}: {len(witnesses)} definitions")
+        return fails
+    if GC3_RETIRED_WITNESS_TEST + "(" in harness:
+        fails.append(f"the retired {GC3_RETIRED_WITNESS_TEST} survives")
+    witness_src = ast.get_source_segment(harness, witnesses[0]) or ""
+    # EXACT assertion text, not a loose substring: every one of these names
+    # appears elsewhere in the same function, so a substring pin would survive
+    # the very weakening it is named for.
+    for clause in (
+        'assert B1_DECISION_CARRIER.is_file(), (',
+        "    probe.validate_decision(carrier)",
+        '    measured_model = probe.validate_cpu_model(_host_fingerprint()["cpu_model"])',
+        '    entry = carrier["models"].get(measured_model)',
+        '    assert entry["status"] == probe.DECISION_SELECTED, '
+        '(measured_model, entry["status"])',
+        '    assert entry["selected"] == topology, '
+        '(measured_model, entry["selected"], topology)',
+        '    assert entry["placementSchema"] == B1_TOPOLOGY_PLACEMENT_SCHEMA',
+        '    assert CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL[measured_model] == cardinality',
+        '    assert _parse_b1_env_field(line, "placement_schema") == '
+        "str(B1_TOPOLOGY_PLACEMENT_SCHEMA)",
+        '    topology = _parse_b1_env_field(line, "reference_topology")',
+        "    assert topology in probe.TOPOLOGY_IDS, topology",
+        "    assert topology == declaration.topology",
+        '        rendered = _parse_b1_env_field(line, f"{role}_thread_siblings_pct")',
+        "        assert rendered != DIAGNOSTIC_UNAVAILABLE, role",
+        "    assert declaration.carries_topology",
+    ):
+        if clause not in witness_src:
+            fails.append(f"{GC3_WITNESS_TEST} lost the exact clause {clause!r}")
+    if "for role in B1_ROLES:" not in witness_src:
+        fails.append(f"{GC3_WITNESS_TEST} does not gate every role sibling map")
+    if f'B1_DECISION_CARRIER = Path("{GC3_MOUNTED_CARRIER}")' not in harness:
+        fails.append("the mounted carrier path moved")
+    # The host route record never reaches the run directory, and the closed
+    # placement contract never gains a cpuModel key.
+    if "B1_ROUTE_RECORD" in harness:
+        fails.append("the harness reads the host route record")
+    if "cpuModel" in ast.get_source_segment(
+        helper, next(n for n in ast.parse(helper).body
+                     if isinstance(n, ast.FunctionDef) and n.name == "selected_contract")
+    ):
+        fails.append("the closed placement contract carries a cpuModel key")
     return fails
 
 
@@ -3359,8 +3701,8 @@ def _gc3_scope_failures() -> list[str]:
         GC1_AFFINITY_CARDINALITIES["product-exclusive"]
     ):
         fails.append("the product-local 4/3/1 placement moved")
-    if ast.literal_eval(harness_assigns["B1_PLACEMENT_SCHEMA"]) != GC3_SCHEMA2:
-        fails.append("the schema-2 contract moved")
+    if ast.literal_eval(harness_assigns["PRODUCT_PLACEMENT_SCHEMA"]) != GC3_SCHEMA2:
+        fails.append("the product schema-2 contract moved")
     if 'b1_product() {' not in launcher or '"minimumHostLogicalCpus": 8,' not in launcher:
         fails.append("the product-local route moved")
     if 'if [ "${#cpus[@]}" -lt 8 ]; then' not in launcher:
@@ -3369,17 +3711,26 @@ def _gc3_scope_failures() -> list[str]:
     if "b1_complete_sibling_pairs" in product_region:
         fails.append("the SMT-pair prerequisite leaked into b1_product")
 
-    # (6) The ordinary b1 prerequisite: named failure, never a skip, and the
-    # 2/1/1 mapping over the first four allowed CPUs is untouched at this head.
+    # (6) The ordinary b1 prerequisite: a named failure on a gating route,
+    # never a skip and never four unrelated CPUs. GC-3 retired the 2/1/1
+    # literals entirely -- their absence is asserted, not assumed.
     for clause in (
         'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")',
         'if [ "${#sibling_pairs[@]}" -lt 2 ]; then',
+        'if [ "${#cpus[@]}" -lt 4 ]; then',
+    ):
+        if clause not in b1_region and clause not in launcher:
+            fails.append(f"the ordinary b1 route lost {clause!r}")
+    for retired in (
         'gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"',
         'postgres_cpus="$(b1_canonical_cpu_list "${cpus[2]}")"',
         'driver_cpus="$(b1_canonical_cpu_list "${cpus[3]}")"',
     ):
-        if clause not in b1_region and clause not in launcher:
-            fails.append(f"the ordinary b1 route lost {clause!r}")
+        if retired in b1_region:
+            fails.append(f"the retired ordinary 2/1/1 literal survives: {retired!r}")
+    for escape_hatch in ("pytest.mark.skip", "--deselect", "|| true"):
+        if escape_hatch in b1_region:
+            fails.append(f"the ordinary b1 route carries {escape_hatch}")
 
     # (7) No escape hatch, no bandwidth control, in any carrier this slice adds.
     for label, text in (("launcher", launcher), ("probe live", probe_live),
@@ -3400,8 +3751,12 @@ def _gc3_scope_failures() -> list[str]:
     # GitHub run identity of the record.
     if "getenv" in harness or "os.environ.get" in harness:
         fails.append("the harness reads the environment")
+    # The only environment reads in the helper are the GitHub run identity of
+    # the record and the step-summary sink the route row is appended to. None
+    # of them is a profile, candidate, affinity, model or bar value.
     env_reads = set(re.findall(r'os\.environ\.get\("([A-Z_]+)"', probe_helper))
-    if not env_reads <= {"GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"}:
+    if not env_reads <= {"GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+                         "GITHUB_STEP_SUMMARY"}:
         fails.append(f"the probe helper reads {sorted(env_reads)}")
     if "os.environ.get" in probe_live or "getenv" in probe_live:
         fails.append("the probe live module reads the environment")
@@ -3423,61 +3778,92 @@ def _gc3_scope_failures() -> list[str]:
 
 
 def test_gc3_reference_topology_decision_is_evidence_backed():
-    """FP-GC3-3: the tracked decision is the selector's own result, or nothing.
+    """FP-GC3-3: every tracked model entry is the selector's own result, or nothing.
 
     RED BY DESIGN at the probe implementation head, with the named reason
-    ``gc3_decision_missing``. Two complete EPYC 7763 discovery artifacts, from
-    distinct GitHub runs at this exact SHA, must be measured before a decision
-    can exist. This never skips, never defaults and never writes a placeholder:
-    a selected topology that nothing measured is precisely the failure this
-    slice exists to prevent.
+    ``gc3_decision_missing``. A model earns an entry only from two complete
+    discovery artifacts OF THAT EXACT MODEL, from distinct GitHub runs at one
+    source SHA. This never skips, never defaults and never writes a
+    placeholder: a selected topology that nothing measured is precisely the
+    failure this slice exists to prevent, and one model's evidence is never
+    allowed to decide another model's outcome.
     """
     assert _gc3_selector_failures() == []
 
     assert GC3_DECISION.is_file(), (
         f"{GC3_DECISION_MISSING_REASON}: "
         f"tests/benchmark/b1_topology_decision.json does not exist. Dispatch "
-        f"ci.yml twice with b1_topology_probe=true at this head, keep the two "
-        f"complete {GC3_REFERENCE_CPU_MODEL} artifacts, and generate the carrier "
-        f"with `b1_topology_probe.py decide`. Absence is never a skip, a default "
-        f"or a placeholder."
+        f"ci.yml with b1_topology_probe=true at this head until some exact CPU "
+        f"model has two complete artifacts from distinct runs, then generate "
+        f"that model's entry with `b1_topology_probe.py decide --out ... "
+        f"--pair <first> <second>`. Absence is never a skip, a default or a "
+        f"placeholder."
     )
 
-    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    raw = GC3_DECISION.read_text(encoding="utf-8")
+    decision = json.loads(raw)
     # The carrier is canonical, so the recomputation below reads the same bytes
     # a reviewer does.
-    assert gc3.canonical_json(decision) == GC3_DECISION.read_text(encoding="utf-8")
-    assert decision["schema"] == gc3.DECISION_SCHEMA
+    assert gc3.canonical_json(decision) == raw
+    assert decision["schema"] == gc3.DECISION_SCHEMA == 2
     assert decision["topologySetVersion"] == gc3.TOPOLOGY_SET_VERSION
-    assert decision["status"] in (gc3.DECISION_SELECTED, gc3.DECISION_UNHOSTABLE)
+    assert sorted(decision) == ["models", "schema", "topologySetVersion"]
+    models = decision["models"]
+    assert isinstance(models, dict) and models
+    # Lexical key order, so two reviewers reading the file see one order.
+    assert list(models) == sorted(models)
 
-    embedded = decision["artifacts"]
-    assert len(embedded) == 2
-    runs = {entry["githubRunId"] for entry in embedded}
-    assert len(runs) == 2, f"both artifacts come from run {sorted(runs)}"
-    for entry in embedded:
-        assert entry["url"].startswith("https://github.com/"), entry["url"]
-        assert str(entry["githubRunId"]) in entry["url"]
-        artifact = entry["artifact"]
-        assert artifact["status"] == "complete"
-        assert artifact["cpuModel"] == GC3_REFERENCE_CPU_MODEL
-        assert artifact["logicalCpuCount"] == GC3_REFERENCE_LOGICAL_CPUS
-        assert len(artifact["arms"]) == GC3_ARMS_PER_ARTIFACT
-        assert artifact["headSha"] == decision["headSha"]
-
-    # The decision must be exactly what the immutable selector derives from the
-    # artifacts the file itself carries -- recomputed here, never trusted.
+    # The whole carrier, validated and recomputed from its own embedded
+    # evidence -- never trusted, and never read one entry at a time.
+    gc3.validate_decision(decision)
     recomputed = gc3.recompute_decision(decision)
-    assert recomputed["status"] == decision["status"]
-    assert recomputed["selected"] == decision["selected"]
-    assert list(recomputed["ratifiable"]) == list(decision["ratifiable"])
-    if decision["status"] == gc3.DECISION_SELECTED:
-        assert decision["selected"] in GC3_TOPOLOGY_IDS
-        assert decision["selected"] in decision["ratifiable"]
-        assert decision["score"] == recomputed["score"]
-    else:
-        assert decision["selected"] is None
-        assert decision["ratifiable"] == []
+    assert sorted(recomputed) == sorted(models)
+
+    for model, entry in models.items():
+        assert gc3.validate_cpu_model(model) == model
+        assert entry["status"] in (gc3.DECISION_SELECTED, gc3.DECISION_UNHOSTABLE)
+        assert entry == recomputed[model], model
+        embedded = entry["artifacts"]
+        assert len(embedded) == 2, model
+        runs = {wrapper["artifact"]["githubRunId"] for wrapper in embedded}
+        assert len(runs) == 2, f"{model}: both artifacts come from run {sorted(runs)}"
+        for wrapper in embedded:
+            assert sorted(wrapper) == ["artifact", "sha256", "sourceUrl"]
+            assert wrapper["sourceUrl"].startswith("https://github.com/"), wrapper["sourceUrl"]
+            artifact = wrapper["artifact"]
+            assert str(artifact["githubRunId"]) in wrapper["sourceUrl"]
+            assert wrapper["sha256"] == hashlib.sha256(
+                gc3.canonical_json(artifact).encode("utf-8")
+            ).hexdigest(), model
+            assert artifact["status"] == "complete"
+            # The model key IS the artifacts' own model. No cross-model pair.
+            assert artifact["cpuModel"] == model
+            assert artifact["logicalCpuCount"] == GC3_REFERENCE_LOGICAL_CPUS
+            assert artifact["githubJob"] == GC3_PROBE_JOB
+            assert len(artifact["arms"]) == GC3_ARMS_PER_ARTIFACT
+            assert artifact["headSha"] == entry["evidenceHeadSha"]
+        if entry["status"] == gc3.DECISION_SELECTED:
+            assert entry["selected"] in GC3_TOPOLOGY_IDS, model
+            assert entry["selected"] in entry["ratifiable"]
+            assert entry["cardinality"] == gc3.topology_cardinality(entry["selected"])
+            assert entry["placementSchema"] == GC1_SELECTED_PLACEMENT_SCHEMA == 3
+            assert set(entry["score"]) == {"maxP99Ms", "maxInFlight", "minServedRate"}
+        else:
+            for null_field in ("selected", "cardinality", "placementSchema", "score"):
+                assert entry[null_field] is None, (model, null_field)
+            assert entry["ratifiable"] == []
+
+    # A hand-written entry is not a decision: mutating any derived field makes
+    # the carrier disagree with a fresh selector run over its own evidence.
+    for model, entry in models.items():
+        if entry["status"] != gc3.DECISION_SELECTED:
+            continue
+        forged = json.loads(json.dumps(decision))
+        others = [t for t in GC3_TOPOLOGY_IDS if t != entry["selected"]]
+        forged["models"][model]["selected"] = others[0]
+        with pytest.raises(gc3.TopologyProbeError):
+            gc3.validate_decision(forged)
+        break
 
 
 def test_gc3_reference_topology_scope_and_decision_are_pinned():
@@ -3487,8 +3873,8 @@ def test_gc3_reference_topology_scope_and_decision_are_pinned():
     required, so this test enforces the scope boundary even while it is red.
     The carrier assertion is the last of the head's checks and the first of the
     decision's: below it are the clauses that only a measured decision can
-    settle -- the selected topology literal in the launcher, the Python
-    declaration surface and the B1 manifest note.
+    settle -- the per-model declaration maps, the manifest note's per-model
+    table and the mounted-carrier live witness's own model key.
     """
     assert _gc3_candidate_space_failures() == []
     assert _gc3_topology_surface_failures(REF_TEST.read_text(encoding="utf-8")) == []
@@ -3498,6 +3884,10 @@ def test_gc3_reference_topology_scope_and_decision_are_pinned():
     probe_src = PROBE_TEST.read_text(encoding="utf-8")
     assert _gc3_probe_partition_failures(probe_src) == []
     assert _gc3_scope_failures() == []
+    assert _gc3_route_surface_failures() == []
+    assert _gc1_cardinality_map_failures(
+        _source_assigns(REF_TEST.read_text(encoding="utf-8"))
+    ) == []
 
     # Negative control: truth-gating a recorded performance status is red.
     gated = probe_src.replace(
@@ -3522,6 +3912,7 @@ def test_gc3_reference_topology_scope_and_decision_are_pinned():
     # Both fail-closed carriers name the reason, and neither reaches for a skip.
     own_src = Path(__file__).read_text(encoding="utf-8")
     assert GC3_DECISION_MISSING_REASON == gc3.DECISION_MISSING_REASON == "gc3_decision_missing"
+    assert GC3_DECISION_INVALID_REASON == gc3.DECISION_INVALID_REASON == "gc3_decision_invalid"
     for name in ("test_gc3_reference_topology_decision_is_evidence_backed",
                  "test_gc3_reference_topology_scope_and_decision_are_pinned"):
         node = next(
@@ -3552,35 +3943,56 @@ def test_gc3_reference_topology_scope_and_decision_are_pinned():
 
     assert GC3_DECISION.is_file(), (
         f"{GC3_DECISION_MISSING_REASON}: "
-        f"tests/benchmark/b1_topology_decision.json does not exist, so no topology "
-        f"is selected and none may be applied to the ordinary B1 route. Every "
-        f"scope clause above holds at this probe head; what remains is the "
-        f"measurement."
+        f"tests/benchmark/b1_topology_decision.json does not exist, so no model "
+        f"has a ratified topology and none may be applied to the ordinary B1 "
+        f"route. Every scope clause above holds at this probe head; what "
+        f"remains is the measurement."
     )
 
     decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
-    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    gc3.validate_decision(decision)
     harness = REF_TEST.read_text(encoding="utf-8")
+    harness_assigns = _source_assigns(harness)
     thresholds = yaml.safe_load(
         (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(encoding="utf-8")
     )
-    notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
-    if decision["status"] == gc3.DECISION_SELECTED:
-        selected = decision["selected"]
-        assert f'"topology": "{selected}"' in launcher, selected
-        assert selected in harness
-        assert selected in notes
-        assert "the first four CPUs available to the launcher, split 2/1/1" not in notes
-        assert "first two complete SMT sibling pairs available to the launcher" in notes
-        cardinality = gc3.topology_cardinality(selected)
-        assert ast.literal_eval(
-            _source_assigns(harness)["CI_SCALE_AFFINITY_CARDINALITY"]
-        ) == cardinality
-    else:
-        for topology in GC3_TOPOLOGY_IDS:
-            assert f'"topology": "{topology}"' not in launcher, topology
-        assert "first two complete SMT sibling pairs available to the launcher" not in notes
-        b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
-        assert b1_entry["status"] == "covered", (
-            "an unhostable decision never relabels the B1 gate"
-        )
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    notes = b1_entry["notes"]
+    # The bar is never relabelled by any model's outcome.
+    assert b1_entry["status"] == "covered"
+    assert "the first four CPUs available to the launcher, split 2/1/1" not in notes
+    assert "first two complete SMT sibling pairs available to the launcher" in notes
+
+    selected = {
+        model: entry for model, entry in decision["models"].items()
+        if entry["status"] == gc3.DECISION_SELECTED
+    }
+    unhostable = {
+        model: entry for model, entry in decision["models"].items()
+        if entry["status"] == gc3.DECISION_UNHOSTABLE
+    }
+    # Declaration surface == carrier, model by model, with no scalar default.
+    assert ast.literal_eval(
+        harness_assigns["CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"]
+    ) == {model: entry["cardinality"] for model, entry in selected.items()}
+    assert ast.literal_eval(
+        harness_assigns["CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"]
+    ) == {model: GC1_SELECTED_PLACEMENT_SCHEMA for model in selected}
+    for model, entry in selected.items():
+        assert model in notes, model
+        assert entry["selected"] in notes, model
+        assert str(entry["cardinality"]["gateway"]) in notes
+        for url in (w["sourceUrl"] for w in entry["artifacts"]):
+            assert url in notes, url
+    for model in unhostable:
+        assert model in notes, model
+        assert f"topology_unratified_sku:{model}" in notes or (
+            "topology_unratified_sku:<model>" in notes
+        ), model
+    # The launcher never names a topology, whatever the carrier decided: the
+    # ratified class reaches placement through route -> route-fields ->
+    # contract-selected and nowhere else.
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    for topology in GC3_TOPOLOGY_IDS:
+        assert f'"topology": "{topology}"' not in launcher, topology
+        assert topology not in launcher, topology
