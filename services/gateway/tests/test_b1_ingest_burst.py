@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.parse
 import uuid
@@ -2717,6 +2718,350 @@ def _read_cpu_files(container=None):
     )
 
 
+# ---------------------------------------------------------------------------
+# GC-4 (FP-GC4-5) — measured-window PostgreSQL cost and wait diagnostics.
+#
+# Test-only, reported-only, and symmetric: the same sampler runs in a control
+# and in a candidate record, so its own small PostgreSQL cost is included in
+# both rather than subtracted by estimate. It touches no product engine or
+# pool; it opens its OWN autocommit connection, reads `pg_stat_activity`, and
+# nothing it produces is a B1 verdict, a GC-3 selector input or a sizing value.
+# ---------------------------------------------------------------------------
+
+#: The six reported-only cost fields, in the order the fingerprint carries
+#: them -- after the two existing lateness-leg fields, never before a gating one.
+B1_POSTGRES_COST_FIELDS = (
+    "postgres_cpu_us_per_req",
+    "postgres_wait_scheduled",
+    "postgres_wait_completed",
+    "postgres_wait_failed",
+    "postgres_wait_observations",
+    "postgres_wait_events_pct",
+)
+B1_WAIT_SAMPLER_APPLICATION_NAME = "gc4-wait-sampler"
+B1_WAIT_SAMPLE_INTERVAL_S = 0.05
+B1_WAIT_ACTIVE_CPU_KEY = "active/CPU/running"
+B1_WAIT_NONE = "none"
+B1_WAIT_JOIN_TIMEOUT_S = 10.0
+# Diagnostic-integrity rule for ONE wait sample. It decides only whether the
+# five wait fields carry readings or `unavailable` plus a note; it is not a bar,
+# not a verdict and never fatal on any route. The former absolute floor of 500
+# completed samples is retired: valid observed counts ranged from 486 to 576
+# because each `pg_stat_activity` query itself took 4-12 ms, so an absolute
+# floor rejected honest records for a reason unrelated to their integrity.
+B1_WAIT_MIN_COMPLETION_RATIO = 0.90
+# `:` and `+` are this histogram's own separators, so they are NOT safe inside
+# a key. Derived from the existing diagnostic set rather than re-typed.
+B1_WAIT_KEY_SAFE_CHARACTERS = B1_DIAGNOSTIC_SAFE_CHARACTERS - frozenset(":+")
+# Non-idle client backends of the measured database, grouped exactly as §3.6
+# specifies, with this sampler's own backend excluded by pid AND by name.
+B1_WAIT_SAMPLE_SQL = (
+    "SELECT state, wait_event_type, wait_event, count(*) AS backends "
+    "FROM pg_stat_activity "
+    "WHERE datname = current_database() "
+    "AND backend_type = 'client backend' "
+    "AND pid <> pg_backend_pid() "
+    "AND coalesce(application_name, '') <> %(application_name)s "
+    "AND state IS NOT NULL AND state <> 'idle' "
+    "GROUP BY 1, 2, 3"
+)
+
+
+def classify_postgres_wait(state, wait_event_type, wait_event) -> str:
+    """One canonical histogram key for one observed backend group.
+
+    An active backend with no wait event is on CPU; every other observation
+    keeps its own `<state>/<wait_event_type>/<wait_event>` identity. A row
+    without a state is a malformed sample and raises rather than being
+    silently folded into the CPU bucket.
+    """
+    if not state:
+        raise b1.B1PlacementParseError(
+            f"wait sample carries no state: {(state, wait_event_type, wait_event)!r}"
+        )
+    if state == "active" and wait_event_type is None and wait_event is None:
+        return B1_WAIT_ACTIVE_CPU_KEY
+    return (
+        f"{state}/{wait_event_type or B1_WAIT_NONE}/{wait_event or B1_WAIT_NONE}"
+    )
+
+
+def _percent_encode_wait_key(value: str) -> str:
+    """Percent-encode one histogram key (uppercase hex), separators included."""
+    if not isinstance(value, str):
+        raise b1.B1PlacementParseError(f"wait histogram key is not a string: {value!r}")
+    out: list[str] = []
+    for byte in value.encode("utf-8"):
+        char = chr(byte)
+        out.append(char if char in B1_WAIT_KEY_SAFE_CHARACTERS else f"%{byte:02X}")
+    return "".join(out)
+
+
+def serialize_postgres_wait_histogram(histogram) -> str:
+    """Sorted, percent-encoded `key:count` pairs, `+`-joined; never a literal."""
+    if not histogram:
+        return DIAGNOSTIC_UNAVAILABLE
+    parts: list[str] = []
+    for key in sorted(histogram):
+        count = histogram[key]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise b1.B1PlacementParseError(
+                f"wait histogram count for {key!r} is not a count: {count!r}"
+            )
+        parts.append(f"{_percent_encode_wait_key(key)}:{count}")
+    return "+".join(parts)
+
+
+@dataclass(frozen=True)
+class B1PostgresWaitSample:
+    """One measured window's PostgreSQL wait observation. Reported-only."""
+
+    scheduled: int
+    completed: int
+    failed: int
+    observations: int
+    histogram: "dict[str, int]"
+
+
+class B1PostgresWaitSampler:
+    """One thread, one connection, one stop event, for one measured window.
+
+    `stop()` is idempotent and always does all four things in order: set the
+    event, join the thread, verify it is no longer alive, close the connection.
+    A thread that outlives its join is a defect and raises -- after the
+    connection has been closed, so a stuck sampler never also leaks a backend.
+    """
+
+    def __init__(
+        self,
+        connect,
+        *,
+        interval_s: float = B1_WAIT_SAMPLE_INTERVAL_S,
+        join_timeout_s: float = B1_WAIT_JOIN_TIMEOUT_S,
+    ) -> None:
+        self._connect = connect
+        self._interval_s = interval_s
+        self._join_timeout_s = join_timeout_s
+        self._stop_event = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._connection = None
+        self._started = False
+        self._result: "B1PostgresWaitSample | None" = None
+        self.scheduled = 0
+        self.completed = 0
+        self.failed = 0
+        self.observations = 0
+        self.histogram: "dict[str, int]" = {}
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    def start(self) -> None:
+        if self._started:
+            raise B1PlacementError("the GC-4 wait sampler is already running")
+        self._connection = self._connect()
+        self._started = True
+        self._thread = threading.Thread(
+            target=self._run, name=B1_WAIT_SAMPLER_APPLICATION_NAME, daemon=True
+        )
+        self._thread.start()
+
+    def _sample(self):
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(
+                B1_WAIT_SAMPLE_SQL,
+                {"application_name": B1_WAIT_SAMPLER_APPLICATION_NAME},
+            )
+            return list(cursor.fetchall())
+        finally:
+            cursor.close()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self.scheduled += 1
+            try:
+                rows = self._sample()
+            except Exception:  # noqa: BLE001 — a failed sample is recorded, never raised
+                self.failed += 1
+            else:
+                for state, wait_event_type, wait_event, backends in rows:
+                    key = classify_postgres_wait(state, wait_event_type, wait_event)
+                    count = int(backends)
+                    self.histogram[key] = self.histogram.get(key, 0) + count
+                    self.observations += count
+                self.completed += 1
+            self._stop_event.wait(self._interval_s)
+
+    def stop(self) -> "B1PostgresWaitSample | None":
+        if self._result is not None or not self._started:
+            return self._result
+        self._stop_event.set()
+        thread, self._thread = self._thread, None
+        alive = False
+        if thread is not None:
+            thread.join(self._join_timeout_s)
+            alive = thread.is_alive()
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 — a diagnostic must never fail the run
+                pass
+        if alive:
+            raise B1PlacementError(
+                f"the GC-4 wait sampler thread is still alive "
+                f"{self._join_timeout_s} s after its stop event"
+            )
+        self._result = B1PostgresWaitSample(
+            scheduled=self.scheduled,
+            completed=self.completed,
+            failed=self.failed,
+            observations=self.observations,
+            histogram=dict(self.histogram),
+        )
+        return self._result
+
+    def shutdown(self) -> None:
+        """Teardown-safe stop: still sets, joins, verifies and closes, but a
+        stuck thread is reported by `stop()`'s own raise at the seam that owns
+        it, never by failing a fixture that has already emitted its record."""
+        try:
+            self.stop()
+        except B1PlacementError:
+            pass
+
+
+def _open_postgres_wait_connection(dsn: str):
+    """One dedicated autocommit diagnostic connection, named for exclusion."""
+    import psycopg2
+    from sqlalchemy.engine import make_url
+
+    url = make_url(dsn).set(drivername="postgresql").update_query_dict(
+        {"application_name": B1_WAIT_SAMPLER_APPLICATION_NAME}
+    )
+    connection = psycopg2.connect(url.render_as_string(hide_password=False))
+    connection.autocommit = True
+    return connection
+
+
+def serialize_postgres_cost_fields(usage_usec, served, sample) -> str:
+    """The six reported-only cost fields, in their pinned order.
+
+    A missing PostgreSQL usage reading or a non-positive served count
+    serializes `unavailable`, never a zero that would read like a measurement.
+    """
+    if (
+        isinstance(usage_usec, (int, float))
+        and not isinstance(usage_usec, bool)
+        and isinstance(served, int)
+        and not isinstance(served, bool)
+        and served > 0
+    ):
+        cpu_per_req = f"{usage_usec / served:.3f}"
+    else:
+        cpu_per_req = DIAGNOSTIC_UNAVAILABLE
+    if postgres_wait_sample_failure(sample) is not None:
+        # Missing OR unusable: every wait field is `unavailable`, and the run's
+        # diagnostic notes carry the reason with the raw counts. Never a zero,
+        # which would read like a measurement.
+        scheduled = completed = failed = observations = DIAGNOSTIC_UNAVAILABLE
+        events = DIAGNOSTIC_UNAVAILABLE
+    else:
+        scheduled = str(sample.scheduled)
+        completed = str(sample.completed)
+        failed = str(sample.failed)
+        observations = str(sample.observations)
+        events = serialize_postgres_wait_histogram(sample.histogram)
+    return (
+        f"postgres_cpu_us_per_req={cpu_per_req},"
+        f"postgres_wait_scheduled={scheduled},"
+        f"postgres_wait_completed={completed},"
+        f"postgres_wait_failed={failed},"
+        f"postgres_wait_observations={observations},"
+        f"postgres_wait_events_pct={events}"
+    )
+
+
+def postgres_wait_sample_failure(sample) -> "str | None":
+    """Why this wait sample is not usable, or ``None`` when it is.
+
+    Diagnostic integrity only. An unusable -- or absent -- sample publishes
+    `unavailable` in all five wait fields plus this reason as a note, carrying
+    whatever raw counts exist. It is NEVER fatal: it voids no product record
+    and no GC-3 discovery arm, because a test-only sampler must not be able to
+    destroy a 28-arm sweep's evidence.
+    """
+    if sample is None:
+        return "no measured-window PostgreSQL wait sample was taken"
+    counts = (
+        f"scheduled={sample.scheduled} completed={sample.completed} "
+        f"failed={sample.failed} observations={sample.observations}"
+    )
+    if sample.failed != 0:
+        return f"{sample.failed} wait samples failed ({counts})"
+    if sample.scheduled <= 0:
+        return f"no wait sample was scheduled ({counts})"
+    if sample.completed < B1_WAIT_MIN_COMPLETION_RATIO * sample.scheduled:
+        return (
+            f"only {sample.completed}/{sample.scheduled} wait samples completed, "
+            f"below {B1_WAIT_MIN_COMPLETION_RATIO:.0%} ({counts})"
+        )
+    if not sample.histogram:
+        return f"the wait histogram is empty ({counts})"
+    return None
+
+
+def postgres_cost_record_failures(run: dict) -> list[str]:
+    """Are this record's HARNESS-OWNED cost operands present and numeric?
+
+    Exactly three things, all produced by the workload/placement harness
+    itself: a positive served count, a positive PostgreSQL CPU reading, and
+    both finite three-lateness-leg tuples.
+
+    Deliberately NOT here: the wait sampler. A missing, failed, sub-90%-complete
+    or empty sample selects `unavailable` wait fields plus a note and is never
+    fatal (`postgres_wait_sample_failure`). Also not here: load accounting and
+    any performance comparison -- on the discovery route those are recorded
+    data owned by `build_probe_arm_record` and GC-3's verdicts, and gating them
+    here would stop the sweep at the first expected miss.
+    """
+    fails: list[str] = []
+    result = run.get("result")
+    served = getattr(result, "served", None)
+    usage = run.get("postgres_usage_usec")
+    if isinstance(served, bool) or not isinstance(served, int) or served <= 0:
+        fails.append(f"served is not a positive count: {served!r}")
+    if (
+        isinstance(usage, bool)
+        or not isinstance(usage, (int, float))
+        or usage <= 0
+    ):
+        fails.append(f"postgres_usage_usec is not a positive number: {usage!r}")
+    for field in ("p99_leg_split", "leg_p99s"):
+        legs = run.get(field)
+        if (
+            not isinstance(legs, tuple)
+            or len(legs) != 3
+            or not all(isinstance(v, float) and math.isfinite(v) for v in legs)
+        ):
+            fails.append(f"{field} is not a finite three-leg value: {legs!r}")
+    return fails
+
+
+def assert_complete_postgres_cost_record(run: dict) -> None:
+    """FP-GC4-5: refuse a record whose harness-owned cost operands are missing.
+
+    Wait-sampler availability is explicitly outside this contract.
+    """
+    fails = postgres_cost_record_failures(run)
+    if fails:
+        raise B1PlacementError(
+            "incomplete GC-4 cost record: " + "; ".join(fails)
+        )
+
+
 def _role_diagnostics(role: str, cpu_max_text, stat_before, stat_after) -> B1RoleDiagnostics:
     """Render one role's reported-only cgroup fields, failing soft to `unavailable`."""
     notes: list[str] = []
@@ -3104,14 +3449,39 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             )
             marks.setdefault("diagnostic_notes", []).extend(notes)
 
+        # GC-4 (FP-GC4-5): one wait sampler per run, stopped exactly once
+        # however this fixture ends. Its own PostgreSQL cost is inside the
+        # measured window on purpose, identically in control and candidate.
+        wait_sampler = B1PostgresWaitSampler(
+            lambda: _open_postgres_wait_connection(dsn)
+        )
+        stack.callback(wait_sampler.shutdown)
+
         def _after_prologue() -> None:
             # Snapshot AFTER the unmeasured prologue so CPU/audit exclude it (C2).
             _collect_cpu_diagnostics("before")
             marks["committed_before"] = _committed_ingest_rows(dsn)
+            # ...and only then open the diagnostic connection and start sampling.
+            _try_diagnostic(
+                "postgres wait sampler", marks.setdefault("diagnostic_notes", []),
+                wait_sampler.start,
+            )
 
         def _after_window() -> None:
-            # Close the reported CPU interval at drain/census stop, before the
-            # O(N) leg derivation; the log prefix is taken strictly after it.
+            # Stop sampling at window close, BEFORE the CPU-after snapshot, so
+            # the sampler's own backend is not inside the reported interval's
+            # tail. A sampler that cannot be stopped cleanly is a diagnostic
+            # failure like any other here: it becomes a note and `unavailable`
+            # fields, never a lost record. Then close the reported CPU interval
+            # at drain/census stop, before the O(N) leg derivation; the log
+            # prefix is taken strictly after it.
+            notes = marks.setdefault("diagnostic_notes", [])
+            sample = _try_diagnostic("postgres wait sampler stop", notes,
+                                     wait_sampler.stop)
+            marks["postgres_wait_sample"] = sample
+            reason = postgres_wait_sample_failure(sample)
+            if reason is not None:
+                notes.append(f"postgres wait sampler: {reason}")
             _collect_cpu_diagnostics("after")
             marks["log_prefix_bytes"] = _snapshot_container_log(gateway, log_path)
 
@@ -3211,6 +3581,7 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         )
         p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
         leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
+        wait_sample = marks.get("postgres_wait_sample")
         verdicts = (
             _product_promise_verdicts(result)
             if profile.name == PRODUCT_PROFILE_NAME
@@ -3264,6 +3635,9 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         probe_reference_cpus = declaration.reference_cpus
         probe_unassigned_cpus = declaration.unassigned_cpus
         postgres_usage_usec = diagnostics["postgres"].usage_usec_delta
+        postgres_cost_fields = serialize_postgres_cost_fields(
+            postgres_usage_usec, result.served, wait_sample
+        )
         fingerprint_line = (
             f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
             f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
@@ -3291,7 +3665,8 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             f"peak_worker_established={peak_worker_est_str},"
             f"{product_fields}"
             f"p99_leg_split={p99_leg_split_str},"
-            f"leg_p99s={leg_p99s_str}"
+            f"leg_p99s={leg_p99s_str},"
+            f"{postgres_cost_fields}"
         )
         print(fingerprint_line, flush=True)
 
@@ -3341,6 +3716,9 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             "role_thread_siblings": role_thread_siblings,
             "measured_span_seconds": span,
             "postgres_usage_usec": postgres_usage_usec,
+            # GC-4 (FP-GC4-5): reported-only cost diagnostics of this window.
+            "postgres_wait_sample": wait_sample,
+            "postgres_cost_fields": postgres_cost_fields,
             "diagnostic_notes": diagnostic_notes,
         }
 
@@ -4017,6 +4395,73 @@ def test_b1_product_fingerprint_proves_exclusive_placement(b1_product_run):
     for role in B1_ROLES:
         quota = _parse_b1_env_field(line, f"{role}_quota_cpus")
         assert quota == DIAGNOSTIC_UNAVAILABLE or quota == b1.CPU_QUOTA_MAX or float(quota) > 0
+
+
+@pytest.mark.b1_live
+@pytest.mark.b1_product
+def test_gc4_live_postgres_cost_record_is_complete(b1_product_run):
+    """FP-GC4-5 diagnostics: the product record publishes them, and decides nothing.
+
+    The quantitative GC-4 outcome is the fused-statement regression
+    ``test_gc4_fused_merge_reduces_server_statement_time`` on the
+    planning-enabled fixture -- not anything measured here. This node checks
+    that the record's harness-owned operands are present and that the six
+    reported-only fields are serialized honestly, in either of their two
+    admitted representations: real readings, or `unavailable` plus a
+    diagnostic note when the test-only sampler was not usable. Sampler
+    availability is never an outcome. The node reuses the product route's
+    existing module-scoped fixture, so it adds no second 30-second workload.
+    """
+    assert_complete_postgres_cost_record(b1_product_run)
+
+    line = b1_product_run["fingerprint"]
+    result = b1_product_run["result"]
+    sample = b1_product_run["postgres_wait_sample"]
+    notes = b1_product_run["diagnostic_notes"]
+
+    # (1) All six fields, in their pinned order, AFTER both lateness legs --
+    # so no gating field ever moves behind a diagnostic one.
+    at = line.index("leg_p99s=")
+    for field in B1_POSTGRES_COST_FIELDS:
+        position = line.index(f",{field}=")
+        assert position > at, f"{field} is not after the lateness legs"
+        at = position
+
+    # (2) CPU per served request is numeric and is this run's own quotient.
+    rendered = _parse_b1_env_field(line, "postgres_cpu_us_per_req")
+    assert rendered != DIAGNOSTIC_UNAVAILABLE, line
+    usage = b1_product_run["postgres_usage_usec"]
+    assert float(rendered) == pytest.approx(usage / result.served, abs=5e-4)
+    assert float(rendered) > 0
+
+    # (3) The wait fields: EITHER this sample's own counters, OR `unavailable`
+    # in all five plus a note naming the reason. Never a mixture, and never a
+    # fabricated zero.
+    reason = postgres_wait_sample_failure(sample)
+    wait_fields = {
+        field: _parse_b1_env_field(line, field) for field in B1_POSTGRES_COST_FIELDS[1:]
+    }
+    if reason is None:
+        assert wait_fields["postgres_wait_failed"] == "0"
+        assert int(wait_fields["postgres_wait_scheduled"]) == sample.scheduled
+        assert int(wait_fields["postgres_wait_completed"]) == sample.completed
+        assert int(wait_fields["postgres_wait_observations"]) == sample.observations
+        assert wait_fields["postgres_wait_events_pct"] == (
+            serialize_postgres_wait_histogram(sample.histogram)
+        )
+        assert sample.observations > 0
+        assert sample.completed >= B1_WAIT_MIN_COMPLETION_RATIO * sample.scheduled
+    else:
+        assert set(wait_fields.values()) == {DIAGNOSTIC_UNAVAILABLE}, wait_fields
+        assert any("postgres wait sampler" in note for note in notes), notes
+
+    # (4) Reported-only: not one of these names is a gating placement field, a
+    # product verdict or a discovery verdict.
+    for field in B1_POSTGRES_COST_FIELDS:
+        assert field not in B1_GATING_PLACEMENT_FIELDS
+        assert field not in B1_TOPOLOGY_GATING_PLACEMENT_FIELDS
+        assert field not in PRODUCT_VERDICT_FIELDS
+        assert field not in probe.VERDICT_FIELDS
 
 
 @pytest.mark.b1_live
@@ -6009,6 +6454,26 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
 
     postgres_sentinel = object()
     roles_open = {"gateway": _role("gateway", (0, 1), pids=(11,))}
+
+    class _FakeWaitSampler:
+        """GC-4: records that sampling stops INSIDE the window-complete hook."""
+
+        def __init__(self):
+            self.stops = 0
+            self.next_sample = B1PostgresWaitSample(
+                scheduled=600, completed=600, failed=0, observations=1800,
+                histogram={B1_WAIT_ACTIVE_CPU_KEY: 1200, "active/IO/WALSync": 600},
+            )
+
+        def stop(self):
+            # Sampling must stop before the CPU-after snapshot closes the
+            # reported interval, so the sampler's own backend is not in its
+            # tail.
+            assert "gateway_cpu_stat_after" not in marks
+            self.stops += 1
+            return self.next_sample
+
+    wait_sampler = _FakeWaitSampler()
     namespace = {
         "b1": b1,
         "marks": marks,
@@ -6017,6 +6482,8 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
         "postgres": postgres_sentinel,
         "log_path": log_path,
         "B1_ROLES": B1_ROLES,
+        "wait_sampler": wait_sampler,
+        "postgres_wait_sample_failure": postgres_wait_sample_failure,
         "_read_cpu_files": _fake_read_cpu_files,
         "_gateway_set_busy_usec": _fake_busy,
         "_try_diagnostic": _try_diagnostic,
@@ -6025,6 +6492,10 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     exec(compile(ast.Module(body=[collector, callback], type_ignores=[]),
                  "<fixture-callback>", "exec"), namespace)
     namespace["_after_window"]()
+    assert wait_sampler.stops == 1
+    assert marks["postgres_wait_sample"].completed == 600
+    # A usable sample leaves no sampler note behind...
+    assert not any("postgres wait sampler" in note for note in marks["diagnostic_notes"])
     assert marks["gateway_cpu_stat_after"] == cpu_stat
     assert marks["postgres_cpu_stat_after"] is None   # fail-soft, not fatal
     assert marks["busy_after"] == {0: 7, 1: 7}
@@ -6109,6 +6580,25 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
         if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "result"
     }
     namespace["result"] = SimpleNamespace(**dict.fromkeys(attrs, 1))
+    # GC-4: execute the real cost-field serialization statement rather than
+    # letting the placeholder loop above invent a value for it.
+    cost_assign = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "postgres_cost_fields" for t in n.targets)
+    )
+    namespace.update(
+        serialize_postgres_cost_fields=serialize_postgres_cost_fields,
+        postgres_usage_usec=4500,
+        wait_sample=marks["postgres_wait_sample"],
+    )
+    namespace["result"] = SimpleNamespace(**dict.fromkeys(attrs | {"served"}, 1))
+    namespace["result"].served = 9
+    exec(compile(ast.Module(body=[cost_assign], type_ignores=[]), "<fixture-cost>", "exec"),
+         namespace)
+    assert namespace["postgres_cost_fields"] == serialize_postgres_cost_fields(
+        4500, 9, marks["postgres_wait_sample"]
+    )
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), "<fixture-line>", "exec"),
          namespace)
     yielded = eval(compile(ast.Expression(mapping), "<fixture-mapping>", "eval"), namespace)
@@ -6120,6 +6610,27 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     assert yielded["gateway_log_path"] == log_path
     assert yielded["product_verdicts"] == {}
     assert yielded["placement_ok"] is True
+    # GC-4: the six reported-only cost fields close the line, after both
+    # lateness legs, and the sample travels in the yielded mapping too.
+    at = yielded["fingerprint"].index("leg_p99s=")
+    for field_name in B1_POSTGRES_COST_FIELDS:
+        position = yielded["fingerprint"].index(f",{field_name}=")
+        assert position > at, field_name
+        at = position
+    assert yielded["fingerprint"].endswith(
+        serialize_postgres_cost_fields(4500, 9, marks["postgres_wait_sample"])
+    )
+    assert _parse_b1_env_field(yielded["fingerprint"], "postgres_cpu_us_per_req") == "500.000"
+    assert yielded["postgres_wait_sample"] is marks["postgres_wait_sample"]
+    assert postgres_cost_record_failures(
+        {
+            "result": SimpleNamespace(served=9),
+            "postgres_usage_usec": 4500,
+            "p99_leg_split": (1.0, 2.0, 3.0),
+            "leg_p99s": (1.0, 2.0, 3.0),
+            "postgres_wait_sample": yielded["postgres_wait_sample"],
+        }
+    ) == []
     # Pin the real callback registration and its ordering before the probe.
     calls = [n for n in ast.walk(fixture) if isinstance(n, ast.Call)]
     run = next(n for n in calls if isinstance(n.func, ast.Attribute) and n.func.attr == "run_open_loop")
@@ -6129,6 +6640,22 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     )
     probe = next(n for n in calls if isinstance(n.func, ast.Attribute) and n.func.attr == "run_shed_probe")
     assert run.lineno < count_assignment.lineno < probe.lineno
+    # GC-4 fail-soft: an UNUSABLE sample is recorded as such -- the hook keeps
+    # going, the sample still reaches `marks`, and a note names the reason with
+    # the raw counts. Nothing about it is fatal.
+    marks.clear()
+    wait_sampler.next_sample = B1PostgresWaitSample(
+        scheduled=600, completed=400, failed=3, observations=0, histogram={},
+    )
+    namespace["_after_window"]()
+    assert wait_sampler.stops == 2
+    assert marks["postgres_wait_sample"].failed == 3
+    sampler_notes = [n for n in marks["diagnostic_notes"] if "postgres wait sampler" in n]
+    assert len(sampler_notes) == 1, marks["diagnostic_notes"]
+    assert "3 wait samples failed" in sampler_notes[0]
+    for raw in ("scheduled=600", "completed=400", "failed=3", "observations=0"):
+        assert raw in sampler_notes[0], (raw, sampler_notes[0])
+
     # A failed log snapshot cannot yield a zero-valued count/fingerprint.
     marks.clear()
     gateway_store.payload = None
@@ -8455,3 +8982,391 @@ def test_gc3_cpu_model_route_is_ratified_or_recorded(tmp_path, monkeypatch):
         "contract-selected", "--topology", "gateway-hyperthread", "--pairs", "0-1", "2-3",
         "--run-id", _gc3_run_id(5), "--out", str(contract_path),
     ]) == 1
+
+
+# ---------------------------------------------------------------------------
+# GC-4 (FP-GC4-5/6) — the wait sampler and the reported-only cost fields,
+# container-free. Bounded real threads over fake connections; every one of
+# them must be gone before the test returns.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWaitCursor:
+    def __init__(self, connection):
+        self._connection = connection
+        self.closed = False
+
+    def execute(self, statement, parameters):
+        self._connection.statements.append((statement, dict(parameters)))
+        if self._connection.gate is not None:
+            self._connection.gate.wait(30)
+        if self._connection.raises:
+            raise RuntimeError("induced sample failure")
+
+    def fetchall(self):
+        return list(self._connection.rows)
+
+    def close(self):
+        self.closed = True
+        self._connection.closed_cursors += 1
+
+
+class _FakeWaitConnection:
+    """A DBAPI-shaped stand-in with a controllable clock, rows and failures."""
+
+    def __init__(self, rows=(), *, raises=False, gate=None, close_raises=False):
+        self.rows = list(rows)
+        self.raises = raises
+        self.gate = gate
+        self.close_raises = close_raises
+        self.statements: list = []
+        self.closed = False
+        self.closed_cursors = 0
+
+    def cursor(self):
+        return _FakeWaitCursor(self)
+
+    def close(self):
+        self.closed = True
+        if self.close_raises:
+            raise RuntimeError("induced close failure")
+
+
+def _drain_sampler(sampler, *, at_least: int = 1, timeout_s: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while sampler.scheduled < at_least and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+
+def test_gc4_postgres_wait_sampler_classifies_serializes_and_stops():
+    """FP-GC4-5: closed classification, sorted encoding, counts, stop/join/close."""
+    # (1) Classification is closed. An active backend with no wait event is on
+    # CPU; everything else keeps its own identity; a stateless row raises
+    # rather than being folded into the CPU bucket.
+    assert classify_postgres_wait("active", None, None) == B1_WAIT_ACTIVE_CPU_KEY
+    assert classify_postgres_wait("active", "LWLock", "WALWrite") == "active/LWLock/WALWrite"
+    assert classify_postgres_wait("active", "IO", "WALSync") == "active/IO/WALSync"
+    assert (
+        classify_postgres_wait("idle in transaction", "Client", "ClientRead")
+        == "idle in transaction/Client/ClientRead"
+    )
+    assert (
+        classify_postgres_wait("idle in transaction", None, None)
+        == f"idle in transaction/{B1_WAIT_NONE}/{B1_WAIT_NONE}"
+    )
+    for bad in (None, ""):
+        with pytest.raises(b1.B1PlacementParseError):
+            classify_postgres_wait(bad, "LWLock", "WALWrite")
+
+    # (2) Serialization: sorted keys, percent-encoded (the `/` of the key and
+    # the spaces of a multi-word state included, because `:` and `+` are this
+    # field's own separators), never a literal zero for "nothing observed".
+    assert serialize_postgres_wait_histogram({}) == DIAGNOSTIC_UNAVAILABLE
+    assert serialize_postgres_wait_histogram(None) == DIAGNOSTIC_UNAVAILABLE
+    rendered = serialize_postgres_wait_histogram(
+        {
+            "active/LWLock/WALWrite": 3,
+            B1_WAIT_ACTIVE_CPU_KEY: 12,
+            "idle in transaction/Client/ClientRead": 1,
+        }
+    )
+    assert rendered == (
+        "active%2FCPU%2Frunning:12+active%2FLWLock%2FWALWrite:3"
+        "+idle%20in%20transaction%2FClient%2FClientRead:1"
+    )
+    keys = [pair.rsplit(":", 1)[0] for pair in rendered.split("+")]
+    assert keys == sorted(keys), keys
+    assert all(char in B1_DIAGNOSTIC_SAFE_CHARACTERS or char == "%" for char in rendered)
+    for bad_count in (-1, 1.5, True, "3"):
+        with pytest.raises(b1.B1PlacementParseError):
+            serialize_postgres_wait_histogram({B1_WAIT_ACTIVE_CPU_KEY: bad_count})
+
+    # (3) A bounded real thread over a fake connection: counts accumulate, the
+    # sampler's own backend is excluded by name in the statement it sends, and
+    # `stop()` sets, joins, verifies and closes.
+    connection = _FakeWaitConnection(
+        rows=[("active", None, None, 2), ("active", "LWLock", "WALWrite", 1)]
+    )
+    sampler = B1PostgresWaitSampler(lambda: connection, interval_s=0.001)
+    sampler.start()
+    try:
+        _drain_sampler(sampler, at_least=3)
+    finally:
+        sample = sampler.stop()
+    assert sample is not None
+    assert sample.scheduled >= 3
+    assert sample.completed == sample.scheduled
+    assert sample.failed == 0
+    assert sample.observations == 3 * sample.completed
+    assert sample.histogram == {
+        B1_WAIT_ACTIVE_CPU_KEY: 2 * sample.completed,
+        "active/LWLock/WALWrite": sample.completed,
+    }
+    assert connection.closed is True
+    assert connection.closed_cursors == sample.scheduled
+    statement, parameters = connection.statements[0]
+    assert "pg_backend_pid()" in statement
+    assert "backend_type = 'client backend'" in statement
+    assert "datname = current_database()" in statement
+    assert "state <> 'idle'" in statement
+    assert parameters == {"application_name": B1_WAIT_SAMPLER_APPLICATION_NAME}
+    assert threading.active_count() >= 1
+    assert not any(
+        thread.name == B1_WAIT_SAMPLER_APPLICATION_NAME and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+    # ...and stopping twice is the same record, not a second teardown.
+    assert sampler.stop() is sample
+
+    # (4) A failing sample is RECORDED, never raised, and never counted as a
+    # completed one.
+    failing = _FakeWaitConnection(rows=[("active", None, None, 1)], raises=True)
+    failing_sampler = B1PostgresWaitSampler(lambda: failing, interval_s=0.001)
+    failing_sampler.start()
+    try:
+        _drain_sampler(failing_sampler, at_least=2)
+    finally:
+        failed_sample = failing_sampler.stop()
+    assert failed_sample.failed == failed_sample.scheduled >= 2
+    assert failed_sample.completed == 0
+    assert failed_sample.observations == 0
+    assert failed_sample.histogram == {}
+    assert failing.closed is True
+
+    # (5) A never-started sampler has no record at all -- not a zero-valued one.
+    def _refuse():
+        raise RuntimeError("no diagnostic connection")
+
+    unavailable = B1PostgresWaitSampler(_refuse)
+    with pytest.raises(RuntimeError):
+        unavailable.start()
+    assert unavailable.started is False
+    assert unavailable.stop() is None
+
+    # (6) A thread that will not stop is a defect: `stop()` closes the
+    # connection FIRST and then raises, so a stuck sampler never also leaks a
+    # backend. The gate is released here so this test leaves no live thread.
+    gate = threading.Event()
+    stuck = _FakeWaitConnection(rows=[], gate=gate)
+    stuck_sampler = B1PostgresWaitSampler(
+        lambda: stuck, interval_s=0.001, join_timeout_s=0.2
+    )
+    stuck_sampler.start()
+    try:
+        _drain_sampler(stuck_sampler, at_least=1)
+        with pytest.raises(B1PlacementError, match="still alive"):
+            stuck_sampler.stop()
+        assert stuck.closed is True
+    finally:
+        gate.set()
+        for thread in threading.enumerate():
+            if thread.name == B1_WAIT_SAMPLER_APPLICATION_NAME:
+                thread.join(10)
+    assert not any(
+        thread.name == B1_WAIT_SAMPLER_APPLICATION_NAME and thread.is_alive()
+        for thread in threading.enumerate()
+    ), "a sampler thread outlived its test"
+
+
+def _cost_run(**overrides) -> dict:
+    sample = overrides.pop(
+        "sample",
+        B1PostgresWaitSample(
+            scheduled=600,
+            completed=600,
+            failed=0,
+            observations=1800,
+            histogram={B1_WAIT_ACTIVE_CPU_KEY: 1200, "active/IO/WALSync": 600},
+        ),
+    )
+    run = {
+        "result": SimpleNamespace(served=30000),
+        "postgres_usage_usec": 18_000_000,
+        "p99_leg_split": (1.0, 2.0, 3.0),
+        "leg_p99s": (1.5, 2.5, 3.5),
+        "postgres_wait_sample": sample,
+    }
+    run.update(overrides)
+    return run
+
+
+def test_gc4_postgres_cost_fields_are_reported_only_and_fail_soft():
+    """FP-GC4-5/6: derived CPU, pinned order, unavailable-not-zero, no verdict use."""
+    sample = _cost_run()["postgres_wait_sample"]
+
+    # (1) The derived value is the run's own quotient, in microseconds per
+    # served request, at the pinned width.
+    rendered = serialize_postgres_cost_fields(18_000_000, 30000, sample)
+    fields = [pair.split("=", 1) for pair in rendered.split(",")]
+    assert [name for name, _ in fields] == list(B1_POSTGRES_COST_FIELDS)
+    values = dict(fields)
+    assert values["postgres_cpu_us_per_req"] == "600.000"
+    assert values["postgres_wait_scheduled"] == "600"
+    assert values["postgres_wait_completed"] == "600"
+    assert values["postgres_wait_failed"] == "0"
+    assert values["postgres_wait_observations"] == "1800"
+    assert values["postgres_wait_events_pct"] == serialize_postgres_wait_histogram(
+        sample.histogram
+    )
+
+    # (2) A missing operand is `unavailable`, NEVER a zero that would read like
+    # a measurement.
+    for usage, served in ((None, 30000), (18_000_000, 0), (18_000_000, None),
+                          (18_000_000, True), (True, 30000)):
+        degraded = dict(
+            pair.split("=", 1)
+            for pair in serialize_postgres_cost_fields(usage, served, sample).split(",")
+        )
+        assert degraded["postgres_cpu_us_per_req"] == DIAGNOSTIC_UNAVAILABLE, (usage, served)
+        assert degraded["postgres_cpu_us_per_req"] != "0.000"
+
+    # (3) There is NO absolute completed-sample floor. A sub-500 sample that
+    # is at least 90% complete is usable, and serializes its own counters --
+    # restoring a 500-style rejection makes exactly this assertion fail.
+    assert not hasattr(sys.modules[__name__], "B1_WAIT_MIN_COMPLETED_SAMPLES"), (
+        "an absolute completed-sample floor was reintroduced"
+    )
+    short = B1PostgresWaitSample(
+        scheduled=550, completed=499, failed=0, observations=1200,
+        histogram={B1_WAIT_ACTIVE_CPU_KEY: 1200},
+    )
+    assert 499 < 500 and short.completed >= B1_WAIT_MIN_COMPLETION_RATIO * short.scheduled
+    assert postgres_wait_sample_failure(short) is None
+    assert postgres_cost_record_failures(_cost_run(sample=short)) == []
+    usable = dict(
+        pair.split("=", 1)
+        for pair in serialize_postgres_cost_fields(18_000_000, 30000, short).split(",")
+    )
+    assert usable["postgres_wait_completed"] == "499"
+    assert usable["postgres_wait_scheduled"] == "550"
+    assert usable["postgres_wait_events_pct"] != DIAGNOSTIC_UNAVAILABLE
+
+    # (4) An absent OR unusable sampler serializes every wait field as
+    # `unavailable` -- never a zero, never a mixture -- and names its reason
+    # with the raw counts it does have. None of it is fatal: the record and,
+    # on the manual route, the GC-3 arm survive a failed sampler.
+    unusable = [
+        (None, "no measured-window PostgreSQL wait sample was taken"),
+        (B1PostgresWaitSample(600, 599, 1, 1800, {B1_WAIT_ACTIVE_CPU_KEY: 1}), "failed"),
+        (B1PostgresWaitSample(700, 600, 0, 1800, {B1_WAIT_ACTIVE_CPU_KEY: 1}), "completed"),
+        (B1PostgresWaitSample(600, 600, 0, 0, {}), "histogram is empty"),
+        (B1PostgresWaitSample(0, 0, 0, 0, {}), "scheduled"),
+    ]
+    for bad, expected in unusable:
+        reason = postgres_wait_sample_failure(bad)
+        assert reason is not None and expected in reason, (bad, reason)
+        if bad is not None:
+            for raw in ("scheduled=", "completed=", "failed=", "observations="):
+                assert raw in reason, (raw, reason)
+        rendered_bad = dict(
+            pair.split("=", 1)
+            for pair in serialize_postgres_cost_fields(18_000_000, 30000, bad).split(",")
+        )
+        for field in B1_POSTGRES_COST_FIELDS[1:]:
+            assert rendered_bad[field] == DIAGNOSTIC_UNAVAILABLE, (bad, field)
+            assert rendered_bad[field] != "0"
+        # The PostgreSQL CPU reading is independent of the sampler...
+        assert rendered_bad["postgres_cpu_us_per_req"] == "600.000"
+        # ...and the harness-operand validator does not raise for any of them.
+        assert postgres_cost_record_failures(_cost_run(sample=bad)) == []
+        assert_complete_postgres_cost_record(_cost_run(sample=bad))
+
+    # (5) The harness-owned operands ARE fatal, and every one is named.
+    assert postgres_cost_record_failures(_cost_run()) == []
+    assert_complete_postgres_cost_record(_cost_run())
+    cases = [
+        ({"postgres_usage_usec": None}, "postgres_usage_usec"),
+        ({"postgres_usage_usec": 0}, "postgres_usage_usec"),
+        ({"result": SimpleNamespace(served=0)}, "served"),
+        ({"p99_leg_split": (1.0, 2.0)}, "p99_leg_split"),
+        ({"leg_p99s": None}, "leg_p99s"),
+        ({"leg_p99s": (1.0, 2.0, float("nan"))}, "leg_p99s"),
+    ]
+    for overrides, expected in cases:
+        failures = postgres_cost_record_failures(_cost_run(**overrides))
+        assert any(expected in failure for failure in failures), (overrides, failures)
+        with pytest.raises(B1PlacementError, match="incomplete GC-4 cost record"):
+            assert_complete_postgres_cost_record(_cost_run(**overrides))
+
+    # (6) Reported-only, structurally: no cost field is a gating placement
+    # field, a product verdict, a discovery verdict or a GC-3 record key. The
+    # new diagnostics travel inside the existing fingerprint field and nowhere
+    # else, so the decision carrier's embedded evidence stays valid.
+    for field in B1_POSTGRES_COST_FIELDS:
+        assert field not in B1_PLACEMENT_FIELDS
+        assert field not in B1_TOPOLOGY_PLACEMENT_FIELDS
+        assert field not in PRODUCT_VERDICT_FIELDS
+        assert field not in probe.VERDICT_FIELDS
+        assert field not in probe.RECORD_KEYS
+
+
+def test_gc4_probe_arm_is_written_when_only_the_wait_sampler_is_unavailable():
+    """FP-GC4-5 / FP-GC3-2: a failed GC-4 diagnostic never voids a GC-3 arm.
+
+    The 28-arm discovery sweep is GC-3's evidence. A test-only wait sampler
+    that fails one `pg_stat_activity` query must not be able to destroy an
+    arm's artifact, so the shared validator the manual node calls is proven
+    here to accept every unusable-sampler shape, and the node itself is proven
+    to reach `write_probe_arm_record` unconditionally after it.
+    """
+    probe_src = (Path(__file__).resolve().parent / "b1_topology_probe_live.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(probe_src)
+    node = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "test_b1_ci_scale_topology_probe_record"
+    )
+
+    # (a) Behavioural: for every unusable-sampler shape the validator accepts
+    # the record, and the wait fields degrade to `unavailable` plus a reason.
+    for bad in (
+        None,
+        B1PostgresWaitSample(600, 599, 1, 1800, {B1_WAIT_ACTIVE_CPU_KEY: 1}),
+        B1PostgresWaitSample(700, 600, 0, 1800, {B1_WAIT_ACTIVE_CPU_KEY: 1}),
+        B1PostgresWaitSample(600, 600, 0, 0, {}),
+    ):
+        run = _cost_run(sample=bad)
+        assert_complete_postgres_cost_record(run)  # must not raise
+        assert postgres_wait_sample_failure(bad) is not None
+        rendered = dict(
+            pair.split("=", 1)
+            for pair in serialize_postgres_cost_fields(18_000_000, 30000, bad).split(",")
+        )
+        assert {rendered[f] for f in B1_POSTGRES_COST_FIELDS[1:]} == {
+            DIAGNOSTIC_UNAVAILABLE
+        }
+
+    # (b) Structural: the validator call is an unconditional statement of the
+    # node body, `write_probe_arm_record(record)` follows it, and nothing
+    # between them can return, raise or branch around the write.
+    statements = node.body
+    validator_at = next(
+        i for i, stmt in enumerate(statements)
+        if "assert_complete_postgres_cost_record" in ast.unparse(stmt)
+    )
+    write_at = next(
+        i for i, stmt in enumerate(statements)
+        if "write_probe_arm_record" in ast.unparse(stmt)
+    )
+    assert validator_at < write_at, "the arm is written before it is validated"
+    assert isinstance(statements[validator_at], ast.Expr), (
+        "the validator call is not a plain statement of the node body"
+    )
+    for stmt in statements[validator_at:write_at]:
+        rendered = ast.unparse(stmt)
+        for escape in ("return", "raise", "pytest.skip", "if "):
+            assert escape not in rendered, (
+                f"a {escape!r} sits between the validator and the arm write: {rendered}"
+            )
+
+    # (c) ...and the validator the node calls owns no wait-sampler rule at all.
+    validator_src = ast.get_source_segment(
+        Path(__file__).read_text(encoding="utf-8"),
+        next(
+            n for n in ast.walk(ast.parse(Path(__file__).read_text(encoding="utf-8")))
+            if isinstance(n, ast.FunctionDef) and n.name == "postgres_cost_record_failures"
+        ),
+    ) or ""
+    for forbidden in ("postgres_wait_sample", "failed", "histogram", "scheduled"):
+        assert forbidden not in validator_src.split('"""')[-1], forbidden

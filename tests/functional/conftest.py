@@ -30,6 +30,7 @@ import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import create_engine, text
 from temporalio.testing import WorkflowEnvironment
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import LogMessageWaitStrategy
@@ -59,6 +60,46 @@ def postgres_dsn() -> str:
     with PostgresContainer("postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent") as pg:
         dsn = pg.get_connection_url()  # postgresql+psycopg2://...
         _run_migrations(dsn)
+        yield dsn
+
+
+# GC-4 (FP-GC4-4): the planning-enabled PostgreSQL 16 server the plan-reuse
+# regression observes itself on. `pg_stat_statements` only splits planning from
+# execution when it is preloaded AND `track_planning` is on, and the stock
+# `postgres:16-alpine` above loads neither -- which is exactly why this is a
+# SECOND container rather than a setting on the shared one: the ordinary
+# fixture, production PostgreSQL settings and every B1 container keep the
+# profile they measure today. Stock durability settings stay on here too.
+PG_STAT_STATEMENTS_COMMAND = (
+    "postgres -c shared_preload_libraries=pg_stat_statements "
+    "-c pg_stat_statements.track_planning=on "
+    "-c pg_stat_statements.track=all"
+)
+
+
+@pytest.fixture(scope="session")
+def pg_stat_statements_dsn() -> str:
+    """Real ephemeral PG16 with planning-aware `pg_stat_statements` installed.
+
+    Migrated to head with the same real Alembic migration the ordinary fixture
+    runs, so the plan-reuse regression executes the production statement
+    against the production schema. The extension is created here; the
+    fixture-integrity function test, not this fixture, is what proves the
+    preload, tracking, extension, reset and counters are real.
+    """
+    container = PostgresContainer(
+        "postgres:16-alpine", dbname="dbagent", username="dbagent", password="dbagent"
+    ).with_command(PG_STAT_STATEMENTS_COMMAND)
+    with container as pg:
+        dsn = pg.get_connection_url()  # postgresql+psycopg2://...
+        _run_migrations(dsn)
+        engine = create_engine(dsn, future=True)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"))
+                conn.commit()
+        finally:
+            engine.dispose()
         yield dsn
 
 

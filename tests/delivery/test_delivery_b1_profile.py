@@ -5,9 +5,11 @@ import ast
 import asyncio
 import hashlib
 import importlib.util
+import io
 import json
 import re
 import time
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -3996,3 +3998,556 @@ def test_gc3_reference_topology_scope_and_decision_are_pinned():
     for topology in GC3_TOPOLOGY_IDS:
         assert f'"topology": "{topology}"' not in launcher, topology
         assert topology not in launcher, topology
+
+
+# ---------------------------------------------------------------------------
+# GC-4 — the scoped Psycopg 3 gateway engine, the fixed bars it may not move,
+# and the head-scoped GC-3 handoff.
+#
+# Every literal below is declared here, independently of the module it pins,
+# for the same reason the GC-2 and GC-3 blocks above declare theirs: the pin
+# says what this slice did and did not change, and it infers no performance
+# from source shape.
+# ---------------------------------------------------------------------------
+
+GC4_MAIN_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "main.py"
+GC4_INGEST_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "ingest.py"
+GC4_SESSION_PATH = (
+    REPO_ROOT / "libs" / "py" / "rca_common" / "rca_common" / "db" / "session.py"
+)
+GC4_REPO_PATH = (
+    REPO_ROOT / "libs" / "py" / "rca_common" / "rca_common" / "investigation_repo.py"
+)
+GC4_GATEWAY_PYPROJECT = REPO_ROOT / "services" / "gateway" / "pyproject.toml"
+GC4_COMMON_PYPROJECT = REPO_ROOT / "libs" / "py" / "rca_common" / "pyproject.toml"
+GC4_MIGRATIONS_DIR = REPO_ROOT / "libs" / "py" / "rca_common" / "migrations"
+GC4_VALUES_PATH = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
+GC4_DEPLOY_DIR = REPO_ROOT / "deploy"
+GC4_THRESHOLDS = REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml"
+GC4_CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+GC4_LAUNCHER = REPO_ROOT / "scripts" / "integration-test.sh"
+
+GC4_ENGINE_FACTORY = "make_gateway_engine"
+GC4_LISTENER = "_pin_gateway_prepare_threshold"
+GC4_THRESHOLD_CONSTANT = "GATEWAY_PREPARE_THRESHOLD"
+GC4_PREPARE_THRESHOLD = 5
+GC4_DIALECT = "postgresql+psycopg"
+GC4_GATEWAY_DEPENDENCY = "psycopg[binary]>=3.2,<4"
+GC4_COMMON_DEPENDENCY = "psycopg2-binary>=2.9,<3"
+# Production modules that build a shared engine and are NOT the ingest gateway.
+# Each keeps its DSN-selected Psycopg 2 behaviour: none of them may name the
+# gateway's constructor, dialect, driver or threshold.
+GC4_OTHER_ENGINE_MODULES = (
+    ("services", "worker", "worker", "worker_main.py"),
+    ("services", "worker", "scripts", "seed_playbooks.py"),
+    ("services", "dashboard-api", "dashboard_api", "main.py"),
+    ("services", "dashboard-api", "dashboard_api", "bootstrap_admin.py"),
+    ("libs", "py", "rca_common", "rca_common", "db", "session.py"),
+    ("libs", "py", "rca_common", "rca_common", "db", "__init__.py"),
+)
+# Every way of widening the engine, the pool or the connection that the
+# gateway constructor is forbidden to use. `connect_args` is named explicitly
+# so the one sanctioned new per-connection setting -- the connect-event
+# listener -- is not confused with a smuggled engine argument.
+GC4_FORBIDDEN_ENGINE_KEYWORDS = (
+    "connect_args",
+    "poolclass",
+    "pool_size",
+    "max_overflow",
+    "pool_timeout",
+    "pool_recycle",
+    "pool_pre_ping",
+    "pool_use_lifo",
+    "isolation_level",
+    "execution_options",
+    "creator",
+    "NullPool",
+    "StaticPool",
+    "QueuePool",
+)
+GC4_FORBIDDEN_SQL_TOKENS = (
+    "PREPARE ",
+    "EXECUTE ",
+    "DEALLOCATE",
+    "CREATE FUNCTION",
+    "CREATE OR REPLACE FUNCTION",
+    "plan_cache_mode",
+    "force_generic_plan",
+)
+# The GC-2 statement, byte-unchanged. The digest is over the Python constant's
+# own value, so an edit of a single character inside the SQL fails by name --
+# and the bind inventory below fixes the typed binds the Psycopg dialect
+# renders its casts from.
+GC4_MERGE_SQL_SHA256 = (
+    "2cc1897aab8247c562f5fdd5996b9e2be7fa54cd7d8f23443c4582e96cbcd3bb"
+)
+GC4_MERGE_BIND_INVENTORY = (
+    ("platform_key", "Text"),
+    ("fingerprint", "Text"),
+    ("source", "Text"),
+    ("severity", "Text"),
+    ("event_id", "UUID"),
+    ("event_id_text", "Text"),
+    ("normalized", "JSONB"),
+    ("non_terminal_statuses", "ARRAY"),
+    ("statement_at", "TIMESTAMP"),
+    ("default_correlation_window_seconds", "Integer"),
+)
+# Workload, capacity, durability and index values GC-4 is forbidden to touch.
+GC4_FIXED_CI_SCALE_LITERALS = {
+    "CI_SCALE_BURST_RATE": 500,
+    "CI_SCALE_BURST_SECONDS": 30,
+    "CI_SCALE_TOTAL_REQUESTS": 15000,
+    "CI_SCALE_P99_MS": 150.0,
+    "CI_SCALE_SUSTAINED_FLOOR": 450,
+    "CI_SCALE_MAX_IN_FLIGHT": 500,
+}
+GC4_FIXED_PRODUCT_LITERALS = {
+    "PRODUCT_P99_MS": 150.0,
+    "PRODUCT_SUSTAINED_FLOOR": 200,
+    "PRODUCT_MAX_IN_FLIGHT": 1000,
+    "PRODUCT_TOTAL_REQUESTS": 30000,
+}
+GC4_MAX_CONNECTIONS_PER_WORKER = 150
+GC4_BACKLOG = 2048
+GC4_GATEWAY_WORKERS = "4"
+GC4_THREADPOOL_BOUNDARY = "run_in_threadpool(self._ingest_txn, event)"
+# The index PostgreSQL names `alert_events_fingerprint_received_at_idx`, as the
+# migration spells it. Dropping it makes candidate selection O(n); it stays.
+GC4_FINGERPRINT_INDEX = "CREATE INDEX ON alert_events (fingerprint, received_at);"
+GC4_DURABILITY_TOKENS = ("synchronous_commit", "fsync", "full_page_writes")
+GC4_BASIS_MS_PER_REQUEST = "cpuMsPerRequest: 2.427"
+# This slice's own diagnostic values. None may become a sizing-carrier value
+# or a B1-LATENCY-BASIS-1 observation; they are evidence and nothing else.
+GC4_RCA_DIAGNOSTICS = ("2.105", "1.901", "2.008")
+GC4_SIZING_CARRIERS = (
+    ("deploy", "charts", "dbagent", "values.yaml"),
+    ("tests", "benchmark", "thresholds.yaml"),
+    ("tests", "delivery", "test_delivery_sizing_ledger.py"),
+    ("services", "gateway", "tests", "b1_reference_profile.py"),
+    ("services", "gateway", "tests", "test_b1_ingest_burst.py"),
+    ("scripts", "integration-test.sh"),
+)
+# The test-only wait sampler: its symbols may live only in the B1 harness.
+GC4_SAMPLER_SYMBOLS = (
+    "B1PostgresWaitSampler",
+    "B1PostgresWaitSample",
+    "classify_postgres_wait",
+    "serialize_postgres_wait_histogram",
+    "serialize_postgres_cost_fields",
+    "postgres_wait_",
+    "gc4-wait-sampler",
+)
+GC4_COST_FIELDS = (
+    "postgres_cpu_us_per_req",
+    "postgres_wait_scheduled",
+    "postgres_wait_completed",
+    "postgres_wait_failed",
+    "postgres_wait_observations",
+    "postgres_wait_events_pct",
+)
+# GC-3's recorded evidence head. Every current model entry belongs to it, and
+# to no other product head -- GC-4 changes cost, not topology.
+GC4_GC3_EVIDENCE_HEAD = "51e8a3175a4c247ab6afa47a5588bcbb96fafa99"
+GC4_GC3_REQUALIFICATION_PHRASES = (
+    "requalification",
+    "two complete distinct-run artifacts",
+    "at the shipped GC-4 head",
+    # rev 0.5: the manifest states what GC-4 actually changed, narrowly -- the
+    # fused statement's own plan+execute cost, not "the gateway's PostgreSQL
+    # cost", which would read as a whole-container claim this slice disclaims.
+    "the fused statement's plan+execute cost per merge",
+)
+GC4_PRODUCT_SOURCE_DIRS = (
+    ("services", "gateway", "gateway"),
+    ("services", "worker", "worker"),
+    ("services", "dashboard-api", "dashboard_api"),
+    ("libs", "py", "rca_common", "rca_common"),
+)
+
+
+def _gc4_prose_free(src: str) -> str:
+    """Source with comments and docstrings blanked; other literals untouched.
+
+    The pins below forbid tokens that the prose explaining them legitimately
+    names -- a scan that reads a comment finds the word in the sentence that
+    says the word must not be in the code. String literals stay, because a
+    SQL ``PREPARE`` smuggled in as a literal is exactly what is forbidden.
+    """
+    tree = ast.parse(src)
+    docstring_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstring_lines.update(
+                range(first.lineno, (first.end_lineno or first.lineno) + 1)
+            )
+    lines = src.splitlines()
+    for token in tokenize.generate_tokens(io.StringIO(src).readline):
+        if token.type != tokenize.COMMENT:
+            continue
+        row, col = token.start
+        lines[row - 1] = lines[row - 1][:col]
+    return "\n".join(
+        "" if index in docstring_lines else line
+        for index, line in enumerate(lines, start=1)
+    )
+
+
+def _gc4_function(tree: ast.AST, name: str) -> ast.AST:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found")
+
+
+def _gc4_product_sources() -> "list[tuple[str, str]]":
+    """Every production Python module, with its prose removed."""
+    out: list[tuple[str, str]] = []
+    for parts in GC4_PRODUCT_SOURCE_DIRS:
+        root = REPO_ROOT.joinpath(*parts)
+        for path in sorted(root.rglob("*.py")):
+            out.append((
+                str(path.relative_to(REPO_ROOT)),
+                _gc4_prose_free(path.read_text(encoding="utf-8")),
+            ))
+    return out
+
+
+def test_gc4_gateway_driver_scope_is_pinned():
+    """FP-GC4-2: Psycopg 3 and the fixed threshold are the gateway's alone.
+
+    The one engine, the one call site, the one connect listener, the unchanged
+    shared factory and the unchanged callers -- each read from its own source,
+    none of them inferred from another.
+    """
+    main_src = GC4_MAIN_PATH.read_text(encoding="utf-8")
+    main_code = _gc4_prose_free(main_src)
+    main_tree = ast.parse(main_src)
+
+    # (1) The dependency is the gateway package's alone, bounded, and does not
+    # displace the common library's Psycopg 2.
+    gateway_toml = GC4_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
+    assert gateway_toml.count(GC4_GATEWAY_DEPENDENCY) == 1, GC4_GATEWAY_DEPENDENCY
+    common_toml = GC4_COMMON_PYPROJECT.read_text(encoding="utf-8")
+    assert GC4_COMMON_DEPENDENCY in common_toml, "rca_common lost its Psycopg 2 pin"
+    assert "psycopg[" not in common_toml, "Psycopg 3 moved into the common library"
+    for parts in (
+        ("services", "worker", "pyproject.toml"),
+        ("services", "dashboard-api", "pyproject.toml"),
+    ):
+        text = REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+        assert "psycopg[" not in text, f"{parts[-2]} acquired Psycopg 3"
+
+    # (2) Exactly one engine constructor, with exactly one `make_engine` call
+    # site inside it, one positional argument and no keyword at all -- which is
+    # also what keeps the connection-budget AST count at one.
+    factory = _gc4_function(main_tree, GC4_ENGINE_FACTORY)
+    module_calls = _gc2_named_calls(main_tree, "make_engine")
+    assert len(module_calls) == 1, "the gateway has more than one make_engine call site"
+    assert module_calls[0] in _gc2_named_calls(factory, "make_engine")
+    assert len(module_calls[0].args) == 1
+    assert not module_calls[0].keywords, "the gateway engine gained a keyword"
+    factory_src = ast.get_source_segment(main_src, factory) or ""
+    assert "render_as_string(hide_password=False)" in factory_src, (
+        "the shared `dsn: str` signature is not rendered back to a string"
+    )
+    assert "make_url(dsn)" in factory_src, "the DSN is not carried by a URL object"
+    assert f'drivername="{GC4_DIALECT}"' in factory_src, GC4_DIALECT
+    assert not _gc2_named_calls(factory, "replace"), "ad-hoc DSN string replacement"
+    assert len(_gc2_named_calls(main_tree, GC4_ENGINE_FACTORY)) == 1, (
+        "build_app is not the only caller of the gateway engine constructor"
+    )
+    build_app = _gc4_function(main_tree, "build_app")
+    assert _gc2_named_calls(build_app, GC4_ENGINE_FACTORY), (
+        "build_app does not build its engine through the gateway constructor"
+    )
+    assert not _gc2_named_calls(build_app, "make_engine")
+
+    # (3) The one new per-connection setting is the connect-event listener.
+    # No connect_args, no pool keyword, no engine keyword anywhere in main.
+    listen = [
+        call for call in _gc2_named_calls(factory, "listen")
+        if ast.unparse(call.func).endswith("event.listen")
+    ]
+    assert len(listen) == 1, "the prepare-threshold hook is not one connect listener"
+    rendered = ast.unparse(listen[0])
+    assert "'connect'" in rendered, rendered
+    assert GC4_LISTENER in rendered, rendered
+    for keyword in GC4_FORBIDDEN_ENGINE_KEYWORDS:
+        assert keyword not in main_code, f"the gateway engine gained {keyword}"
+    for token in GC4_DURABILITY_TOKENS:
+        assert token not in main_code, token
+
+    # (4) The threshold is a fixed constant, set on the raw connection, with no
+    # environment, YAML, chart, query-string or caller override.
+    main_assigns = _source_assigns(main_src)
+    threshold = main_assigns[GC4_THRESHOLD_CONSTANT]
+    assert isinstance(threshold, ast.Constant), "the threshold is not a literal"
+    assert threshold.value == GC4_PREPARE_THRESHOLD, threshold.value
+    listener = _gc4_function(main_tree, GC4_LISTENER)
+    listener_src = ast.get_source_segment(main_src, listener) or ""
+    assert f"prepare_threshold = {GC4_THRESHOLD_CONSTANT}" in listener_src, listener_src
+    env_reads = {
+        ast.unparse(call.args[0])
+        for call in ast.walk(main_tree)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) in ("os.environ.get", "os.getenv")
+        and call.args
+    }
+    for name in env_reads:
+        assert "PREPARE" not in name.upper(), name
+        assert "PSYCOPG" not in name.upper(), name
+        assert "DRIVER" not in name.upper(), name
+    assert not _gc2_named_calls(factory, "load_config")
+    assert len(factory.args.args) == 1, "the constructor gained a caller-facing knob"
+    assert factory.args.kwonlyargs == [] and factory.args.defaults == []
+
+    # (5) The shared factory and every other production caller are unchanged.
+    session_src = GC4_SESSION_PATH.read_text(encoding="utf-8")
+    assert "def make_engine(dsn: str, **kwargs) -> Engine:" in session_src
+    assert "create_engine(dsn, future=True, **kwargs)" in session_src
+    assert "expire_on_commit=False" in session_src
+    for parts in GC4_OTHER_ENGINE_MODULES:
+        path = REPO_ROOT.joinpath(*parts)
+        text = _gc4_prose_free(path.read_text(encoding="utf-8"))
+        assert "make_engine" in text, f"{parts[-1]} no longer uses the shared factory"
+        for forbidden in (GC4_ENGINE_FACTORY, GC4_DIALECT, "prepare_threshold", "psycopg"):
+            assert forbidden not in text, f"{parts[-1]} acquired {forbidden!r}"
+
+    # (6) Migrations, deployment, chart and compose DSNs stay ordinary.
+    for path in sorted(GC4_MIGRATIONS_DIR.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        text = _gc4_prose_free(path.read_text(encoding="utf-8"))
+        assert "psycopg" not in text, f"{path.name} names a driver"
+    for path in sorted(GC4_DEPLOY_DIR.rglob("*")):
+        if not path.is_file() or path.suffix not in (".yaml", ".yml", ".tpl", ".env"):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        assert GC4_DIALECT not in text, f"{path} names the gateway dialect"
+        assert "prepare_threshold" not in text, f"{path} names the threshold"
+
+    # (7) The connection-budget carrier is untouched and still says one.
+    budget = _load(REPO_ROOT / "tests" / "delivery" / "connection_budget.py", "gc4_budget")
+    assert budget.ENGINES_PER_PROCESS["ingest-gateway"] == 1
+    assert budget.count_make_engine_calls("ingest-gateway") == 1
+    assert budget.stock_engine_capacity() == 15
+
+
+def test_gc4_fixed_bars_and_sizing_boundaries_are_pinned():
+    """FP-GC4-6: the statement, the workload, the capacity and the ledger stand still."""
+    # (1) The GC-2 statement is byte-unchanged and keeps its typed binds. The
+    # digest is of the Python constant; the wire form legitimately differs
+    # under the Psycopg dialect's bind casts, and is deliberately not pinned.
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "libs" / "py" / "rca_common"))
+    try:
+        from rca_common import investigation_repo as gc4_repo
+    finally:
+        sys.path.pop(0)
+    sql = gc4_repo._MERGE_EXISTING_EVENT_WITH_AUDIT_SQL
+    assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GC4_MERGE_SQL_SHA256, (
+        "the GC-2 fused statement changed"
+    )
+    binds = gc4_repo._MERGE_EXISTING_EVENT_WITH_AUDIT_STMT._bindparams
+    observed = {name: type(param.type).__name__ for name, param in binds.items()}
+    assert observed == dict(GC4_MERGE_BIND_INVENTORY), observed
+    # `(?<!:)` keeps the statement's own `::TYPE` casts out of the bind set.
+    assert set(re.findall(r"(?<!:):([a-z_]+)", sql)) == {
+        name for name, _ in GC4_MERGE_BIND_INVENTORY
+    }
+    helper = _gc4_function(
+        ast.parse(GC4_REPO_PATH.read_text(encoding="utf-8")),
+        "merge_existing_event_with_audit",
+    )
+    assert len(_gc2_named_calls(helper, "execute")) == 1, "a second product execute"
+    assert not _gc2_named_calls(helper, "commit")
+
+    # (2) No SQL-level preparation, stored form or driver-level retry anywhere
+    # in product code.
+    for relative, text in _gc4_product_sources():
+        upper = text.upper()
+        for token in GC4_FORBIDDEN_SQL_TOKENS:
+            assert token.upper() not in upper, f"{relative} carries {token!r}"
+    # ...and the gateway adds no driver-level retry of its own.
+    gateway_code = _gc4_prose_free(GC4_MAIN_PATH.read_text(encoding="utf-8")).lower()
+    for token in ("retry", "reconnect", "while true"):
+        assert token not in gateway_code, token
+
+    # (3) Workload, capacity, durability and threadpool boundary.
+    profile_assigns = _module_assigns(REF_PATH)
+    harness_src = REF_TEST.read_text(encoding="utf-8")
+    harness_assigns = _source_assigns(harness_src)
+    for name, expected in GC4_FIXED_CI_SCALE_LITERALS.items():
+        assert _eval_simple_constant(profile_assigns[name], profile_assigns) == expected, name
+    for name, expected in {
+        **GC4_FIXED_CI_SCALE_LITERALS, **GC4_FIXED_PRODUCT_LITERALS,
+    }.items():
+        node = harness_assigns.get(name)
+        if node is None:
+            continue
+        assert isinstance(node, ast.Constant) and node.value == expected, name
+    assert "MAX_IN_FLIGHT = BURST_RATE" in REF_PATH.read_text(encoding="utf-8")
+    main_src = GC4_MAIN_PATH.read_text(encoding="utf-8")
+    main_assigns = _source_assigns(main_src)
+    assert ast.literal_eval(
+        main_assigns["DEFAULT_MAX_CONNECTIONS_PER_WORKER"]
+    ) == GC4_MAX_CONNECTIONS_PER_WORKER
+    assert ast.literal_eval(main_assigns["BACKLOG"]) == GC4_BACKLOG
+    assert f'"DBAGENT_GATEWAY_WORKERS", "{GC4_GATEWAY_WORKERS}"' in main_src
+    assert "limit_concurrency=max_connections" in main_src
+    ingest_src = GC4_INGEST_PATH.read_text(encoding="utf-8")
+    assert GC4_THREADPOOL_BOUNDARY in ingest_src, "the threadpool boundary moved"
+    session_src = GC4_SESSION_PATH.read_text(encoding="utf-8")
+    for token in GC4_DURABILITY_TOKENS:
+        for label, text in (("main", main_src), ("session", session_src),
+                            ("ingest", ingest_src),
+                            ("repo", GC4_REPO_PATH.read_text(encoding="utf-8"))):
+            assert token not in _gc4_prose_free(text), f"{label} touches {token}"
+    assert ast.literal_eval(
+        harness_assigns["PRODUCT_AFFINITY_CARDINALITY"]
+    ) == GC1_AFFINITY_CARDINALITIES["product-exclusive"]
+
+    # (4) The fingerprint index is load-bearing and still declared.
+    migration = (GC4_MIGRATIONS_DIR / "versions" / "0001_initial_schema.py").read_text(
+        encoding="utf-8"
+    )
+    assert GC4_FINGERPRINT_INDEX in migration, "the fingerprint index was dropped"
+
+    # (5) The wait sampler is test-only: its symbols exist in the B1 harness
+    # and in no product source, and it builds no product engine.
+    for relative, text in _gc4_product_sources():
+        for symbol in GC4_SAMPLER_SYMBOLS:
+            assert symbol not in text, f"{relative} carries the test-only {symbol!r}"
+    assert _module_tuple(ast.parse(harness_src), "B1_POSTGRES_COST_FIELDS") == GC4_COST_FIELDS
+    sampler = _gc4_function(ast.parse(harness_src), "_open_postgres_wait_connection")
+    sampler_src = ast.get_source_segment(harness_src, sampler) or ""
+    assert "psycopg2.connect" in sampler_src, "the sampler does not own its connection"
+    for forbidden in ("make_engine", "make_gateway_engine", "session_factory"):
+        assert forbidden not in sampler_src, forbidden
+
+    # ...and no cost field is a gating field, a verdict or a GC-3 record key.
+    harness_tree = ast.parse(harness_src)
+    gating = set(_module_tuple(harness_tree, "B1_GATING_PLACEMENT_FIELDS"))
+    topology_gating = set(_module_tuple(harness_tree, "B1_TOPOLOGY_GATING_PLACEMENT_FIELDS"))
+    product_verdicts = set(_module_tuple(harness_tree, "PRODUCT_VERDICT_FIELDS"))
+    for field in GC4_COST_FIELDS:
+        assert field not in gating, field
+        assert field not in topology_gating, field
+        assert field not in product_verdicts, field
+        assert field not in gc3.VERDICT_FIELDS, field
+        assert field not in gc3.RECORD_KEYS, field
+
+    # (6) The sizing basis, its empty ledger and the prohibited diagnostics.
+    values = yaml.safe_load(GC4_VALUES_PATH.read_text(encoding="utf-8"))
+    basis = values["ingestGateway"]["sizingBasis"]
+    assert float(basis["cpuMsPerRequest"]) == 2.427
+    assert GC4_BASIS_MS_PER_REQUEST in GC4_VALUES_PATH.read_text(encoding="utf-8")
+    assert basis["observations"] == [], basis["observations"]
+    for parts in GC4_SIZING_CARRIERS:
+        carrier = REPO_ROOT.joinpath(*parts)
+        assert carrier.is_file(), parts[-1]
+        text = carrier.read_text(encoding="utf-8")
+        for value in GC4_RCA_DIAGNOSTICS:
+            assert value not in text, f"{parts[-1]} carries the diagnostic {value}"
+    # No investigation or CI run id may enter a sizing observation. Scoped to
+    # the sizing block itself: the manifest legitimately cites GC-3 discovery
+    # run ids as evidence in its prose, which is not a sizing carrier value.
+    assert not re.search(r"\b\d{9,}\b", yaml.safe_dump(basis)), basis
+
+
+def test_gc4_gc3_requalification_handoff_is_head_scoped():
+    """FP-GC4-7: the current decision stays evidence for its own product head.
+
+    GC-4 records no topology, relabels no SKU and claims no hostability. What
+    it owes GC-3 is a statement, in the tracked manifest, that the recorded
+    entries belong to the head they were measured at and that a later,
+    separately audited requalification at the shipped GC-4 head is what may
+    supersede them.
+    """
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    models = decision["models"]
+    assert models, "the decision carrier has no model entry"
+
+    # (1) Every current entry is evidence for the recorded product head, and
+    # for no other: both the entry and each embedded artifact say so.
+    for model, entry in models.items():
+        assert entry["evidenceHeadSha"] == GC4_GC3_EVIDENCE_HEAD, model
+        for wrapper in entry["artifacts"]:
+            assert wrapper["artifact"]["headSha"] == GC4_GC3_EVIDENCE_HEAD, model
+
+    # (2) No SKU is relabelled by this slice: every entry is still unhostable,
+    # with no topology, cardinality, schema or score, and the harness declares
+    # no selected model at all.
+    for model, entry in models.items():
+        assert entry["status"] == gc3.DECISION_UNHOSTABLE, (model, entry["status"])
+        assert entry["ratifiable"] == [], model
+        for null_field in ("selected", "cardinality", "placementSchema", "score"):
+            assert entry[null_field] is None, (model, null_field)
+    harness_assigns = _source_assigns(REF_TEST.read_text(encoding="utf-8"))
+    assert ast.literal_eval(
+        harness_assigns["CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"]
+    ) == {}
+    assert ast.literal_eval(
+        harness_assigns["CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"]
+    ) == {}
+
+    # (3) The manifest says the entries are head-specific and names the later
+    # same-head requalification as the only route that may supersede them.
+    thresholds = yaml.safe_load(GC4_THRESHOLDS.read_text(encoding="utf-8"))
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    notes = b1_entry["notes"]
+    assert b1_entry["status"] == "covered", "the bar was relabelled"
+    assert GC4_GC3_EVIDENCE_HEAD[:7] in notes or GC4_GC3_EVIDENCE_HEAD in notes
+    for phrase in GC4_GC3_REQUALIFICATION_PHRASES:
+        assert phrase in notes, f"the manifest does not state {phrase!r}"
+    for model in models:
+        assert model in notes, model
+        assert f"topology_unratified_sku:{model}" in notes, model
+    # The unchanged bar is still stated, and no GC-4 record may be read as it.
+    assert "p99<150ms" in notes.replace(" ", "")
+    assert CI_SCALE_REF_TEST in notes
+    for claim in ("is hostable", "now hostable", "GC-4 selects", "selected by GC-4"):
+        assert claim not in notes, claim
+
+    # (4) The cost diagnostics are described as reported-only in the same
+    # manifest, so a reader cannot take them for a bar or a selector input.
+    for field in GC4_COST_FIELDS:
+        assert field in notes, field
+    assert "reported diagnostic" in notes
+
+    # (5) No runner class is added and no job waits on a new one: the probe is
+    # still the manual `ubuntu-latest` workflow-dispatch route.
+    ci = yaml.safe_load(GC4_CI_YML.read_text(encoding="utf-8"))
+    for name, job in ci["jobs"].items():
+        assert job.get("runs-on") == "ubuntu-latest", (name, job.get("runs-on"))
+    launcher = GC4_LAUNCHER.read_text(encoding="utf-8")
+    for topology in GC3_TOPOLOGY_IDS:
+        assert topology not in launcher, topology
+
+    # (6) The only test that can establish the CI-scale bar is unchanged, and
+    # no GC-4 node claims it.
+    harness_src = REF_TEST.read_text(encoding="utf-8")
+    ci_scale = _gc2_function(ast.parse(harness_src), CI_SCALE_REF_TEST)
+    observed = {
+        ast.unparse(node.test) for node in ast.walk(ci_scale) if isinstance(node, ast.Assert)
+    }
+    assert not GC2_CI_SCALE_REQUIRED_ASSERTIONS - observed
+    gc4_node = _gc4_function(ast.parse(harness_src), "test_gc4_live_postgres_cost_record_is_complete")
+    gc4_src = ast.get_source_segment(harness_src, gc4_node) or ""
+    for forbidden in ("CI_SCALE_P99_MS", "PRODUCT_P99_MS", "hostable", "selected",
+                      "VERDICT_MET", "b1_topology_decision"):
+        assert forbidden not in gc4_src, forbidden

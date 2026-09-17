@@ -104,6 +104,24 @@ benchmarks:
     design/slices/gc-1-reference-topology/design.md and recorded in design/frozen-deviations.md;
     the per-exact-cpuModel CI-scale topology decision and its recorded routes are specified by
     design/slices/gc-3-reference-topology/design.md.
+    GC-4 (gateway PostgreSQL plan reuse) appends six cost fields to both B1 fingerprint lines, after
+    the two lateness-leg fields and never before a gating one: postgres_cpu_us_per_req is
+    measured-window PostgreSQL CPU microseconds per served request, and postgres_wait_scheduled,
+    postgres_wait_completed, postgres_wait_failed, postgres_wait_observations and
+    postgres_wait_events_pct describe a test-only 50 ms sampler of non-idle client backends over the
+    same window. Each is a reported diagnostic in the same sense as max_lateness_ms: none is a bar,
+    a recorded verdict, a topology-selector input or a sizing observation, and a missing reading is
+    serialized as `unavailable` rather than as a zero. The per-exact-cpuModel decision table above is
+    evidence for the product head it was measured at and for no other. GC-4 changed
+    the fused statement's plan+execute cost per merge
+    and nothing else: not this profile, not any bar, not any capacity or durability setting, and not
+    any recorded entry, so every entry remains head-specific and awaits a separately audited GC-3
+    requalification. That requalification supersedes a model's entry only from
+    two complete distinct-run artifacts of that exact model
+    at the shipped GC-4 head
+    and re-derives the entry through the same selector; manual editing is not an allowed shortcut.
+    Until it publishes a recomputed entry no model is selected, GC-4 claims no SKU and no p99 result,
+    and the unchanged CI-scale bar stated above remains the only thing that can establish one.
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms

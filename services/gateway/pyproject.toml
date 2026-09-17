@@ -12,6 +12,11 @@ dependencies = [
     "uvicorn[standard]>=0.27,<1",
     "temporalio>=1.7,<2",
     "rca-common",
+    # GC-4 (FP-GC4-2): the ingest gateway alone runs its PostgreSQL engine on
+    # SQLAlchemy's synchronous Psycopg 3 dialect, for per-connection automatic
+    # preparation of the unchanged GC-2 fused merge. rca_common, the worker,
+    # dashboard-api, scripts, migrations and the B11 writers keep psycopg2.
+    "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]

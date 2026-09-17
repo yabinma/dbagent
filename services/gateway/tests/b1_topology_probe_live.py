@@ -25,6 +25,7 @@ first expected miss.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -93,4 +94,29 @@ def test_b1_ci_scale_topology_probe_record(b1_topology_probe_run):
     assert tuple(verdicts) == probe.VERDICT_FIELDS
     print(f"B1 probe verdicts={probe.serialize_verdicts(verdicts)}", flush=True)
 
+    # (5) GC-4 (FP-GC4-5): the shared HARNESS-OPERAND validator -- a positive
+    # served count, a positive PostgreSQL CPU reading and both finite lateness
+    # legs. Nothing else. It judges no comparison, gates no candidate and, in
+    # particular, does not inspect the test-only wait sampler: a sampler that
+    # failed, stalled or saw nothing serializes `unavailable` in all five wait
+    # fields plus a note, and this arm is still written. A GC-4 diagnostic must
+    # never be able to destroy a 28-arm GC-3 sweep's evidence.
+    harness.assert_complete_postgres_cost_record(run)
+
     harness.write_probe_arm_record(record)
+
+    # (6) ...and that is verified on the arm that was actually written: the
+    # record exists, its fingerprint carries the wait fields in one of their
+    # two admitted representations, and an unavailable sampler is accompanied
+    # by its note rather than by a fabricated zero.
+    written = json.loads(harness.B1_PROBE_RECORD.read_text(encoding="utf-8"))
+    assert written["index"] == record["index"]
+    wait_fields = {
+        field: harness._parse_b1_env_field(written["fingerprint"], field)
+        for field in harness.B1_POSTGRES_COST_FIELDS[1:]
+    }
+    if harness.postgres_wait_sample_failure(run["postgres_wait_sample"]) is None:
+        assert harness.DIAGNOSTIC_UNAVAILABLE not in set(wait_fields.values()), wait_fields
+    else:
+        assert set(wait_fields.values()) == {harness.DIAGNOSTIC_UNAVAILABLE}, wait_fields
+        assert any("postgres wait sampler" in note for note in written["notes"]), written["notes"]

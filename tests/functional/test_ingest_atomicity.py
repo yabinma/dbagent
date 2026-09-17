@@ -6,6 +6,11 @@ rendezvous onto it. The seam is a wrapper around
 ``gateway.ingest.merge_existing_event_with_audit``; ``find_open_by_fingerprint``
 is deliberately left unpatched in both modules, so the deciding under-lock
 re-read that follows the advisory lock is the real product read.
+
+GC-4 (FP-GC4-1/3/4) runs every one of those product gateway-path proofs through
+``gateway.main.make_gateway_engine`` -- the scoped synchronous Psycopg 3 engine
+the gateway really builds -- and adds the planning-enabled fixture-integrity
+proof and the separate plan-reuse regression below.
 """
 from __future__ import annotations
 
@@ -19,10 +24,14 @@ import pytest
 from sqlalchemy import event as sa_event
 from sqlalchemy import select, text
 
+from gateway.main import GATEWAY_PREPARE_THRESHOLD, make_gateway_engine
 from gateway.ingest import IngestService
 from rca_common.db.models import AlertEventRow, Investigation, Platform
-from rca_common.db.session import make_engine, make_session_factory
-from rca_common.investigation_repo import create_investigation
+from rca_common.db.session import make_session_factory
+from rca_common.investigation_repo import (
+    create_investigation,
+    merge_existing_event_with_audit,
+)
 
 
 class _RecordingStarter:
@@ -137,7 +146,7 @@ async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgr
     leaves no row lock, so all eight can sit in the rendezvous at once; the
     advisory lock and the deciding re-read after it are unpatched product code.
     """
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     platform_key = f"atomicity-{uuid.uuid4().hex[:8]}"
     fingerprint_summary = "same-fingerprint-storm"
@@ -208,7 +217,7 @@ async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgr
     for level in isolation_levels:
         assert "read committed" in level.lower().replace("-", " "), level
 
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     try:
         with session_factory() as session:
@@ -258,7 +267,7 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
     """
     import contextvars
 
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     platform_key = f"merge-race-{uuid.uuid4().hex[:8]}"
     fingerprint_summary = "merge-racing-open-fp"
@@ -392,7 +401,7 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
     )
     assert opener_holding_uncommitted.is_set()
 
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     try:
         with session_factory() as session:
@@ -425,7 +434,7 @@ async def test_gc2_existing_merge_is_one_product_statement_plus_commit(postgres_
     Execution is observed at SQLAlchemy's cursor boundary, so the count is of
     statements the product really sent, not of calls the test made.
     """
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     platform_key = f"gc2-one-stmt-{uuid.uuid4().hex[:8]}"
     fingerprint = f"fp-{uuid.uuid4().hex[:8]}"
@@ -475,7 +484,7 @@ async def test_gc2_existing_merge_is_one_product_statement_plus_commit(postgres_
     assert rollbacks == []
 
     # (c) The persisted rows carry exactly the frozen values.
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     try:
         with session_factory() as session:
@@ -539,7 +548,7 @@ async def test_gc2_existing_merge_is_one_product_statement_plus_commit(postgres_
 @pytest.mark.asyncio
 async def test_gc2_merge_commit_failure_rolls_back_event_and_audit(postgres_dsn):
     """FP-GC2-2: neither row survives a failed commit or a failed statement."""
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     platform_key = f"gc2-rollback-{uuid.uuid4().hex[:8]}"
     fingerprint = f"fp-{uuid.uuid4().hex[:8]}"
@@ -666,7 +675,7 @@ async def test_gc2_window_override_fast_and_fallback_cases(
     postgres_dsn, label, config, age_seconds, fast_hit, expected_status
 ):
     """FP-GC2-3: actual SQL decides precedence; ineligible overrides fall back."""
-    engine = make_engine(postgres_dsn)
+    engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     platform_key = f"gc2-window-{uuid.uuid4().hex[:8]}"
     fingerprint = f"fp-{uuid.uuid4().hex[:8]}"
@@ -674,8 +683,6 @@ async def test_gc2_window_override_fast_and_fallback_cases(
     investigation_id = _seed_committed_case(
         session_factory, platform_key, fingerprint, age_seconds=age_seconds
     )
-
-    from rca_common.investigation_repo import merge_existing_event_with_audit
 
     starter = _RecordingStarter()
     svc = _make_service(session_factory, starter)
@@ -735,3 +742,411 @@ async def test_gc2_window_override_fast_and_fallback_cases(
             ), label
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# GC-4 — the planning-enabled fixture, then the plan-reuse regression that
+# rests on it. Two separate tests on purpose: fixture trustworthiness is
+# established before any plans/calls ratio is allowed to mean anything.
+# ---------------------------------------------------------------------------
+
+GC4_FUSED_QUERY_PREFIX = "WITH platform AS MATERIALIZED"
+GC4_MERGE_CALLS = 1000
+GC4_DISTINCT_FINGERPRINTS = 50
+GC4_PLAN_RATIO_DIVISOR = 10
+
+
+def _pgss_row(conn, pattern: str):
+    return conn.execute(
+        text(
+            "SELECT calls, plans, total_plan_time FROM pg_stat_statements "
+            "WHERE query LIKE :pattern"
+        ),
+        {"pattern": pattern},
+    ).all()
+
+
+def test_gc4_plan_reuse_fixture_tracks_planning(pg_stat_statements_dsn):
+    """FP-GC4-4: the fixture proves its own preload, tracking, extension and reset.
+
+    This test owns fixture trustworthiness. Without it, a server that silently
+    failed to preload ``pg_stat_statements`` -- or one tracking execution but
+    not planning -- would report ``plans = 0`` for every statement, and a
+    ``plans < calls / 10`` assertion would pass for exactly the wrong reason.
+    The ordinary shared factory builds the engine here: this is a claim about
+    the server, not about the gateway's driver.
+    """
+    from rca_common.db.session import make_engine
+
+    engine = make_engine(pg_stat_statements_dsn)
+    try:
+        with engine.connect() as conn:
+            # (1) The server really was started with the preload and both
+            # tracking settings -- read back from the running server, never
+            # from the fixture's own command string.
+            preload = conn.execute(text("SHOW shared_preload_libraries")).scalar()
+            assert "pg_stat_statements" in (preload or ""), (
+                f"shared_preload_libraries={preload!r} does not load pg_stat_statements"
+            )
+            track_planning = conn.execute(
+                text("SHOW pg_stat_statements.track_planning")
+            ).scalar()
+            assert track_planning == "on", (
+                f"pg_stat_statements.track_planning={track_planning!r}: planning "
+                f"counters would be zero for every statement"
+            )
+            track = conn.execute(text("SHOW pg_stat_statements.track")).scalar()
+            assert track == "all", f"pg_stat_statements.track={track!r}"
+
+            # (2) The extension is installed, not merely preloaded.
+            installed = conn.execute(
+                text("SELECT extname FROM pg_extension WHERE extname = 'pg_stat_statements'")
+            ).scalar()
+            assert installed == "pg_stat_statements", (
+                "pg_stat_statements is not installed in this database"
+            )
+
+            # (3) Reset really empties the view: a sentinel statement is
+            # observed present, then observed gone. Without this, a fixture
+            # that never reset could carry another test's counters.
+            sentinel_alias = f"gc4_fixture_sentinel_{uuid.uuid4().hex[:8]}"
+            conn.execute(text(f"SELECT CAST(:n AS integer) AS {sentinel_alias}"), {"n": 1})
+            conn.commit()
+            assert len(_pgss_row(conn, f"%{sentinel_alias}%")) == 1, (
+                "the sentinel statement was not tracked at all"
+            )
+            conn.execute(text("SELECT pg_stat_statements_reset()"))
+            conn.commit()
+            assert _pgss_row(conn, f"%{sentinel_alias}%") == [], (
+                "pg_stat_statements_reset() left the sentinel row behind"
+            )
+
+            # (4) ...and after the reset a uniquely aliased parameterized
+            # probe produces positive call AND planning counters.
+            probe_alias = f"gc4_fixture_probe_{uuid.uuid4().hex[:8]}"
+            probes = 5
+            for _ in range(probes):
+                conn.execute(text(f"SELECT CAST(:n AS integer) AS {probe_alias}"), {"n": 7})
+            conn.commit()
+            rows = _pgss_row(conn, f"%{probe_alias}%")
+            assert len(rows) == 1, f"expected exactly one probe row, got {rows}"
+            calls, plans, total_plan_time = rows[0]
+            assert calls == probes, f"calls={calls}, expected {probes} after the reset"
+            assert plans > 0, "plans == 0: planning is not being counted"
+            assert total_plan_time > 0, (
+                "total_plan_time == 0: planning time is not being counted"
+            )
+    finally:
+        engine.dispose()
+
+
+def test_gc4_fused_merge_reuses_server_plan(pg_stat_statements_dsn):
+    """FP-GC4-1: >=1000 real merges replan fewer than one time in ten.
+
+    The production helper, the production session factory and the gateway's own
+    engine constructor -- nothing here reimplements the statement, and nothing
+    issues SQL ``PREPARE``. The row is matched STRUCTURALLY (``ltrim(query)``
+    starts with the constant's first line, and the text carries both inserts),
+    never by byte equality with the Psycopg 2 rendering or with the Python
+    constant: SQLAlchemy's Psycopg dialect renders bind casts on the wire, so
+    the observed text is legitimately different there.
+    """
+    engine = make_gateway_engine(pg_stat_statements_dsn)
+    session_factory = make_session_factory(engine)
+    platform_key = f"gc4-plan-{uuid.uuid4().hex[:8]}"
+    _seed_platform(session_factory, platform_key)
+
+    starter = _RecordingStarter()
+    svc = _make_service(session_factory, starter)
+
+    # (1) Fifty committed non-terminal cases with distinct fingerprints, in the
+    # B1 request shape (`burst-{i % 50}` error summaries, no explicit
+    # fingerprint, so the product's own fingerprint function decides it).
+    raws = [
+        {
+            "source": "manual",
+            "platform_key": platform_key,
+            "error_summary": f"burst-{index}",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "event_id": str(uuid.uuid4()),
+        }
+        for index in range(GC4_DISTINCT_FINGERPRINTS)
+    ]
+    events = [svc.normalize_payload(raw) for raw in raws]
+    fingerprints = {event["fingerprint"] for event in events}
+    assert len(fingerprints) == GC4_DISTINCT_FINGERPRINTS, fingerprints
+    for event in events:
+        _seed_committed_case(session_factory, platform_key, event["fingerprint"])
+
+    try:
+        # (2) Reset AFTER every migration and seed statement, so the window
+        # contains the measured merges and nothing else.
+        with session_factory() as session:
+            session.execute(text("SELECT pg_stat_statements_reset()"))
+            session.commit()
+
+        # (3) >=1000 real merges: one fresh Session context per request over
+        # the one engine, a fresh event UUID each time, one commit each --
+        # exactly what `_ingest_txn` does on a committed hit.
+        for index in range(GC4_MERGE_CALLS):
+            event = dict(events[index % GC4_DISTINCT_FINGERPRINTS])
+            event["event_id"] = str(uuid.uuid4())
+            with session_factory() as session:
+                merged = merge_existing_event_with_audit(
+                    session,
+                    event=event,
+                    default_correlation_window_seconds=1800,
+                )
+                assert merged is not None, (index, event["fingerprint"])
+                session.commit()
+
+        # (4) Exactly ONE structurally matched row. A type or query-shape fork
+        # would produce two rows and is caught here rather than summed away.
+        with session_factory() as session:
+            rows = session.execute(
+                text(
+                    "SELECT query, calls, plans, total_plan_time "
+                    "FROM pg_stat_statements "
+                    "WHERE ltrim(query) LIKE :prefix"
+                ),
+                {"prefix": f"{GC4_FUSED_QUERY_PREFIX}%"},
+            ).all()
+        assert len(rows) == 1, (
+            f"expected exactly one fused-merge row, got {len(rows)}: "
+            f"{[(row[0][:80], row[1], row[2]) for row in rows]}"
+        )
+        query, calls, plans, total_plan_time = rows[0]
+        assert query.lstrip().startswith(GC4_FUSED_QUERY_PREFIX), query[:120]
+        assert query.count("INSERT INTO alert_events") == 1, query
+        assert query.count("INSERT INTO audit_log") == 1, query
+
+        # (5) The regression itself.
+        print(
+            f"GC-4 fused merge plan reuse: calls={calls} plans={plans} "
+            f"ratio={plans / calls:.4f} total_plan_time_ms={total_plan_time:.3f}",
+            flush=True,
+        )
+        assert calls >= GC4_MERGE_CALLS, f"calls={calls}"
+        assert plans > 0, "plans == 0: the fixture is not counting planning"
+        assert total_plan_time > 0, "total_plan_time == 0"
+        assert plans < calls / GC4_PLAN_RATIO_DIVISOR, (
+            f"the fused merge is replanned per call: plans={plans}, calls={calls}, "
+            f"ratio={plans / calls:.4f} (bar: < {1 / GC4_PLAN_RATIO_DIVISOR})"
+        )
+
+        # (6) Defense in depth, after the ratio: the pooled physical connection
+        # really carries the pinned threshold. Read through `getattr` so a
+        # Psycopg 2 connection reports the miss as a value rather than as an
+        # AttributeError.
+        raw = engine.raw_connection()
+        try:
+            threshold = getattr(raw.driver_connection, "prepare_threshold", None)
+            assert threshold == GATEWAY_PREPARE_THRESHOLD == 5, (
+                f"{type(raw.driver_connection).__module__}."
+                f"{type(raw.driver_connection).__name__} reports "
+                f"prepare_threshold={threshold!r}"
+            )
+        finally:
+            raw.close()
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# GC-4 FP-GC4-5 — the quantitative gate: the fused statement's own server time.
+#
+# This is the one GC-4 performance outcome. It measures exactly the quantity
+# the mechanism governs -- `(total_plan_time + total_exec_time) / calls` for
+# the fused statement itself -- and nothing else. Container CPU, queueing and
+# latency are recorded elsewhere and decide nothing.
+# ---------------------------------------------------------------------------
+
+#: Candidate fused-statement server time per call, as a fraction of its matched
+#: Psycopg 2 control. The conservative envelope above every observed ratio
+#: (0.143 one-thread, 0.292 RCA same-SQL prepared process CPU, 0.495 under
+#: 40-thread contention) -- not the expected value of this sequential test,
+#: whose own shape corresponds to the one-thread datum.
+GC4_STATEMENT_TIME_RATIO = 0.60
+#: Leg identity, established from the measurement itself rather than from a
+#: driver name: the control replans essentially every call, the candidate
+#: essentially never.
+GC4_CONTROL_MIN_PLANS_PER_CALL = 0.90
+GC4_CANDIDATE_MAX_PLANS_PER_CALL = 0.10
+
+
+def _gc4_seed_population(session_factory, svc, platform_key: str) -> list[dict]:
+    """One online platform and 50 committed non-terminal cases, B1 request shape."""
+    _seed_platform(session_factory, platform_key)
+    events = []
+    for index in range(GC4_DISTINCT_FINGERPRINTS):
+        event = svc.normalize_payload(
+            {
+                "source": "manual",
+                "platform_key": platform_key,
+                "error_summary": f"burst-{index}",
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "event_id": str(uuid.uuid4()),
+            }
+        )
+        events.append(event)
+        _seed_committed_case(session_factory, platform_key, event["fingerprint"])
+    return events
+
+
+def _gc4_measure_statement_leg(dsn: str, engine_factory, events: list[dict], label: str) -> dict:
+    """One variant leg: fresh engine, own reset, >=1000 sequential merges, one row.
+
+    The engine is disposed before this function returns, so the next leg's
+    `pg_stat_statements_reset()` cannot run while a pooled connection of this
+    leg -- and its retained server plan -- is still open.
+    """
+    engine = engine_factory(dsn)
+    session_factory = make_session_factory(engine)
+    try:
+        with session_factory() as session:
+            session.execute(text("SELECT pg_stat_statements_reset()"))
+            session.commit()
+
+        for index in range(GC4_MERGE_CALLS):
+            event = dict(events[index % GC4_DISTINCT_FINGERPRINTS])
+            event["event_id"] = str(uuid.uuid4())
+            with session_factory() as session:
+                merged = merge_existing_event_with_audit(
+                    session,
+                    event=event,
+                    default_correlation_window_seconds=1800,
+                )
+                assert merged is not None, (label, index, event["fingerprint"])
+                session.commit()
+
+        with session_factory() as session:
+            rows = session.execute(
+                text(
+                    "SELECT query, calls, plans, total_plan_time, total_exec_time "
+                    "FROM pg_stat_statements WHERE ltrim(query) LIKE :prefix"
+                ),
+                {"prefix": f"{GC4_FUSED_QUERY_PREFIX}%"},
+            ).all()
+    finally:
+        engine.dispose()
+
+    assert len(rows) == 1, (
+        f"{label}: expected exactly one fused-merge row, got {len(rows)}: "
+        f"{[(row[0][:80], row[1], row[2]) for row in rows]}"
+    )
+    query, calls, plans, total_plan_time, total_exec_time = rows[0]
+    assert query.lstrip().startswith(GC4_FUSED_QUERY_PREFIX), (label, query[:120])
+    assert query.count("INSERT INTO alert_events") == 1, label
+    assert query.count("INSERT INTO audit_log") == 1, label
+    assert calls >= GC4_MERGE_CALLS, (label, calls)
+    assert total_plan_time > 0, (label, total_plan_time)
+    assert total_exec_time > 0, (label, total_exec_time)
+    leg = {
+        "label": label,
+        "calls": int(calls),
+        "plans": int(plans),
+        "total_plan_time": float(total_plan_time),
+        "total_exec_time": float(total_exec_time),
+        "plans_per_call": float(plans) / float(calls),
+        "server_us_per_call": 1000.0 * (float(total_plan_time) + float(total_exec_time))
+        / float(calls),
+    }
+    print(
+        f"GC-4 statement time [{label}]: calls={leg['calls']} plans={leg['plans']} "
+        f"plans_per_call={leg['plans_per_call']:.4f} "
+        f"total_plan_ms={leg['total_plan_time']:.3f} "
+        f"total_exec_ms={leg['total_exec_time']:.3f} "
+        f"server_us_per_call={leg['server_us_per_call']:.3f}",
+        flush=True,
+    )
+    return leg
+
+
+def test_gc4_fused_merge_reduces_server_statement_time(pg_stat_statements_dsn):
+    """FP-GC4-5: prepared fused-statement server time/call <= 60% of the control.
+
+    Two order-balanced rounds over four isolated, equivalent populations, each
+    keyed by its own platform key so no leg can see another leg's rows. The
+    control builds its engine with the shared
+    ``rca_common.db.session.make_engine`` -- the testcontainers DSN is
+    ``postgresql+psycopg2``, so that leg is the real unprepared path -- and the
+    candidate with the gateway's own ``make_gateway_engine``. Leg identity is
+    established by the measurement (`plans/calls`), never by a driver name, so
+    a mutation that returns the candidate to Psycopg 2 fails here for its own
+    reason rather than passing quietly.
+    """
+    from rca_common.db.session import make_engine
+
+    seed_engine = make_engine(pg_stat_statements_dsn)
+    seed_factory = make_session_factory(seed_engine)
+    starter = _RecordingStarter()
+    svc = _make_service(seed_factory, starter)
+    suffix = uuid.uuid4().hex[:8]
+
+    # (1) Four isolated but equivalent populations, all seeded before any round
+    # is measured, each under its own platform key.
+    legs = [
+        ("round1-control", "control", f"gc4-r1c-{suffix}"),
+        ("round1-candidate", "candidate", f"gc4-r1k-{suffix}"),
+        ("round2-candidate", "candidate", f"gc4-r2k-{suffix}"),
+        ("round2-control", "control", f"gc4-r2c-{suffix}"),
+    ]
+    populations: dict[str, list[dict]] = {}
+    try:
+        for label, _variant, platform_key in legs:
+            populations[label] = _gc4_seed_population(seed_factory, svc, platform_key)
+    finally:
+        # Seed work is done; no seeding connection may be open across a leg's
+        # own reset.
+        seed_engine.dispose()
+
+    factories = {"control": make_engine, "candidate": make_gateway_engine}
+
+    # (2) Round one runs control then candidate; round two reverses that order.
+    measured = [
+        _gc4_measure_statement_leg(
+            pg_stat_statements_dsn, factories[variant], populations[label], label
+        )
+        for label, variant, _platform_key in legs
+    ]
+
+    # (3) Leg identity, from the counters themselves.
+    by_variant: dict[str, list[dict]] = {"control": [], "candidate": []}
+    for (label, variant, _key), leg in zip(legs, measured):
+        by_variant[variant].append(leg)
+    for leg in by_variant["control"]:
+        assert leg["plans_per_call"] >= GC4_CONTROL_MIN_PLANS_PER_CALL, (
+            f"{leg['label']} is not an unprepared control: "
+            f"plans/calls={leg['plans_per_call']:.4f}"
+        )
+    for leg in by_variant["candidate"]:
+        assert leg["plans_per_call"] < GC4_CANDIDATE_MAX_PLANS_PER_CALL, (
+            f"{leg['label']} did not reuse a server plan: "
+            f"plans/calls={leg['plans_per_call']:.4f}"
+        )
+
+    # (4) Aggregate each variant across its two order-balanced legs.
+    aggregates = {}
+    for variant, variant_legs in by_variant.items():
+        assert len(variant_legs) == 2, (variant, variant_legs)
+        calls = sum(leg["calls"] for leg in variant_legs)
+        server_ms = sum(
+            leg["total_plan_time"] + leg["total_exec_time"] for leg in variant_legs
+        )
+        aggregates[variant] = 1000.0 * server_ms / calls
+    ratio = aggregates["candidate"] / aggregates["control"]
+    print(
+        f"GC-4 statement time: control={aggregates['control']:.3f} us/call "
+        f"candidate={aggregates['candidate']:.3f} us/call ratio={ratio:.4f} "
+        f"(bar: <= {GC4_STATEMENT_TIME_RATIO})",
+        flush=True,
+    )
+
+    # (5) The gate.
+    assert aggregates["control"] > 0 and aggregates["candidate"] > 0
+    assert aggregates["candidate"] <= GC4_STATEMENT_TIME_RATIO * aggregates["control"], (
+        f"the prepared fused statement did not cut its own server time: "
+        f"candidate={aggregates['candidate']:.3f} us/call, "
+        f"control={aggregates['control']:.3f} us/call, ratio={ratio:.4f} "
+        f"(bar: <= {GC4_STATEMENT_TIME_RATIO})"
+    )

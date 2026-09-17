@@ -8,6 +8,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
+from sqlalchemy import event
+from sqlalchemy.engine import Engine, make_url
 from temporalio.client import Client
 
 from rca_common.config import load_config
@@ -30,6 +32,51 @@ DEFAULT_MAX_CONNECTIONS_PER_WORKER = 150
 DEFAULT_TIMEOUT_KEEP_ALIVE_S = 5
 # Pin documenting uvicorn's compiled default; not an operator knob.
 BACKLOG = 2048
+
+# GC-4 (FP-GC4-1/2). Psycopg 3 counts identical executions per physical DBAPI
+# connection and creates the prepared form once the threshold is crossed; the
+# server plan then survives SQLAlchemy check-in/check-out until that physical
+# connection is closed. Five is Psycopg 3's own shipped default for
+# ``Connection.prepare_threshold``, so the connect listener below does not turn
+# automatic preparation on -- selecting the ``postgresql+psycopg`` dialect does
+# that. The listener exists to make the value a repository constant rather than
+# an inherited driver default, and it is the only per-connection setting the
+# gateway adds: no ``connect_args``, no pool keyword and no engine keyword.
+# Five rather than one so the one-off reject/open-path statements are not all
+# prepared on first sight, while the dominant fused merge crosses it almost
+# immediately. It is a fixed implementation constant, not configuration.
+GATEWAY_PREPARE_THRESHOLD = 5
+
+
+def _pin_gateway_prepare_threshold(dbapi_connection, _connection_record) -> None:
+    """Pin Psycopg 3's automatic-preparation threshold on one new connection."""
+    dbapi_connection.prepare_threshold = GATEWAY_PREPARE_THRESHOLD
+
+
+def make_gateway_engine(dsn: str) -> Engine:
+    """The ingest gateway's own engine: Psycopg 3 for PostgreSQL, nothing else.
+
+    FP-GC4-1/2: a PostgreSQL DSN is re-rendered onto SQLAlchemy's synchronous
+    ``postgresql+psycopg`` dialect through the URL object, so user, password,
+    host, port, database and every existing libpq query option survive exactly
+    (ad-hoc string replacement is forbidden). The shared
+    ``rca_common.db.session.make_engine`` factory, its ``dsn: str`` signature
+    and the stock QueuePool are unchanged, and this constructor contains
+    exactly one ``make_engine`` call site so the repository's
+    one-engine-per-gateway-process connection budget is unchanged.
+
+    The non-PostgreSQL path exists only for the repository's established SQLite
+    wiring tests: it converts no dialect and installs no prepare hook.
+    """
+    url = make_url(dsn)
+    is_postgresql = url.get_backend_name() == "postgresql"
+    if is_postgresql:
+        url = url.set(drivername="postgresql+psycopg")
+
+    engine = make_engine(url.render_as_string(hide_password=False))
+    if is_postgresql:
+        event.listen(engine, "connect", _pin_gateway_prepare_threshold)
+    return engine
 
 
 def _parse_positive_int_env(name: str, default: int) -> int:
@@ -81,7 +128,7 @@ class TemporalWorkflowStarter:
 def build_app(config_path: str | None = None):
     path = config_path or os.environ.get("DBAGENT_GATEWAY_CONFIG", "/etc/dbagent/config.yaml")
     config = load_config(path)
-    engine = make_engine(config.storage.postgres_dsn)
+    engine = make_gateway_engine(config.storage.postgres_dsn)
     session_factory = make_session_factory(engine)
     secrets = {s.name: s.secret for s in config.ingest.sources}
     # Workflow starter is attached after Temporal connects in create_worker_app().
