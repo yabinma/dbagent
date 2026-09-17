@@ -92,9 +92,13 @@ EXPECTED_CONCURRENCY_MODEL = {
                     # The committed-existing-case merge writes its own audit
                     # row inside merge_existing_event_with_audit; B11's
                     # threshold, writer count, pool model and durability are
-                    # unchanged by that.
+                    # unchanged by that. GC-5 moved that fused statement
+                    # into the shared merge group, which shifted this call
+                    # site's LINE; the resolved value is re-synchronised here
+                    # and in the manifest, and one audit row per ingested
+                    # alert on four mutually exclusive branches is unchanged.
                     "file": "services/gateway/gateway/ingest.py",
-                    "line": 158,
+                    "line": 252,
                     "in": "IngestService._ingest_txn",
                     "symbol": "write_audit",
                     "expr": "write_audit(",

@@ -332,3 +332,95 @@ def test_gc4_gateway_engine_preserves_url_and_sqlite_test_seam():
         assert _gateway_prepare_listeners(sqlite_engine) == []
     finally:
         sqlite_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# GC-5 (FP-GC5-5) — the worker lifespan drains the service on shutdown.
+# ---------------------------------------------------------------------------
+
+
+def _write_gc5_config(path) -> None:
+    path.write_text(
+        """
+storage:
+  postgres_dsn: "sqlite:///:memory:"
+ingest:
+  sources:
+    - {name: manual, secret: s}
+temporal:
+  address: localhost:7233
+  namespace: default
+  task_queue: rca-worker
+"""
+    )
+
+
+@pytest.mark.asyncio
+async def test_gc5_worker_lifespan_drains_service_on_shutdown(tmp_path, monkeypatch):
+    """FP-GC5-5: the lifespan's `finally` awaits the service close coroutine.
+
+    Structural and behavioural: the ``yield`` really sits inside a ``try``
+    whose ``finally`` awaits ``service.close()``, the close runs after the
+    lifespan body has ended, and neither the Temporal connect nor the engine
+    construction moved into that block.
+    """
+    import ast
+    import inspect
+
+    # (1) Structure: one try/finally around the yield, one awaited close in
+    # the finally, and no engine or Temporal work inside it.
+    source = inspect.getsource(main_mod.create_worker_app)
+    factory = ast.parse(source.lstrip()).body[0]
+    lifespan = next(
+        node for node in ast.walk(factory)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_lifespan"
+    )
+    tries = [node for node in lifespan.body if isinstance(node, ast.Try)]
+    assert len(tries) == 1, "the lifespan yield is not wrapped in one try/finally"
+    guard = tries[0]
+    assert any(
+        isinstance(node, ast.Yield) for node in ast.walk(ast.Module(body=guard.body, type_ignores=[]))
+    ), "the yield is not inside the try body"
+    assert guard.finalbody, "the lifespan has no finally"
+    finally_src = "\n".join(ast.unparse(node) for node in guard.finalbody)
+    assert finally_src.strip() == "await service.close()", finally_src
+    for forbidden in ("make_gateway_engine", "make_session_factory", "Client.connect",
+                      "TemporalWorkflowStarter"):
+        assert forbidden not in finally_src, forbidden
+    assert "Client.connect" in ast.unparse(lifespan), "the Temporal connect moved"
+
+    # (2) Behaviour: entering and leaving the lifespan closes the service
+    # exactly once, after the body has finished.
+    cfg = tmp_path / "config.yaml"
+    _write_gc5_config(cfg)
+
+    class FakeClient:
+        async def start_workflow(self, *a, **k):
+            raise AssertionError("no workflow in this test")
+
+    async def fake_connect(*_a, **_k):
+        return FakeClient()
+
+    monkeypatch.setattr(main_mod.Client, "connect", fake_connect)
+    app = main_mod.create_worker_app(str(cfg))
+    service = app.state.ingest_service
+    trace: list[str] = []
+    real_close = service.close
+
+    async def recording_close():
+        trace.append("close")
+        await real_close()
+
+    service.close = recording_close
+
+    async with app.router.lifespan_context(app):
+        trace.append("serving")
+        assert isinstance(service._workflow_starter, TemporalWorkflowStarter)
+    assert trace == ["serving", "close"], trace
+
+    # (3) ...and the close still runs when the body fails.
+    trace.clear()
+    with pytest.raises(RuntimeError, match="worker died"):
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("worker died")
+    assert trace == ["close"], trace

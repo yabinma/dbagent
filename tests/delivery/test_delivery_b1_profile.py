@@ -2558,18 +2558,36 @@ GC2_MAX_CONNECTIONS_PER_WORKER = 150
 GC2_BACKLOG = 2048
 GC2_GATEWAY_WORKERS = "4"
 GC2_DURABILITY_TOKENS = ("synchronous_commit", "fsync", "full_page_writes")
+# Deferred-audit machinery: ways of moving the audit row out of the merge's
+# own transaction. GC-5 re-scoped two of the original tokens rather than
+# weakening the rule. `batch` is retired because the slice's whole mechanism
+# is a per-worker merge GROUP whose method is named for it -- the property
+# that matters, one event row and one audit row inside the SAME committed
+# transaction, is asserted structurally below and by FP-GC5-1's real-PostgreSQL
+# owner. `asyncio` is retired from this scan and asserted on the coalescer
+# module instead, which owns queueing and must contain no audit or insert
+# symbol at all.
 GC2_DEFERRED_AUDIT_TOKENS = (
     "BackgroundTask",
     "background_tasks",
-    "create_task",
     "run_in_executor",
     "ThreadPoolExecutor",
     "Queue(",
-    "asyncio",
     "after_response",
-    "batch",
     "defer",
 )
+#: GC-5's coalescer: queueing only. None of these may appear in it.
+GC2_COALESCER_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "merge_commit.py"
+GC2_COALESCER_FORBIDDEN = (
+    "write_audit",
+    "insert_alert_event",
+    "audit",
+    "alert_events",
+    "audit_log",
+    "INSERT",
+)
+GC2_BATCH_CALLBACK = "_execute_merge_batch"
+GC2_BATCH_CLOSER = "_finish_merge_batch"
 # CI-scale 2/1/1 and product 4/3/1, spelled as the launcher spells them.
 # GC-1's launcher allocation, as GC-3 leaves it. The three ordinary CI-scale
 # lines are RETIRED: that route no longer allocates roles at all -- it renders
@@ -2653,42 +2671,110 @@ def _gc2_named_calls(node: ast.AST, name: str) -> list[ast.Call]:
 
 
 def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
-    """FP-GC2-7: the fused call order, the fixed bar, and the untouched knobs."""
+    """FP-GC2-7, re-scoped by GC-5: the fused call, its order, the fixed bar.
+
+    GC-5 moved transaction ownership for the committed-hit branch out of
+    ``_ingest_txn`` and into the per-worker group, exactly as its frozen
+    deviation registers. This pin moves with it and weakens nothing: there is
+    still exactly ONE fused call in the module, it is still the request's
+    first database operation, the merged 200 body still follows one durable
+    commit, the fallback still keeps its platform lookup, its advisory lock
+    before the deciding read and its own commit, and no audit row is deferred
+    outside the transaction that writes its event.
+    """
     ingest_src = GC2_INGEST_PATH.read_text(encoding="utf-8")
     ingest_tree = ast.parse(ingest_src)
     txn = _gc2_function(ingest_tree, GC2_TXN, cls="IngestService")
     ingest_fn = _gc2_function(ingest_tree, "ingest", cls="IngestService")
+    batch = _gc2_function(ingest_tree, GC2_BATCH_CALLBACK, cls="IngestService")
+    closer = _gc2_function(ingest_tree, GC2_BATCH_CLOSER, cls="IngestService")
 
-    # (1) Exactly one fused call, first, before the platform lookup; the merged
-    # return is preceded by exactly one commit inside its own branch.
-    fused = _gc2_named_calls(txn, GC2_FUSED_HELPER)
-    assert len(fused) == 1, [c.lineno for c in fused]
-    platform_calls = _gc2_named_calls(txn, "get_platform")
-    assert platform_calls, "the fallback lost its platform lookup"
-    assert fused[0].lineno < min(c.lineno for c in platform_calls), (
-        "the fused merge must be the first database operation"
+    # (1) Exactly one fused call in the whole module, inside the group
+    # callback, and it is the request's FIRST database operation: the
+    # coalescer is awaited before the individual transaction is dispatched,
+    # and that transaction now begins at the platform lookup.
+    module_fused = _gc2_named_calls(ingest_tree, GC2_FUSED_HELPER)
+    assert len(module_fused) == 1, [c.lineno for c in module_fused]
+    batch_fused = _gc2_named_calls(batch, GC2_FUSED_HELPER)
+    assert len(batch_fused) == 1, [c.lineno for c in batch_fused]
+    assert not _gc2_named_calls(txn, GC2_FUSED_HELPER), (
+        "the fused statement is repeated on the fallback"
     )
-    assert len(_gc2_named_calls(ingest_tree, GC2_FUSED_HELPER)) == 1
     assert not _gc2_named_calls(ingest_fn, GC2_FUSED_HELPER), (
         "the fused statement must not run on the event loop"
     )
+    platform_calls = _gc2_named_calls(txn, "get_platform")
+    assert platform_calls, "the fallback lost its platform lookup"
+    txn_db_calls = [
+        call for call in ast.walk(txn)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id in {
+            "get_platform", "acquire_correlation_lock", "find_open_by_fingerprint",
+            "insert_alert_event", "write_audit", "create_investigation",
+        }
+    ]
+    assert min(call.lineno for call in txn_db_calls) == min(
+        call.lineno for call in platform_calls
+    ), "the individual transaction no longer begins at the platform lookup"
+    submits = [
+        node for node in ast.walk(ingest_fn)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("submit")
+    ]
+    dispatches = [
+        node for node in ast.walk(ingest_fn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "run_in_threadpool"
+    ]
+    assert len(submits) == 1 and len(dispatches) == 1
+    assert submits[0].lineno < dispatches[0].lineno, (
+        "the fused merge must be the first database operation of a request"
+    )
 
+    # (2) The merged 200 body is produced only for a group hit -- whose
+    # transaction committed before the callback returned -- and it carries no
+    # workflow id. The group performs exactly one outer commit.
     merged_branch = None
-    for node in ast.walk(txn):
-        if isinstance(node, ast.If) and "existing_id is not None" in ast.unparse(node.test):
+    for node in ast.walk(ingest_fn):
+        if isinstance(node, ast.If) and "MergeHit" in ast.unparse(node.test):
             merged_branch = node
     assert merged_branch is not None, "the merged fast branch is gone"
-    branch_commits = _gc2_named_calls(merged_branch, "commit")
     branch_returns = [n for n in ast.walk(merged_branch) if isinstance(n, ast.Return)]
-    assert len(branch_commits) == 1, [c.lineno for c in branch_commits]
     assert len(branch_returns) == 1
-    assert branch_commits[0].lineno < branch_returns[0].lineno, (
-        "a 2xx must not be produced before the durable commit"
-    )
     returned = ast.unparse(branch_returns[0])
     assert returned.startswith("return (200,"), returned
     assert "'status': 'merged'" in returned, returned
-    assert returned.rstrip().endswith("None)"), (
+    assert not _gc2_named_calls(merged_branch, "commit"), (
+        "the event loop commits for a hit"
+    )
+    assert not _gc2_named_calls(merged_branch, "start_investigation"), (
+        "a merge must start no workflow"
+    )
+    session_commits = [
+        call for call in _gc2_named_calls(closer, "commit")
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "session"
+    ]
+    assert len(session_commits) == 1, [c.lineno for c in session_commits]
+    closer_calls = _gc2_named_calls(batch, GC2_BATCH_CLOSER)
+    assert len(closer_calls) == 1, [c.lineno for c in closer_calls]
+    batch_returns = [n for n in ast.walk(batch) if isinstance(n, ast.Return)]
+    assert batch_returns and all(
+        node.lineno > closer_calls[0].lineno for node in batch_returns
+    ), "an outcome is returned before the group's transaction was closed"
+    # The under-lock merge branch of the fallback keeps its own single commit
+    # before its own 200.
+    under_lock = None
+    for node in ast.walk(txn):
+        if isinstance(node, ast.If) and "existing is not None" in ast.unparse(node.test):
+            under_lock = node
+    assert under_lock is not None, "the under-lock merge branch is gone"
+    under_lock_commits = _gc2_named_calls(under_lock, "commit")
+    under_lock_returns = [n for n in ast.walk(under_lock) if isinstance(n, ast.Return)]
+    assert len(under_lock_commits) == 1 and len(under_lock_returns) == 1
+    assert under_lock_commits[0].lineno < under_lock_returns[0].lineno
+    assert ast.unparse(under_lock_returns[0]).rstrip().endswith("None)"), (
         "a merge must return no workflow id"
     )
 
@@ -2714,15 +2800,43 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
     assert _gc2_named_calls(guard, "start_investigation"), (
         "the workflow start lost its opened-branch guard"
     )
-    # No deferred, batched or off-transaction audit machinery appeared.
+    # No deferred or off-transaction audit machinery appeared, and the audit
+    # row still travels inside the transaction that writes its event: every
+    # `write_audit` call in this module is inside the individual transaction
+    # or its reject helper, before that transaction's own commit, and the
+    # grouped hit's audit row is written by the fused statement itself.
     for token in GC2_DEFERRED_AUDIT_TOKENS:
         assert token not in ingest_src, f"deferred audit machinery: {token}"
-    session_scopes = [
-        node for node in ast.walk(txn)
-        if isinstance(node, ast.With)
-        and "self._session_factory()" in ast.unparse(node)
+    reject = _gc2_function(ingest_tree, "_reject", cls="IngestService")
+    audit_owners = (txn, reject)
+    for call in _gc2_named_calls(ingest_tree, "write_audit"):
+        assert any(
+            owner.lineno <= call.lineno <= (owner.end_lineno or call.lineno)
+            for owner in audit_owners
+        ), f"write_audit at line {call.lineno} is outside the individual transaction"
+    assert not _gc2_named_calls(batch, "write_audit"), (
+        "the group writes an audit row outside the fused statement"
+    )
+    coalescer_code = _gc4_prose_free(GC2_COALESCER_PATH.read_text(encoding="utf-8"))
+    for token in GC2_COALESCER_FORBIDDEN:
+        assert token not in coalescer_code, f"the coalescer carries {token!r}"
+    for token in GC2_DEFERRED_AUDIT_TOKENS:
+        assert token not in coalescer_code, f"deferred audit machinery: {token}"
+    # One session scope per transaction owner: one for the group, one for the
+    # individual transaction, and none anywhere else.
+    for owner, label in ((txn, GC2_TXN), (batch, GC2_BATCH_CALLBACK)):
+        session_scopes = [
+            node for node in ast.walk(owner)
+            if isinstance(node, ast.With)
+            and "self._session_factory()" in ast.unparse(node)
+        ]
+        assert len(session_scopes) == 1, f"{label}: one transaction, one session scope"
+    factories = [
+        node for node in ast.walk(ingest_tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_session_factory"
     ]
-    assert len(session_scopes) == 1, "one request, one session scope"
+    # One store in __init__, one use in each of the two transaction owners.
+    assert len(factories) == 3, [node.lineno for node in factories]
 
     # (3) The CI-scale bar is unchanged and still failure-producing.
     test_src = REF_TEST.read_text(encoding="utf-8")
@@ -2839,28 +2953,45 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
     assert serializer.count("_percent_encode_diagnostic(") == 2, serializer
     assert serializer.count("DIAGNOSTIC_UNAVAILABLE") >= 5
 
-    # Negative controls: one mutation at a time, each named.
-    unordered = ingest_src.replace(
-        "            existing_id = merge_existing_event_with_audit(",
-        "            platform = get_platform(session, event['platform_key'])\n"
-        "            existing_id = merge_existing_event_with_audit(", 1)
-    assert unordered != ingest_src
-    mutated = ast.parse(unordered)
-    mutated_txn = _gc2_function(mutated, GC2_TXN, cls="IngestService")
-    assert _gc2_named_calls(mutated_txn, GC2_FUSED_HELPER)[0].lineno > min(
-        c.lineno for c in _gc2_named_calls(mutated_txn, "get_platform")
-    ), "the ordering pin would not notice a reordered platform lookup"
-    late_commit = ingest_src.replace(
-        "            if existing_id is not None:\n                session.commit()\n",
-        "            if existing_id is not None:\n", 1)
-    assert late_commit != ingest_src
-    late_branch = None
-    for node in ast.walk(_gc2_function(ast.parse(late_commit), GC2_TXN, cls="IngestService")):
-        if isinstance(node, ast.If) and "existing_id is not None" in ast.unparse(node.test):
-            late_branch = node
-    assert late_branch is not None
-    assert not _gc2_named_calls(late_branch, "commit"), (
-        "the commit-before-return pin would not notice a dropped commit"
+    # Negative controls: one mutation at a time, each named. Each proves the
+    # pin above would notice, on the GC-5 shape rather than on the retired one.
+    repeated = ingest_src.replace(
+        "        with self._session_factory() as session:\n"
+        "            platform = get_platform(session, event[\"platform_key\"])",
+        "        with self._session_factory() as session:\n"
+        "            existing_id = merge_existing_event_with_audit(\n"
+        "                session,\n"
+        "                event=event,\n"
+        "                default_correlation_window_seconds=1800,\n"
+        "            )\n"
+        "            platform = get_platform(session, event[\"platform_key\"])", 1)
+    assert repeated != ingest_src
+    repeated_txn = _gc2_function(ast.parse(repeated), GC2_TXN, cls="IngestService")
+    assert _gc2_named_calls(repeated_txn, GC2_FUSED_HELPER), (
+        "the one-fused-call pin would not notice a second fused call on the fallback"
+    )
+    dropped_commit = ingest_src.replace(
+        "            try:\n                session.commit()\n",
+        "            try:\n                pass\n", 1)
+    assert dropped_commit != ingest_src
+    dropped_closer = _gc2_function(
+        ast.parse(dropped_commit), GC2_BATCH_CLOSER, cls="IngestService"
+    )
+    assert not [
+        call for call in _gc2_named_calls(dropped_closer, "commit")
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "session"
+    ], "the one-outer-commit pin would not notice a dropped commit"
+    early_return = ingest_src.replace(
+        "            fatal = self._finish_merge_batch(session, outcomes, fatal)\n",
+        "            return outcomes\n", 1)
+    assert early_return != ingest_src
+    early_batch = _gc2_function(
+        ast.parse(early_return), GC2_BATCH_CALLBACK, cls="IngestService"
+    )
+    assert not _gc2_named_calls(early_batch, GC2_BATCH_CLOSER), (
+        "the commit-before-outcome pin would not notice an early return"
     )
     unlocked = ingest_src.replace(
         "            acquire_correlation_lock(session, event[\"platform_key\"], "
@@ -4551,3 +4682,950 @@ def test_gc4_gc3_requalification_handoff_is_head_scoped():
     for forbidden in ("CI_SCALE_P99_MS", "PRODUCT_P99_MS", "hostable", "selected",
                       "VERDICT_MET", "b1_topology_decision"):
         assert forbidden not in gc4_src, forbidden
+
+
+# ---------------------------------------------------------------------------
+# GC-5 — the durable commit-shape slice's source and configuration boundary
+# (FP-GC5-6 / FP-GC5-8 / FP-GC5-9 / FP-GC5-10).
+#
+# Every literal below is declared here, independently of the module it pins,
+# for the same reason the GC-2, GC-3 and GC-4 blocks above declare theirs. The
+# pins are structural: they say what this slice did and did not change, and
+# they infer no performance from source shape -- the product-local record
+# required by FP-GC5-7 remains the only mechanism evidence.
+# ---------------------------------------------------------------------------
+
+GC5_COALESCER_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "merge_commit.py"
+GC5_INGEST_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "ingest.py"
+GC5_MAIN_PATH = REPO_ROOT / "services" / "gateway" / "gateway" / "main.py"
+GC5_SESSION_PATH = (
+    REPO_ROOT / "libs" / "py" / "rca_common" / "rca_common" / "db" / "session.py"
+)
+GC5_REPO_PATH = (
+    REPO_ROOT / "libs" / "py" / "rca_common" / "rca_common" / "investigation_repo.py"
+)
+GC5_CONFTEST = REPO_ROOT / "tests" / "functional" / "conftest.py"
+GC5_THRESHOLDS = REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml"
+GC5_CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+GC5_LAUNCHER = REPO_ROOT / "scripts" / "integration-test.sh"
+GC5_VALUES_PATH = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
+GC5_MIGRATIONS_DIR = REPO_ROOT / "libs" / "py" / "rca_common" / "migrations"
+GC5_PROBE_LIVE = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe_live.py"
+GC5_PROBE_HELPER = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe.py"
+
+#: The fixed batch shape, and the one production carrier that may declare it.
+GC5_BATCH_SIZE = 8
+GC5_MAX_WAIT_SECONDS = 0.010
+GC5_BATCH_CONSTANTS = ("MERGE_COMMIT_BATCH_SIZE", "MERGE_COMMIT_MAX_WAIT_SECONDS")
+GC5_COALESCER_CLASS = "MergeCommitCoalescer"
+GC5_BATCH_CALLBACK = "_execute_merge_batch"
+#: Durability settings and WAL surrogates no source or configuration may name.
+#: `SET LOCAL synchronous_commit=off` is a knob change whatever its scope, and
+#: an LSN poll is not a transaction-owned flush primitive; both are rejected.
+GC5_DURABILITY_TOKENS = (
+    "synchronous_commit",
+    "fsync",
+    "full_page_writes",
+    "commit_delay",
+    "commit_siblings",
+    "wal_writer_delay",
+    "wal_writer_flush_after",
+    "wal_sync_method",
+    "SET LOCAL",
+    "SET SESSION",
+    "pg_current_wal_insert_lsn",
+    "pg_current_wal_flush_lsn",
+    "pg_current_wal_lsn",
+    "pg_wal_lsn_diff",
+    "pg_switch_wal",
+    "pg_walfile_name",
+    "pg_stat_get_wal_senders",
+    "synchronous_standby_names",
+)
+#: Ways of turning the fixed batch shape into a knob.
+GC5_OVERRIDE_TOKENS = (
+    "MERGE_COMMIT_BATCH",
+    "MERGE_COMMIT_MAX_WAIT",
+    "BATCH_SIZE",
+    "COALESC",
+    "batch_size",
+    "max_wait",
+)
+GC5_POOL_KEYWORDS = (
+    "connect_args",
+    "poolclass",
+    "pool_size",
+    "max_overflow",
+    "pool_timeout",
+    "pool_recycle",
+    "pool_pre_ping",
+    "pool_use_lifo",
+    "isolation_level",
+    "execution_options",
+    "creator",
+    "NullPool",
+    "StaticPool",
+    "QueuePool",
+)
+GC5_RETRY_TOKENS = ("retry", "reconnect", "attempt_again", "backoff")
+#: The GC-2 statement, byte-unchanged under GC-5 as well.
+GC5_MERGE_SQL_SHA256 = (
+    "2cc1897aab8247c562f5fdd5996b9e2be7fa54cd7d8f23443c4582e96cbcd3bb"
+)
+GC5_FUSED_HELPER = "merge_existing_event_with_audit"
+GC5_TXN = "_ingest_txn"
+GC5_THREADPOOL_BOUNDARY = "run_in_threadpool(self._ingest_txn, event)"
+GC5_FINGERPRINT_INDEX = "CREATE INDEX ON alert_events (fingerprint, received_at);"
+GC5_FIXED_CI_SCALE_LITERALS = {
+    "CI_SCALE_BURST_RATE": 500,
+    "CI_SCALE_BURST_SECONDS": 30,
+    "CI_SCALE_TOTAL_REQUESTS": 15000,
+    "CI_SCALE_P99_MS": 150.0,
+    "CI_SCALE_SUSTAINED_FLOOR": 450,
+    "CI_SCALE_MAX_IN_FLIGHT": 500,
+}
+GC5_FIXED_PRODUCT_LITERALS = {
+    "PRODUCT_P99_MS": 150.0,
+    "PRODUCT_SUSTAINED_FLOOR": 200,
+    "PRODUCT_MAX_IN_FLIGHT": 1000,
+    "PRODUCT_TOTAL_REQUESTS": 30000,
+}
+#: The product profile's own offer, as the profile module spells it.
+GC5_FIXED_PRODUCT_PROFILE_LITERALS = {
+    "BURST_RATE": 1000,
+    "BURST_SECONDS": 30,
+    "TOTAL_REQUESTS": 30000,
+    "P99_MS": 150.0,
+    "SUSTAINED_FLOOR": 200,
+}
+GC5_TIMEOUT_KEEP_ALIVE_S = 5
+#: The AnyIO threadpool limiter: nothing in the repository may resize it, so
+#: the effective capacity stays AnyIO's shipped default.
+GC5_LIMITER_TOKENS = (
+    "current_default_thread_limiter",
+    "total_tokens",
+    "CapacityLimiter",
+    "RunVar",
+)
+GC5_B1_THRESHOLD = (
+    "CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s offered for\n"
+    "30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; product recorded, "
+    "non-gating:\nserved == offered, p99 < 150 ms, 0 errors at 1000 req/s offered for 30s "
+    "with 4 gateway CPUs\nexclusive from PG/driver"
+)
+GC5_MAX_CONNECTIONS_PER_WORKER = 150
+GC5_BACKLOG = 2048
+GC5_GATEWAY_WORKERS = "4"
+GC5_PREPARE_THRESHOLD = 5
+GC5_BASIS_MS_PER_REQUEST = 2.427
+#: The one GC-5 outcome and the diagnostic fields around it.
+GC5_MAX_COMMITS_PER_SERVED = 0.60
+GC5_RATIO_CONSTANT = "B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED"
+GC5_COMMIT_FIELDS = (
+    "postgres_xact_commit_delta",
+    "postgres_xact_rollback_delta",
+    "postgres_xact_commits_per_served",
+    "postgres_wal_records_delta",
+    "postgres_wal_bytes_delta",
+    "postgres_wal_write_delta",
+    "postgres_wal_sync_delta",
+    "postgres_wal_syncs_per_served",
+)
+GC5_STATS_SYMBOLS = (
+    "B1PostgresCommitSnapshot",
+    "B1PostgresStatsReader",
+    "serialize_postgres_commit_fields",
+    "postgres_commit_snapshot_failure",
+    "postgres_xact_commits_per_served",
+    "commit_shape_record_failures",
+    "gc5-stats-reader",
+)
+GC5_SAMPLER_APPLICATION_NAME = "gc4-wait-sampler"
+GC5_STATS_APPLICATION_NAME = "gc5-stats-reader"
+GC5_MAINTENANCE_DATABASE = "postgres"
+GC5_MAINTENANCE_ALTERNATE = "template1"
+GC5_GATE_NODE = "test_gc5_commit_shape_reference_profile"
+GC5_CONTEXT_NODE = "test_gc5_product_record_carries_commit_cost_and_lateness_context"
+GC5_PRODUCT_MARKERS = {"b1_live", "b1_product"}
+#: GC-3's authority, restated: GC-5 changes the product head and nothing about
+#: the decision carrier or its routing.
+GC5_GC3_EVIDENCE_HEAD = "51e8a3175a4c247ab6afa47a5588bcbb96fafa99"
+GC5_GC3_REQUALIFICATION_PHRASES = (
+    "requalification",
+    "two complete distinct-run artifacts",
+    "at the shipped\n    GC-5 head",
+    "how many ingested events share one durable commit",
+)
+GC5_HOSTABILITY_CLAIMS = (
+    "is hostable",
+    "now hostable",
+    "GC-5 selects",
+    "selected by GC-5",
+)
+GC5_PRODUCT_SOURCE_DIRS = (
+    ("services", "gateway", "gateway"),
+    ("services", "worker", "worker"),
+    ("services", "dashboard-api", "dashboard_api"),
+    ("libs", "py", "rca_common", "rca_common"),
+)
+
+
+def _gc5_product_sources() -> "list[tuple[str, str]]":
+    """Every production Python module, with its prose removed."""
+    out: list[tuple[str, str]] = []
+    for parts in GC5_PRODUCT_SOURCE_DIRS:
+        root = REPO_ROOT.joinpath(*parts)
+        for path in sorted(root.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            out.append((
+                str(path.relative_to(REPO_ROOT)),
+                _gc4_prose_free(path.read_text(encoding="utf-8")),
+            ))
+    return out
+
+
+def _gc5_configuration_files() -> "list[tuple[str, str]]":
+    """Every shipped configuration carrier a durability knob could hide in."""
+    out: list[tuple[str, str]] = []
+    for root, suffixes in (
+        (REPO_ROOT / "deploy", (".yaml", ".yml", ".tpl", ".env", ".conf")),
+        (REPO_ROOT / ".github", (".yml", ".yaml")),
+    ):
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            out.append((
+                str(path.relative_to(REPO_ROOT)),
+                path.read_text(encoding="utf-8", errors="replace"),
+            ))
+    for parts in (("scripts", "integration-test.sh"),
+                  ("tests", "benchmark", "thresholds.yaml")):
+        path = REPO_ROOT.joinpath(*parts)
+        out.append((str(path.relative_to(REPO_ROOT)),
+                    path.read_text(encoding="utf-8", errors="replace")))
+    return out
+
+
+def _gc5_method(tree: ast.AST, name: str, *, cls: str = "IngestService") -> ast.AST:
+    return _gc2_function(tree, name, cls=cls)
+
+
+def _gc5_other_benchmark_entries() -> "dict[str, tuple[str, str]]":
+    """Every benchmark entry GC-5 did not touch, id -> (status, threshold)."""
+    return {
+        'B10': (
+            'covered',
+            'list/filter p99 < 200 ms',
+        ),
+        'B11': (
+            'covered',
+            '>= 1000 inserts/s combined without partition-routing degradation',
+        ),
+        'B12': (
+            'covered',
+            'p99 < 300 ms',
+        ),
+        'B13': (
+            'covered',
+            '< 1 s per round',
+        ),
+        'B14': (
+            'covered',
+            'prompt build < 200 ms; assembled context <= model budget with zero truncation of the latest round',
+        ),
+        'B2': (
+            'covered',
+            'p99 < 20 ms',
+        ),
+        'B3': (
+            'covered',
+            'dispatch p99 < 50 ms, no heartbeat misses',
+        ),
+        'B4': (
+            'covered',
+            'end-to-end p99 < 2 s, reassembly CPU < 1 core',
+        ),
+        'B5': (
+            'covered',
+            '< 100 ms',
+        ),
+        'B6': (
+            'covered',
+            '< 5 ms per command',
+        ),
+        'B7': (
+            'covered',
+            '< 10 ms round trip',
+        ),
+        'B8': (
+            'covered',
+            'round collection overhead (non-model) < 2 s',
+        ),
+        'B9': (
+            'covered',
+            '< 500 ms',
+        ),
+    }
+
+
+def test_gc5_synchronous_durability_policy_is_pinned():
+    """FP-GC5-6: stock synchronous durability, and no application-side fence.
+
+    The selected mechanism groups transactions; it does not change what a
+    COMMIT means. So: no durability setting is named at any scope in product
+    code, in the benchmark harness or in any shipped configuration; no LSN
+    poll or other flush surrogate exists; and the committed-hit path's only
+    successful response fence is one ordinary outer ``commit()``.
+    """
+    ingest_src = GC5_INGEST_PATH.read_text(encoding="utf-8")
+    ingest_code = _gc4_prose_free(ingest_src)
+    ingest_tree = ast.parse(ingest_src)
+    coalescer_src = GC5_COALESCER_PATH.read_text(encoding="utf-8")
+    coalescer_code = _gc4_prose_free(coalescer_src)
+    main_code = _gc4_prose_free(GC5_MAIN_PATH.read_text(encoding="utf-8"))
+    session_code = _gc4_prose_free(GC5_SESSION_PATH.read_text(encoding="utf-8"))
+    repo_code = _gc4_prose_free(GC5_REPO_PATH.read_text(encoding="utf-8"))
+    harness_code = _gc4_prose_free(REF_TEST.read_text(encoding="utf-8"))
+    profile_code = _gc4_prose_free(REF_PATH.read_text(encoding="utf-8"))
+    conftest_code = _gc4_prose_free(GC5_CONFTEST.read_text(encoding="utf-8"))
+
+    # (1) No durability setting and no WAL/LSN surrogate, in product code, in
+    # the shared library, in the B1 harness or in its fixtures.
+    for label, code in (
+        ("ingest", ingest_code),
+        ("merge_commit", coalescer_code),
+        ("main", main_code),
+        ("session", session_code),
+        ("investigation_repo", repo_code),
+        ("b1 harness", harness_code),
+        ("b1 profile", profile_code),
+        ("functional conftest", conftest_code),
+    ):
+        for token in GC5_DURABILITY_TOKENS:
+            assert token not in code, f"{label} names {token!r}"
+    for relative, code in _gc5_product_sources():
+        for token in GC5_DURABILITY_TOKENS:
+            assert token not in code, f"{relative} names {token!r}"
+
+    # (2) ...and in no shipped configuration, workflow or launcher either.
+    for relative, text in _gc5_configuration_files():
+        for token in GC5_DURABILITY_TOKENS:
+            if token in ("fsync", "SET LOCAL", "SET SESSION"):
+                # `fsync` is a substring of nothing here, but keep the search
+                # case-exact and scoped: a setting is written as `name=value`
+                # or `-c name=value`.
+                assert f"{token}=" not in text, f"{relative} sets {token}"
+                assert f"{token} =" not in text, f"{relative} sets {token}"
+                continue
+            assert token not in text, f"{relative} names {token!r}"
+
+    # (3) The PostgreSQL containers the benchmark and the functional tier
+    # start carry no server-setting override beyond the GC-4 statement
+    # tracking, so the effective policy is PostgreSQL 16's stock
+    # synchronous_commit=on / fsync=on / full_page_writes=on.
+    assert 'PostgresContainer(\n            "postgres:16-alpine"' in REF_TEST.read_text(
+        encoding="utf-8"
+    ), "the B1 PostgreSQL container declaration moved"
+    conftest_src = GC5_CONFTEST.read_text(encoding="utf-8")
+    command = _source_assigns(conftest_src)["PG_STAT_STATEMENTS_COMMAND"]
+    rendered = ast.literal_eval(command) if isinstance(command, ast.Constant) else (
+        "".join(
+            ast.literal_eval(part) for part in command.values
+        ) if isinstance(command, ast.JoinedStr) else ast.unparse(command)
+    )
+    for token in ("shared_preload_libraries", "track_planning", "track="):
+        assert token in rendered, rendered
+    for token in GC5_DURABILITY_TOKENS:
+        assert token not in rendered, f"the planning fixture sets {token}"
+
+    # (4) The committed-hit path's one successful fence: exactly one outer
+    # `session.commit()`, in the group's own closing method, and every other
+    # `commit()` in the batch path is a SAVEPOINT release on the savepoint
+    # object -- never a second durable commit.
+    batch = _gc5_method(ingest_tree, GC5_BATCH_CALLBACK)
+    closer = _gc5_method(ingest_tree, "_finish_merge_batch")
+    session_commits = [
+        call for call in _gc2_named_calls(closer, "commit")
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "session"
+    ]
+    assert len(session_commits) == 1, [c.lineno for c in session_commits]
+    for call in _gc2_named_calls(batch, "commit"):
+        assert isinstance(call.func, ast.Attribute), ast.unparse(call)
+        assert isinstance(call.func.value, ast.Name), ast.unparse(call)
+        assert call.func.value.id == "savepoint", (
+            f"a non-savepoint commit inside the group: {ast.unparse(call)}"
+        )
+    # A hit is resolved only after that commit: the callback returns its
+    # outcomes after the closing method ran, and the coalescer performs no
+    # commit of its own at all.
+    assert not [
+        call for call in _gc2_named_calls(ast.parse(coalescer_src), "commit")
+        if isinstance(call.func, ast.Attribute)
+    ], "the coalescer performs a commit of its own"
+    finish_calls = _gc2_named_calls(batch, "_finish_merge_batch")
+    assert len(finish_calls) == 1, [c.lineno for c in finish_calls]
+    returns = [node for node in ast.walk(batch) if isinstance(node, ast.Return)]
+    assert returns and all(
+        node.lineno > finish_calls[0].lineno for node in returns
+    ), "the group returns an outcome before its transaction was closed"
+
+    # (5) The group is not a durability policy of its own: no autocommit, no
+    # begin/commit on a raw connection, no explicit transaction control beyond
+    # savepoints in the product path.
+    for forbidden in ("autocommit", "raw_connection", "engine.connect", "text("):
+        assert forbidden not in ingest_code, f"ingest names {forbidden!r}"
+        assert forbidden not in coalescer_code, f"merge_commit names {forbidden!r}"
+
+
+def test_gc5_fixed_workload_pool_schema_and_sizing_boundaries():
+    """FP-GC5-9: the shape changed; every frozen carrier stood still."""
+    ingest_src = GC5_INGEST_PATH.read_text(encoding="utf-8")
+    ingest_tree = ast.parse(ingest_src)
+    coalescer_src = GC5_COALESCER_PATH.read_text(encoding="utf-8")
+    coalescer_tree = ast.parse(coalescer_src)
+    coalescer_code = _gc4_prose_free(coalescer_src)
+    main_src = GC5_MAIN_PATH.read_text(encoding="utf-8")
+    main_code = _gc4_prose_free(main_src)
+    harness_src = REF_TEST.read_text(encoding="utf-8")
+
+    # (1) The batch shape is exactly eight events and ten milliseconds, as two
+    # literals in ONE production carrier, with no configuration read and no
+    # caller-facing override anywhere.
+    coalescer_assigns = _source_assigns(coalescer_src)
+    for name, expected in zip(
+        GC5_BATCH_CONSTANTS, (GC5_BATCH_SIZE, GC5_MAX_WAIT_SECONDS)
+    ):
+        node = coalescer_assigns[name]
+        assert isinstance(node, ast.Constant), f"{name} is not a literal"
+        assert node.value == expected, (name, node.value)
+    assert not _has_environ_read(GC5_COALESCER_PATH), "the coalescer reads the environment"
+    assert not _has_environ_read(GC5_INGEST_PATH), "ingest reads the environment"
+    assert not _gc2_named_calls(coalescer_tree, "load_config")
+    coalescer_class = _gc2_function(coalescer_tree, "__init__", cls=GC5_COALESCER_CLASS)
+    argument_names = [arg.arg for arg in coalescer_class.args.args] + [
+        arg.arg for arg in coalescer_class.args.kwonlyargs
+    ]
+    assert argument_names == ["self", "execute_batch"], argument_names
+    assert coalescer_class.args.defaults == [] and coalescer_class.args.kw_defaults == []
+    for name in GC5_BATCH_CONSTANTS:
+        # The constants are read from the module, never taken as parameters.
+        assert name not in argument_names
+    for relative, code in _gc5_product_sources():
+        if relative.endswith("merge_commit.py"):
+            continue
+        for token in GC5_OVERRIDE_TOKENS:
+            assert token not in code, f"{relative} carries a batching knob {token!r}"
+    for relative, text in _gc5_configuration_files():
+        for token in GC5_OVERRIDE_TOKENS + ("merge_commit", "MergeCommitCoalescer"):
+            assert token not in text, f"{relative} configures batching ({token!r})"
+    env_reads = {
+        ast.unparse(call.args[0])
+        for call in ast.walk(ast.parse(main_src))
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) in ("os.environ.get", "os.getenv")
+        and call.args
+    }
+    for name in env_reads:
+        for token in ("BATCH", "MERGE", "COALESC", "COMMIT"):
+            assert token not in name.upper(), name
+
+    # (2) No pool keyword, no retry loop and no second execution of a group.
+    for label, code in (("main", main_code), ("merge_commit", coalescer_code),
+                        ("ingest", _gc4_prose_free(ingest_src))):
+        for keyword in GC5_POOL_KEYWORDS:
+            assert keyword not in code, f"{label} gained {keyword}"
+        for token in GC5_RETRY_TOKENS:
+            assert token not in code.lower(), f"{label} gained {token}"
+    # The bound callback is stored once and handed to the threadpool once; it
+    # is never called directly (that would put database work on the loop) and
+    # never called twice (that would be a retry of a group).
+    references = [
+        node for node in ast.walk(coalescer_tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_execute_batch"
+    ]
+    assert len(references) == 2, [ast.unparse(node) for node in references]
+    direct_calls = [
+        node for node in ast.walk(coalescer_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_execute_batch"
+    ]
+    assert direct_calls == [], [ast.unparse(node) for node in direct_calls]
+    dispatched = [
+        node for node in ast.walk(coalescer_tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "run_in_threadpool"
+        and node.args
+        and ast.unparse(node.args[0]) == "self._execute_batch"
+    ]
+    assert len(dispatched) == 1, [ast.unparse(node) for node in dispatched]
+    engine_calls = _gc2_named_calls(ast.parse(main_src), "make_engine")
+    assert len(engine_calls) == 1 and not engine_calls[0].keywords
+    assert "create_engine(dsn, future=True, **kwargs)" in GC5_SESSION_PATH.read_text(
+        encoding="utf-8"
+    )
+
+    # (3) Workload, serve parameters, workers, prepare threshold and the
+    # threadpool boundary are untouched.
+    profile_assigns = _module_assigns(REF_PATH)
+    harness_assigns = _source_assigns(harness_src)
+    for name, expected in GC5_FIXED_CI_SCALE_LITERALS.items():
+        assert _eval_simple_constant(profile_assigns[name], profile_assigns) == expected, name
+    for name, expected in {
+        **GC5_FIXED_CI_SCALE_LITERALS, **GC5_FIXED_PRODUCT_LITERALS,
+    }.items():
+        node = harness_assigns.get(name)
+        if node is None:
+            continue
+        assert isinstance(node, ast.Constant) and node.value == expected, name
+    assert "MAX_IN_FLIGHT = BURST_RATE" in REF_PATH.read_text(encoding="utf-8")
+    for name, expected in GC5_FIXED_PRODUCT_PROFILE_LITERALS.items():
+        assert _eval_simple_constant(
+            profile_assigns[name], profile_assigns
+        ) == expected, name
+    main_assigns = _source_assigns(main_src)
+    assert ast.literal_eval(
+        main_assigns["DEFAULT_MAX_CONNECTIONS_PER_WORKER"]
+    ) == GC5_MAX_CONNECTIONS_PER_WORKER
+    assert ast.literal_eval(main_assigns["BACKLOG"]) == GC5_BACKLOG
+    assert ast.literal_eval(
+        main_assigns["DEFAULT_TIMEOUT_KEEP_ALIVE_S"]
+    ) == GC5_TIMEOUT_KEEP_ALIVE_S
+    assert "timeout_keep_alive=timeout_keep_alive" in main_src
+    assert "backlog=BACKLOG" in main_src
+    # The threadpool the group and the fallback share is AnyIO's default: no
+    # source resizes the limiter, and the dispatch is still the shared
+    # `run_in_threadpool` boundary rather than an executor of our own.
+    for relative, code in _gc5_product_sources():
+        for token in GC5_LIMITER_TOKENS:
+            assert token not in code, f"{relative} resizes the threadpool ({token})"
+    # ...and the stock pool capacity the shared factory builds is unchanged.
+    budget = _load(REPO_ROOT / "tests" / "delivery" / "connection_budget.py", "gc5_budget")
+    assert budget.ENGINES_PER_PROCESS["ingest-gateway"] == 1
+    assert budget.count_make_engine_calls("ingest-gateway") == 1
+    assert budget.stock_engine_capacity() == 15
+    assert ast.literal_eval(
+        main_assigns["GATEWAY_PREPARE_THRESHOLD"]
+    ) == GC5_PREPARE_THRESHOLD
+    assert f'"DBAGENT_GATEWAY_WORKERS", "{GC5_GATEWAY_WORKERS}"' in main_src
+    assert "limit_concurrency=max_connections" in main_src
+    assert GC5_THREADPOOL_BOUNDARY in ingest_src, "the threadpool boundary moved"
+    assert ast.literal_eval(
+        harness_assigns["PRODUCT_AFFINITY_CARDINALITY"]
+    ) == GC1_AFFINITY_CARDINALITIES["product-exclusive"]
+
+    # (4) The statement, its binds, the index and the schema are unchanged,
+    # and no migration was added.
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "libs" / "py" / "rca_common"))
+    try:
+        from rca_common import investigation_repo as gc5_repo
+    finally:
+        sys.path.pop(0)
+    sql = gc5_repo._MERGE_EXISTING_EVENT_WITH_AUDIT_SQL
+    assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GC5_MERGE_SQL_SHA256, (
+        "the GC-2 fused statement changed"
+    )
+    helper = _gc4_function(ast.parse(GC5_REPO_PATH.read_text(encoding="utf-8")),
+                           GC5_FUSED_HELPER)
+    assert len(_gc2_named_calls(helper, "execute")) == 1, "a second product execute"
+    assert not _gc2_named_calls(helper, "commit")
+    migration = (GC5_MIGRATIONS_DIR / "versions" / "0001_initial_schema.py").read_text(
+        encoding="utf-8"
+    )
+    assert GC5_FINGERPRINT_INDEX in migration, "the fingerprint index was dropped"
+    versions = sorted(
+        path.name for path in (GC5_MIGRATIONS_DIR / "versions").glob("*.py")
+        if "__pycache__" not in path.parts
+    )
+    assert versions == [
+        "0001_initial_schema.py",
+        "0002_dashboard_m4.py",
+        "0003_m6_list_indexes.py",
+    ], versions
+
+    # (5) Every ingest branch, response body, audit action and the advisory
+    # lock remain reachable, and the fused statement runs once per request.
+    ingest_fn = _gc5_method(ingest_tree, "ingest")
+    txn = _gc5_method(ingest_tree, GC5_TXN)
+    batch = _gc5_method(ingest_tree, GC5_BATCH_CALLBACK)
+    assert len(_gc2_named_calls(ast.parse(ingest_src), GC5_FUSED_HELPER)) == 1
+    assert len(_gc2_named_calls(batch, GC5_FUSED_HELPER)) == 1
+    assert not _gc2_named_calls(txn, GC5_FUSED_HELPER), (
+        "the fused statement is repeated on the fallback"
+    )
+    assert not _gc2_named_calls(ingest_fn, GC5_FUSED_HELPER)
+    rendered_ingest = ast.unparse(ingest_fn)
+    for reason in ("missing_platform_key", "missing_error_summary", "unknown_source"):
+        assert reason in rendered_ingest, reason
+    rendered_txn = ast.unparse(txn)
+    for reason in ("unknown_platform_key", "platform_not_ready"):
+        assert reason in rendered_txn, reason
+    for action in ("event_merged", "event_received", "event_rejected"):
+        assert f'action="{action}"' in ingest_src, action
+    lock_calls = _gc2_named_calls(txn, "acquire_correlation_lock")
+    find_calls = _gc2_named_calls(txn, "find_open_by_fingerprint")
+    assert len(lock_calls) == 1 and len(find_calls) == 1
+    assert lock_calls[0].lineno < find_calls[0].lineno, (
+        "the deciding correlation read must happen under the advisory lock"
+    )
+    assert "'status': 'merged'" in ast.unparse(ingest_fn) or (
+        '"status": "merged"' in ingest_src
+    )
+    starters = _gc2_named_calls(ast.parse(ingest_src), "start_investigation")
+    assert len(starters) == 1
+    assert _gc2_named_calls(ingest_fn, "start_investigation")
+    assert not _gc2_named_calls(txn, "start_investigation")
+    assert not _gc2_named_calls(batch, "start_investigation"), (
+        "a workflow is started for a grouped hit"
+    )
+
+    # (6) The sizing basis, the ledger owner and the runner classes.
+    values_text = GC5_VALUES_PATH.read_text(encoding="utf-8")
+    values = yaml.safe_load(values_text)
+    basis = values["ingestGateway"]["sizingBasis"]
+    assert float(basis["cpuMsPerRequest"]) == GC5_BASIS_MS_PER_REQUEST == 2.427
+    assert f"cpuMsPerRequest: {GC5_BASIS_MS_PER_REQUEST}" in values_text
+    assert basis["observations"] == [], basis["observations"]
+    assert not re.search(r"\b\d{9,}\b", yaml.safe_dump(basis)), basis
+    thresholds = yaml.safe_load(GC5_THRESHOLDS.read_text(encoding="utf-8"))
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    assert b1_entry["status"] == "covered", "the bar was relabelled"
+    assert b1_entry["threshold"].split() == GC5_B1_THRESHOLD.split(), (
+        "the B1 threshold string moved"
+    )
+    assert GC1_BASIS_OWNER in b1_entry["notes"]
+    assert "p99<150ms" in b1_entry["notes"].replace(" ", "")
+    # Every other benchmark entry keeps its own threshold and status: this
+    # slice appended prose to B1's notes and touched nothing else.
+    assert {
+        entry["id"]: (entry["status"], entry["threshold"])
+        for entry in thresholds["benchmarks"]
+        if entry["id"] != "B1"
+    } == _gc5_other_benchmark_entries(), "another benchmark entry moved"
+    ci = yaml.safe_load(GC5_CI_YML.read_text(encoding="utf-8"))
+    for name, job in ci["jobs"].items():
+        assert job.get("runs-on") == "ubuntu-latest", (name, job.get("runs-on"))
+    launcher = GC5_LAUNCHER.read_text(encoding="utf-8")
+    for line in GC2_LAUNCHER_AFFINITY_LINES:
+        assert line in launcher, line
+    for line in GC2_LAUNCHER_ROUTED_LINES:
+        assert line in launcher, line
+    for token in GC5_OVERRIDE_TOKENS:
+        assert token not in launcher, f"the launcher configures batching ({token!r})"
+
+    # (7) No dependency, endpoint, response field or request option was added.
+    gateway_toml = (REPO_ROOT / "services" / "gateway" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert gateway_toml.count(GC4_GATEWAY_DEPENDENCY) == 1
+    import tomllib
+
+    declared = set(
+        tomllib.loads(gateway_toml)["project"]["dependencies"]
+    )
+    assert declared == {
+        "fastapi>=0.110,<1",
+        "uvicorn[standard]>=0.27,<1",
+        "temporalio>=1.7,<2",
+        "rca-common",
+        GC4_GATEWAY_DEPENDENCY,
+    }, sorted(declared)
+    app_src = (REPO_ROOT / "services" / "gateway" / "gateway" / "app.py").read_text(
+        encoding="utf-8"
+    )
+    routes = re.findall(r'@app\.(get|post|put|delete)\("([^"]+)"\)', app_src)
+    assert sorted(routes) == [("get", "/healthz"), ("post", "/api/v1/events")], routes
+    for token in GC5_COMMIT_FIELDS + GC5_BATCH_CONSTANTS:
+        assert token not in app_src, f"the HTTP surface gained {token}"
+    for token in ("batch_id", "batch_size", "coalesc", "merge_group"):
+        assert token not in _gc4_prose_free(app_src).lower(), token
+
+
+def test_gc5_diagnostics_do_not_enter_gc3_verdicts_or_sizing():
+    """FP-GC5-8/9: the eight new fields are diagnostics and nothing else.
+
+    They live in the B1 harness, travel inside the existing fingerprint, and
+    appear in no product source, no GC-3 verdict or ranking input, and no
+    sizing observation.
+    """
+    harness_src = REF_TEST.read_text(encoding="utf-8")
+    harness_tree = ast.parse(harness_src)
+
+    # (1) The field inventory is exactly these eight, in this order, declared
+    # once, in the harness.
+    assert _module_tuple(harness_tree, "B1_POSTGRES_COMMIT_FIELDS") == GC5_COMMIT_FIELDS
+    assert _module_tuple(harness_tree, "B1_POSTGRES_COST_FIELDS") == GC4_COST_FIELDS
+    assert not set(GC5_COMMIT_FIELDS) & set(GC4_COST_FIELDS)
+
+    # (2) The stats reader is test-only: neither its symbols nor the new field
+    # names occur in any production source.
+    for relative, code in _gc5_product_sources():
+        for symbol in GC5_STATS_SYMBOLS + GC5_COMMIT_FIELDS:
+            assert symbol not in code, f"{relative} carries the test-only {symbol!r}"
+
+    # (3) It owns its own connection to a DIFFERENT database, and builds no
+    # engine and no Session.
+    for opener in ("_open_postgres_stats_connection", "_open_postgres_wait_connection"):
+        node = _gc4_function(harness_tree, opener)
+        source = ast.get_source_segment(harness_src, node) or ""
+        assert "psycopg2.connect" in source, f"{opener} does not own its connection"
+        assert "maintenance_dsn(" in source, f"{opener} is not on the maintenance database"
+        for forbidden in ("make_engine", "make_gateway_engine", "session_factory"):
+            assert forbidden not in source, (opener, forbidden)
+    maintenance = _gc4_function(harness_tree, "maintenance_database_name")
+    maintenance_src = ast.get_source_segment(harness_src, maintenance) or ""
+    assert "B1_MAINTENANCE_DATABASE_ALTERNATE" in maintenance_src, (
+        "the reader can be pointed at the measured database when it is `postgres`"
+    )
+    assigns = _source_assigns(harness_src)
+    assert ast.literal_eval(assigns["B1_MAINTENANCE_DATABASE"]) == GC5_MAINTENANCE_DATABASE
+    assert ast.literal_eval(
+        assigns["B1_MAINTENANCE_DATABASE_ALTERNATE"]
+    ) == GC5_MAINTENANCE_ALTERNATE
+    assert ast.literal_eval(
+        assigns["B1_STATS_READER_APPLICATION_NAME"]
+    ) == GC5_STATS_APPLICATION_NAME
+    assert ast.literal_eval(
+        assigns["B1_WAIT_SAMPLER_APPLICATION_NAME"]
+    ) == GC5_SAMPLER_APPLICATION_NAME
+    wait_sql = ast.literal_eval(assigns["B1_WAIT_SAMPLE_SQL"]) if isinstance(
+        assigns["B1_WAIT_SAMPLE_SQL"], ast.Constant
+    ) else "".join(
+        ast.literal_eval(part) for part in assigns["B1_WAIT_SAMPLE_SQL"].values
+    )
+    # The sampler kept its application-name exclusion and now names the
+    # measured database instead of inheriting it from its own connection.
+    assert "coalesce(application_name, '') <> %(application_name)s" in wait_sql
+    assert "datname = %(target_database)s" in wait_sql
+    assert "current_database()" not in wait_sql
+    for statement_name in ("B1_DATABASE_STATS_SQL", "B1_WAL_STATS_SQL"):
+        statement = assigns[statement_name]
+        rendered = ast.literal_eval(statement) if isinstance(
+            statement, ast.Constant
+        ) else "".join(ast.literal_eval(part) for part in statement.values)
+        assert "current_database()" not in rendered, statement_name
+        for token in ("INSERT", "UPDATE", "DELETE", "pg_stat_reset"):
+            assert token not in rendered.upper(), (statement_name, token)
+
+    # (4) No new field is a gating field, a product verdict, a GC-3 verdict or
+    # a GC-3 record key, and none enters the selector's ranking.
+    gating = set(_module_tuple(harness_tree, "B1_GATING_PLACEMENT_FIELDS"))
+    topology_gating = set(_module_tuple(harness_tree, "B1_TOPOLOGY_GATING_PLACEMENT_FIELDS"))
+    # Both full inventories are concatenations in the harness, so they are
+    # rebuilt here from their two declared halves.
+    placement = gating | set(
+        _module_tuple(harness_tree, "B1_DIAGNOSTIC_PLACEMENT_FIELDS")
+    )
+    topology_placement = topology_gating | set(
+        _module_tuple(harness_tree, "B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS")
+    )
+    product_verdicts = set(_module_tuple(harness_tree, "PRODUCT_VERDICT_FIELDS"))
+    probe_src = GC5_PROBE_HELPER.read_text(encoding="utf-8")
+    for field in GC5_COMMIT_FIELDS:
+        assert field not in gating, field
+        assert field not in topology_gating, field
+        assert field not in placement, field
+        assert field not in topology_placement, field
+        assert field not in product_verdicts, field
+        assert field not in gc3.VERDICT_FIELDS, field
+        assert field not in gc3.RECORD_KEYS, field
+        assert field not in probe_src, f"the GC-3 helper names {field}"
+
+    # (5) The decision carrier is untouched by them: no key and no value
+    # outside an embedded fingerprint mentions a GC-5 field.
+    def _walk_json(node, key=None):
+        if isinstance(node, dict):
+            for name, value in node.items():
+                for field in GC5_COMMIT_FIELDS:
+                    assert field not in name, (name, field)
+                _walk_json(value, name)
+        elif isinstance(node, list):
+            for value in node:
+                _walk_json(value, key)
+        elif isinstance(node, str) and key != "fingerprint":
+            for field in GC5_COMMIT_FIELDS:
+                assert field not in node, (key, field)
+
+    _walk_json(json.loads(GC3_DECISION.read_text(encoding="utf-8")))
+
+    # (6) No sizing carrier records them, and the ratio bar is not a sizing
+    # value: the chart, the profile module and the ledger never name them.
+    for parts in GC4_SIZING_CARRIERS:
+        carrier = REPO_ROOT.joinpath(*parts)
+        assert carrier.is_file(), parts[-1]
+        text = carrier.read_text(encoding="utf-8")
+        if parts[-1] in ("thresholds.yaml", "test_b1_ingest_burst.py"):
+            # The manifest describes them as reported diagnostics and the
+            # harness produces them; both are checked below rather than here.
+            continue
+        for field in GC5_COMMIT_FIELDS + (GC5_RATIO_CONSTANT,):
+            assert field not in text, f"{parts[-1]} carries {field}"
+    values = yaml.safe_load(GC5_VALUES_PATH.read_text(encoding="utf-8"))
+    basis = yaml.safe_dump(values["ingestGateway"]["sizingBasis"])
+    for field in GC5_COMMIT_FIELDS:
+        assert field not in basis, field
+
+    # (7) The manifest describes them as diagnostics, once, and names the one
+    # node that consumes the ratio.
+    thresholds = yaml.safe_load(GC5_THRESHOLDS.read_text(encoding="utf-8"))
+    notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
+    for field in GC5_COMMIT_FIELDS:
+        assert field in notes, field
+    assert "reported diagnostic" in notes
+    assert GC5_GATE_NODE in notes, "the manifest does not name the gate node"
+    assert str(GC5_MAX_COMMITS_PER_SERVED) in notes
+
+    # (8) Only the gate node consumes the ratio; the probe route does not.
+    probe_live_src = GC5_PROBE_LIVE.read_text(encoding="utf-8")
+    assert GC5_RATIO_CONSTANT not in probe_live_src, (
+        "the GC-3 probe route gates the GC-5 ratio"
+    )
+    assert "assert_complete_commit_shape_record" not in probe_live_src, (
+        "a GC-5 diagnostic can void a GC-3 arm"
+    )
+    assert "postgres_commit_snapshot_failure" in probe_live_src, (
+        "the probe route does not record the GC-5 fields at all"
+    )
+    # The bar is COMPARED against in exactly two places: the live gate node
+    # and the serializer unit test that pins its boundary. Anywhere else the
+    # constant may only be named (the recorded-context node checks that the
+    # gate still compares it), never used to decide a measured value.
+    ratio_comparers = []
+    for node in ast.walk(harness_tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for statement in ast.walk(node):
+            if not isinstance(statement, ast.Assert):
+                continue
+            for compare in ast.walk(statement.test):
+                if not isinstance(compare, ast.Compare):
+                    continue
+                operands = [compare.left, *compare.comparators]
+                if any(
+                    isinstance(operand, ast.Name)
+                    and operand.id == GC5_RATIO_CONSTANT
+                    for operand in operands
+                ):
+                    ratio_comparers.append(node.name)
+    assert GC5_GATE_NODE in ratio_comparers, ratio_comparers
+    assert set(ratio_comparers) == {
+        GC5_GATE_NODE,
+        "test_gc5_commit_shape_fields_serialize_honestly_and_only_ratio_gates",
+    }, ratio_comparers
+
+    # ...and the bar is inclusive: a record whose ratio is exactly 0.60
+    # satisfies FP-GC5-7, so the gate compares with `<=`, never `<`.
+    gate = _gc4_function(harness_tree, GC5_GATE_NODE)
+    gate_comparisons = [
+        node for node in ast.walk(gate)
+        if isinstance(node, ast.Compare)
+        and any(
+            isinstance(operand, ast.Name) and operand.id == GC5_RATIO_CONSTANT
+            for operand in [node.left, *node.comparators]
+        )
+    ]
+    assert len(gate_comparisons) == 1, [ast.unparse(c) for c in gate_comparisons]
+    comparison = gate_comparisons[0]
+    assert [type(op) for op in comparison.ops] == [ast.LtE], ast.unparse(comparison)
+    assert ast.unparse(comparison.left) == "ratio", ast.unparse(comparison)
+    assert ast.unparse(comparison.comparators[0]) == GC5_RATIO_CONSTANT
+
+
+def test_gc5_gc3_requalification_handoff_is_head_scoped():
+    """FP-GC5-10: GC-5 hands over a head; GC-3 alone decides hostability."""
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    models = decision["models"]
+    assert models, "the decision carrier has no model entry"
+
+    # (1) The carrier is unedited: every entry still belongs to the head it
+    # was measured at, is still `unhostable`, and claims no topology.
+    for model, entry in models.items():
+        assert entry["evidenceHeadSha"] == GC5_GC3_EVIDENCE_HEAD, model
+        for wrapper in entry["artifacts"]:
+            assert wrapper["artifact"]["headSha"] == GC5_GC3_EVIDENCE_HEAD, model
+        assert entry["status"] == gc3.DECISION_UNHOSTABLE, (model, entry["status"])
+        assert entry["ratifiable"] == [], model
+        for null_field in ("selected", "cardinality", "placementSchema", "score"):
+            assert entry[null_field] is None, (model, null_field)
+    harness_src = REF_TEST.read_text(encoding="utf-8")
+    harness_assigns = _source_assigns(harness_src)
+    assert ast.literal_eval(
+        harness_assigns["CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"]
+    ) == {}
+    assert ast.literal_eval(
+        harness_assigns["CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"]
+    ) == {}
+
+    # (2) The manifest states what GC-5 changed, narrowly, and names the
+    # separate same-head requalification as the only route that may supersede
+    # an entry -- without claiming any SKU.
+    thresholds_text = GC5_THRESHOLDS.read_text(encoding="utf-8")
+    thresholds = yaml.safe_load(thresholds_text)
+    notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
+    for phrase in GC5_GC3_REQUALIFICATION_PHRASES:
+        assert phrase.replace("\n    ", " ") in notes.replace("\n", " "), (
+            f"the manifest does not state {phrase!r}"
+        )
+    assert "GC-5 head" in notes
+    for model in models:
+        assert model in notes, model
+        assert f"topology_unratified_sku:{model}" in notes, model
+    for claim in GC5_HOSTABILITY_CLAIMS:
+        assert claim not in notes, claim
+
+    # (3) No GC-5 node touches the carrier, the selector or a hostability
+    # claim, and none of them asserts the unchanged 150 ms bar.
+    harness_tree = ast.parse(harness_src)
+    for node_name in (GC5_GATE_NODE, GC5_CONTEXT_NODE):
+        node = _gc4_function(harness_tree, node_name)
+        source = ast.get_source_segment(harness_src, node) or ""
+        for forbidden in (
+            "CI_SCALE_P99_MS",
+            "PRODUCT_P99_MS",
+            "hostable",
+            "selected",
+            "b1_topology_decision",
+            "B1_DECISION_CARRIER",
+            "evaluate_verdicts",
+        ):
+            assert forbidden not in source, (node_name, forbidden)
+        markers = _decorator_markers(node)
+        assert markers == GC5_PRODUCT_MARKERS, (node_name, markers)
+    # ...and the one test that can establish the CI-scale bar is unchanged.
+    ci_scale = _gc2_function(harness_tree, CI_SCALE_REF_TEST)
+    observed = {
+        ast.unparse(node.test) for node in ast.walk(ci_scale) if isinstance(node, ast.Assert)
+    }
+    assert not GC2_CI_SCALE_REQUIRED_ASSERTIONS - observed
+
+    # (4) The probe route still writes every arm, and the GC-5 fields cannot
+    # stop it: the shared validator it calls owns no GC-5 rule.
+    probe_live_src = GC5_PROBE_LIVE.read_text(encoding="utf-8")
+    node = next(
+        n for n in ast.walk(ast.parse(probe_live_src))
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "test_b1_ci_scale_topology_probe_record"
+    )
+    statements = node.body
+    validator_at = next(
+        i for i, stmt in enumerate(statements)
+        if "assert_complete_postgres_cost_record" in ast.unparse(stmt)
+    )
+    write_at = next(
+        i for i, stmt in enumerate(statements)
+        if "write_probe_arm_record" in ast.unparse(stmt)
+    )
+    assert validator_at < write_at
+    for stmt in statements[validator_at:write_at]:
+        rendered = ast.unparse(stmt)
+        for escape in ("return", "raise", "pytest.skip", "if "):
+            assert escape not in rendered, rendered
+    validator = _gc4_function(ast.parse(harness_src), "postgres_cost_record_failures")
+    validator_src = ast.get_source_segment(harness_src, validator) or ""
+    for forbidden in ("postgres_commit", "xact_commit", "wal_"):
+        assert forbidden not in validator_src, forbidden

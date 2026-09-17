@@ -2755,10 +2755,16 @@ B1_WAIT_MIN_COMPLETION_RATIO = 0.90
 B1_WAIT_KEY_SAFE_CHARACTERS = B1_DIAGNOSTIC_SAFE_CHARACTERS - frozenset(":+")
 # Non-idle client backends of the measured database, grouped exactly as §3.6
 # specifies, with this sampler's own backend excluded by pid AND by name.
+#
+# GC-5 (FP-GC5-7): the sampler's own connection moved to a MAINTENANCE
+# database, so `current_database()` is no longer the measured one and the
+# target is named explicitly instead. The application-name exclusion is
+# retained exactly as GC-4 wrote it, and every GC-4 field keeps its meaning:
+# this still counts non-idle client backends of the measured database.
 B1_WAIT_SAMPLE_SQL = (
     "SELECT state, wait_event_type, wait_event, count(*) AS backends "
     "FROM pg_stat_activity "
-    "WHERE datname = current_database() "
+    "WHERE datname = %(target_database)s "
     "AND backend_type = 'client backend' "
     "AND pid <> pg_backend_pid() "
     "AND coalesce(application_name, '') <> %(application_name)s "
@@ -2836,10 +2842,12 @@ class B1PostgresWaitSampler:
         self,
         connect,
         *,
+        target_database: str,
         interval_s: float = B1_WAIT_SAMPLE_INTERVAL_S,
         join_timeout_s: float = B1_WAIT_JOIN_TIMEOUT_S,
     ) -> None:
         self._connect = connect
+        self._target_database = target_database
         self._interval_s = interval_s
         self._join_timeout_s = join_timeout_s
         self._stop_event = threading.Event()
@@ -2872,7 +2880,10 @@ class B1PostgresWaitSampler:
         try:
             cursor.execute(
                 B1_WAIT_SAMPLE_SQL,
-                {"application_name": B1_WAIT_SAMPLER_APPLICATION_NAME},
+                {
+                    "application_name": B1_WAIT_SAMPLER_APPLICATION_NAME,
+                    "target_database": self._target_database,
+                },
             )
             return list(cursor.fetchall())
         finally:
@@ -2933,15 +2944,64 @@ class B1PostgresWaitSampler:
             pass
 
 
-def _open_postgres_wait_connection(dsn: str):
-    """One dedicated autocommit diagnostic connection, named for exclusion."""
-    import psycopg2
+def target_database_name(dsn: str) -> str:
+    """The measured database's own name, read from the harness DSN."""
     from sqlalchemy.engine import make_url
 
-    url = make_url(dsn).set(drivername="postgresql").update_query_dict(
-        {"application_name": B1_WAIT_SAMPLER_APPLICATION_NAME}
+    database = make_url(dsn).database
+    if not database:
+        raise B1PlacementError(f"the measured DSN names no database: {dsn!r}")
+    return database
+
+
+def maintenance_database_name(dsn: str) -> str:
+    """A maintenance database that is NOT the measured one (FP-GC5-7).
+
+    Every diagnostic connection of this harness lives here, so its own read
+    transactions are counted against this database and can never inflate the
+    measured database's `xact_commit`.
+    """
+    if target_database_name(dsn) == B1_MAINTENANCE_DATABASE:
+        return B1_MAINTENANCE_DATABASE_ALTERNATE
+    return B1_MAINTENANCE_DATABASE
+
+
+def maintenance_dsn(dsn: str, application_name: str) -> str:
+    """The same server, the maintenance database, one named application."""
+    from sqlalchemy.engine import make_url
+
+    url = (
+        make_url(dsn)
+        .set(drivername="postgresql", database=maintenance_database_name(dsn))
+        .update_query_dict({"application_name": application_name})
     )
-    connection = psycopg2.connect(url.render_as_string(hide_password=False))
+    return url.render_as_string(hide_password=False)
+
+
+def _open_postgres_wait_connection(dsn: str):
+    """One dedicated autocommit diagnostic connection, named for exclusion.
+
+    GC-5: opened against the maintenance database rather than the measured
+    one, so each polling query commits there instead of inflating the
+    measured database's transaction count. The application name is unchanged
+    and is still what the sample statement excludes.
+    """
+    import psycopg2
+
+    connection = psycopg2.connect(
+        maintenance_dsn(dsn, B1_WAIT_SAMPLER_APPLICATION_NAME)
+    )
+    connection.autocommit = True
+    return connection
+
+
+def _open_postgres_stats_connection(dsn: str):
+    """The GC-5 stats reader's own autocommit maintenance connection."""
+    import psycopg2
+
+    connection = psycopg2.connect(
+        maintenance_dsn(dsn, B1_STATS_READER_APPLICATION_NAME)
+    )
     connection.autocommit = True
     return connection
 
@@ -3059,6 +3119,283 @@ def assert_complete_postgres_cost_record(run: dict) -> None:
     if fails:
         raise B1PlacementError(
             "incomplete GC-4 cost record: " + "; ".join(fails)
+        )
+
+
+# ---------------------------------------------------------------------------
+# GC-5 (FP-GC5-7/8) — measured-window transaction and WAL counters.
+#
+# The quantity the commit coalescer governs is how many durable database
+# transactions one served request costs. It is read from `pg_stat_database`
+# for the measured database and `pg_stat_wal` for the cluster, through a
+# connection to a DIFFERENT (maintenance) database: a reader connected to the
+# measured database would commit its own read transactions there and inflate
+# exactly the counter it is reporting. Only `postgres_xact_commits_per_served`
+# is an outcome; every other field here is recorded context.
+# ---------------------------------------------------------------------------
+
+#: The eight fields, in the order the fingerprint carries them -- after the six
+#: GC-4 cost fields, never before a gating one.
+B1_POSTGRES_COMMIT_FIELDS = (
+    "postgres_xact_commit_delta",
+    "postgres_xact_rollback_delta",
+    "postgres_xact_commits_per_served",
+    "postgres_wal_records_delta",
+    "postgres_wal_bytes_delta",
+    "postgres_wal_write_delta",
+    "postgres_wal_sync_delta",
+    "postgres_wal_syncs_per_served",
+)
+#: FP-GC5-7's one quantitative bar: committed database transactions per served
+#: request on a qualifying product-shaped record. The pre-GC-5 shape is one
+#: transaction per served request; a perfect group of eight would approach
+#: 0.125 on the hit population. Not tuned from a post-change result.
+B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED = 0.60
+B1_MAINTENANCE_DATABASE = "postgres"
+B1_MAINTENANCE_DATABASE_ALTERNATE = "template1"
+B1_STATS_READER_APPLICATION_NAME = "gc5-stats-reader"
+#: PostgreSQL publishes cumulative statistics from each backend at an interval
+#: of its own; this is the floor before the first read, not a tuning knob.
+B1_STATS_PUBLICATION_WAIT_S = 1.1
+B1_STATS_STABLE_INTERVAL_S = 0.1
+B1_STATS_STABLE_TIMEOUT_S = 5.0
+B1_DATABASE_STATS_SQL = (
+    "SELECT d.oid, d.datname, s.xact_commit, s.xact_rollback, s.stats_reset "
+    "FROM pg_database d JOIN pg_stat_database s ON s.datid = d.oid "
+    "WHERE d.datname = %(target_database)s"
+)
+B1_WAL_STATS_SQL = (
+    "SELECT wal_records, wal_bytes, wal_write, wal_sync, stats_reset FROM pg_stat_wal"
+)
+
+
+@dataclass(frozen=True)
+class B1PostgresCommitSnapshot:
+    """One end of the measured window's transaction/WAL counters."""
+
+    database_name: str
+    database_oid: int
+    xact_commit: int
+    xact_rollback: int
+    database_stats_reset: str
+    wal_records: int
+    wal_bytes: int
+    wal_write: int
+    wal_sync: int
+    wal_stats_reset: str
+
+
+class B1PostgresStatsReader:
+    """One autocommit maintenance connection, for one measured window.
+
+    It reads the measured database's row by name and the cluster-wide WAL row;
+    its own transactions belong to the maintenance database, so they cannot
+    enter either delta it reports.
+    """
+
+    def __init__(self, connect, *, target_database: str, sleep=time.sleep,
+                 monotonic=time.monotonic) -> None:
+        self._connect = connect
+        self._target_database = target_database
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._connection = None
+
+    @property
+    def target_database(self) -> str:
+        return self._target_database
+
+    def _cursor_rows(self, statement, parameters=None):
+        if self._connection is None:
+            self._connection = self._connect()
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(statement, parameters)
+            return list(cursor.fetchall())
+        finally:
+            cursor.close()
+
+    def _database_row(self):
+        rows = self._cursor_rows(
+            B1_DATABASE_STATS_SQL, {"target_database": self._target_database}
+        )
+        if len(rows) != 1:
+            raise B1PlacementError(
+                f"pg_stat_database has {len(rows)} rows for "
+                f"{self._target_database!r}; exactly one is required"
+            )
+        return rows[0]
+
+    def read_xact_commit(self) -> int:
+        return int(self._database_row()[2])
+
+    def snapshot(self) -> B1PostgresCommitSnapshot:
+        """Both counter sets, read through one maintenance connection."""
+        oid, datname, xact_commit, xact_rollback, database_reset = self._database_row()
+        wal_rows = self._cursor_rows(B1_WAL_STATS_SQL)
+        if len(wal_rows) != 1:
+            raise B1PlacementError(
+                f"pg_stat_wal has {len(wal_rows)} rows; exactly one is required"
+            )
+        wal_records, wal_bytes, wal_write, wal_sync, wal_reset = wal_rows[0]
+        return B1PostgresCommitSnapshot(
+            database_name=str(datname),
+            database_oid=int(oid),
+            xact_commit=int(xact_commit),
+            xact_rollback=int(xact_rollback),
+            database_stats_reset=str(database_reset),
+            wal_records=int(wal_records),
+            wal_bytes=int(wal_bytes),
+            wal_write=int(wal_write),
+            wal_sync=int(wal_sync),
+            wal_stats_reset=str(wal_reset),
+        )
+
+    def wait_until_published(self) -> int:
+        """Wait for publication, then for two equal readings 100 ms apart."""
+        self._sleep(B1_STATS_PUBLICATION_WAIT_S)
+        deadline = self._monotonic() + B1_STATS_STABLE_TIMEOUT_S
+        previous = self.read_xact_commit()
+        while True:
+            self._sleep(B1_STATS_STABLE_INTERVAL_S)
+            current = self.read_xact_commit()
+            if current == previous:
+                return current
+            previous = current
+            if self._monotonic() >= deadline:
+                raise B1PlacementError(
+                    f"the measured database's xact_commit did not settle within "
+                    f"{B1_STATS_STABLE_TIMEOUT_S} s (last {current})"
+                )
+
+    def published_snapshot(self) -> B1PostgresCommitSnapshot:
+        """The post-window end: publication wait, stability, then one read."""
+        self.wait_until_published()
+        return self.snapshot()
+
+    def close(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 — a diagnostic must never fail the run
+                pass
+
+
+def postgres_commit_snapshot_failure(before, after, served) -> "str | None":
+    """Why this window's transaction counters are unusable, or ``None``.
+
+    Counter reset, unavailable, negative, unstable or cross-database
+    observations cannot satisfy FP-GC5-7, and they are never repaired into a
+    zero: the fields serialize `unavailable` and the record carries the reason.
+    """
+    if before is None or after is None:
+        return "no measured-window PostgreSQL transaction snapshot was taken"
+    if (before.database_name, before.database_oid) != (
+        after.database_name,
+        after.database_oid,
+    ):
+        return (
+            f"the measured database changed identity between snapshots: "
+            f"{before.database_name}/{before.database_oid} -> "
+            f"{after.database_name}/{after.database_oid}"
+        )
+    if before.database_stats_reset != after.database_stats_reset:
+        return (
+            f"pg_stat_database was reset inside the measured window "
+            f"({before.database_stats_reset} -> {after.database_stats_reset})"
+        )
+    if before.wal_stats_reset != after.wal_stats_reset:
+        return (
+            f"pg_stat_wal was reset inside the measured window "
+            f"({before.wal_stats_reset} -> {after.wal_stats_reset})"
+        )
+    for field in (
+        "xact_commit", "xact_rollback", "wal_records", "wal_bytes",
+        "wal_write", "wal_sync",
+    ):
+        start = getattr(before, field)
+        end = getattr(after, field)
+        if end < start:
+            return f"{field} decreased across the measured window ({start} -> {end})"
+    if isinstance(served, bool) or not isinstance(served, int) or served <= 0:
+        return f"served is not a positive count: {served!r}"
+    if after.xact_commit - before.xact_commit <= 0:
+        return (
+            f"no database transaction committed inside the measured window "
+            f"({before.xact_commit} -> {after.xact_commit})"
+        )
+    for name, value in (
+        ("postgres_xact_commits_per_served",
+         (after.xact_commit - before.xact_commit) / served),
+        ("postgres_wal_syncs_per_served", (after.wal_sync - before.wal_sync) / served),
+    ):
+        if not math.isfinite(value):
+            return f"{name} is not finite: {value!r}"
+    return None
+
+
+def postgres_xact_commits_per_served(before, after, served) -> float:
+    """The FP-GC5-7 quantity itself, unrounded.
+
+    The gate consumes THIS value, never its rendered form: rounding before
+    comparing would let a ratio above the bar pass as `0.600000`.
+    """
+    return (after.xact_commit - before.xact_commit) / served
+
+
+def serialize_postgres_commit_fields(before, after, served) -> str:
+    """The eight transaction/WAL fields, in their pinned order.
+
+    An unusable observation renders `unavailable` in ALL of them -- never a
+    zero, never a mixture -- and the run's notes carry the reason.
+    """
+    if postgres_commit_snapshot_failure(before, after, served) is not None:
+        return ",".join(
+            f"{field}={DIAGNOSTIC_UNAVAILABLE}" for field in B1_POSTGRES_COMMIT_FIELDS
+        )
+    commits = after.xact_commit - before.xact_commit
+    rollbacks = after.xact_rollback - before.xact_rollback
+    wal_records = after.wal_records - before.wal_records
+    wal_bytes = after.wal_bytes - before.wal_bytes
+    wal_write = after.wal_write - before.wal_write
+    wal_sync = after.wal_sync - before.wal_sync
+    return (
+        f"postgres_xact_commit_delta={commits},"
+        f"postgres_xact_rollback_delta={rollbacks},"
+        f"postgres_xact_commits_per_served={commits / served:.6f},"
+        f"postgres_wal_records_delta={wal_records},"
+        f"postgres_wal_bytes_delta={wal_bytes},"
+        f"postgres_wal_write_delta={wal_write},"
+        f"postgres_wal_sync_delta={wal_sync},"
+        f"postgres_wal_syncs_per_served={wal_sync / served:.6f}"
+    )
+
+
+def commit_shape_record_failures(run: dict) -> list[str]:
+    """Is this record admissible as FP-GC5-7 mechanism evidence?
+
+    Complete, non-contaminated transaction counters are MANDATORY here --
+    unlike the GC-4 wait sampler, whose absence stays fail-soft. The ratio bar
+    itself is asserted by the node, not by this validator.
+    """
+    fails: list[str] = []
+    result = run.get("result")
+    served = getattr(result, "served", None)
+    reason = postgres_commit_snapshot_failure(
+        run.get("postgres_commit_before"), run.get("postgres_commit_after"), served
+    )
+    if reason is not None:
+        fails.append(reason)
+    return fails
+
+
+def assert_complete_commit_shape_record(run: dict) -> None:
+    """FP-GC5-7: refuse a record whose transaction counters are not usable."""
+    fails = commit_shape_record_failures(run)
+    if fails:
+        raise B1PlacementError(
+            "incomplete GC-5 commit-shape record: " + "; ".join(fails)
         )
 
 
@@ -3453,17 +3790,32 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         # however this fixture ends. Its own PostgreSQL cost is inside the
         # measured window on purpose, identically in control and candidate.
         wait_sampler = B1PostgresWaitSampler(
-            lambda: _open_postgres_wait_connection(dsn)
+            lambda: _open_postgres_wait_connection(dsn),
+            target_database=target_database_name(dsn),
         )
         stack.callback(wait_sampler.shutdown)
+        # GC-5 (FP-GC5-7): the transaction/WAL reader, on the SAME maintenance
+        # database as the sampler and never on the measured one.
+        stats_reader = B1PostgresStatsReader(
+            lambda: _open_postgres_stats_connection(dsn),
+            target_database=target_database_name(dsn),
+        )
+        stack.callback(stats_reader.close)
 
         def _after_prologue() -> None:
             # Snapshot AFTER the unmeasured prologue so CPU/audit exclude it (C2).
             _collect_cpu_diagnostics("before")
             marks["committed_before"] = _committed_ingest_rows(dsn)
+            # GC-5: the pre-window transaction/WAL snapshot is taken AFTER that
+            # audit-count query, so the prologue's own transactions are outside
+            # the measured delta.
+            notes = marks.setdefault("diagnostic_notes", [])
+            marks["postgres_commit_before"] = _try_diagnostic(
+                "postgres transaction snapshot (before)", notes, stats_reader.snapshot,
+            )
             # ...and only then open the diagnostic connection and start sampling.
             _try_diagnostic(
-                "postgres wait sampler", marks.setdefault("diagnostic_notes", []),
+                "postgres wait sampler", notes,
                 wait_sampler.start,
             )
 
@@ -3484,6 +3836,13 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
                 notes.append(f"postgres wait sampler: {reason}")
             _collect_cpu_diagnostics("after")
             marks["log_prefix_bytes"] = _snapshot_container_log(gateway, log_path)
+            # GC-5: wait for cumulative-stat publication, require two equal
+            # readings 100 ms apart, then take the post-window snapshot --
+            # still before the post-window audit-count query below.
+            marks["postgres_commit_after"] = _try_diagnostic(
+                "postgres transaction snapshot (after)", notes,
+                stats_reader.published_snapshot,
+            )
 
         result = asyncio.run(
             b1.run_open_loop(
@@ -3582,6 +3941,18 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         p99_leg_split_str = b1.serialize_leg_triple(result.p99_leg_split)
         leg_p99s_str = b1.serialize_leg_triple(result.leg_p99s)
         wait_sample = marks.get("postgres_wait_sample")
+        commit_before = marks.get("postgres_commit_before")
+        commit_after = marks.get("postgres_commit_after")
+        commit_reason = postgres_commit_snapshot_failure(
+            commit_before, commit_after, result.served
+        )
+        if commit_reason is not None:
+            # Recorded as a note with its reason, exactly like an unusable wait
+            # sample: never repaired into a zero, and never fatal here -- the
+            # FP-GC5-7 node is what refuses such a record.
+            marks.setdefault("diagnostic_notes", []).append(
+                f"postgres transaction snapshot: {commit_reason}"
+            )
         verdicts = (
             _product_promise_verdicts(result)
             if profile.name == PRODUCT_PROFILE_NAME
@@ -3638,6 +4009,9 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         postgres_cost_fields = serialize_postgres_cost_fields(
             postgres_usage_usec, result.served, wait_sample
         )
+        postgres_commit_fields = serialize_postgres_commit_fields(
+            commit_before, commit_after, result.served
+        )
         fingerprint_line = (
             f"B1 env=cpus={fp['cpus']},cpu_model={fp['cpu_model']},image={fp['image']},"
             f"tier=reference,workers={b1.INGEST_GATEWAY_WORKERS},"
@@ -3666,7 +4040,8 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             f"{product_fields}"
             f"p99_leg_split={p99_leg_split_str},"
             f"leg_p99s={leg_p99s_str},"
-            f"{postgres_cost_fields}"
+            f"{postgres_cost_fields},"
+            f"{postgres_commit_fields}"
         )
         print(fingerprint_line, flush=True)
 
@@ -3719,6 +4094,11 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             # GC-4 (FP-GC4-5): reported-only cost diagnostics of this window.
             "postgres_wait_sample": wait_sample,
             "postgres_cost_fields": postgres_cost_fields,
+            # GC-5 (FP-GC5-7/8): the raw ends of the window and the rendered
+            # deltas. The gate consumes the snapshots, never the rendering.
+            "postgres_commit_before": commit_before,
+            "postgres_commit_after": commit_after,
+            "postgres_commit_fields": postgres_commit_fields,
             "diagnostic_notes": diagnostic_notes,
         }
 
@@ -4462,6 +4842,196 @@ def test_gc4_live_postgres_cost_record_is_complete(b1_product_run):
         assert field not in B1_TOPOLOGY_GATING_PLACEMENT_FIELDS
         assert field not in PRODUCT_VERDICT_FIELDS
         assert field not in probe.VERDICT_FIELDS
+
+
+@pytest.mark.b1_live
+@pytest.mark.b1_product
+def test_gc5_commit_shape_reference_profile(b1_product_run):
+    """FP-GC5-7: committed database transactions per served request <= 0.60.
+
+    The one quantitative GC-5 outcome, measured on the existing module-scoped
+    product-local route -- no second workload. Everything before the bar is
+    qualification: the exact product profile and placement, exact request and
+    audit accounting, a harness that was not itself the limit, and complete,
+    non-contaminated counters read from a maintenance database. The three
+    product-promise comparisons keep their GC-1 recorded-only status and
+    decide nothing here.
+    """
+    run = b1_product_run
+    result = run["result"]
+    served = result.served
+    line = run["fingerprint"]
+
+    # (1) The qualifying route: this is the product-local record, at the exact
+    # declared placement, over the unchanged product workload.
+    assert run["placement_ok"] is True, line
+    assert run["profile"].name == PRODUCT_PROFILE_NAME, line
+    assert _parse_b1_env_field(line, "measurement_authority") == AUTHORITY_PRODUCT_LOCAL
+    declaration = run["declaration"]
+    for role, cardinality in PRODUCT_AFFINITY_CARDINALITY.items():
+        effective = run["placement"][role].allowed_cpus
+        assert effective == declaration.allowed(role), role
+        assert len(effective) == cardinality, (role, sorted(effective))
+    assert result.offered == PRODUCT_TOTAL_REQUESTS, f"offered={result.offered}; {line}"
+
+    # (2) Exact accounting: every offered request is served or an error, every
+    # served request is one committed ingest audit row, and the client harness
+    # was not the binding constraint (a bound harness would understate the
+    # transactions the gateway was asked to perform).
+    assert served + result.errors == result.offered, line
+    assert run["committed"] == served, f"committed={run['committed']} served={served}"
+    assert result.max_in_flight < PRODUCT_MAX_IN_FLIGHT, (
+        f"max_in_flight={result.max_in_flight} hit the ceiling; harness was binding"
+    )
+    assert run["worker_set_ok"], (
+        f"worker set changed or under-populated; pre={sorted(run['workers_pre'])} "
+        f"post={sorted(run['workers_post'])}"
+    )
+
+    # (3) Complete cost/lateness operands and complete transaction counters.
+    # A reset, missing, negative, unstable or cross-database observation
+    # cannot satisfy this FP.
+    assert_complete_postgres_cost_record(run)
+    assert_complete_commit_shape_record(run)
+    before = run["postgres_commit_before"]
+    after = run["postgres_commit_after"]
+    assert before.database_name == after.database_name
+    assert before.database_oid == after.database_oid
+
+    # (4) The bar, on the unrounded quotient the mechanism governs.
+    ratio = postgres_xact_commits_per_served(before, after, served)
+    commits = after.xact_commit - before.xact_commit
+    print(
+        f"GC-5 commit shape: xact_commit {before.xact_commit} -> {after.xact_commit} "
+        f"(delta {commits}), served={served}, "
+        f"postgres_xact_commits_per_served={ratio:.6f} "
+        f"(bar: <= {B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED})",
+        flush=True,
+    )
+    assert float(
+        _parse_b1_env_field(line, "postgres_xact_commits_per_served")
+    ) == pytest.approx(ratio, abs=5e-7), line
+    assert ratio <= B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED, (
+        f"the committed-hit path still costs {ratio:.6f} database transactions "
+        f"per served request (delta {commits} over {served} served; bar "
+        f"<= {B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED}); {line}"
+    )
+
+    # (5) The three product-promise comparisons remain recorded, not gating:
+    # this node reads their truthful tokens and requires none of them to be
+    # `met`.
+    for field_name in PRODUCT_VERDICT_FIELDS:
+        assert _parse_b1_env_field(line, field_name) in (VERDICT_MET, VERDICT_MISSED)
+
+
+@pytest.mark.b1_live
+@pytest.mark.b1_product
+def test_gc5_product_record_carries_commit_cost_and_lateness_context(b1_product_run):
+    """FP-GC5-8: the whole context is published, and none of it is a bar.
+
+    CPU per served request on both sides, max in flight, due-time p99, both
+    three-leg lateness views, the GC-4 wait histogram with its raw counts, and
+    the eight transaction/WAL fields. Every one of them is recorded so review
+    can see whether the mechanism moved cost or queueing elsewhere; only the
+    commit ratio is consumed by GC-5 outcome logic.
+    """
+    run = b1_product_run
+    line = run["fingerprint"]
+    result = run["result"]
+
+    # (1) Gateway and PostgreSQL cost per served request, in flight, p99 and
+    # both lateness views are present and are this run's own values.
+    cpu_ms = _parse_b1_env_field(line, "cpu_ms_per_req")
+    assert cpu_ms == DIAGNOSTIC_UNAVAILABLE or float(cpu_ms) > 0, line
+    postgres_cpu = _parse_b1_env_field(line, "postgres_cpu_us_per_req")
+    assert float(postgres_cpu) == pytest.approx(
+        run["postgres_usage_usec"] / result.served, abs=5e-4
+    )
+    assert int(_parse_b1_env_field(line, "max_in_flight")) == result.max_in_flight
+    assert float(_parse_b1_env_field(line, "p99_ms")) == pytest.approx(result.p99, abs=0.05)
+    assert _parse_b1_env_field(line, "p99_leg_split") == b1.serialize_leg_triple(
+        result.p99_leg_split
+    )
+    assert _parse_b1_env_field(line, "leg_p99s") == b1.serialize_leg_triple(result.leg_p99s)
+
+    # (2) The GC-4 wait fields in one of their two admitted representations.
+    sample = run["postgres_wait_sample"]
+    reason = postgres_wait_sample_failure(sample)
+    wait_fields = {
+        field: _parse_b1_env_field(line, field) for field in B1_POSTGRES_COST_FIELDS[1:]
+    }
+    if reason is None:
+        assert int(wait_fields["postgres_wait_scheduled"]) == sample.scheduled
+        assert int(wait_fields["postgres_wait_completed"]) == sample.completed
+        assert wait_fields["postgres_wait_failed"] == "0"
+        assert int(wait_fields["postgres_wait_observations"]) == sample.observations
+        assert wait_fields["postgres_wait_events_pct"] == (
+            serialize_postgres_wait_histogram(sample.histogram)
+        )
+    else:
+        assert set(wait_fields.values()) == {DIAGNOSTIC_UNAVAILABLE}, wait_fields
+        assert any("postgres wait sampler" in note for note in run["diagnostic_notes"])
+
+    # (3) The eight transaction/WAL fields, in their pinned order, after the
+    # six GC-4 cost fields -- so no gating field ever moves behind them.
+    at = line.index("leg_p99s=")
+    for field in B1_POSTGRES_COST_FIELDS + B1_POSTGRES_COMMIT_FIELDS:
+        position = line.index(f",{field}=")
+        assert position > at, f"{field} is out of order"
+        at = position
+    before = run["postgres_commit_before"]
+    after = run["postgres_commit_after"]
+    assert postgres_commit_snapshot_failure(before, after, result.served) is None
+    assert line.endswith(
+        serialize_postgres_commit_fields(before, after, result.served)
+    ), line
+    wal_sync_delta = after.wal_sync - before.wal_sync
+    print(
+        "GC-5 recorded context: "
+        f"cpu_ms_per_req={cpu_ms} postgres_cpu_us_per_req={postgres_cpu} "
+        f"max_in_flight={result.max_in_flight} p99_ms={result.p99:.1f} "
+        f"p99_leg_split={b1.serialize_leg_triple(result.p99_leg_split)} "
+        f"leg_p99s={b1.serialize_leg_triple(result.leg_p99s)} "
+        f"xact_commit_delta={after.xact_commit - before.xact_commit} "
+        f"xact_rollback_delta={after.xact_rollback - before.xact_rollback} "
+        f"wal_records_delta={after.wal_records - before.wal_records} "
+        f"wal_bytes_delta={after.wal_bytes - before.wal_bytes} "
+        f"wal_write_delta={after.wal_write - before.wal_write} "
+        f"wal_sync_delta={wal_sync_delta} "
+        f"wal_syncs_per_served={wal_sync_delta / result.served:.6f}",
+        flush=True,
+    )
+
+    # (4) None of that context is a GC-5 outcome: the gate node compares
+    # nothing but the transaction ratio and the record's own identity.
+    source = Path(__file__).read_text(encoding="utf-8")
+    gate = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_gc5_commit_shape_reference_profile"
+    )
+    compared: list[str] = []
+    for node in ast.walk(gate):
+        if isinstance(node, ast.Assert):
+            compared.append(ast.unparse(node.test))
+    proxies = (
+        "cpu_ms_per_req",
+        "postgres_cpu_us_per_req",
+        "p99",
+        "leg_p99s",
+        "p99_leg_split",
+        "postgres_wait_",
+        "wal_",
+    )
+    for rendered in compared:
+        for proxy in proxies:
+            assert proxy not in rendered, (proxy, rendered)
+        # The product comparisons may be READ for their truthful token; they
+        # may never be required to be `met`.
+        assert "== VERDICT_MET" not in rendered, rendered
+    assert any(
+        "B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED" in rendered for rendered in compared
+    ), "the gate no longer compares the transaction ratio"
 
 
 @pytest.mark.b1_live
@@ -6421,6 +6991,10 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
         n for n in ast.walk(fixture)
         if isinstance(n, ast.FunctionDef) and n.name == "_after_window"
     )
+    prologue_callback = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.FunctionDef) and n.name == "_after_prologue"
+    )
     warning = b"WARNING:  Exceeded concurrency limit.\n"
     log_path = tmp_path / "gateway.log"
     marks = {}
@@ -6474,6 +7048,30 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
             return self.next_sample
 
     wait_sampler = _FakeWaitSampler()
+
+    class _FakeStatsReader:
+        """GC-5: records WHERE in the callback the post-window snapshot is taken."""
+
+        def __init__(self):
+            self.snapshots = 0
+            self.published = 0
+            self.next_snapshot = _commit_snapshot(xact_commit=9_000)
+
+        def snapshot(self):
+            self.snapshots += 1
+            return self.next_snapshot
+
+        def published_snapshot(self):
+            # The publication wait and the stability rule are the reader's own
+            # contract; what this callback owes is ORDER -- the post-window
+            # snapshot is taken after the sampler stopped and after the log
+            # prefix closed, and before the fixture's post-window audit count.
+            assert wait_sampler.stops >= 1
+            assert "log_prefix_bytes" in marks
+            self.published += 1
+            return self.next_snapshot
+
+    stats_reader = _FakeStatsReader()
     namespace = {
         "b1": b1,
         "marks": marks,
@@ -6483,14 +7081,35 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
         "log_path": log_path,
         "B1_ROLES": B1_ROLES,
         "wait_sampler": wait_sampler,
+        "stats_reader": stats_reader,
         "postgres_wait_sample_failure": postgres_wait_sample_failure,
         "_read_cpu_files": _fake_read_cpu_files,
         "_gateway_set_busy_usec": _fake_busy,
         "_try_diagnostic": _try_diagnostic,
         "_snapshot_container_log": _snapshot_container_log,
     }
-    exec(compile(ast.Module(body=[collector, callback], type_ignores=[]),
+    exec(compile(ast.Module(body=[collector, callback, prologue_callback],
+                            type_ignores=[]),
                  "<fixture-callback>", "exec"), namespace)
+
+    # GC-5: the pre-window collection ORDER, executed rather than described.
+    # The transaction snapshot is taken AFTER the unmeasured prologue's own
+    # audit-count query -- so the prologue's transactions are outside the
+    # measured delta -- and BEFORE the wait sampler opens its connection.
+    order: list[str] = []
+    namespace["_committed_ingest_rows"] = lambda _dsn: order.append("audit-count") or 7
+    namespace["dsn"] = "postgresql://ignored/db"
+    stats_reader.snapshot = lambda: (
+        order.append("snapshot") or stats_reader.next_snapshot
+    )
+    wait_sampler.start = lambda: order.append("sampler-start")
+    namespace["_after_prologue"]()
+    assert order == ["audit-count", "snapshot", "sampler-start"], order
+    assert marks["committed_before"] == 7
+    assert marks["postgres_commit_before"] is stats_reader.next_snapshot
+    marks.clear()
+    stats_reader.snapshot = stats_reader.__class__.snapshot.__get__(stats_reader)
+
     namespace["_after_window"]()
     assert wait_sampler.stops == 1
     assert marks["postgres_wait_sample"].completed == 600
@@ -6501,6 +7120,10 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     assert marks["busy_after"] == {0: 7, 1: 7}
     assert any("postgres cgroup files" in note for note in marks["diagnostic_notes"])
     assert marks["log_prefix_bytes"] == len(warning) * 2
+    # GC-5: the post-window transaction snapshot is taken by the same callback,
+    # exactly once, after the log prefix closed.
+    assert stats_reader.published == 1
+    assert marks["postgres_commit_after"] is stats_reader.next_snapshot
 
     with log_path.open("ab") as output:
         output.write(warning * 2)  # Later shed-probe phase must not enter the prefix.
@@ -6599,6 +7222,28 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     assert namespace["postgres_cost_fields"] == serialize_postgres_cost_fields(
         4500, 9, marks["postgres_wait_sample"]
     )
+    # GC-5: the real transaction-field serialization statement, on a window
+    # whose two ends are this test's own snapshots.
+    commit_assign = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "postgres_commit_fields"
+            for t in n.targets
+        )
+    )
+    commit_before = _commit_snapshot(xact_commit=1_000, wal_sync=100)
+    commit_after = _commit_snapshot(xact_commit=1_003, wal_sync=101)
+    namespace.update(
+        serialize_postgres_commit_fields=serialize_postgres_commit_fields,
+        commit_before=commit_before,
+        commit_after=commit_after,
+    )
+    exec(compile(ast.Module(body=[commit_assign], type_ignores=[]),
+                 "<fixture-commit>", "exec"), namespace)
+    assert namespace["postgres_commit_fields"] == serialize_postgres_commit_fields(
+        commit_before, commit_after, 9
+    )
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), "<fixture-line>", "exec"),
          namespace)
     yielded = eval(compile(ast.Expression(mapping), "<fixture-mapping>", "eval"), namespace)
@@ -6613,14 +7258,31 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     # GC-4: the six reported-only cost fields close the line, after both
     # lateness legs, and the sample travels in the yielded mapping too.
     at = yielded["fingerprint"].index("leg_p99s=")
-    for field_name in B1_POSTGRES_COST_FIELDS:
+    for field_name in B1_POSTGRES_COST_FIELDS + B1_POSTGRES_COMMIT_FIELDS:
         position = yielded["fingerprint"].index(f",{field_name}=")
         assert position > at, field_name
         at = position
     assert yielded["fingerprint"].endswith(
-        serialize_postgres_cost_fields(4500, 9, marks["postgres_wait_sample"])
+        serialize_postgres_commit_fields(commit_before, commit_after, 9)
     )
+    assert serialize_postgres_cost_fields(
+        4500, 9, marks["postgres_wait_sample"]
+    ) in yielded["fingerprint"]
     assert _parse_b1_env_field(yielded["fingerprint"], "postgres_cpu_us_per_req") == "500.000"
+    # Three commits over nine served requests, carried unrounded enough to
+    # decide the FP-GC5-7 bar.
+    assert _parse_b1_env_field(
+        yielded["fingerprint"], "postgres_xact_commits_per_served"
+    ) == "0.333333"
+    assert yielded["postgres_commit_before"] is commit_before
+    assert yielded["postgres_commit_after"] is commit_after
+    assert commit_shape_record_failures(
+        {
+            "result": SimpleNamespace(served=9),
+            "postgres_commit_before": commit_before,
+            "postgres_commit_after": commit_after,
+        }
+    ) == []
     assert yielded["postgres_wait_sample"] is marks["postgres_wait_sample"]
     assert postgres_cost_record_failures(
         {
@@ -9087,7 +9749,9 @@ def test_gc4_postgres_wait_sampler_classifies_serializes_and_stops():
     connection = _FakeWaitConnection(
         rows=[("active", None, None, 2), ("active", "LWLock", "WALWrite", 1)]
     )
-    sampler = B1PostgresWaitSampler(lambda: connection, interval_s=0.001)
+    sampler = B1PostgresWaitSampler(
+        lambda: connection, target_database="dbagent", interval_s=0.001
+    )
     sampler.start()
     try:
         _drain_sampler(sampler, at_least=3)
@@ -9107,9 +9771,15 @@ def test_gc4_postgres_wait_sampler_classifies_serializes_and_stops():
     statement, parameters = connection.statements[0]
     assert "pg_backend_pid()" in statement
     assert "backend_type = 'client backend'" in statement
-    assert "datname = current_database()" in statement
+    # GC-5: the sampler lives on a maintenance database now, so the measured
+    # database is named explicitly rather than taken from the connection.
+    assert "datname = %(target_database)s" in statement
+    assert "current_database()" not in statement
     assert "state <> 'idle'" in statement
-    assert parameters == {"application_name": B1_WAIT_SAMPLER_APPLICATION_NAME}
+    assert parameters == {
+        "application_name": B1_WAIT_SAMPLER_APPLICATION_NAME,
+        "target_database": "dbagent",
+    }
     assert threading.active_count() >= 1
     assert not any(
         thread.name == B1_WAIT_SAMPLER_APPLICATION_NAME and thread.is_alive()
@@ -9121,7 +9791,9 @@ def test_gc4_postgres_wait_sampler_classifies_serializes_and_stops():
     # (4) A failing sample is RECORDED, never raised, and never counted as a
     # completed one.
     failing = _FakeWaitConnection(rows=[("active", None, None, 1)], raises=True)
-    failing_sampler = B1PostgresWaitSampler(lambda: failing, interval_s=0.001)
+    failing_sampler = B1PostgresWaitSampler(
+        lambda: failing, target_database="dbagent", interval_s=0.001
+    )
     failing_sampler.start()
     try:
         _drain_sampler(failing_sampler, at_least=2)
@@ -9137,7 +9809,7 @@ def test_gc4_postgres_wait_sampler_classifies_serializes_and_stops():
     def _refuse():
         raise RuntimeError("no diagnostic connection")
 
-    unavailable = B1PostgresWaitSampler(_refuse)
+    unavailable = B1PostgresWaitSampler(_refuse, target_database="dbagent")
     with pytest.raises(RuntimeError):
         unavailable.start()
     assert unavailable.started is False
@@ -9149,7 +9821,7 @@ def test_gc4_postgres_wait_sampler_classifies_serializes_and_stops():
     gate = threading.Event()
     stuck = _FakeWaitConnection(rows=[], gate=gate)
     stuck_sampler = B1PostgresWaitSampler(
-        lambda: stuck, interval_s=0.001, join_timeout_s=0.2
+        lambda: stuck, target_database="dbagent", interval_s=0.001, join_timeout_s=0.2
     )
     stuck_sampler.start()
     try:
@@ -9370,3 +10042,338 @@ def test_gc4_probe_arm_is_written_when_only_the_wait_sampler_is_unavailable():
     ) or ""
     for forbidden in ("postgres_wait_sample", "failed", "histogram", "scheduled"):
         assert forbidden not in validator_src.split('"""')[-1], forbidden
+
+
+# ---------------------------------------------------------------------------
+# GC-5 (FP-GC5-7/8) — the maintenance-database stats reader and the eight
+# transaction/WAL fields, container-free. Real threads are not needed here:
+# the reader is synchronous and its connection is faked.
+# ---------------------------------------------------------------------------
+
+
+def _commit_snapshot(**overrides) -> B1PostgresCommitSnapshot:
+    base = dict(
+        database_name="dbagent",
+        database_oid=16384,
+        xact_commit=1_000,
+        xact_rollback=5,
+        database_stats_reset="2026-09-17 00:00:00+00",
+        wal_records=2_000,
+        wal_bytes=900_000,
+        wal_write=300,
+        wal_sync=120,
+        wal_stats_reset="2026-09-17 00:00:00+00",
+    )
+    base.update(overrides)
+    return B1PostgresCommitSnapshot(**base)
+
+
+class _FakeStatsCursor:
+    def __init__(self, connection):
+        self._connection = connection
+        self.closed = False
+
+    def execute(self, statement, parameters=None):
+        self._connection.statements.append((statement, parameters))
+        if B1_WAL_STATS_SQL in statement:
+            self._connection.rows = list(self._connection.wal_rows)
+        else:
+            self._connection.rows = list(self._connection.database_rows())
+
+    def fetchall(self):
+        return list(self._connection.rows)
+
+    def close(self):
+        self.closed = True
+        self._connection.closed_cursors += 1
+
+
+class _FakeStatsConnection:
+    """A DBAPI-shaped stand-in whose target counter can advance per read."""
+
+    def __init__(self, commits, *, oid=16384, datname="dbagent", wal_rows=None,
+                 increasing=False):
+        self.commits = list(commits)
+        self.increasing = increasing
+        self.oid = oid
+        self.datname = datname
+        self.wal_rows = wal_rows or [(2_000, 900_000, 300, 120, "2026-09-17 00:00:00+00")]
+        self.statements: list = []
+        self.rows: list = []
+        self.closed = False
+        self.closed_cursors = 0
+        self.reads = 0
+
+    def database_rows(self):
+        if self.increasing:
+            value = self.commits[0] + self.reads
+        else:
+            value = self.commits[min(self.reads, len(self.commits) - 1)]
+        self.reads += 1
+        return [(self.oid, self.datname, value, 5, "2026-09-17 00:00:00+00")]
+
+    def cursor(self):
+        return _FakeStatsCursor(self)
+
+    def close(self):
+        self.closed = True
+
+
+def test_gc5_postgres_snapshot_uses_a_distinct_maintenance_database():
+    """FP-GC5-7: both readers leave the measured database's counter alone.
+
+    The DSN rewrite, the retained sampler exclusion, the target identity, the
+    publication/stability rule and the unavailable-not-zero behaviour, all
+    without a container: a reader that connected to the measured database
+    would commit its own read transactions into the very counter it reports.
+    """
+    target = "postgresql+psycopg2://dbagent:dbagent@127.0.0.1:5433/dbagent"
+
+    # (1) The DSN rewrite: same server, same credentials, a DIFFERENT database,
+    # and an application name that identifies the reader.
+    assert target_database_name(target) == "dbagent"
+    assert maintenance_database_name(target) == B1_MAINTENANCE_DATABASE
+    rewritten = maintenance_dsn(target, B1_STATS_READER_APPLICATION_NAME)
+    from sqlalchemy.engine import make_url
+
+    url = make_url(rewritten)
+    assert url.database == B1_MAINTENANCE_DATABASE != target_database_name(target)
+    assert (url.host, url.port, url.username, url.password) == (
+        "127.0.0.1", 5433, "dbagent", "dbagent",
+    )
+    assert url.query["application_name"] == B1_STATS_READER_APPLICATION_NAME
+    assert url.get_backend_name() == "postgresql"
+
+    # ...and when the measured database IS `postgres`, the maintenance one is
+    # the documented alternate, never the target itself.
+    self_named = "postgresql://dbagent@127.0.0.1:5433/postgres"
+    assert maintenance_database_name(self_named) == B1_MAINTENANCE_DATABASE_ALTERNATE
+    assert make_url(
+        maintenance_dsn(self_named, B1_STATS_READER_APPLICATION_NAME)
+    ).database == B1_MAINTENANCE_DATABASE_ALTERNATE
+    with pytest.raises(B1PlacementError):
+        target_database_name("postgresql://dbagent@127.0.0.1:5433/")
+
+    # (2) The GC-4 wait sampler moved with it and kept its own exclusion: its
+    # connection is the maintenance one, its application name is unchanged,
+    # and the measured database is now named explicitly in the statement.
+    sampler_dsn = maintenance_dsn(target, B1_WAIT_SAMPLER_APPLICATION_NAME)
+    sampler_url = make_url(sampler_dsn)
+    assert sampler_url.database == B1_MAINTENANCE_DATABASE
+    assert sampler_url.query["application_name"] == B1_WAIT_SAMPLER_APPLICATION_NAME
+    assert "coalesce(application_name, '') <> %(application_name)s" in B1_WAIT_SAMPLE_SQL
+    assert "datname = %(target_database)s" in B1_WAIT_SAMPLE_SQL
+    assert "current_database()" not in B1_WAIT_SAMPLE_SQL
+
+    # (3) The reader asks for the measured database by name and reads the
+    # cluster's WAL row, through one connection it owns.
+    connection = _FakeStatsConnection([1_000])
+    reader = B1PostgresStatsReader(
+        lambda: connection, target_database="dbagent",
+        sleep=lambda _s: None, monotonic=lambda: 0.0,
+    )
+    snapshot = reader.snapshot()
+    assert snapshot.database_name == "dbagent" and snapshot.database_oid == 16384
+    assert snapshot.xact_commit == 1_000 and snapshot.xact_rollback == 5
+    assert (snapshot.wal_records, snapshot.wal_bytes) == (2_000, 900_000)
+    assert (snapshot.wal_write, snapshot.wal_sync) == (300, 120)
+    statements = [statement for statement, _ in connection.statements]
+    assert any("pg_stat_database" in statement for statement in statements)
+    assert any("pg_stat_wal" in statement for statement in statements)
+    assert connection.statements[0][1] == {"target_database": "dbagent"}
+    for statement in statements:
+        assert "current_database()" not in statement, statement
+    reader.close()
+    assert connection.closed is True
+
+    # (4) A missing or duplicated target row is a failure, not a guess.
+    for rows in ([], [1, 2]):
+        broken = _FakeStatsConnection([1_000])
+        broken.database_rows = lambda rows=rows: [
+            (16384, "dbagent", 1, 0, "r") for _ in rows
+        ]
+        with pytest.raises(B1PlacementError):
+            B1PostgresStatsReader(
+                lambda: broken, target_database="dbagent"
+            ).snapshot()
+
+    # (5) Publication and stability: the reader waits at least 1.1 s, then
+    # reads until two consecutive counters 100 ms apart agree.
+    slept: list[float] = []
+    ticking = _FakeStatsConnection([1_000, 1_005, 1_007, 1_007, 1_007])
+    clock = {"now": 0.0}
+
+    def _sleep(seconds):
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    stable = B1PostgresStatsReader(
+        lambda: ticking, target_database="dbagent",
+        sleep=_sleep, monotonic=lambda: clock["now"],
+    )
+    assert stable.wait_until_published() == 1_007
+    assert slept[0] == B1_STATS_PUBLICATION_WAIT_S
+    assert slept[1:] == [B1_STATS_STABLE_INTERVAL_S] * (len(slept) - 1)
+
+    # ...and a counter that never settles is a bounded failure, not a hang.
+    forever = _FakeStatsConnection([1], increasing=True)
+    runaway = {"now": 0.0}
+
+    def _runaway_sleep(seconds):
+        runaway["now"] += seconds
+
+    with pytest.raises(B1PlacementError, match="did not settle"):
+        B1PostgresStatsReader(
+            lambda: forever, target_database="dbagent",
+            sleep=_runaway_sleep, monotonic=lambda: runaway["now"],
+        ).wait_until_published()
+
+    # (6) Closing a reader that never connected is safe, and a close failure
+    # cannot fail the run.
+    B1PostgresStatsReader(lambda: None, target_database="dbagent").close()
+
+    class _CloseRaises(_FakeStatsConnection):
+        def close(self):
+            raise RuntimeError("induced close failure")
+
+    raising = _CloseRaises([1])
+    closing_reader = B1PostgresStatsReader(
+        lambda: raising, target_database="dbagent"
+    )
+    closing_reader.snapshot()
+    closing_reader.close()
+
+
+def test_gc5_commit_shape_fields_serialize_honestly_and_only_ratio_gates():
+    """FP-GC5-7/8: exact fields and arithmetic, the 0.60 boundary, no proxies."""
+    before = _commit_snapshot(xact_commit=1_000, xact_rollback=5,
+                              wal_records=2_000, wal_bytes=900_000,
+                              wal_write=300, wal_sync=120)
+    after = _commit_snapshot(xact_commit=1_300, xact_rollback=9,
+                             wal_records=4_400, wal_bytes=1_800_000,
+                             wal_write=460, wal_sync=180)
+
+    # (1) Exact field inventory, order and arithmetic.
+    rendered = serialize_postgres_commit_fields(before, after, 1_000)
+    fields = [pair.split("=", 1) for pair in rendered.split(",")]
+    assert [name for name, _ in fields] == list(B1_POSTGRES_COMMIT_FIELDS)
+    values = dict(fields)
+    assert values["postgres_xact_commit_delta"] == "300"
+    assert values["postgres_xact_rollback_delta"] == "4"
+    assert values["postgres_xact_commits_per_served"] == "0.300000"
+    assert values["postgres_wal_records_delta"] == "2400"
+    assert values["postgres_wal_bytes_delta"] == "900000"
+    assert values["postgres_wal_write_delta"] == "160"
+    assert values["postgres_wal_sync_delta"] == "60"
+    assert values["postgres_wal_syncs_per_served"] == "0.060000"
+    assert postgres_xact_commits_per_served(before, after, 1_000) == 0.3
+
+    # (2) The ratio is computed against SERVED, not offered, and unrounded:
+    # a value that renders as `0.600000` but exceeds the bar still fails it.
+    assert postgres_xact_commits_per_served(before, after, 500) == 0.6
+    exactly = _commit_snapshot(xact_commit=1_600)
+    assert postgres_xact_commits_per_served(before, exactly, 1_000) == 0.6
+    assert (
+        postgres_xact_commits_per_served(before, exactly, 1_000)
+        <= B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED
+    ), "the boundary value 0.60 must satisfy the bar"
+    just_over = _commit_snapshot(xact_commit=1_600 + 1)
+    ratio = postgres_xact_commits_per_served(before, just_over, 1_000)
+    assert ratio > B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED
+    rounding = _commit_snapshot(xact_commit=1_000 + 600_000)
+    rounded_ratio = postgres_xact_commits_per_served(before, rounding, 1_000_000)
+    assert rounded_ratio == 0.6
+    barely = _commit_snapshot(xact_commit=1_000 + 600_001)
+    barely_ratio = postgres_xact_commits_per_served(before, barely, 1_000_000)
+    assert f"{barely_ratio:.6f}" == "0.600001"
+    assert barely_ratio > B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED, (
+        "a ratio above the bar must fail even when its rendering is close"
+    )
+    # ...and a ratio that ROUNDING would wash out still exceeds the bar: the
+    # quantity is compared unrounded, so a `round(..., 6)` in the computation
+    # would turn this into a false pass.
+    washed = _commit_snapshot(xact_commit=1_000 + 6_000_001)
+    washed_ratio = postgres_xact_commits_per_served(before, washed, 10_000_000)
+    assert round(washed_ratio, 6) == 0.6, washed_ratio
+    assert washed_ratio > B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED, (
+        "the ratio is rounded before it is compared"
+    )
+    assert washed_ratio == pytest.approx(0.6000001, abs=1e-12)
+
+    # (3) Every unusable observation renders `unavailable` in ALL eight
+    # fields -- never a zero, never a mixture -- and names its reason.
+    unusable = [
+        ((None, after, 1_000), "no measured-window PostgreSQL transaction snapshot"),
+        ((before, None, 1_000), "no measured-window PostgreSQL transaction snapshot"),
+        ((before, _commit_snapshot(database_oid=99, xact_commit=1_300), 1_000),
+         "changed identity"),
+        ((before, _commit_snapshot(database_name="other", xact_commit=1_300), 1_000),
+         "changed identity"),
+        ((before, _commit_snapshot(xact_commit=1_300,
+                                   database_stats_reset="2026-09-17 01:00:00+00"), 1_000),
+         "pg_stat_database was reset"),
+        ((before, _commit_snapshot(xact_commit=1_300,
+                                   wal_stats_reset="2026-09-17 01:00:00+00"), 1_000),
+         "pg_stat_wal was reset"),
+        ((before, _commit_snapshot(xact_commit=999), 1_000), "xact_commit decreased"),
+        ((before, _commit_snapshot(xact_commit=1_300, wal_sync=1), 1_000),
+         "wal_sync decreased"),
+        ((before, _commit_snapshot(xact_commit=1_000), 1_000), "no database transaction"),
+        ((before, after, 0), "served is not a positive count"),
+        ((before, after, None), "served is not a positive count"),
+        ((before, after, True), "served is not a positive count"),
+    ]
+    for (start, end, served), expected in unusable:
+        reason = postgres_commit_snapshot_failure(start, end, served)
+        assert reason is not None and expected in reason, (expected, reason)
+        degraded = dict(
+            pair.split("=", 1)
+            for pair in serialize_postgres_commit_fields(start, end, served).split(",")
+        )
+        assert set(degraded) == set(B1_POSTGRES_COMMIT_FIELDS)
+        for field in B1_POSTGRES_COMMIT_FIELDS:
+            assert degraded[field] == DIAGNOSTIC_UNAVAILABLE, (expected, field)
+            assert degraded[field] not in ("0", "0.000000"), (expected, field)
+        # ...and such a record cannot satisfy FP-GC5-7.
+        run = {
+            "result": SimpleNamespace(served=served),
+            "postgres_commit_before": start,
+            "postgres_commit_after": end,
+        }
+        assert commit_shape_record_failures(run), expected
+        with pytest.raises(B1PlacementError, match="incomplete GC-5 commit-shape"):
+            assert_complete_commit_shape_record(run)
+
+    # (4) A complete observation is admissible, and the validator judges
+    # nothing else: no CPU, p99, in-flight, wait or WAL direction.
+    good = {
+        "result": SimpleNamespace(served=1_000),
+        "postgres_commit_before": before,
+        "postgres_commit_after": after,
+    }
+    assert commit_shape_record_failures(good) == []
+    assert_complete_commit_shape_record(good)
+    validator_source = ast.get_source_segment(
+        Path(__file__).read_text(encoding="utf-8"),
+        next(
+            node for node in ast.walk(ast.parse(Path(__file__).read_text(encoding="utf-8")))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "commit_shape_record_failures"
+        ),
+    ) or ""
+    body = validator_source.split('"""')[-1]
+    for proxy in ("cpu", "p99", "max_in_flight", "wait", "wal"):
+        assert proxy not in body.lower(), proxy
+
+    # (5) Reported-only, structurally: no transaction field is a gating
+    # placement field, a product verdict, a GC-3 verdict or a GC-3 record key.
+    for field in B1_POSTGRES_COMMIT_FIELDS:
+        assert field not in B1_PLACEMENT_FIELDS
+        assert field not in B1_GATING_PLACEMENT_FIELDS
+        assert field not in B1_TOPOLOGY_PLACEMENT_FIELDS
+        assert field not in B1_TOPOLOGY_GATING_PLACEMENT_FIELDS
+        assert field not in PRODUCT_VERDICT_FIELDS
+        assert field not in probe.VERDICT_FIELDS
+        assert field not in probe.RECORD_KEYS
+    # ...and the eight fields are distinct from the six GC-4 cost fields.
+    assert not set(B1_POSTGRES_COMMIT_FIELDS) & set(B1_POSTGRES_COST_FIELDS)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -136,15 +137,46 @@ def _audit_count(session, investigation_id, action: str) -> int:
     )
 
 
+GC5_CONTENDERS = 8
+#: The only transaction-control statements the happy path may add per request.
+GC5_SAVEPOINT_CONTROL = ("SAVEPOINT ", "RELEASE SAVEPOINT ")
+#: ...and the failure-path one, owned by FP-GC5-2 rather than by a happy path.
+GC5_ROLLBACK_TO_SAVEPOINT = "ROLLBACK TO SAVEPOINT "
+
+
+def _split_cursor_statements(statements: list[str]) -> tuple[list[str], list[str]]:
+    """Partition observed cursor statements into data-modifying and control.
+
+    Transaction control is recognised by its own leading keyword, never by a
+    substring: a data-modifying statement that merely mentions a savepoint in
+    a comment stays on the data side and still has to answer for itself.
+    """
+    data: list[str] = []
+    control: list[str] = []
+    for statement in statements:
+        head = statement.strip().upper()
+        if head.startswith(GC5_SAVEPOINT_CONTROL) or head.startswith(
+            GC5_ROLLBACK_TO_SAVEPOINT
+        ):
+            control.append(statement.strip())
+        else:
+            data.append(statement)
+    return data, control
+
+
 @pytest.mark.asyncio
 async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgres_dsn):
-    """n=8 contenders; barrier AFTER every lock-free fused merge has missed.
+    """n=8 contenders on ONE loop; barrier immediately before the real lock.
 
-    Call the real fused statement BEFORE entering the barrier so all eight
-    transactions have observed 'missing' before any may open (C5 / FP-IG-16 /
-    FP-GC2-3). The fused statement takes no advisory lock and, on a miss,
-    leaves no row lock, so all eight can sit in the rendezvous at once; the
-    advisory lock and the deciding re-read after it are unpatched product code.
+    GC-5 moved the lock-free fused merge into a per-worker group that runs its
+    candidates sequentially in one thread, so the old rendezvous on the fused
+    seam would now deadlock rather than race. The contention that matters is
+    unchanged and is where it always was: all eight fused statements miss in
+    one read-only batch transaction, and only then do eight individual
+    fallback transactions race at the advisory lock. Each waits in the
+    threadpool immediately before the real ``acquire_correlation_lock`` and
+    then calls it, so removing the lock or the deciding re-read still lets all
+    eight open (C5 / FP-IG-16 / FP-GC2-3 / FP-GC5-3).
     """
     engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
@@ -161,26 +193,43 @@ async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgr
     arrived = {"count": 0}
     count_lock = threading.Lock()
     isolation_levels: list[str] = []
+    #: The backend each capture came from. Eight distinct backends is what
+    #: makes the capture a claim about the eight CONTENDING transactions: a
+    #: capture moved into the shared batch Session would report one backend
+    #: eight times, and read committed either way.
+    isolation_backends: list[int] = []
     isolation_lock = threading.Lock()
+    fused_results: list = []
 
     from rca_common import investigation_repo as repo
 
     real_merge = repo.merge_existing_event_with_audit
+    real_lock = repo.acquire_correlation_lock
 
-    def gated_merge(session, **kwargs):
-        # Real fused statement first: on an empty slot it must miss, write
-        # nothing, and hold no lock that would stop the other seven arriving.
+    def recording_merge(session, **kwargs):
+        # The real fused statement, inside the shared batch transaction: on an
+        # empty slot every one of them must miss and write nothing.
         result = real_merge(session, **kwargs)
+        with isolation_lock:
+            fused_results.append(result)
+        return result
+
+    def gated_lock(session, platform_key_arg, fingerprint_arg):
+        # Runs in the AnyIO worker thread that owns THIS contender's fallback
+        # Session -- already open after `get_platform` -- immediately before
+        # the real advisory lock. The isolation capture belongs here, not in
+        # the batch Session, so it observes the eight contending transactions
+        # rather than one batch transaction eight times (C5).
         try:
-            assert result is None, f"fused merge hit an empty slot: {result}"
-            # Capture isolation inside the contending transaction (not later);
-            # the helper's execute has already opened it.
-            level = session.execute(text("SHOW transaction_isolation")).scalar()
+            observed = session.execute(
+                text("SELECT current_setting('transaction_isolation'), pg_backend_pid()")
+            ).one()
         except BaseException:
             barrier.abort()
             raise
         with isolation_lock:
-            isolation_levels.append(str(level))
+            isolation_levels.append(str(observed[0]))
+            isolation_backends.append(int(observed[1]))
         with count_lock:
             arrived["count"] += 1
         try:
@@ -189,20 +238,20 @@ async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgr
             raise AssertionError(
                 f"barrier expired; arrived={arrived['count']}/{n}"
             ) from exc
-        return result
-
-    results: list = []
-
-    def one(i: int):
-        return asyncio.run(svc.ingest(_payload(platform_key, fingerprint_summary)))
+        return real_lock(session, platform_key_arg, fingerprint_arg)
 
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("gateway.ingest.merge_existing_event_with_audit", gated_merge)
-            with ThreadPoolExecutor(max_workers=n) as pool:
-                futs = [pool.submit(one, i) for i in range(n)]
-                results = [f.result(timeout=60) for f in futs]
+            mp.setattr("gateway.ingest.merge_existing_event_with_audit", recording_merge)
+            mp.setattr("gateway.ingest.acquire_correlation_lock", gated_lock)
+            results = await asyncio.gather(
+                *[
+                    svc.ingest(_payload(platform_key, fingerprint_summary))
+                    for _ in range(n)
+                ]
+            )
     finally:
+        await svc.close()
         engine.dispose()
 
     opened = [r for r in results if r[0] == 202]
@@ -211,11 +260,20 @@ async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgr
     assert len(merged) == n - 1, f"expected {n-1} merges, got {results}"
     assert len(starter.started) == 1
 
-    # Isolation asserted inside contending transactions (C5).
+    # The race is not vacuous: every fused statement ran once and missed, so
+    # the outcome was decided by the advisory lock and the read under it.
+    assert fused_results == [None] * n, fused_results
+
+    # Isolation asserted inside each contending fallback transaction (C5).
     assert isolation_levels, "no isolation level captured inside contenders"
     assert len(isolation_levels) == n
     for level in isolation_levels:
         assert "read committed" in level.lower().replace("-", " "), level
+    assert len(isolation_backends) == n
+    assert len(set(isolation_backends)) == n, (
+        f"the isolation capture observed {len(set(isolation_backends))} backend(s) "
+        f"for {n} contenders: {isolation_backends}"
+    )
 
     engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
@@ -244,29 +302,31 @@ async def test_concurrent_identical_alerts_open_exactly_one_investigation(postgr
 async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
     """FP-IG-16 merge-vs-open: merger read/insert while an opener is uncommitted.
 
-    No pre-seeded investigation — a committed seed would make the under-lock
+    No pre-seeded investigation -- a committed seed would make the under-lock
     re-read succeed regardless of the advisory lock, so neutralising the lock
     would not turn the test red (review C2).
 
-    Roles are passed through a ``contextvars.ContextVar`` that
-    ``run_in_threadpool`` propagates into the AnyIO worker where
-    ``_ingest_txn`` / the fused merge statement actually run. Inferring role
-    from the outer ThreadPoolExecutor thread id is wrong: that id never
-    appears on the transaction seam (review C2).
+    Roles are immutable event-ID membership, read from the ``event`` the fused
+    helper is called with. Nothing here infers a role from a ``ContextVar``,
+    from a thread identity or from thread-local state: under GC-5 one batch
+    thread runs several contenders' statements in turn, so a per-thread role
+    would be wrong by construction (FP-GC5-3).
 
-    Interleaving (n=8, half/half):
-    - Open racers (4): the real fused merge on an empty slot → all miss →
-      barrier → open path (lock → deciding re-read → open/merge). The winning
-      opener pauses after ``create_investigation`` (still uncommitted) until
-      every merger has run its own fused merge.
-    - Mergers (4): wait until an opener holds an uncommitted open, then run
-      the real fused merge, which must miss because READ COMMITTED cannot see
-      that uncommitted open, and proceed into the lock / re-read / merge path
-      while it is still in flight. This is the merge-vs-open case from
-      §11.3.3 O, now decided by the unpatched under-lock read (FP-GC2-3).
+    Interleaving (n=8, half/half), all on the one pytest event loop:
+    - Open racers (4): enter immediately; their four fused statements miss in
+      one read-only batch; the four fallbacks then rendezvous immediately
+      before the real advisory lock. The winning opener pauses after
+      ``create_investigation`` -- still uncommitted -- until every merger has
+      run its own fused statement.
+    - Mergers (4): each awaits an ``asyncio.Event`` the opener's hook sets
+      through ``loop.call_soon_threadsafe`` before it enters ``svc.ingest`` at
+      all; a synchronous ``threading.Event.wait()`` in a coroutine would block
+      the single loop the drainer runs on and deadlock the test. Their fused
+      statements must then miss, because READ COMMITTED cannot see the
+      uncommitted open, and their fallbacks queue on the real advisory lock.
+      This is the merge-vs-open case from 11.3.3 O, decided by the unpatched
+      under-lock read (FP-GC2-3).
     """
-    import contextvars
-
     engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
     platform_key = f"merge-race-{uuid.uuid4().hex[:8]}"
@@ -276,28 +336,31 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
     n_mergers = n - n_openers
 
     _seed_platform(session_factory, platform_key)
-    # Deliberately no pre-seeded investigation — the open is concurrent.
+    # Deliberately no pre-seeded investigation -- the open is concurrent.
 
     starter = _RecordingStarter()
     svc = _make_service(session_factory, starter)
 
+    # Explicit immutable event IDs, in two disjoint sets. This membership is
+    # the only role seam.
+    opener_event_ids = tuple(str(uuid.uuid4()) for _ in range(n_openers))
+    merger_event_ids = tuple(str(uuid.uuid4()) for _ in range(n_mergers))
+    assert not set(opener_event_ids) & set(merger_event_ids)
+    role_by_event_id = {
+        **{event_id: "opener" for event_id in opener_event_ids},
+        **{event_id: "merger" for event_id in merger_event_ids},
+    }
+
+    loop = asyncio.get_running_loop()
     opener_barrier = threading.Barrier(n_openers, timeout=30)
-    # Set after create_investigation, *before* commit — opener still uncommitted.
-    opener_holding_uncommitted = threading.Event()
-    # Set once every merger has run its own lock-free fused merge.
+    # Set after create_investigation, *before* commit -- opener still
+    # uncommitted. An asyncio.Event, bridged from the threadpool thread.
+    opener_holding_uncommitted = asyncio.Event()
+    # Set once every merger has run its own fused statement.
     mergers_first_find_done = threading.Event()
     arrived = {"count": 0}
     merger_first_finds = {"count": 0}
     count_lock = threading.Lock()
-    # Explicit role seam visible inside the transaction worker thread.
-    role_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-        "ingest_race_role", default="opener"
-    )
-    role_by_index: dict[int, str] = {
-        i: ("opener" if i < n_openers else "merger") for i in range(n)
-    }
-    # Prove roles were observed on the *transaction* thread, not only the
-    # outer executor thread.
     roles_seen_on_txn: list[str] = []
     roles_seen_lock = threading.Lock()
 
@@ -305,21 +368,15 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
 
     real_merge = repo.merge_existing_event_with_audit
     real_create = repo.create_investigation
+    real_lock = repo.acquire_correlation_lock
 
     def gated_merge(session, **kwargs):
-        # Role comes from the contextvar propagated into this AnyIO worker.
-        role = role_var.get()
+        # Role from the immutable event id this call carries, nothing else.
+        role = role_by_event_id[kwargs["event"]["event_id"]]
         with roles_seen_lock:
             roles_seen_on_txn.append(role)
-
+        result = real_merge(session, **kwargs)
         if role == "merger":
-            # Block until an opener has created an investigation but has not
-            # yet committed — the fused statement races an uncommitted open.
-            if not opener_holding_uncommitted.wait(timeout=30):
-                raise AssertionError(
-                    "timed out waiting for opener to hold uncommitted open"
-                )
-            result = real_merge(session, **kwargs)
             assert result is None, (
                 f"READ COMMITTED must not see the uncommitted open; got {result}"
             )
@@ -328,30 +385,36 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
                 if merger_first_finds["count"] >= n_mergers:
                     mergers_first_find_done.set()
             return result
-
-        # Opener path: real fused miss, barrier with other openers, then race.
-        result = real_merge(session, **kwargs)
         try:
             assert result is None, f"fused merge hit an empty slot: {result}"
         except BaseException:
             opener_barrier.abort()
             raise
+        return result
+
+    def gated_lock(session, platform_key_arg, fingerprint_arg):
+        # The openers' rendezvous, immediately before the real lock, in the
+        # fallback thread that owns this contender's own Session. The mergers
+        # reach it later, after the opener already holds it.
         with count_lock:
             arrived["count"] += 1
-        try:
-            opener_barrier.wait()
-        except threading.BrokenBarrierError as exc:
-            raise AssertionError(
-                f"opener barrier expired; arrived={arrived['count']}/{n_openers}"
-            ) from exc
-        return result
+            waiting_for_openers = arrived["count"] <= n_openers
+        if waiting_for_openers:
+            try:
+                opener_barrier.wait()
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError(
+                    f"opener barrier expired; arrived={arrived['count']}/{n_openers}"
+                ) from exc
+        return real_lock(session, platform_key_arg, fingerprint_arg)
 
     def gated_create(session, **kwargs):
         inv = real_create(session, **kwargs)
         # Investigation row is in this transaction but not committed. Signal
-        # mergers, then wait until they have all run their fused merge against
-        # this still-uncommitted state.
-        opener_holding_uncommitted.set()
+        # the mergers from this threadpool thread onto the loop, then wait
+        # until they have all run their fused statement against this
+        # still-uncommitted state.
+        loop.call_soon_threadsafe(opener_holding_uncommitted.set)
         if not mergers_first_find_done.wait(timeout=30):
             raise AssertionError(
                 "timed out waiting for mergers to complete their fused merge "
@@ -359,28 +422,32 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
             )
         return inv
 
-    results: list = [None] * n  # type: ignore[list-item]
+    async def _opener(event_id: str):
+        return await svc.ingest(
+            _payload(platform_key, fingerprint_summary, event_id=event_id)
+        )
 
-    def one(i: int):
-        # Bind role on this executor thread; anyio.to_thread copies the
-        # context into the worker that runs _ingest_txn / gated_merge.
-        role_var.set(role_by_index[i])
-        return asyncio.run(svc.ingest(_payload(platform_key, fingerprint_summary)))
+    async def _merger(event_id: str):
+        await asyncio.wait_for(opener_holding_uncommitted.wait(), 30)
+        return await svc.ingest(
+            _payload(platform_key, fingerprint_summary, event_id=event_id)
+        )
 
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gateway.ingest.merge_existing_event_with_audit", gated_merge)
+            mp.setattr("gateway.ingest.acquire_correlation_lock", gated_lock)
             mp.setattr(repo, "create_investigation", gated_create)
             mp.setattr("gateway.ingest.create_investigation", gated_create)
-            with ThreadPoolExecutor(max_workers=n) as pool:
-                futs = {pool.submit(one, i): i for i in range(n)}
-                for fut in futs:
-                    idx = futs[fut]
-                    results[idx] = fut.result(timeout=60)
+            results = await asyncio.gather(
+                *[_opener(event_id) for event_id in opener_event_ids],
+                *[_merger(event_id) for event_id in merger_event_ids],
+            )
     finally:
         # Unblock any waiter if a contender failed before signalling.
-        opener_holding_uncommitted.set()
         mergers_first_find_done.set()
+        loop.call_soon_threadsafe(opener_holding_uncommitted.set)
+        await svc.close()
         engine.dispose()
 
     opened = [r for r in results if r[0] == 202]
@@ -389,7 +456,7 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
     assert len(merged) == n - 1, f"expected {n-1} merges, got {results}"
     assert len(starter.started) == 1
 
-    # Roles must have been observed on the transaction seam (not defaulted).
+    # Roles must have been observed on the fused-statement seam, by event id.
     with roles_seen_lock:
         seen = list(roles_seen_on_txn)
     assert seen.count("opener") == n_openers, f"opener roles on txn seam: {seen}"
@@ -429,10 +496,19 @@ async def test_merge_racing_open_keeps_single_investigation(postgres_dsn):
 
 @pytest.mark.asyncio
 async def test_gc2_existing_merge_is_one_product_statement_plus_commit(postgres_dsn):
-    """FP-GC2-1/2: one product statement carrying both inserts, then one commit.
+    """FP-GC2-1/2 (re-scoped by GC-5): one fused DML, savepoint control, one commit.
 
     Execution is observed at SQLAlchemy's cursor boundary, so the count is of
-    statements the product really sent, not of calls the test made.
+    statements the product really sent, not of calls the test made. GC-5 puts
+    each candidate inside its own savepoint, so the observations are
+    CLASSIFIED rather than counted raw: exactly one data-modifying statement
+    per request -- the unchanged fused statement, one ``INSERT INTO
+    alert_events``, one ``INSERT INTO audit_log``, no advisory lock -- and the
+    only additional cursor statements the happy path may carry are the
+    enumerated ``SAVEPOINT`` / ``RELEASE SAVEPOINT`` control statements. A
+    second data-modifying statement, any other control statement, a second
+    commit or any rollback fails this test. ``ROLLBACK TO SAVEPOINT`` is a
+    failure-path statement and is owned by FP-GC5-2, never admitted here.
     """
     engine = make_gateway_engine(postgres_dsn)
     session_factory = make_session_factory(engine)
@@ -474,12 +550,18 @@ async def test_gc2_existing_merge_is_one_product_statement_plus_commit(postgres_
     assert body == {"status": "merged", "investigation_id": str(investigation_id)}
     assert starter.started == []
 
-    # (b) Exactly one product statement, carrying both inserts, then one commit.
-    assert len(statements) == 1, statements
-    only = statements[0]
+    # (b) Exactly one data-modifying statement, carrying both inserts; the
+    # only other cursor statements are this request's savepoint and its
+    # release; one commit; no rollback of any kind.
+    data, control = _split_cursor_statements(statements)
+    assert len(data) == 1, data
+    only = data[0]
     assert only.count("INSERT INTO alert_events") == 1, only
     assert only.count("INSERT INTO audit_log") == 1, only
     assert "pg_advisory_xact_lock" not in only
+    for statement in control:
+        assert statement.upper().startswith(GC5_SAVEPOINT_CONTROL), statement
+    assert len(control) == 2, control
     assert len(commits) == 1, commits
     assert rollbacks == []
 
@@ -1150,3 +1232,402 @@ def test_gc4_fused_merge_reduces_server_statement_time(pg_stat_statements_dsn):
         f"control={aggregates['control']:.3f} us/call, ratio={ratio:.4f} "
         f"(bar: <= {GC4_STATEMENT_TIME_RATIO})"
     )
+
+
+# ---------------------------------------------------------------------------
+# GC-5 — the per-worker commit coalescer against real PostgreSQL
+# (FP-GC5-1 / FP-GC5-2 / FP-GC5-3)
+#
+# The metric these nodes own is the number of OUTER commits the product really
+# emitted for n concurrent committed hits, observed at SQLAlchemy's own
+# transaction events rather than counted from calls the test made. Against the
+# pre-GC-5 head the first node observes eight commits for eight requests; under
+# the coalescer it observes one.
+# ---------------------------------------------------------------------------
+
+class _CursorTrace:
+    """Thread-safe record of cursor statements and transaction events."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._lock = threading.Lock()
+        self.statements: list[str] = []
+        self.commits: list[float] = []
+        self.rollbacks: list[float] = []
+        self.savepoints: list[str] = []
+        self.releases: list[str] = []
+        self.rollback_savepoints: list[str] = []
+
+    def _before_cursor(self, conn, cursor, statement, parameters, context, executemany):
+        with self._lock:
+            self.statements.append(statement)
+
+    def _on_commit(self, conn):
+        with self._lock:
+            self.commits.append(time.monotonic())
+
+    def _on_rollback(self, conn):
+        with self._lock:
+            self.rollbacks.append(time.monotonic())
+
+    def _on_savepoint(self, conn, name):
+        with self._lock:
+            self.savepoints.append(str(name))
+
+    def _on_release_savepoint(self, conn, name, context):
+        with self._lock:
+            self.releases.append(str(name))
+
+    def _on_rollback_savepoint(self, conn, name, context):
+        with self._lock:
+            self.rollback_savepoints.append(str(name))
+
+    _HOOKS = (
+        ("before_cursor_execute", "_before_cursor"),
+        ("commit", "_on_commit"),
+        ("rollback", "_on_rollback"),
+        ("savepoint", "_on_savepoint"),
+        ("release_savepoint", "_on_release_savepoint"),
+        ("rollback_savepoint", "_on_rollback_savepoint"),
+    )
+
+    def __enter__(self):
+        for name, attr in self._HOOKS:
+            sa_event.listen(self._engine, name, getattr(self, attr))
+        return self
+
+    def __exit__(self, *exc):
+        for name, attr in self._HOOKS:
+            sa_event.remove(self._engine, name, getattr(self, attr))
+        return False
+
+    def fused(self) -> list[str]:
+        data, _control = _split_cursor_statements(self.statements)
+        return data
+
+
+@pytest.mark.asyncio
+async def test_gc5_eight_concurrent_merges_share_one_durable_commit(postgres_dsn):
+    """FP-GC5-1: eight committed hits, eight fused statements, ONE outer commit.
+
+    The benchmark witness for the coalescer: outer commits per successful merge
+    must be exactly ``1 / 8``, with eight exact event/audit pairs and no 200
+    released before that commit succeeded. Against the pre-GC-5 head the same
+    body observes eight commits -- a red at the governed quantity, not at a
+    missing import.
+    """
+    engine = make_gateway_engine(postgres_dsn)
+    session_factory = make_session_factory(engine)
+    platform_key = f"gc5-batch-{uuid.uuid4().hex[:8]}"
+    fingerprint = f"fp-{uuid.uuid4().hex[:8]}"
+    _seed_platform(session_factory, platform_key)
+    investigation_id = _seed_committed_case(session_factory, platform_key, fingerprint)
+
+    starter = _RecordingStarter()
+    svc = _make_service(session_factory, starter)
+    event_ids = [str(uuid.uuid4()) for _ in range(GC5_CONTENDERS)]
+
+    async def _one(event_id: str):
+        code, body = await svc.ingest(
+            _payload(platform_key, fingerprint, event_id=event_id)
+        )
+        return code, body, time.monotonic()
+
+    try:
+        with _CursorTrace(engine) as trace:
+            results = await asyncio.gather(*[_one(event_id) for event_id in event_ids])
+    finally:
+        engine.dispose()
+
+    # (a) One outer commit for the whole batch, and no rollback at all.
+    assert len(trace.commits) == 1, (
+        f"outer commits per batch = {len(trace.commits)}, expected 1 "
+        f"(bar: {1}/{GC5_CONTENDERS} commits per successful merge)"
+    )
+    assert trace.rollbacks == [], trace.rollbacks
+    assert len(trace.rollback_savepoints) == 0, trace.rollback_savepoints
+
+    # (b) Eight unchanged fused statements, one per request, each carrying both
+    # inserts and no advisory lock; every other statement is savepoint control.
+    fused = trace.fused()
+    assert len(fused) == GC5_CONTENDERS, [statement[:60] for statement in fused]
+    for statement in fused:
+        assert statement.count("INSERT INTO alert_events") == 1, statement
+        assert statement.count("INSERT INTO audit_log") == 1, statement
+        assert "pg_advisory_xact_lock" not in statement
+    assert len(trace.savepoints) == GC5_CONTENDERS, trace.savepoints
+    assert len(trace.releases) == GC5_CONTENDERS, trace.releases
+
+    # (c) Eight exact 200 bodies, none released before the outer commit, and no
+    # workflow for a merge.
+    commit_at = trace.commits[0]
+    for code, body, resolved_at in results:
+        assert code == 200
+        assert body == {
+            "status": "merged",
+            "investigation_id": str(investigation_id),
+        }, body
+        assert resolved_at >= commit_at, (
+            "a 200 was released before the shared durable commit"
+        )
+    assert starter.started == []
+
+    # (d) Eight persisted event/audit pairs, all of them inside that commit.
+    engine = make_gateway_engine(postgres_dsn)
+    session_factory = make_session_factory(engine)
+    try:
+        with session_factory() as session:
+            rows = session.execute(
+                text(
+                    "SELECT event_id, disposition, investigation_id FROM alert_events "
+                    "WHERE platform_key = :p AND disposition = 'merged'"
+                ),
+                {"p": platform_key},
+            ).mappings().all()
+            assert len(rows) == GC5_CONTENDERS, rows
+            assert {str(row["event_id"]) for row in rows} == set(event_ids)
+            assert {row["investigation_id"] for row in rows} == {investigation_id}
+            assert _audit_count(session, investigation_id, "event_merged") == GC5_CONTENDERS
+            assert _audit_count(session, investigation_id, "event_received") == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_gc5_savepoint_isolates_one_merge_failure_and_outer_commit_failure_fails_batch(
+    postgres_dsn,
+):
+    """FP-GC5-2: one bad item is item-local; a failed outer commit fails all.
+
+    (a) uses a REAL immediate constraint failure -- a duplicate ``event_id``
+    against the primary key of ``alert_events`` -- inside a group of eight, so
+    the isolation proved here is PostgreSQL's own savepoint behaviour and not
+    a fake. (b) induces a failure at the one place whose outcome can be
+    uncertain, the outer commit, and requires that no member is released as a
+    success and no row survives.
+    """
+    engine = make_gateway_engine(postgres_dsn)
+    session_factory = make_session_factory(engine)
+    platform_key = f"gc5-savepoint-{uuid.uuid4().hex[:8]}"
+    fingerprint = f"fp-{uuid.uuid4().hex[:8]}"
+    _seed_platform(session_factory, platform_key)
+    investigation_id = _seed_committed_case(session_factory, platform_key, fingerprint)
+
+    starter = _RecordingStarter()
+    svc = _make_service(session_factory, starter)
+
+    # One committed merge first: its event id is the duplicate below.
+    duplicate_event_id = str(uuid.uuid4())
+    code, body = await svc.ingest(
+        _payload(platform_key, fingerprint, event_id=duplicate_event_id)
+    )
+    assert code == 200 and body["status"] == "merged"
+
+    # (a) Eight candidates, one of which repeats that event id.
+    valid_event_ids = [str(uuid.uuid4()) for _ in range(GC5_CONTENDERS - 1)]
+    event_ids = [valid_event_ids[0], duplicate_event_id, *valid_event_ids[1:]]
+    try:
+        with _CursorTrace(engine) as trace:
+            results = await asyncio.gather(
+                *[
+                    svc.ingest(_payload(platform_key, fingerprint, event_id=event_id))
+                    for event_id in event_ids
+                ],
+                return_exceptions=True,
+            )
+    finally:
+        await svc.close()
+
+    from sqlalchemy.exc import IntegrityError
+
+    failed = results[1]
+    assert isinstance(failed, IntegrityError), failed
+    for index, result in enumerate(results):
+        if index == 1:
+            continue
+        assert result == (
+            200,
+            {"status": "merged", "investigation_id": str(investigation_id)},
+        ), (index, result)
+
+    # One savepoint rollback for the bad item, one shared commit for the rest,
+    # and no outer rollback: the surrounding transaction stayed usable.
+    assert len(trace.rollback_savepoints) == 1, trace.rollback_savepoints
+    assert len(trace.commits) == 1, trace.commits
+    assert trace.rollbacks == [], trace.rollbacks
+    assert len(trace.savepoints) == GC5_CONTENDERS, trace.savepoints
+    assert len(trace.releases) == GC5_CONTENDERS - 1, trace.releases
+    assert starter.started == []
+
+    with session_factory() as session:
+        merged_rows = int(
+            session.execute(
+                text(
+                    "SELECT count(*) FROM alert_events WHERE platform_key = :p "
+                    "AND disposition = 'merged'"
+                ),
+                {"p": platform_key},
+            ).scalar()
+        )
+        # The first request plus the seven valid siblings; the duplicate
+        # contributed no second row.
+        assert merged_rows == GC5_CONTENDERS, merged_rows
+        assert _audit_count(session, investigation_id, "event_merged") == GC5_CONTENDERS
+
+    # (b) The outer commit fails: every member fails, nothing persists, and no
+    # member is retried.
+    class _CommitFails:
+        """Session proxy whose outer commit raises before the database commits."""
+
+        def __init__(self, session):
+            object.__setattr__(self, "_session", session)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_session"), name)
+
+        def commit(self):
+            raise RuntimeError("induced outer commit failure")
+
+    class _Ctx:
+        def __init__(self, session):
+            self._session = session
+
+        def __enter__(self):
+            return _CommitFails(self._session.__enter__())
+
+        def __exit__(self, *exc):
+            return self._session.__exit__(*exc)
+
+    def failing_factory():
+        return _Ctx(session_factory())
+
+    failing_starter = _RecordingStarter()
+    failing = _make_service(failing_factory, failing_starter)
+    failing_event_ids = [str(uuid.uuid4()) for _ in range(GC5_CONTENDERS)]
+    try:
+        with _CursorTrace(engine) as failing_trace:
+            failed_results = await asyncio.gather(
+                *[
+                    failing.ingest(
+                        _payload(platform_key, fingerprint, event_id=event_id)
+                    )
+                    for event_id in failing_event_ids
+                ],
+                return_exceptions=True,
+            )
+    finally:
+        await failing.close()
+        engine.dispose()
+
+    assert len(failed_results) == GC5_CONTENDERS
+    for result in failed_results:
+        assert isinstance(result, RuntimeError), result
+        assert "induced outer commit failure" in str(result)
+    assert failing_trace.commits == [], failing_trace.commits
+    assert failing_starter.started == []
+
+    engine = make_gateway_engine(postgres_dsn)
+    session_factory = make_session_factory(engine)
+    try:
+        with session_factory() as session:
+            survivors = int(
+                session.execute(
+                    text(
+                        "SELECT count(*) FROM alert_events WHERE event_id = ANY(:ids)"
+                    ),
+                    {"ids": [uuid.UUID(e) for e in failing_event_ids]},
+                ).scalar()
+            )
+            assert survivors == 0, "a merged event survived a failed outer commit"
+            assert _audit_count(session, investigation_id, "event_merged") == (
+                GC5_CONTENDERS
+            ), "an audit row survived a failed outer commit"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_gc5_batch_misses_preserve_one_open_and_complete_audit(postgres_dsn):
+    """FP-GC5-3: misses leave the group unwritten and keep the frozen open path.
+
+    Eight simultaneous no-case events: every fused statement misses inside one
+    read-only group transaction, nothing is written there, and each event then
+    takes the unchanged individual reject / advisory-lock / deciding-read /
+    open transaction exactly once -- the fused statement is not repeated on
+    the fallback. One 202, seven 200s, one investigation, eight events, one
+    ``event_received`` and seven ``event_merged`` audit rows.
+    """
+    engine = make_gateway_engine(postgres_dsn)
+    session_factory = make_session_factory(engine)
+    platform_key = f"gc5-miss-{uuid.uuid4().hex[:8]}"
+    fingerprint = f"fp-{uuid.uuid4().hex[:8]}"
+    _seed_platform(session_factory, platform_key)
+
+    starter = _RecordingStarter()
+    svc = _make_service(session_factory, starter)
+    event_ids = [str(uuid.uuid4()) for _ in range(GC5_CONTENDERS)]
+
+    from rca_common import investigation_repo as repo
+
+    real_merge = repo.merge_existing_event_with_audit
+    fused_calls: list[tuple[str, object]] = []
+    fused_lock = threading.Lock()
+
+    def recording_merge(session, **kwargs):
+        result = real_merge(session, **kwargs)
+        with fused_lock:
+            fused_calls.append((kwargs["event"]["event_id"], result))
+        return result
+
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("gateway.ingest.merge_existing_event_with_audit", recording_merge)
+            results = await asyncio.gather(
+                *[
+                    svc.ingest(_payload(platform_key, fingerprint, event_id=event_id))
+                    for event_id in event_ids
+                ]
+            )
+    finally:
+        await svc.close()
+        engine.dispose()
+
+    # The fused statement ran exactly once per event and missed every time:
+    # no group write, and no second fused call on the fallback.
+    assert len(fused_calls) == GC5_CONTENDERS, fused_calls
+    assert [event_id for event_id, _ in fused_calls] and sorted(
+        event_id for event_id, _ in fused_calls
+    ) == sorted(event_ids)
+    assert {result for _, result in fused_calls} == {None}
+
+    opened = [r for r in results if r[0] == 202]
+    merged = [r for r in results if r[0] == 200 and r[1].get("status") == "merged"]
+    assert len(opened) == 1, results
+    assert len(merged) == GC5_CONTENDERS - 1, results
+    assert len(starter.started) == 1
+
+    engine = make_gateway_engine(postgres_dsn)
+    session_factory = make_session_factory(engine)
+    try:
+        with session_factory() as session:
+            invs = session.scalars(
+                select(Investigation).where(Investigation.platform_key == platform_key)
+            ).all()
+            ids = {i.investigation_id for i in invs}
+            assert len(ids) == 1, f"investigations={ids}"
+            investigation_id = list(ids)[0]
+            assert str(investigation_id) == opened[0][1]["investigation_id"]
+            events = session.scalars(
+                select(AlertEventRow).where(AlertEventRow.platform_key == platform_key)
+            ).all()
+            assert len(events) == GC5_CONTENDERS
+            assert sorted(e.disposition for e in events) == (
+                ["merged"] * (GC5_CONTENDERS - 1) + ["opened"]
+            )
+            assert {str(e.event_id) for e in events} == set(event_ids)
+            assert _audit_count(session, investigation_id, "event_received") == 1
+            assert _audit_count(session, investigation_id, "event_merged") == (
+                GC5_CONTENDERS - 1
+            )
+    finally:
+        engine.dispose()

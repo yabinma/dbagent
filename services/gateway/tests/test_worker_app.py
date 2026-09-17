@@ -107,6 +107,15 @@ def test_worker_app_starts_workflows_on_the_configured_task_queue(
     def fake_txn(event):
         return 202, {"investigation_id": str(opened_id)}, opened_id
 
+    # GC-5: the fused statement now runs in the shared merge group, whose
+    # callback the coalescer bound at construction time. This wiring test has
+    # a SQLite engine, so the PostgreSQL-only statement is patched at the
+    # established module seam to miss; the faked individual transaction below
+    # then owns the 202 open, exactly as before.
+    monkeypatch.setattr(
+        "gateway.ingest.merge_existing_event_with_audit", lambda *a, **k: None
+    )
+
     with TestClient(app) as client:
         app.state.ingest_service._ingest_txn = fake_txn
         body = json.dumps(

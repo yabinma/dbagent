@@ -12,7 +12,35 @@ from gateway.hmac_auth import compute_signature
 from gateway.ingest import IngestService
 
 
+class _Savepoint:
+    """The nested SessionTransaction GC-5 opens around one candidate."""
+
+    def __init__(self, session):
+        self._session = session
+
+    def commit(self):
+        self._session.released += 1
+
+    def rollback(self):
+        self._session.rolled_back_to += 1
+
+
 class _Sess:
+    is_active = True
+
+    def __init__(self):
+        self.savepoints = 0
+        self.released = 0
+        self.rolled_back_to = 0
+
+    def begin_nested(self):
+        # FP-GC5-2: every candidate statement runs inside its own savepoint.
+        self.savepoints += 1
+        return _Savepoint(self)
+
+    def rollback(self):
+        return None
+
     def get(self, *a, **k):
         return None
 

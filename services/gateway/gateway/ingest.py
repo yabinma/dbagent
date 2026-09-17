@@ -14,15 +14,24 @@ statement (``merge_existing_event_with_audit``) which selects the same
 candidate as ``find_open_by_fingerprint`` and inserts both the merged event
 and its ``event_merged`` audit row; a miss writes nothing and continues on
 the unchanged reject / advisory-lock / deciding-re-read / open path.
+
+FP-GC5-1/2/3: that one statement now runs inside a per-worker group. Up to
+``MERGE_COMMIT_BATCH_SIZE`` candidates collected for at most
+``MERGE_COMMIT_MAX_WAIT_SECONDS`` share one outer transaction, each inside its
+own savepoint, and one stock-durability outer commit fences every 2xx in the
+group. A candidate whose statement finds no committed case leaves the group
+without a write and continues on the unchanged individual reject /
+advisory-lock / deciding-re-read / open transaction.
 """
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from starlette.concurrency import run_in_threadpool
 
+from gateway.merge_commit import MergeCommitCoalescer, MergeHit, MergeMiss
 from rca_common.audit import actor_system, write_audit
 from rca_common.fingerprint import compute_fingerprint
 from rca_common.investigation_repo import (
@@ -56,6 +65,10 @@ class IngestService:
         self._correlation_window_seconds = correlation_window_seconds
         self._known_sources = known_sources or {}
         self._workflow_starter = workflow_starter
+        # FP-GC5-1: exactly one FIFO coalescer per service, and so exactly one
+        # per independently spawned uvicorn worker. It owns no engine, Session
+        # or connection; this bound callback owns database execution.
+        self._merge_coalescer = MergeCommitCoalescer(self._execute_merge_batch)
 
     def normalize_payload(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Build a Section 4.1 AlertEvent from a webhook JSON body."""
@@ -87,33 +100,114 @@ class IngestService:
         if event["source"] and self._known_sources and event["source"] not in self._known_sources:
             return 200, {"status": "rejected", "reason": "unknown_source"}
 
+        # FP-GC5-1/3: the dominant request is offered to this worker's one
+        # coalescer. A hit's outer transaction has already committed durably
+        # when the group resolves; a miss has written nothing and takes the
+        # unchanged individual transaction below, exactly once.
+        outcome = await self._merge_coalescer.submit(event)
+        if isinstance(outcome, MergeHit):
+            return 200, {
+                "status": "merged",
+                "investigation_id": str(outcome.investigation_id),
+            }
+
         status, payload, investigation_id = await run_in_threadpool(self._ingest_txn, event)
         if investigation_id is not None and self._workflow_starter is not None:
             await self._workflow_starter.start_investigation(event, investigation_id)
         return status, payload
 
+    async def close(self) -> None:
+        """FP-GC5-5: stop admission and resolve every accepted merge item."""
+        await self._merge_coalescer.close()
+
+    def _execute_merge_batch(self, events: Sequence[dict[str, Any]]) -> list[Any]:
+        """One group of candidates, one Session, at most one durable commit.
+
+        FP-GC5-1/2: each candidate runs the unchanged fused statement once
+        inside its own savepoint, in FIFO order. A statement failure whose
+        savepoint rollback leaves the outer transaction usable belongs to that
+        one request; a failed savepoint recovery, an unusable outer
+        transaction or a failed outer commit fails every unresolved member of
+        the group and is never retried. Plain synchronous method: the drainer
+        reaches it only through ``run_in_threadpool``.
+        """
+        outcomes: list[Any] = [None] * len(events)
+        fatal: BaseException | None = None
+        with self._session_factory() as session:
+            for index, event in enumerate(events):
+                if fatal is not None:
+                    break
+                savepoint = session.begin_nested()
+                try:
+                    existing_id = merge_existing_event_with_audit(
+                        session,
+                        event=event,
+                        default_correlation_window_seconds=self._correlation_window_seconds,
+                    )
+                except BaseException as exc:  # noqa: BLE001 — one request's own failure
+                    outcomes[index] = exc
+                    fatal = self._recover_savepoint(session, savepoint, exc)
+                else:
+                    savepoint.commit()
+                    outcomes[index] = (
+                        MergeHit(existing_id) if existing_id is not None else MergeMiss()
+                    )
+            fatal = self._finish_merge_batch(session, outcomes, fatal)
+        if fatal is not None:
+            # Members that already carry their own failure keep it; every
+            # unresolved member fails with the group.
+            outcomes = [
+                outcome if isinstance(outcome, BaseException) else fatal
+                for outcome in outcomes
+            ]
+        return outcomes
+
+    @staticmethod
+    def _recover_savepoint(session, savepoint, exc: BaseException):
+        """Roll one candidate back; return a group-fatal failure or ``None``.
+
+        A successful rollback to savepoint that leaves the outer transaction
+        active is the proof that the surrounding transaction is still usable,
+        so unrelated hits keep their isolation. Losing that proof is the only
+        thing that widens one request's failure to the whole group.
+        """
+        try:
+            savepoint.rollback()
+        except BaseException as recovery_error:  # noqa: BLE001 — group-fatal
+            return recovery_error
+        if not session.is_active:
+            return exc
+        return None
+
+    @staticmethod
+    def _finish_merge_batch(session, outcomes: list[Any], fatal: BaseException | None):
+        """Close the shared transaction: one commit, or an explicit rollback."""
+        if fatal is not None:
+            _rollback_quietly(session)
+            return fatal
+        if any(isinstance(outcome, MergeHit) for outcome in outcomes):
+            try:
+                session.commit()
+            except BaseException as commit_error:  # noqa: BLE001 — group-fatal
+                _rollback_quietly(session)
+                return commit_error
+            return None
+        # No hit: the read-only outer transaction is rolled back explicitly,
+        # so a group of misses never manufactures a committed transaction.
+        session.rollback()
+        return None
+
     def _ingest_txn(
         self, event: dict[str, Any]
     ) -> tuple[int, dict[str, Any], uuid.UUID | None]:
-        """Synchronous DB transaction; invoked via run_in_threadpool (FP-IG-5)."""
-        with self._session_factory() as session:
-            # FP-GC2-1: the dominant request — a merge into an already
-            # committed non-terminal case — is one parameterized statement
-            # that writes both the alert_events row and its audit_log row,
-            # then the one unchanged durable commit. A miss has written
-            # nothing and falls through to the frozen protocol below.
-            existing_id = merge_existing_event_with_audit(
-                session,
-                event=event,
-                default_correlation_window_seconds=self._correlation_window_seconds,
-            )
-            if existing_id is not None:
-                session.commit()
-                return 200, {
-                    "status": "merged",
-                    "investigation_id": str(existing_id),
-                }, None
+        """Synchronous DB transaction; invoked via run_in_threadpool (FP-IG-5).
 
+        FP-GC5-3: reached only after the shared group transaction ended with a
+        miss for this event. The fused statement is not repeated here: another
+        request may have opened a case since, and the deciding re-read under
+        the advisory lock below is the authoritative race resolver.
+        """
+        with self._session_factory() as session:
             platform = get_platform(session, event["platform_key"])
             if platform is None:
                 self._reject(session, event, "unknown_platform_key")
@@ -230,3 +324,11 @@ class IngestService:
             investigation_id=None,
             detail={"event_id": event["event_id"], "reason": reason},
         )
+
+
+def _rollback_quietly(session) -> None:
+    """Best-effort outer rollback after a failure that already decided the group."""
+    try:
+        session.rollback()
+    except BaseException:  # noqa: BLE001 — the group has already failed
+        pass

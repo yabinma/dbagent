@@ -122,6 +122,28 @@ benchmarks:
     and re-derives the entry through the same selector; manual editing is not an allowed shortcut.
     Until it publishes a recomputed entry no model is selected, GC-4 claims no SKU and no p99 result,
     and the unchanged CI-scale bar stated above remains the only thing that can establish one.
+    GC-5 (durable commit shape) appends eight further reported fields to both B1 fingerprint lines,
+    immediately after those six and still never before a gating one: postgres_xact_commit_delta,
+    postgres_xact_rollback_delta, postgres_xact_commits_per_served, postgres_wal_records_delta,
+    postgres_wal_bytes_delta, postgres_wal_write_delta, postgres_wal_sync_delta and
+    postgres_wal_syncs_per_served, read for the measured database from pg_stat_database and
+    pg_stat_wal through a connection to a separate maintenance database so the reader's own
+    transactions cannot enter the counter it reports; an unusable observation serializes
+    `unavailable` in all eight rather than a zero. GC-5's claim is transaction frequency and nothing
+    else: committed database transactions per served request on the recorded product-local route,
+    which its own node
+    services/gateway/tests/test_b1_ingest_burst.py::test_gc5_commit_shape_reference_profile
+    requires to be at most 0.60. That node consumes no other quantity; CPU per request, max in
+    flight, p99, the three lateness legs, the wait histogram and the WAL deltas stay reported
+    diagnostics in the same sense as max_lateness_ms, and none of them becomes a bar, a recorded
+    verdict, a topology-selector input or a sizing observation. GC-5 changed
+    how many ingested events share one durable commit
+    and nothing else: not this profile, not the CI-scale bar above, not MAX_IN_FLIGHT, workers,
+    limit_concurrency, the pools, the schema, the durability settings or the 2.427 sizing basis. It
+    claims no SKU, no p99 result and no hosting outcome, so every per-model entry above remains
+    head-specific and awaits the same separately audited GC-3 requalification, now at the shipped
+    GC-5 head, derived through the same selector from two complete distinct-run artifacts of that
+    exact model.
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms
@@ -274,8 +296,8 @@ benchmarks:
     \ correctness. The 1000/s figure is derived from B1 rather than from this entry: B1 requires\
     \ the ingest front door to sustain a 5x burst of 200 req/s for 30 s with 0\
     \ errors, and services/gateway/gateway/ingest.py writes exactly one audit_log row\
-    \ per ingested alert on four mutually exclusive branches (event_merged:158,\
-    \ event_received:193, event_rejected:226; one reference per action, the\
+    \ per ingested alert on four mutually exclusive branches (event_merged:252,\
+    \ event_received:287, event_rejected:320; one reference per action, the\
     \ representative first occurrence). GC-2 leaves that one-row-per-alert\
     \ accounting unchanged while moving the committed-existing-case merge into\
     \ the fused statement merge_existing_event_with_audit, which writes its\
@@ -306,7 +328,7 @@ benchmarks:
         tables: [audit_log]
         call_sites:
           - file: services/gateway/gateway/ingest.py
-            line: 158
+            line: 252
             in: IngestService._ingest_txn
             symbol: write_audit
             expr: "write_audit("

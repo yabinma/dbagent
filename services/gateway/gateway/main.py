@@ -163,7 +163,13 @@ def create_worker_app(config_path: str | None = None):
         service._workflow_starter = TemporalWorkflowStarter(
             client, task_queue=config.temporal.task_queue
         )
-        yield
+        try:
+            yield
+        finally:
+            # FP-GC5-5: graceful shutdown stops admission and resolves every
+            # accepted merge item before this worker's loop goes away. Engine,
+            # pool, worker and serve arguments are untouched.
+            await service.close()
 
     app.router.lifespan_context = _lifespan
     return app

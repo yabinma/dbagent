@@ -15,6 +15,11 @@ validates or scores a record lives in ``b1_topology_probe.py`` and
 here is one module-scoped live fixture and one assertion body, which no
 tracer ever runs.
 
+GC-5 (FP-GC5-10) adds its transaction/WAL fields to the same fingerprint and
+nothing else: this route neither asserts the commit ratio nor lets an
+unavailable reading void an arm, because only GC-3's own separately audited
+requalification may change a model's outcome.
+
 The node's gate is *measurement integrity*, not candidate performance. It
 fails on any placement, topology, lifecycle, platform, worker, record-integrity
 or accounting defect, and it deliberately does not assert that the five
@@ -120,3 +125,30 @@ def test_b1_ci_scale_topology_probe_record(b1_topology_probe_run):
     else:
         assert set(wait_fields.values()) == {harness.DIAGNOSTIC_UNAVAILABLE}, wait_fields
         assert any("postgres wait sampler" in note for note in written["notes"]), written["notes"]
+
+    # (7) GC-5 (FP-GC5-7/8/10): the transaction and WAL fields travel inside
+    # this arm's existing fingerprint, in one of the same two admitted
+    # representations. Their absence is NOT a verdict and their ratio is NOT
+    # compared here: the mechanism gate lives on the product-local route, and
+    # a GC-5 diagnostic must never be able to void a GC-3 discovery arm.
+    commit_fields = {
+        field: harness._parse_b1_env_field(written["fingerprint"], field)
+        for field in harness.B1_POSTGRES_COMMIT_FIELDS
+    }
+    commit_reason = harness.postgres_commit_snapshot_failure(
+        run["postgres_commit_before"],
+        run["postgres_commit_after"],
+        run["result"].served,
+    )
+    if commit_reason is None:
+        assert harness.DIAGNOSTIC_UNAVAILABLE not in set(commit_fields.values()), (
+            commit_fields
+        )
+        assert int(commit_fields["postgres_xact_commit_delta"]) > 0, commit_fields
+    else:
+        assert set(commit_fields.values()) == {harness.DIAGNOSTIC_UNAVAILABLE}, (
+            commit_fields
+        )
+        assert any(
+            "postgres transaction snapshot" in note for note in written["notes"]
+        ), written["notes"]
