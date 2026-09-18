@@ -3749,7 +3749,8 @@
       "ratifiable": [],
       "score": null,
       "selected": null,
-      "status": "unhostable"
+      "status": "unhostable",
+      "superseded": []
     },
     "AMD EPYC 9V74 80-Core Processor": {
       "artifacts": [
@@ -7500,9 +7501,10 @@
       "ratifiable": [],
       "score": null,
       "selected": null,
-      "status": "unhostable"
+      "status": "unhostable",
+      "superseded": []
     }
   },
-  "schema": 2,
+  "schema": 3,
   "topologySetVersion": 1
 }

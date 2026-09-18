@@ -8464,7 +8464,7 @@ def _gc3_operands(**overrides) -> dict:
 
 
 def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None,
-                cpu_model: str = _GC3_MODEL, **overrides) -> dict:
+                cpu_model: str = _GC3_MODEL, head: str = _GC3_SHA, **overrides) -> dict:
     arm = probe.enumerate_arms(*pairs)[index]
     groups = _gc3_sibling_groups(pairs)
     values = _gc3_operands() if operands is None else dict(operands)
@@ -8496,7 +8496,7 @@ def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None,
         "cpuModel": cpu_model,
         "logicalCpuCount": 4,
         "siblingPairs": [probe.format_cpu_list(pair) for pair in pairs],
-        "headSha": _GC3_SHA,
+        "headSha": head,
         "githubRunId": "1",
         "githubRunAttempt": "1",
         "githubJob": probe.PROBE_JOB,
@@ -8506,11 +8506,12 @@ def _gc3_record(index: int, *, salt: int = 0, pairs=_GC3_PAIRS, operands=None,
     return record
 
 
-def _gc3_plan(run_id: str = "1", *, cpu_model: str = _GC3_MODEL) -> dict:
+def _gc3_plan(run_id: str = "1", *, cpu_model: str = _GC3_MODEL,
+              head: str = _GC3_SHA) -> dict:
     return {
         "topologySetVersion": probe.TOPOLOGY_SET_VERSION,
         "identity": {
-            "headSha": _GC3_SHA,
+            "headSha": head,
             "githubRunId": run_id,
             "githubRunAttempt": "1",
             "githubJob": probe.PROBE_JOB,
@@ -8524,31 +8525,95 @@ def _gc3_plan(run_id: str = "1", *, cpu_model: str = _GC3_MODEL) -> dict:
     }
 
 
-def _gc3_artifact(run_id: str = "1", *, per_arm=None, cpu_model: str = _GC3_MODEL) -> dict:
+def _gc3_artifact(run_id: str = "1", *, per_arm=None, cpu_model: str = _GC3_MODEL,
+                  head: str = _GC3_SHA) -> dict:
     records = []
     for index in range(probe.ARMS_PER_ARTIFACT):
         operands = per_arm(index) if per_arm else None
-        record = _gc3_record(index, salt=int(run_id), operands=operands, cpu_model=cpu_model)
+        record = _gc3_record(
+            index, salt=int(run_id), operands=operands, cpu_model=cpu_model, head=head
+        )
         record["githubRunId"] = run_id
         records.append(record)
-    return probe.collect_artifact(_gc3_plan(run_id, cpu_model=cpu_model), records)
+    return probe.collect_artifact(
+        _gc3_plan(run_id, cpu_model=cpu_model, head=head), records
+    )
+
+
+def _gc3_wrapper(artifact: dict, path: Path) -> dict:
+    """One embedded evidence wrapper, computed test-side from public helpers."""
+    return {
+        "sourceUrl": (
+            f"https://github.com/yabinma/dbagent/actions/runs/{artifact['githubRunId']}"
+        ),
+        "sha256": hashlib.sha256(
+            probe.canonical_json(artifact).encode("utf-8")
+        ).hexdigest(),
+        "artifact": artifact,
+    }
+
+
+def _gc3_seed_carrier(path: Path, *pairs) -> Path:
+    """A valid schema-3 base carrier, assembled HERE from the real selector.
+
+    `decide` requires `--base`: rev 0.8 deliberately exposes no no-base
+    initialisation path, because omitting the base could construct a
+    one-model replacement that looked valid while discarding every other
+    model and every history. A fixture that needs a starting carrier therefore
+    builds one out of the selector's own result and proves it valid -- the
+    module itself never offers that route.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    models: dict[str, dict] = {}
+    for first, second in pairs:
+        first, second = sorted(
+            (first, second), key=lambda artifact: int(artifact["githubRunId"])
+        )
+        first_path = path.parent / f"seed-{first['githubRunId']}.json"
+        second_path = path.parent / f"seed-{second['githubRunId']}.json"
+        probe.write_artifact(first_path, first)
+        probe.write_artifact(second_path, second)
+        model = probe.admit_evidence(first, second)
+        entry = probe.select_topology(first, second)
+        entry["artifacts"] = [
+            _gc3_wrapper(first, first_path), _gc3_wrapper(second, second_path)
+        ]
+        entry["superseded"] = []
+        models[model] = entry
+    carrier = {
+        "schema": probe.DECISION_SCHEMA,
+        "topologySetVersion": probe.TOPOLOGY_SET_VERSION,
+        "models": models,
+    }
+    probe.validate_decision(carrier)
+    probe.write_canonical(path, carrier)
+    return path
 
 
 def _gc3_carrier(tmp_path: Path, *pairs, out_name: str = "b1_topology_decision.json") -> Path:
-    """Generate a model-keyed carrier through the CLI, one `--pair` per model."""
+    """A model-keyed carrier: one seeded model, then one `--pair` per model.
+
+    Every merge step writes to its OWN output: `--out` and `--base` must
+    resolve to different paths, so a base is read and never rewritten.
+    """
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
     out = tmp_path / out_name
-    base = None
-    for index, (first, second) in enumerate(pairs):
+    first_pair, *rest = pairs
+    base = _gc3_seed_carrier(tmp_path / f"seed-{out_name}", first_pair)
+    for index, (first, second) in enumerate(rest):
         first_path = tmp_path / f"artifact-{index}-a.json"
         second_path = tmp_path / f"artifact-{index}-b.json"
         probe.write_artifact(first_path, first)
         probe.write_artifact(second_path, second)
-        argv = ["decide", "--out", str(out)]
-        if base is not None:
-            argv += ["--base", str(base)]
-        argv += ["--pair", str(first_path), str(second_path)]
-        assert probe.main(argv) == 0
-        base = out
+        step = tmp_path / f"merged-{index}.json"
+        assert probe.main([
+            "decide", "--out", str(step), "--base", str(base),
+            "--pair", str(first_path), str(second_path),
+        ]) == 0
+        base = step
+    out.write_text(Path(base).read_text(encoding="utf-8"), encoding="utf-8")
     return out
 
 
@@ -9330,7 +9395,7 @@ def test_gc3_selector_partitions_artifacts_by_cpu_model(tmp_path):
     carrier_path = _gc3_carrier(tmp_path, (first, second))
     carrier = json.loads(carrier_path.read_text(encoding="utf-8"))
     assert carrier_path.read_text(encoding="utf-8") == probe.canonical_json(carrier)
-    assert carrier["schema"] == probe.DECISION_SCHEMA == 2
+    assert carrier["schema"] == probe.DECISION_SCHEMA == 3
     assert carrier["topologySetVersion"] == probe.TOPOLOGY_SET_VERSION
     assert list(carrier["models"]) == [_GC3_MODEL]
     stored = carrier["models"][_GC3_MODEL]
@@ -9346,8 +9411,14 @@ def test_gc3_selector_partitions_artifacts_by_cpu_model(tmp_path):
         ).hexdigest()
     # The pair is embedded in run-id order, whichever order the CLI was given.
     assert [w["artifact"]["githubRunId"] for w in stored["artifacts"]] == ["11", "22"]
+    # A first decision is additive and starts with an empty history.
+    assert stored["superseded"] == []
+    assert set(stored) == set(probe.DECISION_ENTRY_KEYS)
     probe.validate_decision(carrier)
     assert probe.recompute_decision(carrier)[_GC3_MODEL] == stored
+
+    probe.write_artifact(tmp_path / "first.json", first)
+    probe.write_artifact(tmp_path / "second.json", second)
 
     # A second model merges through --base without touching the first entry.
     third = _gc3_artifact("99", per_arm=all_slow, cpu_model=_GC3_OTHER_MODEL)
@@ -9367,9 +9438,17 @@ def test_gc3_selector_partitions_artifacts_by_cpu_model(tmp_path):
     unpaired = tmp_path / "unpaired.json"
     probe.write_artifact(unpaired, other_model)
     before = merged_path.read_text(encoding="utf-8")
+    rejected = tmp_path / "rejected.json"
+    assert probe.main([
+        "decide", "--out", str(rejected), "--base", str(merged_path),
+        "--pair", str(unpaired), str(unpaired),
+    ]) == 1
+    assert merged_path.read_text(encoding="utf-8") == before
+    assert not rejected.exists()
+    # ...and an aliased base/output is refused before anything is read.
     assert probe.main([
         "decide", "--out", str(merged_path), "--base", str(merged_path),
-        "--pair", str(unpaired), str(unpaired),
+        "--pair", str(tmp_path / "first.json"), str(tmp_path / "second.json"),
     ]) == 1
     assert merged_path.read_text(encoding="utf-8") == before
 
@@ -9388,8 +9467,6 @@ def test_gc3_selector_partitions_artifacts_by_cpu_model(tmp_path):
 
     # ...while re-deriving the SAME decision is idempotent.
     again = tmp_path / "again.json"
-    probe.write_artifact(tmp_path / "first.json", first)
-    probe.write_artifact(tmp_path / "second.json", second)
     assert probe.main([
         "decide", "--out", str(again), "--base", str(merged_path),
         "--pair", str(tmp_path / "first.json"), str(tmp_path / "second.json"),
@@ -9456,10 +9533,325 @@ def test_gc3_selector_partitions_artifacts_by_cpu_model(tmp_path):
     # The CLI reports an invalid pair rather than writing a decision.
     missing_out = tmp_path / "never-written.json"
     assert probe.main([
-        "decide", "--out", str(missing_out),
+        "decide", "--out", str(missing_out), "--base", str(merged_path),
         "--pair", str(tmp_path / "first.json"), str(tmp_path / "first.json"),
     ]) == 1
     assert not missing_out.exists()
+    # ...and `--base` is required: there is no no-base initialisation path, so
+    # a missing carrier is restored from version control, never rebuilt here.
+    with pytest.raises(SystemExit) as raised:
+        probe.main([
+            "decide", "--out", str(missing_out),
+            "--pair", str(tmp_path / "first.json"), str(tmp_path / "second.json"),
+        ])
+    assert raised.value.code == 2
+    assert not missing_out.exists()
+
+
+def _gc3_git_repo(tmp_path: Path) -> "tuple[Path, dict[str, str]]":
+    """A real, tiny repository: the linear chain a -> b -> c, plus divergent d.
+
+    The strict-descendant proof is local Git history, never a field an artifact
+    supplies, so the only honest fixture for it is a real object database.
+    """
+    root = Path(tmp_path) / "repo"
+    root.mkdir(parents=True, exist_ok=True)
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "gc3@example.invalid")
+    git("config", "user.name", "GC-3 fixture")
+    git("config", "commit.gpgsign", "false")
+    heads: dict[str, str] = {}
+    for name in ("c1", "c2", "c3", "c4"):
+        (root / f"{name}.txt").write_text(name, encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-q", "-m", name)
+        heads[name] = git("rev-parse", "HEAD")
+    # A head that descends from c1 but NOT from c2: divergent, never older.
+    git("checkout", "-q", "-b", "divergent", heads["c1"])
+    (root / "side.txt").write_text("side", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "side")
+    heads["side"] = git("rev-parse", "HEAD")
+    git("checkout", "-q", "main")
+    return root, heads
+
+
+def test_gc3_selector_supersedes_only_descendant_head_and_preserves_history(
+    tmp_path, monkeypatch
+):
+    """FP-GC3-7: a decided model changes only at a strictly newer product head.
+
+    Everything here is synthetic and offline: a real temporary repository
+    supplies the ancestry and the artifacts are fabricated records AT those
+    exact heads. Nothing in this test claims, or could claim, a measured
+    outcome for a real CPU model -- it proves the mechanism by which a later
+    complete pair may replace an entry, and the many ways it may not.
+    """
+    repo, heads = _gc3_git_repo(tmp_path)
+    monkeypatch.setattr(probe, "REPO_ROOT", repo)
+
+    def slow(index):
+        return _gc3_operands(p99Ms=2387.1, maxInFlight=500)
+
+    def make_pair(run_ids, *, head, cpu_model=_GC3_MODEL, per_arm=None):
+        return tuple(
+            _gc3_artifact(run_id, head=head, cpu_model=cpu_model, per_arm=per_arm)
+            for run_id in run_ids
+        )
+
+    def paths(artifacts, folder):
+        written = []
+        for artifact in artifacts:
+            path = tmp_path / folder / f"artifact-{artifact['githubRunId']}.json"
+            probe.write_artifact(path, artifact)
+            written.append(str(path))
+        return written
+
+    at_c2 = make_pair(("11", "12"), head=heads["c2"])
+    at_c3 = make_pair(("21", "22"), head=heads["c3"], per_arm=slow)
+    at_c4 = make_pair(("31", "32"), head=heads["c4"])
+    at_c1 = make_pair(("41", "42"), head=heads["c1"], per_arm=slow)
+    at_side = make_pair(("71", "72"), head=heads["side"], per_arm=slow)
+    other_at_c2 = make_pair(("51", "52"), head=heads["c2"], cpu_model=_GC3_OTHER_MODEL)
+    c3_paths = paths(at_c3, "pair-c3")
+    c4_paths = paths(at_c4, "pair-c4")
+    c1_paths = paths(at_c1, "pair-c1")
+    side_paths = paths(at_side, "pair-side")
+
+    # The base carrier: two models decided at head c2, both with no history.
+    base = _gc3_seed_carrier(tmp_path / "base" / "carrier.json", at_c2, other_at_c2)
+    original = base.read_text(encoding="utf-8")
+    carrier = json.loads(original)
+    assert carrier["schema"] == probe.DECISION_SCHEMA == 3
+    assert carrier["models"][_GC3_MODEL]["status"] == probe.DECISION_SELECTED
+    assert carrier["models"][_GC3_MODEL]["evidenceHeadSha"] == heads["c2"]
+    for entry in carrier["models"].values():
+        assert entry["superseded"] == []
+        assert set(entry) == set(probe.DECISION_ENTRY_KEYS)
+    # An empty history has no edge to prove, so no Git call is needed for it.
+    assert probe.verify_carrier_ancestry(carrier) == 0
+
+    def decide(pair_paths, *, base_path=None, out, supersede=None):
+        destination = tmp_path / "out" / out
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        argv = [
+            "decide", "--out", str(destination),
+            "--base", str(base if base_path is None else base_path),
+            "--pair", *pair_paths,
+        ]
+        if supersede is not None:
+            argv += ["--supersede", supersede]
+        return probe.main(argv), destination
+
+    # (1) A nonidentical decision for a decided model is refused without the
+    # explicit flag, and nothing is written.
+    status, destination = decide(c3_paths, out="no-flag.json")
+    assert status == 1 and not destination.exists()
+    assert base.read_text(encoding="utf-8") == original
+
+    # (2) --supersede must name that model's CURRENT head: not the pair's own
+    # head, not a head nothing recorded, and not a head that is no object.
+    for index, named in enumerate((heads["c3"], heads["c4"], "f" * 40)):
+        status, destination = decide(
+            c3_paths, supersede=named, out=f"stale-{index}.json"
+        )
+        assert status == 1, named
+        assert not destination.exists(), named
+
+    # (3) An absent model has nothing to supersede.
+    absent_base = _gc3_seed_carrier(
+        tmp_path / "absent" / "carrier.json", other_at_c2
+    )
+    status, destination = decide(
+        c3_paths, base_path=absent_base, supersede=heads["c2"], out="absent.json"
+    )
+    assert status == 1 and not destination.exists()
+
+    # (4) A divergent head is not a descendant; nor is an older one; nor is an
+    # equal one. All three are refused with nothing written.
+    status, destination = decide(
+        side_paths, supersede=heads["c2"], out="divergent.json"
+    )
+    assert status == 1 and not destination.exists()
+    status, destination = decide(c1_paths, supersede=heads["c2"], out="older.json")
+    assert status == 1 and not destination.exists()
+    same_head = paths(
+        make_pair(("61", "62"), head=heads["c2"], per_arm=slow), "pair-same-head"
+    )
+    status, destination = decide(same_head, supersede=heads["c2"], out="equal.json")
+    assert status == 1 and not destination.exists()
+
+    # (5) A strict descendant, explicitly named, supersedes: the replaced
+    # decision is appended IN FULL, the derived one becomes current, and the
+    # other model's entry is preserved byte for byte.
+    status, first_step = decide(c3_paths, supersede=heads["c2"], out="superseded.json")
+    assert status == 0
+    superseded = json.loads(first_step.read_text(encoding="utf-8"))
+    probe.validate_decision(superseded)
+    entry = superseded["models"][_GC3_MODEL]
+    assert entry["status"] == probe.DECISION_UNHOSTABLE
+    assert entry["evidenceHeadSha"] == heads["c3"]
+    assert len(entry["superseded"]) == 1
+    record = entry["superseded"][0]
+    assert sorted(record) == sorted(probe.DECISION_HISTORY_KEYS)
+    assert record["supersededByHeadSha"] == heads["c3"]
+    assert record["decision"] == {
+        key: value for key, value in carrier["models"][_GC3_MODEL].items()
+        if key != "superseded"
+    }
+    assert "superseded" not in record["decision"]
+    assert superseded["models"][_GC3_OTHER_MODEL] == carrier["models"][_GC3_OTHER_MODEL]
+    # Both decisions recompute from their own embedded pairs, and the one edge
+    # is a real strict descent.
+    assert probe.recompute_decision(superseded)[_GC3_MODEL] == entry
+    assert probe.verify_carrier_ancestry(superseded) == 1
+
+    # (6) The exact retry, in the precise two-scratch form, changes no byte;
+    # a retry naming the wrong preceding head is not a retry; and re-deriving
+    # the current decision with no flag is the additive no-op.
+    status, retried = decide(
+        c3_paths, base_path=first_step, supersede=heads["c2"], out="retry.json"
+    )
+    assert status == 0
+    assert retried.read_text(encoding="utf-8") == first_step.read_text(encoding="utf-8")
+    status, destination = decide(
+        c3_paths, base_path=first_step, supersede=heads["c4"], out="bad-retry.json"
+    )
+    assert status == 1 and not destination.exists()
+    status, plain = decide(c3_paths, base_path=first_step, out="noop.json")
+    assert status == 0
+    assert plain.read_text(encoding="utf-8") == first_step.read_text(encoding="utf-8")
+    # An aliased base/output is refused before any validation result is written.
+    aliased = tmp_path / "out" / "aliased.json"
+    aliased.write_text(first_step.read_text(encoding="utf-8"), encoding="utf-8")
+    before = aliased.read_text(encoding="utf-8")
+    assert probe.main([
+        "decide", "--out", str(aliased), "--base", str(aliased), "--pair", *c4_paths,
+        "--supersede", heads["c3"],
+    ]) == 1
+    assert aliased.read_text(encoding="utf-8") == before
+
+    # (7) A second supersession appends AFTER the first: c2 -> c3 -> c4.
+    status, second_step = decide(
+        c4_paths, base_path=first_step, supersede=heads["c3"], out="chain.json"
+    )
+    assert status == 0
+    chain = json.loads(second_step.read_text(encoding="utf-8"))
+    probe.validate_decision(chain)
+    entry = chain["models"][_GC3_MODEL]
+    assert entry["status"] == probe.DECISION_SELECTED
+    assert entry["evidenceHeadSha"] == heads["c4"]
+    assert [r["decision"]["evidenceHeadSha"] for r in entry["superseded"]] == [
+        heads["c2"], heads["c3"]
+    ]
+    assert [r["supersededByHeadSha"] for r in entry["superseded"]] == [
+        heads["c3"], heads["c4"]
+    ]
+    assert [r["decision"]["status"] for r in entry["superseded"]] == [
+        probe.DECISION_SELECTED, probe.DECISION_UNHOSTABLE
+    ]
+    assert probe.verify_carrier_ancestry(chain) == 2
+    assert chain["models"][_GC3_OTHER_MODEL] == carrier["models"][_GC3_OTHER_MODEL]
+
+    # (8) Routing consults ONLY the current entry, and needs no repository at
+    # all: a selected decision that was superseded by an unhostable one records,
+    # and an unhostable decision superseded by a selected one gates.
+    monkeypatch.setattr(probe, "host_cpu_model", lambda: _GC3_MODEL)
+    recorded = probe.route_host(first_step)
+    probe.validate_route(recorded)
+    assert recorded["decisionState"] == "unhostable"
+    assert recorded["disposition"] == "recorded"
+    assert recorded["topology"] is None
+    gating = probe.route_host(second_step)
+    probe.validate_route(gating)
+    assert gating["disposition"] == "gating"
+    assert gating["topology"] == entry["selected"]
+    monkeypatch.setattr(probe, "REPO_ROOT", tmp_path / "not-a-repository")
+    assert probe.route_host(second_step)["disposition"] == "gating"
+    with pytest.raises(probe.TopologyProbeError, match="gc3_ancestry_unavailable"):
+        probe.verify_decision_ancestry(heads["c2"], heads["c3"])
+    monkeypatch.setattr(probe, "REPO_ROOT", repo)
+
+    # (9) The history is closed and append-only. Every structural forgery below
+    # is refused with no Git call: a mutated or nested record, a reordered
+    # chain, a dropped newest or middle record, and an orphan edge. Dropping
+    # the OLDEST record is not structurally visible in the file, which is
+    # exactly why `--base` is required and the carrier is version controlled.
+    def forged(mutate):
+        copy = json.loads(json.dumps(chain))
+        mutate(copy["models"][_GC3_MODEL])
+        return copy
+
+    def _reorder(model_entry):
+        model_entry["superseded"].reverse()
+
+    def _drop_newest(model_entry):
+        del model_entry["superseded"][-1]
+
+    def _drop_middle(model_entry):
+        # c2 -> c3 -> c4 with the c3 record removed: the c2 record's edge now
+        # points at a head no record and no current decision carries.
+        del model_entry["superseded"][1]
+
+    def _mutate(model_entry):
+        model_entry["superseded"][0]["decision"]["status"] = probe.DECISION_UNHOSTABLE
+
+    def _nest(model_entry):
+        model_entry["superseded"][0]["decision"]["superseded"] = []
+
+    def _orphan(model_entry):
+        model_entry["superseded"][-1]["supersededByHeadSha"] = heads["side"]
+
+    def _widen(model_entry):
+        model_entry["superseded"][0]["note"] = "hand written"
+
+    def _self_edge(model_entry):
+        model_entry["superseded"].append({
+            "supersededByHeadSha": model_entry["evidenceHeadSha"],
+            "decision": {
+                key: value for key, value in model_entry.items() if key != "superseded"
+            },
+        })
+
+    for mutate in (_reorder, _drop_newest, _drop_middle, _mutate, _nest, _orphan,
+                   _widen, _self_edge):
+        with pytest.raises(probe.TopologyProbeError):
+            probe.validate_decision(forged(mutate))
+    # A history record that is not a list, or not an object, is not a history.
+    for broken in ({}, "none", [[]]):
+        with pytest.raises(probe.TopologyProbeError):
+            probe.validate_decision(forged(
+                lambda model_entry, value=broken: model_entry.__setitem__(
+                    "superseded", value
+                )
+            ))
+
+    # (10) The ancestry helper itself: accept only a proven strict descent, and
+    # fail closed on anything Git cannot answer. No fetch, no network, no
+    # recorded parent-head string.
+    probe.verify_decision_ancestry(heads["c2"], heads["c4"])
+    probe.verify_decision_ancestry(heads["c1"], heads["side"])
+    for older, newer, reason in (
+        (heads["c4"], heads["c2"], "not a strict descendant"),
+        (heads["c2"], heads["side"], "not a strict descendant"),
+        (heads["side"], heads["c4"], "not a strict descendant"),
+        (heads["c2"], heads["c2"], "equals the named head"),
+        ("f" * 40, heads["c4"], "gc3_ancestry_unavailable"),
+        (heads["c2"], "0" * 40, "gc3_ancestry_unavailable"),
+        ("not a sha", heads["c4"], "40 lowercase hex"),
+        (heads["c2"], heads["c2"].upper(), "40 lowercase hex"),
+    ):
+        with pytest.raises(probe.TopologyProbeError, match=reason):
+            probe.verify_decision_ancestry(older, newer)
 
 
 def test_gc3_cpu_model_route_is_ratified_or_recorded(tmp_path, monkeypatch):

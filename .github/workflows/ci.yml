@@ -307,7 +307,16 @@ jobs:
         unit-go,
       ]
     steps:
+      # GC-3 (FP-GC3-7): the delivery tier repeats every retained
+      # supersession edge's strict-descendant proof with
+      # `git merge-base --is-ancestor` over this checkout's own object
+      # database. A shallow clone cannot see a superseded head at all, and the
+      # proof correctly fails closed with `gc3_ancestry_unavailable`; full
+      # history is what makes it answerable. No other job needs it: the
+      # discovery job proves no ancestry and the benchmark route spawns no Git.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

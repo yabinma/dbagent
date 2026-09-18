@@ -5414,6 +5414,91 @@ GC3_ROUTE_REASONS = {
 }
 
 
+#: GC-3 rev 0.8 (FP-GC3-7): the delivery tier proves every retained
+#: supersession edge offline with `git merge-base --is-ancestor`, so the job
+#: that runs it must check out the FULL history. A shallow clone cannot see a
+#: superseded head at all, and the proof would fail closed with
+#: `gc3_ancestry_unavailable`. The discovery job proves no ancestry and keeps
+#: its plain shallow checkout.
+GC3_ANCESTRY_JOB = "functional"
+GC3_FULL_HISTORY_WITH = {"fetch-depth": 0}
+#: The one lexical anchor the per-model manifest rows keep; the head
+#: assertions below are structural and are not satisfied by it.
+GC3_NO_HISTORY_TEXT = "superseded: none"
+
+
+def _gc3_notes_row(notes: str, model: str) -> "str | None":
+    """The manifest's per-model row, found by the EXACT model string."""
+    marker = f"`{model}` -- status "
+    if notes.count(marker) != 1:
+        return None
+    start = notes.index(marker)
+    rest = notes[start + len(marker):]
+    ends = [
+        rest.index(token) for token in ("\n`", "\nNo row in this revision") if token in rest
+    ]
+    return notes[start:start + len(marker) + (min(ends) if ends else len(rest))]
+
+
+def _gc3_provenance_failures(workflow: dict, notes: str) -> list[str]:
+    """FP-GC3-7: the ancestry checkout, and the published per-model heads.
+
+    Two independent claims: the job that repeats the Git ancestry proof has the
+    history to repeat it with, and the tracked manifest names -- for every
+    exact model -- the carrier's full 40-lowercase-hex current evidence head
+    plus every superseded head in carrier order. A seven-character prefix is
+    not provenance, and a superseded head is never described as the active
+    route.
+    """
+    fails: list[str] = []
+    jobs = workflow.get("jobs") or {}
+    steps = (jobs.get(GC3_ANCESTRY_JOB) or {}).get("steps") or []
+    checkout = next(
+        (
+            step for step in steps
+            if str((step or {}).get("uses", "")).startswith("actions/checkout")
+        ),
+        None,
+    )
+    if checkout is None:
+        fails.append(f"ancestry_job_has_no_checkout {GC3_ANCESTRY_JOB}")
+    elif (checkout.get("with") or {}) != GC3_FULL_HISTORY_WITH:
+        fails.append(
+            f"functional_checkout_not_full_history {(checkout.get('with') or {})}"
+        )
+    probe_steps = (jobs.get(GC3_PROBE_JOB) or {}).get("steps") or []
+    if probe_steps and (probe_steps[0].get("with") or {}):
+        fails.append("probe_checkout_gained_options")
+    if not GC3_DECISION_CARRIER.is_file():
+        return fails + ["decision_carrier_missing"]
+    decision = json.loads(GC3_DECISION_CARRIER.read_text(encoding="utf-8"))
+    models = (decision or {}).get("models") or {}
+    if not models:
+        return fails + ["decision_carrier_has_no_model"]
+    for model, entry in models.items():
+        row = _gc3_notes_row(notes, model)
+        if row is None:
+            fails.append(f"notes_row_missing {model!r}")
+            continue
+        if entry.get("evidenceHeadSha") not in row:
+            fails.append(f"notes_row_omits_current_head {model!r}")
+        heads = [
+            record["decision"]["evidenceHeadSha"]
+            for record in entry.get("superseded") or []
+        ]
+        offsets = []
+        for head in heads:
+            if head not in row:
+                fails.append(f"notes_row_omits_superseded_head {model!r} {head}")
+            else:
+                offsets.append(row.index(head))
+        if offsets != sorted(offsets):
+            fails.append(f"notes_row_superseded_out_of_carrier_order {model!r}")
+        if not heads and GC3_NO_HISTORY_TEXT not in row:
+            fails.append(f"notes_row_omits_superseded_none {model!r}")
+    return fails
+
+
 def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
     """Every clause of the dispatch-only discovery contract, as named failures."""
     fails: list[str] = []
@@ -5922,6 +6007,47 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
     assert "product_placement_schema_drift" in _b1_model_keyed_declaration_failures(
         product_schema_moved
     )
+
+    # --- GC-3 rev 0.8 FP-GC3-7: the ancestry checkout and the published heads
+    thresholds = yaml.safe_load(
+        (REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text(encoding="utf-8")
+    )
+    notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
+    assert _gc3_provenance_failures(wf, notes) == []
+
+    def _provenance_reasons(workflow=None, text=None) -> set:
+        return {
+            f.split(" ", 1)[0]
+            for f in _gc3_provenance_failures(
+                workflow if workflow is not None else _load_wf(),
+                text if text is not None else notes,
+            )
+        }
+
+    shallow = _copy.deepcopy(wf)
+    shallow["jobs"][GC3_ANCESTRY_JOB]["steps"][0].pop("with", None)
+    assert "functional_checkout_not_full_history" in _provenance_reasons(workflow=shallow)
+
+    truncated = _copy.deepcopy(wf)
+    truncated["jobs"][GC3_ANCESTRY_JOB]["steps"][0]["with"] = {"fetch-depth": 1}
+    assert "functional_checkout_not_full_history" in _provenance_reasons(workflow=truncated)
+
+    carrier = json.loads(GC3_DECISION_CARRIER.read_text(encoding="utf-8"))
+    for model, entry in carrier["models"].items():
+        head = entry["evidenceHeadSha"]
+        # A seven-character prefix is not provenance.
+        abbreviated = notes.replace(head, head[:7])
+        assert abbreviated != notes
+        assert "notes_row_omits_current_head" in _provenance_reasons(text=abbreviated)
+        row = _gc3_notes_row(notes, model)
+        assert row is not None and head in row, model
+        unrecorded = notes.replace(GC3_NO_HISTORY_TEXT, "history is not published")
+        assert unrecorded != notes
+        assert "notes_row_omits_superseded_none" in _provenance_reasons(text=unrecorded)
+        rekeyed = notes.replace(f"`{model}` -- status ", "`Some Other CPU` -- status ", 1)
+        assert rekeyed != notes
+        assert "notes_row_missing" in _provenance_reasons(text=rekeyed)
+        break
 
 
 

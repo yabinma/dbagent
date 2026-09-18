@@ -12,7 +12,10 @@ authority for:
 * the closed discovery artifact, and what makes one ``invalid``;
 * the immutable selector that turns two independent complete artifacts of ONE
   exact CPU model into exactly one ``selected`` or ``unhostable`` decision for
-  that model, merged into the model-keyed schema-2 carrier; and
+  that model, merged into the model-keyed schema-3 carrier -- additively for a
+  new model, and for an already decided one only through an explicit
+  ``--supersede`` naming its current head, proved a strict Git ancestor of the
+  new pair's head, with the replaced decision retained in full; and
 * the pre-placement ``route`` / ``route-fields`` / ``contract-selected``
   commands the ordinary ``b1`` launcher branches on, after its unconditional
   container-free coverage phase and before any live process exists.
@@ -37,9 +40,16 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.parse
 from pathlib import Path
+
+#: The repository this module lives in: `services/gateway/tests/<this file>`.
+#: It is the object database the strict-descendant proof reads, and it has no
+#: caller or environment override -- a synthetic test monkeypatches this
+#: constant to a temporary repository and nothing else may change it.
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class TopologyProbeError(ValueError):
@@ -146,11 +156,32 @@ ARTIFACT_INVALID = "invalid"
 
 DECISION_SELECTED = "selected"
 DECISION_UNHOSTABLE = "unhostable"
-#: Schema 2 is the model-keyed carrier: one `models` map whose keys are exact
-#: canonical CPU model strings and whose values are that model's own decision.
-#: It is not a migration of schema 1 (one flat decision for one fixed SKU);
-#: nothing reads schema 1 and there is no compatibility fallback.
-DECISION_SCHEMA = 2
+#: Schema 3 is the model-keyed carrier with provenance: one `models` map whose
+#: keys are exact canonical CPU model strings, whose values carry that model's
+#: CURRENT decision fields directly -- so routing has one unambiguous source --
+#: and an oldest-to-newest `superseded` list of every decision it replaced,
+#: each naming the head that replaced it. It is not a migration of schema 1
+#: (one flat decision for one fixed SKU) and no compatibility reader for
+#: schema 1 or schema 2 survives the one-time checked migration.
+DECISION_SCHEMA = 3
+#: The decision fields of ONE decision, current or superseded. A history
+#: record carries exactly these under `decision` and never nests a history.
+DECISION_DECISION_KEYS = frozenset(
+    {
+        "status", "evidenceHeadSha", "selected", "cardinality", "placementSchema",
+        "ratifiable", "score", "artifacts",
+    }
+)
+#: One current model entry: that decision, plus its append-only history.
+DECISION_ENTRY_KEYS = DECISION_DECISION_KEYS | {"superseded"}
+#: One history record: the whole decision that was replaced, and the head of
+#: the decision that replaced it.
+DECISION_HISTORY_KEYS = frozenset({"supersededByHeadSha", "decision"})
+#: The named, fail-closed reason for an ancestry question local Git cannot
+#: answer: a missing object, an unavailable executable, a checkout without the
+#: history, or any exit that is neither a clean accept nor a clean reject. It
+#: is never softened into an accept and never a network fetch.
+DECISION_ANCESTRY_UNAVAILABLE_REASON = "gc3_ancestry_unavailable"
 #: The named, fail-closed reason the two delivery carriers report while the
 #: decision file does not exist. It never becomes a skip and never a default.
 DECISION_MISSING_REASON = "gc3_decision_missing"
@@ -1422,35 +1453,186 @@ def _ordered_pair(paths) -> tuple[Path, Path]:
     return entries[0][2], entries[1][2]
 
 
-def build_decision(pair_paths, base_path=None) -> dict:
-    """Merge one model's pair into the model-keyed carrier.
+def verify_decision_ancestry(named_head: str, pair_head: str) -> None:
+    """FP-GC3-7: prove ``pair_head`` is a STRICT descendant of ``named_head``.
 
-    One invocation admits exactly one exact model. Every entry already in the
-    base carrier is validated and independently recomputed before it is
-    preserved, a second nonidentical decision for an already decided model is
-    refused, and a rejected model-X invocation therefore cannot mutate,
-    reorder or erase model Y's entry.
+    The proof is local Git history, never a field an artifact supplies and
+    never a recorded parent-head string: two no-shell commands over
+    ``REPO_ROOT``'s own object database, and a three-way outcome. Exit 0 from
+    ``merge-base --is-ancestor`` is accepted only because the two values
+    already differ, exit 1 is a divergent-or-older rejection, and anything
+    else -- a missing object, no Git executable, a checkout without the
+    history -- is the named fail-closed reason. There is no fetch and no
+    network fallback: the ancestry authorities are the functional CI checkout
+    with ``fetch-depth: 0`` and a full-history host checkout.
+    """
+    for label, sha in (("named head", named_head), ("pair head", pair_head)):
+        if not (isinstance(sha, str) and _SHA_RE.match(sha)):
+            raise TopologyProbeError(f"{label} {sha!r} is not 40 lowercase hex")
+    if named_head == pair_head:
+        raise TopologyProbeError(
+            f"pair head {pair_head} equals the named head; a supersession requires a "
+            "strictly newer product head"
+        )
+    for sha in (named_head, pair_head):
+        try:
+            found = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{sha}^{{commit}}"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                shell=False, check=False,
+            )
+        except OSError as exc:
+            raise TopologyProbeError(
+                f"{DECISION_ANCESTRY_UNAVAILABLE_REASON}: git is unavailable ({exc})"
+            ) from exc
+        if found.returncode != 0:
+            raise TopologyProbeError(
+                f"{DECISION_ANCESTRY_UNAVAILABLE_REASON}: {sha} is not a commit object in "
+                f"{REPO_ROOT} (cat-file exit {found.returncode}); the ancestry authorities "
+                "carry the full history"
+            )
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(REPO_ROOT),
+                "merge-base", "--is-ancestor", named_head, pair_head,
+            ],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            shell=False, check=False,
+        )
+    except OSError as exc:
+        raise TopologyProbeError(
+            f"{DECISION_ANCESTRY_UNAVAILABLE_REASON}: git is unavailable ({exc})"
+        ) from exc
+    if result.returncode == 0:
+        return
+    if result.returncode == 1:
+        raise TopologyProbeError(
+            f"{pair_head} is not a strict descendant of {named_head}; an older or divergent "
+            "head never supersedes a decision"
+        )
+    raise TopologyProbeError(
+        f"{DECISION_ANCESTRY_UNAVAILABLE_REASON}: merge-base --is-ancestor exited "
+        f"{result.returncode} ({result.stderr.decode('utf-8', 'replace').strip()})"
+    )
+
+
+def decision_chain(entry: dict) -> tuple[str, ...]:
+    """One model's heads, oldest to newest, ending at its current decision."""
+    return tuple(
+        [record["decision"]["evidenceHeadSha"] for record in entry["superseded"]]
+        + [entry["evidenceHeadSha"]]
+    )
+
+
+def verify_carrier_ancestry(payload: dict) -> int:
+    """Repeat the strict-descendant proof for every retained edge; count them.
+
+    Called by ``decide`` before it considers a new pair, and by the delivery
+    tests. Deliberately NOT called by ``route``: the benchmark route classifies
+    a host from the validated carrier alone and must work at a checkout of any
+    depth, so publication through the Git-backed delivery gate is where the
+    ancestry authority lives.
+    """
+    validate_decision(payload)
+    edges = 0
+    for entry in payload["models"].values():
+        chain = decision_chain(entry)
+        for older, newer in zip(chain, chain[1:]):
+            verify_decision_ancestry(older, newer)
+            edges += 1
+    return edges
+
+
+def build_decision(pair_paths, base_path, supersede=None) -> dict:
+    """Merge one model's pair into the complete model-keyed carrier.
+
+    One invocation admits exactly one exact model. The base is REQUIRED and is
+    validated, independently recomputed and re-proved -- every current
+    decision, every superseded decision and every ancestry edge -- before the
+    new pair is considered, so a rejected model-X invocation cannot mutate,
+    reorder or erase model Y's entry or history.
+
+    For a model absent from the base, ``supersede`` is forbidden and the
+    derived entry is added with an empty history. For a model already present:
+
+    1. an exactly identical derived decision with no ``supersede`` is an
+       idempotent no-op;
+    2. any nonidentical result with no ``supersede`` is refused;
+    3. a supersession requires ``supersede`` to equal that model's current
+       ``evidenceHeadSha`` exactly and the pair head to be its strict
+       descendant;
+    4. retrying that same successful command against its own output is an
+       idempotent no-op; and
+    5. every other stale, historical, equal-head, older-head, divergent-head
+       or nonidentical retry is refused.
     """
     first_path, second_path = _ordered_pair(pair_paths)
     first = json.loads(first_path.read_text(encoding="utf-8"))
     second = json.loads(second_path.read_text(encoding="utf-8"))
     model = admit_evidence(first, second)
-    entry = select_topology(first, second)
-    entry["artifacts"] = [
+    derived = select_topology(first, second)
+    derived["artifacts"] = [
         _evidence_wrapper(first, first_path),
         _evidence_wrapper(second, second_path),
     ]
-    models: dict[str, dict] = {}
-    if base_path is not None:
-        base = json.loads(Path(base_path).read_text(encoding="utf-8"))
-        validate_decision(base)
-        models = dict(base["models"])
-    if model in models and models[model] != entry:
-        raise TopologyProbeError(
-            f"{model!r} already has a decision in the base carrier and this pair derives a "
-            "different one; a decided model is never silently re-decided"
-        )
-    models[model] = entry
+    base = json.loads(Path(base_path).read_text(encoding="utf-8"))
+    validate_decision(base)
+    verify_carrier_ancestry(base)
+    models = {key: json.loads(json.dumps(value)) for key, value in base["models"].items()}
+    existing = models.get(model)
+    if existing is None:
+        if supersede is not None:
+            raise TopologyProbeError(
+                f"{model!r} has no decision in the base carrier, so there is nothing to "
+                f"supersede; --supersede {supersede!r} is refused"
+            )
+        models[model] = {**derived, "superseded": []}
+    else:
+        current = {key: existing[key] for key in existing if key != "superseded"}
+        history = list(existing["superseded"])
+        identical = current == derived
+        if supersede is None:
+            if not identical:
+                raise TopologyProbeError(
+                    f"{model!r} already has a decision at head "
+                    f"{current['evidenceHeadSha']} and this pair derives a different one; "
+                    "pass --supersede <that current evidence head> to replace it"
+                )
+            models[model] = existing
+        elif identical:
+            previous = history[-1] if history else None
+            retry = (
+                previous is not None
+                and previous["decision"]["evidenceHeadSha"] == supersede
+                and previous["supersededByHeadSha"] == current["evidenceHeadSha"]
+            )
+            if not retry:
+                raise TopologyProbeError(
+                    f"{model!r}'s current decision is already this pair's own result at "
+                    f"{current['evidenceHeadSha']}; --supersede {supersede!r} is neither a "
+                    "replacement nor the exact retry of one"
+                )
+            models[model] = existing
+        else:
+            if supersede != current["evidenceHeadSha"]:
+                raise TopologyProbeError(
+                    f"--supersede {supersede!r} is not {model!r}'s current evidence head "
+                    f"{current['evidenceHeadSha']!r}; a stale or historical head never "
+                    "authorises a replacement"
+                )
+            verify_decision_ancestry(
+                current["evidenceHeadSha"], derived["evidenceHeadSha"]
+            )
+            models[model] = {
+                **derived,
+                "superseded": history + [
+                    {
+                        "supersededByHeadSha": derived["evidenceHeadSha"],
+                        "decision": current,
+                    }
+                ],
+            }
     decision = {
         "schema": DECISION_SCHEMA,
         "topologySetVersion": TOPOLOGY_SET_VERSION,
@@ -1460,8 +1642,62 @@ def build_decision(pair_paths, base_path=None) -> dict:
     return decision
 
 
+def _recompute_one(model: str, decision: object) -> dict:
+    """Re-run the selector over ONE decision's own embedded artifacts, offline."""
+    if not isinstance(decision, dict):
+        raise TopologyProbeError(f"{model!r}: a decision is not an object")
+    embedded = decision.get("artifacts")
+    if not isinstance(embedded, list) or len(embedded) != 2:
+        raise TopologyProbeError(
+            f"{model!r}: a decision embeds exactly two complete artifacts"
+        )
+    seen_runs: set[str] = set()
+    for wrapper in embedded:
+        if not isinstance(wrapper, dict) or set(wrapper) != {"sourceUrl", "sha256", "artifact"}:
+            raise TopologyProbeError(
+                f"{model!r}: evidence wrapper keys are exactly "
+                f"['artifact', 'sha256', 'sourceUrl']; got {sorted(wrapper)}"
+                if isinstance(wrapper, dict) else f"{model!r}: evidence wrapper is not an object"
+            )
+        artifact = wrapper["artifact"]
+        if not isinstance(artifact, dict):
+            raise TopologyProbeError(f"{model!r}: embedded artifact is not an object")
+        run_id = artifact.get("githubRunId")
+        if run_id in seen_runs:
+            raise TopologyProbeError(f"{model!r}: duplicate evidence for run {run_id!r}")
+        seen_runs.add(run_id)
+        if not _HTTPS_RUN_URL_RE.match(str(wrapper["sourceUrl"])):
+            raise TopologyProbeError(
+                f"{model!r}: evidence URL {wrapper['sourceUrl']!r} is not an https GitHub "
+                "run URL"
+            )
+        if str(run_id) not in str(wrapper["sourceUrl"]):
+            raise TopologyProbeError(
+                f"{model!r}: evidence URL {wrapper['sourceUrl']!r} does not name run {run_id!r}"
+            )
+        canonical = canonical_json(artifact)
+        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != wrapper["sha256"]:
+            raise TopologyProbeError(
+                f"{model!r}: embedded artifact for run {run_id!r} does not match its digest"
+            )
+        if artifact.get("cpuModel") != model:
+            raise TopologyProbeError(
+                f"{model!r}: embedded artifact reports cpuModel "
+                f"{artifact.get('cpuModel')!r}; a model key is the artifacts' own model"
+            )
+    recomputed = select_topology(embedded[0]["artifact"], embedded[1]["artifact"])
+    recomputed["artifacts"] = list(embedded)
+    return recomputed
+
+
 def recompute_decision(decision: dict) -> dict:
-    """Re-run the selector over every entry's own embedded artifacts, offline."""
+    """Rebuild every CURRENT and SUPERSEDED decision from its own evidence.
+
+    The edge heads are copied rather than derived -- nothing outside the file
+    can recompute which head replaced which -- so `validate_decision` checks
+    the chain's linkage separately. Everything else in every decision, current
+    or historical, is the selector's own result over that decision's own pair.
+    """
     if not isinstance(decision, dict):
         raise TopologyProbeError(f"decision is not an object: {type(decision).__name__}")
     models = decision.get("models")
@@ -1472,51 +1708,66 @@ def recompute_decision(decision: dict) -> dict:
         validate_cpu_model(model)
         if not isinstance(entry, dict):
             raise TopologyProbeError(f"{model!r}: entry is not an object")
-        embedded = entry.get("artifacts")
-        if not isinstance(embedded, list) or len(embedded) != 2:
-            raise TopologyProbeError(f"{model!r}: an entry embeds exactly two complete artifacts")
-        seen_runs: set[str] = set()
-        for wrapper in embedded:
-            if not isinstance(wrapper, dict) or set(wrapper) != {"sourceUrl", "sha256", "artifact"}:
+        current = _recompute_one(model, entry)
+        history = entry.get("superseded")
+        if not isinstance(history, list):
+            raise TopologyProbeError(
+                f"{model!r}: an entry carries an ordered, append-only superseded list"
+            )
+        rebuilt: list[dict] = []
+        for index, record in enumerate(history):
+            if not isinstance(record, dict) or set(record) != set(DECISION_HISTORY_KEYS):
                 raise TopologyProbeError(
-                    f"{model!r}: evidence wrapper keys are exactly "
-                    f"['artifact', 'sha256', 'sourceUrl']; got {sorted(wrapper)}"
-                    if isinstance(wrapper, dict) else f"{model!r}: evidence wrapper is not an object"
+                    f"{model!r}: superseded[{index}] keys are exactly "
+                    f"{sorted(DECISION_HISTORY_KEYS)}"
                 )
-            artifact = wrapper["artifact"]
-            if not isinstance(artifact, dict):
-                raise TopologyProbeError(f"{model!r}: embedded artifact is not an object")
-            run_id = artifact.get("githubRunId")
-            if run_id in seen_runs:
-                raise TopologyProbeError(f"{model!r}: duplicate evidence for run {run_id!r}")
-            seen_runs.add(run_id)
-            if not _HTTPS_RUN_URL_RE.match(str(wrapper["sourceUrl"])):
-                raise TopologyProbeError(
-                    f"{model!r}: evidence URL {wrapper['sourceUrl']!r} is not an https GitHub "
-                    "run URL"
-                )
-            if str(run_id) not in str(wrapper["sourceUrl"]):
-                raise TopologyProbeError(
-                    f"{model!r}: evidence URL {wrapper['sourceUrl']!r} does not name run {run_id!r}"
-                )
-            canonical = canonical_json(artifact)
-            if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != wrapper["sha256"]:
-                raise TopologyProbeError(
-                    f"{model!r}: embedded artifact for run {run_id!r} does not match its digest"
-                )
-            if artifact.get("cpuModel") != model:
-                raise TopologyProbeError(
-                    f"{model!r}: embedded artifact reports cpuModel "
-                    f"{artifact.get('cpuModel')!r}; a model key is the artifacts' own model"
-                )
-        recomputed = select_topology(embedded[0]["artifact"], embedded[1]["artifact"])
-        recomputed["artifacts"] = list(embedded)
-        out[model] = recomputed
+            rebuilt.append({
+                "supersededByHeadSha": record["supersededByHeadSha"],
+                "decision": _recompute_one(model, record["decision"]),
+            })
+        out[model] = {**current, "superseded": rebuilt}
     return out
 
 
+def _validate_decision_fields(model: str, label: str, decision: dict) -> None:
+    """The closed decision shape, current or superseded, or raise."""
+    if set(decision) != set(DECISION_DECISION_KEYS):
+        raise TopologyProbeError(
+            f"{model!r} {label}: closed decision keys {sorted(DECISION_DECISION_KEYS)}; "
+            f"got {sorted(decision)}"
+        )
+    if decision["status"] not in (DECISION_SELECTED, DECISION_UNHOSTABLE):
+        raise TopologyProbeError(f"{model!r} {label}: unknown status {decision['status']!r}")
+    if decision["status"] == DECISION_SELECTED:
+        if decision["selected"] not in TOPOLOGY_IDS:
+            raise TopologyProbeError(f"{model!r} {label}: selected {decision['selected']!r}")
+        if decision["cardinality"] != topology_cardinality(decision["selected"]):
+            raise TopologyProbeError(f"{model!r} {label}: cardinality is not topology-derived")
+        if decision["placementSchema"] != CONTRACT_SCHEMA:
+            raise TopologyProbeError(
+                f"{model!r} {label}: placementSchema {decision['placementSchema']!r}"
+            )
+    else:
+        for null_field in ("selected", "cardinality", "placementSchema", "score"):
+            if decision[null_field] is not None:
+                raise TopologyProbeError(
+                    f"{model!r} {label}: an unhostable decision carries no {null_field}"
+                )
+        if decision["ratifiable"] != []:
+            raise TopologyProbeError(f"{model!r} {label}: an unhostable decision ratifies nothing")
+    if not _SHA_RE.match(str(decision["evidenceHeadSha"])):
+        raise TopologyProbeError(
+            f"{model!r} {label}: evidenceHeadSha {decision['evidenceHeadSha']!r}"
+        )
+
+
 def validate_decision(payload: object) -> dict:
-    """The closed schema-2 carrier, recomputed from its own evidence, or raise."""
+    """The closed schema-3 carrier, recomputed from its own evidence, or raise.
+
+    Structural only: it spawns no Git and requires no repository history, so
+    the ordinary benchmark route can validate the whole carrier at a checkout
+    of any depth. `verify_carrier_ancestry` is the separate, Git-backed proof.
+    """
     if not isinstance(payload, dict):
         raise TopologyProbeError(f"decision is not an object: {type(payload).__name__}")
     if set(payload) != {"schema", "topologySetVersion", "models"}:
@@ -1539,45 +1790,45 @@ def validate_decision(payload: object) -> dict:
         raise TopologyProbeError("a decision carries a nonempty models map")
     recomputed = recompute_decision(payload)
     for model, entry in models.items():
-        if set(entry) != DECISION_ENTRY_KEYS:
+        if set(entry) != set(DECISION_ENTRY_KEYS):
             raise TopologyProbeError(
                 f"{model!r}: closed entry keys {sorted(DECISION_ENTRY_KEYS)}; got {sorted(entry)}"
             )
-        if entry["status"] not in (DECISION_SELECTED, DECISION_UNHOSTABLE):
-            raise TopologyProbeError(f"{model!r}: unknown status {entry['status']!r}")
         if entry != recomputed[model]:
             raise TopologyProbeError(
                 f"{model!r}: the stored entry is not what the selector derives from its own "
                 "embedded artifacts"
             )
-        if entry["status"] == DECISION_SELECTED:
-            if entry["selected"] not in TOPOLOGY_IDS:
-                raise TopologyProbeError(f"{model!r}: selected {entry['selected']!r}")
-            if entry["cardinality"] != topology_cardinality(entry["selected"]):
-                raise TopologyProbeError(f"{model!r}: cardinality is not topology-derived")
-            if entry["placementSchema"] != CONTRACT_SCHEMA:
+        _validate_decision_fields(
+            model, "current", {key: entry[key] for key in entry if key != "superseded"}
+        )
+        history = entry["superseded"]
+        chain: list[str] = []
+        for index, record in enumerate(history):
+            _validate_decision_fields(model, f"superseded[{index}]", record["decision"])
+            target = record["supersededByHeadSha"]
+            if not _SHA_RE.match(str(target)):
                 raise TopologyProbeError(
-                    f"{model!r}: placementSchema {entry['placementSchema']!r}"
+                    f"{model!r}: superseded[{index}] supersededByHeadSha {target!r}"
                 )
-        else:
-            for null_field in ("selected", "cardinality", "placementSchema", "score"):
-                if entry[null_field] is not None:
-                    raise TopologyProbeError(
-                        f"{model!r}: an unhostable entry carries no {null_field}"
-                    )
-            if entry["ratifiable"] != []:
-                raise TopologyProbeError(f"{model!r}: an unhostable entry ratifies nothing")
-        if not _SHA_RE.match(str(entry["evidenceHeadSha"])):
-            raise TopologyProbeError(f"{model!r}: evidenceHeadSha {entry['evidenceHeadSha']!r}")
+            successor = (
+                history[index + 1]["decision"]["evidenceHeadSha"]
+                if index + 1 < len(history) else entry["evidenceHeadSha"]
+            )
+            if target != successor:
+                raise TopologyProbeError(
+                    f"{model!r}: superseded[{index}] was replaced at {target}, but the next "
+                    f"decision in the chain is at {successor}; an orphan or branching edge is "
+                    "not a history"
+                )
+            chain.append(record["decision"]["evidenceHeadSha"])
+        chain.append(entry["evidenceHeadSha"])
+        if len(set(chain)) != len(chain):
+            raise TopologyProbeError(
+                f"{model!r}: head {sorted(h for h in set(chain) if chain.count(h) > 1)} appears "
+                "twice in the chain; one head decides a model once"
+            )
     return payload
-
-
-DECISION_ENTRY_KEYS = frozenset(
-    {
-        "status", "evidenceHeadSha", "selected", "cardinality", "placementSchema",
-        "ratifiable", "score", "artifacts",
-    }
-)
 
 
 def write_canonical(path: Path, payload: dict) -> None:
@@ -1883,8 +2134,21 @@ def _collect_command(args) -> int:
 
 
 def _decide_command(args) -> int:
-    decision = build_decision(args.pair, args.base)
-    write_canonical(Path(args.out), decision)
+    """FP-GC3-3/7: one model's decision, merged into the complete carrier.
+
+    The output is written atomically and only after all validation, and it may
+    never be the base: the base carrier is read, never rewritten, so a
+    rejected invocation leaves both files exactly as they were and an
+    idempotent success produces bytes identical to the base it was given.
+    """
+    out, base = Path(args.out), Path(args.base)
+    if os.path.realpath(out) == os.path.realpath(base):
+        raise TopologyProbeError(
+            f"--out {args.out!r} and --base {args.base!r} resolve to one path; the base "
+            "carrier is read, never rewritten"
+        )
+    decision = build_decision(args.pair, base, args.supersede)
+    write_canonical(out, decision)
     for model, entry in sorted(decision["models"].items()):
         print(f"b1_topology_probe: {model} {entry['status']} {entry['selected']}")
     return 0
@@ -1957,14 +2221,17 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--exit-code", dest="exit_code", type=int, default=0)
     collect.set_defaults(handler=_collect_command)
 
-    # The decision generator: exactly one output path, exactly one two-value
-    # pair, and an optional base carrier to merge another model's entry into.
-    # It has no candidate, threshold, tie-break, model or topology option by
-    # construction, and takes no positional argument at all.
+    # The decision generator: exactly one output path, the REQUIRED complete
+    # base carrier to merge one model's entry into, exactly one two-value pair,
+    # and an optional single evidence head that authorises replacing an
+    # already decided model. Registered in that exact order. It has no
+    # override option of any kind by construction, and takes no positional
+    # argument at all.
     decide = sub.add_parser("decide", help="select one topology, or record unhostable")
     decide.add_argument("--out", required=True)
-    decide.add_argument("--base", default=None)
+    decide.add_argument("--base", required=True)
     decide.add_argument("--pair", required=True, nargs=2, dest="pair")
+    decide.add_argument("--supersede", default=None)
     decide.set_defaults(handler=_decide_command)
 
     # FP-GC3-4: the pre-placement route. It accepts no profile, model,

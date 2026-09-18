@@ -28,18 +28,25 @@ benchmarks:
     the reference set is the first two complete SMT sibling pairs available to the launcher on the
     four-vCPU ubuntu-latest reference host, and the role mapping over those two pairs is the
     topology one exact `cpuModel` earned from two complete same-head discovery artifacts through
-    the tracked carrier tests/benchmark/b1_topology_decision.json (schema 2, keyed by exact
-    cpuModel). Per-model decision table at this revision, every entry decided from two complete
-    28-arm discovery artifacts of its own exact model at head
-    51e8a3175a4c247ab6afa47a5588bcbb96fafa99, produced by the manual sweep
-    `scripts/integration-test.sh b1_topology_probe`:
-    `AMD EPYC 7763 64-Core Processor` -- status unhostable; no topology, no role cardinality and
-    no placement schema are claimed for it; it is recorded, non-gating, under reason
+    the tracked carrier tests/benchmark/b1_topology_decision.json (schema 3, keyed by exact
+    cpuModel). Each entry in that carrier holds one CURRENT decision -- the only thing routing
+    reads -- plus `superseded`, an oldest-to-newest list of every decision it replaced, each
+    naming the head that replaced it. A current decision is replaced only by a complete
+    same-model pair from a strictly descendant product head, through
+    `b1_topology_probe.py decide --supersede <that current evidence head>`, which proves the
+    descent offline with `git merge-base --is-ancestor`; a superseded head below is provenance
+    and never describes the active route. Per-model decision table at this revision, every entry
+    decided from two complete 28-arm discovery artifacts of its own exact model, produced by the
+    manual sweep `scripts/integration-test.sh b1_topology_probe`:
+    `AMD EPYC 7763 64-Core Processor` -- status unhostable; current evidence head
+    51e8a3175a4c247ab6afa47a5588bcbb96fafa99; superseded: none; no topology, no role cardinality
+    and no placement schema are claimed for it; it is recorded, non-gating, under reason
     `topology_unratified_sku:AMD EPYC 7763 64-Core Processor`, and starts no live CI-scale
     workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35184858860
     and https://github.com/yabinma/dbagent/actions/runs/35186707903.
-    `AMD EPYC 9V74 80-Core Processor` -- status unhostable; no topology, no role cardinality and
-    no placement schema are claimed for it; it is recorded, non-gating, under reason
+    `AMD EPYC 9V74 80-Core Processor` -- status unhostable; current evidence head
+    51e8a3175a4c247ab6afa47a5588bcbb96fafa99; superseded: none; no topology, no role cardinality
+    and no placement schema are claimed for it; it is recorded, non-gating, under reason
     `topology_unratified_sku:AMD EPYC 9V74 80-Core Processor`, and starts no live CI-scale
     workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35184851198
     and https://github.com/yabinma/dbagent/actions/runs/35186725808.
@@ -51,7 +58,9 @@ benchmarks:
     gateway/PostgreSQL/driver cardinalities, its physical relationship over the two pairs, its
     all-role sibling witness, placement schema 3, the two discovery evidence URLs and its final
     gating run; an `unhostable` row names no topology and no cardinality and cites
-    `topology_unratified_sku:<model>`. A valid exact model that is absent from the table follows
+    `topology_unratified_sku:<model>`. Every row names its current evidence head as the full
+    40-character commit id and lists every superseded head oldest-to-newest, or `superseded:
+    none`. A valid exact model that is absent from the table follows
     that same recorded, non-gating policy under the same reason; a model whose string cannot be
     read or is outside the closed model-string rules records
     `topology_cpu_model_unavailable`. Both recorded routes run the unconditional container-free
@@ -111,17 +120,17 @@ benchmarks:
     postgres_wait_events_pct describe a test-only 50 ms sampler of non-idle client backends over the
     same window. Each is a reported diagnostic in the same sense as max_lateness_ms: none is a bar,
     a recorded verdict, a topology-selector input or a sizing observation, and a missing reading is
-    serialized as `unavailable` rather than as a zero. The per-exact-cpuModel decision table above is
-    evidence for the product head it was measured at and for no other. GC-4 changed
+    serialized as `unavailable` rather than as a zero. Each row of the per-exact-cpuModel decision
+    table above is evidence for its own current evidence head and for no other; GC-3 alone decides
+    hostability, and it does so from the carrier rather than from any head this slice names. GC-4
+    changed
     the fused statement's plan+execute cost per merge
     and nothing else: not this profile, not any bar, not any capacity or durability setting, and not
-    any recorded entry, so every entry remains head-specific and awaits a separately audited GC-3
-    requalification. That requalification supersedes a model's entry only from
-    two complete distinct-run artifacts of that exact model
-    at the shipped GC-4 head
-    and re-derives the entry through the same selector; manual editing is not an allowed shortcut.
-    Until it publishes a recomputed entry no model is selected, GC-4 claims no SKU and no p99 result,
-    and the unchanged CI-scale bar stated above remains the only thing that can establish one.
+    any recorded entry. A model's current decision is replaced only when the GC-3 selector proves a
+    complete same-model pair at a strictly descendant head and appends the replaced decision to that
+    row's superseded list; manual editing is not an allowed shortcut. Until the selector publishes
+    such a decision the row above remains authoritative, GC-4 claims no SKU and no p99 result, and
+    the unchanged CI-scale bar stated above remains the only thing that can establish one.
     GC-5 (durable commit shape) appends eight further reported fields to both B1 fingerprint lines,
     immediately after those six and still never before a gating one: postgres_xact_commit_delta,
     postgres_xact_rollback_delta, postgres_xact_commits_per_served, postgres_wal_records_delta,
@@ -140,10 +149,10 @@ benchmarks:
     how many ingested events share one durable commit
     and nothing else: not this profile, not the CI-scale bar above, not MAX_IN_FLIGHT, workers,
     limit_concurrency, the pools, the schema, the durability settings or the 2.427 sizing basis. It
-    claims no SKU, no p99 result and no hosting outcome, so every per-model entry above remains
-    head-specific and awaits the same separately audited GC-3 requalification, now at the shipped
-    GC-5 head, derived through the same selector from two complete distinct-run artifacts of that
-    exact model.
+    claims no SKU, no p99 result and no hosting outcome: each per-model row above remains evidence
+    for its own current evidence head, with every superseded head listed there as provenance, and
+    GC-3 alone may change it, through the same selector and the same strict-descendant supersession
+    proof over a complete same-model pair.
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms

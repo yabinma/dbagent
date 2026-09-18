@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import re
+import subprocess
 import time
 import tokenize
 from pathlib import Path
@@ -3036,7 +3037,26 @@ GC3_SCHEMA2 = 2
 # GC-3 rev 0.6: no fixed reference SKU. The decision is keyed by whatever
 # exact canonical model string an artifact carries, and the two tests below pin
 # that the selector holds no manufacturer, family or SKU literal at all.
-GC3_DECISION_SCHEMA = 2
+# GC-3 rev 0.8 (FP-GC3-7): schema 3 adds the append-only supersession history.
+# A model entry carries its CURRENT decision fields directly -- so routing has
+# one unambiguous source -- plus `superseded`, an oldest-to-newest list of the
+# full decisions it replaced, each naming the head that replaced it.
+GC3_DECISION_SCHEMA = 3
+#: The `decide` parser's exact option surface, in registration order.
+GC3_DECIDE_OPTION_ORDER = ["--out", "--base", "--pair", "--supersede"]
+#: The one Git-invoking helper, the two commands it runs, and the closed
+#: fail-closed reason for anything other than a clean accept/reject.
+GC3_ANCESTRY_HELPER = "verify_decision_ancestry"
+GC3_ANCESTRY_UNAVAILABLE_REASON = "gc3_ancestry_unavailable"
+GC3_GIT_EXISTENCE_TOKENS = ("cat-file", "-e", "^{{commit}}")
+GC3_GIT_ANCESTRY_TOKENS = ("merge-base", "--is-ancestor")
+#: Nothing on the benchmark-runtime path may spawn Git: `route` classifies the
+#: host from the validated carrier alone, at a checkout of any depth.
+GC3_ANCESTRY_FREE_FUNCTIONS = (
+    "route_host", "validate_decision", "recompute_decision", "route_fields",
+)
+GC3_HISTORY_KEY = "superseded"
+GC3_HISTORY_RECORD_KEYS = ["decision", "supersededByHeadSha"]
 GC3_REFERENCE_LOGICAL_CPUS = 4
 GC3_ARMS_PER_ARTIFACT = 28
 GC3_ORIENTATIONS = (0, 1)
@@ -3369,11 +3389,14 @@ def _gc3_candidate_space_failures() -> list[str]:
 
 
 def _gc3_decide_parser_failures() -> list[str]:
-    """FP-GC3-3: the `decide` subparser's own argument surface, as built.
+    """FP-GC3-3/7: the `decide` subparser's own argument surface, as built.
 
-    Exactly required `--out`, required two-value `--pair` and optional
-    `--base`; no positional path; and none of the forbidden override flags,
-    read off the parser rather than off its source.
+    Rev 0.8: exactly required `--out`, REQUIRED `--base`, required two-value
+    `--pair` and optional single-value `--supersede`; no positional path; and
+    none of the forbidden override flags, read off the parser rather than off
+    its source. `--base` is required because the tracked carrier already
+    exists: omitting it could construct a one-model replacement that looked
+    valid while discarding every other model and every history.
     """
     import argparse
 
@@ -3392,7 +3415,7 @@ def _gc3_decide_parser_failures() -> list[str]:
     options = {
         option for action in actions.values() for option in action.option_strings
     }
-    if options != {"--out", "--base", "--pair"}:
+    if options != set(GC3_DECIDE_OPTION_ORDER):
         fails.append(f"the decide parser exposes {sorted(options)}")
     positionals = sorted(
         dest for dest, action in actions.items() if not action.option_strings
@@ -3406,12 +3429,288 @@ def _gc3_decide_parser_failures() -> list[str]:
     if pair is None or not pair.required or pair.nargs != 2:
         fails.append(f"--pair is {getattr(pair, 'nargs', None)!r}, required two values")
     base = actions.get("base")
-    if base is None or base.required or base.default is not None:
-        fails.append("--base is not an optional carrier to merge into")
+    if base is None or not base.required:
+        fails.append("--base is not the required complete carrier to merge into")
+    supersede = actions.get("supersede")
+    if (
+        supersede is None
+        or supersede.required
+        or supersede.default is not None
+        or supersede.nargs is not None
+    ):
+        fails.append("--supersede is not an optional single-value evidence head")
     for forbidden in ("--force", "--select", "--candidate", "--threshold", "--tie",
                       "--topology", "--model", "--cpu-model", "--status"):
         if forbidden in options:
             fails.append(f"the decide parser exposes {forbidden}")
+    return fails
+
+
+#: The minimal readability anchors the two downstream handoff notes keep. They
+#: neither replace nor satisfy the structural head assertions below.
+GC3_HANDOFF_ANCHORS = ("current evidence head", "superseded", "GC-3 alone")
+
+
+def _gc3_handoff_provenance_failures(notes: str) -> list[str]:
+    """FP-GC3-7: the carrier-derived provenance both downstream slices hand over.
+
+    Neither GC-4 nor GC-5 may pin an evidence head, a status or an empty
+    declaration map: they change product cost and hand over a head, and GC-3
+    alone decides hostability. What they owe is that the tracked carrier is
+    intact and fully recomputed, that every current and superseded decision
+    carries its own recorded head, that the edge chain terminates at the
+    current head with strict Git descent, and that the manifest's per-model row
+    names those heads as full 40-lowercase-hex values in carrier order.
+    """
+    fails: list[str] = []
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    # The common full-carrier recomputer, so no prior entry can be dropped.
+    gc3.validate_decision(decision)
+    models = decision["models"]
+    if not models:
+        return ["the decision carrier has no model entry"]
+    if gc3.recompute_decision(decision) != models:
+        fails.append("the carrier is not what the selector derives from its own evidence")
+    harness_assigns = _source_assigns(REF_TEST.read_text(encoding="utf-8"))
+    selected = {
+        model: entry for model, entry in models.items()
+        if entry["status"] == gc3.DECISION_SELECTED
+    }
+    expected_cardinalities = {
+        model: entry["cardinality"] for model, entry in selected.items()
+    }
+    expected_schemas = {model: GC1_SELECTED_PLACEMENT_SCHEMA for model in selected}
+    if ast.literal_eval(
+        harness_assigns["CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"]
+    ) != expected_cardinalities:
+        fails.append("the harness cardinality map is not the carrier's selected entries")
+    if ast.literal_eval(
+        harness_assigns["CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"]
+    ) != expected_schemas:
+        fails.append("the harness schema map is not the carrier's selected entries")
+    edges = 0
+    for model, entry in models.items():
+        head = entry["evidenceHeadSha"]
+        for wrapper in entry["artifacts"]:
+            if wrapper["artifact"]["headSha"] != head:
+                fails.append(f"{model}: a current artifact is not at {head}")
+        history = entry[GC3_HISTORY_KEY]
+        chain = []
+        for index, record in enumerate(history):
+            older = record["decision"]["evidenceHeadSha"]
+            for wrapper in record["decision"]["artifacts"]:
+                if wrapper["artifact"]["headSha"] != older:
+                    fails.append(f"{model}: superseded[{index}] artifact is not at {older}")
+            chain.append(older)
+        chain.append(head)
+        if history and history[-1]["supersededByHeadSha"] != head:
+            fails.append(f"{model}: the history chain does not terminate at {head}")
+        for older, newer in zip(chain, chain[1:]):
+            edges += 1
+            try:
+                gc3.verify_decision_ancestry(older, newer)
+            except gc3.TopologyProbeError as exc:
+                fails.append(f"{model}: {older} -> {newer}: {exc}")
+        row = _gc3_notes_row(notes, model)
+        if head not in row:
+            fails.append(f"{model}: the manifest row omits the current head {head}")
+        offsets = []
+        for older in chain[:-1]:
+            if older not in row:
+                fails.append(f"{model}: the manifest row omits superseded head {older}")
+            else:
+                offsets.append(row.index(older))
+        if offsets != sorted(offsets):
+            fails.append(f"{model}: the manifest lists superseded heads out of carrier order")
+        if not history and "superseded: none" not in row:
+            fails.append(f"{model}: the manifest row does not record superseded: none")
+        if entry["status"] != gc3.DECISION_SELECTED:
+            if f"topology_unratified_sku:{model}" not in notes:
+                fails.append(f"{model}: the recorded reason is unpublished")
+    if gc3.verify_carrier_ancestry(decision) != edges:
+        fails.append("the carrier walker proves a different number of edges")
+    for readability in GC3_HANDOFF_ANCHORS:
+        if readability not in notes:
+            fails.append(f"the manifest does not read as provenance: {readability!r}")
+    return fails
+
+
+def _gc3_notes_row(notes: str, model: str) -> str:
+    """The manifest's per-model row, found by the EXACT model string.
+
+    Structural, not lexical: the row is located by its own model key and then
+    required to contain the carrier's full heads. An author-chosen phrase can
+    neither satisfy nor replace that.
+    """
+    marker = f"`{model}` -- status "
+    assert notes.count(marker) == 1, f"the manifest has no single row for {model!r}"
+    start = notes.index(marker)
+    rest = notes[start + len(marker):]
+    ends = [rest.index(token) for token in ("\n`", "\nNo row in this revision") if token in rest]
+    return notes[start:start + len(marker) + (min(ends) if ends else len(rest))]
+
+
+def _gc3_git_output(*arguments: str) -> str:
+    """One offline `git -C <repo> ...` read, or the named fail-closed reason.
+
+    The jailed review-runner image runs as root over a host-owned read-only
+    `/workspace`, where Git refuses with `dubious ownership` unless the
+    reviewer first runs `git config --global --add safe.directory /workspace`.
+    That is an environment result to configure and rerun -- never a waiver and
+    never a non-gating test.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), *arguments],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, check=False,
+    )
+    assert result.returncode == 0, (
+        f"{GC3_ANCESTRY_UNAVAILABLE_REASON}: git {' '.join(arguments)} exited "
+        f"{result.returncode} in {REPO_ROOT} ({result.stderr.strip()}). The ancestry "
+        f"authorities are the functional CI checkout with fetch-depth: 0 and a "
+        f"full-history host checkout; inside the review-runner image run "
+        f"`git config --global --add safe.directory /workspace` first."
+    )
+    return result.stdout.strip()
+
+
+def _gc3_require_commit_object(sha: str) -> None:
+    """Every retained head is a commit in THIS checkout's object database."""
+    assert re.fullmatch(r"[0-9a-f]{40}", sha), sha
+    _gc3_git_output("cat-file", "-e", f"{sha}^{{commit}}")
+
+
+def _gc3_supersession_failures() -> list[str]:
+    """FP-GC3-7: the supersession lifecycle's own source surface.
+
+    Three separable claims, each named:
+
+    * the carrier is schema 3 and every entry closes over the current decision
+      fields plus one append-only `superseded` list of full prior decisions;
+    * the strict-descendant proof is LOCAL Git history -- two no-shell
+      commands, a three-way exit mapping and a closed fail-closed reason --
+      and it lives in exactly one helper; and
+    * nothing on the benchmark-runtime path spawns Git, so `route` keeps
+      working at a checkout of any depth while publication through the
+      Git-backed delivery gate is the ancestry authority.
+    """
+    fails: list[str] = []
+    source = PROBE_HELPER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    # --- the closed schema-3 entry and history shapes ----------------------
+    if getattr(gc3, "DECISION_SCHEMA", None) != GC3_DECISION_SCHEMA:
+        fails.append(f"decision schema {getattr(gc3, 'DECISION_SCHEMA', None)!r}")
+    decision_keys = set(getattr(gc3, "DECISION_DECISION_KEYS", ()) or ())
+    entry_keys = set(getattr(gc3, "DECISION_ENTRY_KEYS", ()) or ())
+    if not decision_keys:
+        fails.append("the closed decision-field inventory is missing")
+    elif GC3_HISTORY_KEY in decision_keys:
+        fails.append(f"a decision carries {GC3_HISTORY_KEY!r} and can nest a history")
+    elif entry_keys != decision_keys | {GC3_HISTORY_KEY}:
+        fails.append(f"a current entry is {sorted(entry_keys)}")
+    history_keys = sorted(getattr(gc3, "DECISION_HISTORY_KEYS", ()) or ())
+    if history_keys != GC3_HISTORY_RECORD_KEYS:
+        fails.append(f"a history record is {history_keys}")
+
+    # --- exactly one Git-invoking helper -----------------------------------
+    spawners = sorted(
+        name for name, node in functions.items()
+        if any(
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "subprocess"
+            for call in ast.walk(node) if isinstance(call, ast.Call)
+        )
+    )
+    if spawners != [GC3_ANCESTRY_HELPER]:
+        fails.append(f"the module spawns a process from {spawners}")
+    if "shell=True" in source:
+        fails.append("the selector runs a shell")
+    helper_node = functions.get(GC3_ANCESTRY_HELPER)
+    if helper_node is None:
+        return fails + [f"{GC3_ANCESTRY_HELPER}: missing"]
+    # Its CODE, with its own prose removed: the prose legitimately names
+    # `fetch-depth` and "no fetch", and a substring scan over it would fire on
+    # the sentence that forbids the thing.
+    code = ast.Module(
+        body=[
+            statement for statement in helper_node.body
+            if not (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            )
+        ],
+        type_ignores=[],
+    )
+    body = ast.unparse(code)
+    for token in ("git", "-C", "str(REPO_ROOT)",
+                  *GC3_GIT_EXISTENCE_TOKENS, *GC3_GIT_ANCESTRY_TOKENS):
+        if token not in body:
+            fails.append(f"{GC3_ANCESTRY_HELPER} lost {token!r}")
+    # The three-way exit mapping: accept, reject, fail closed. Nothing else.
+    if getattr(gc3, "DECISION_ANCESTRY_UNAVAILABLE_REASON", None) != (
+        GC3_ANCESTRY_UNAVAILABLE_REASON
+    ):
+        fails.append("the fail-closed ancestry reason is not the named one")
+    for clause in ("returncode == 0", "returncode == 1",
+                   "DECISION_ANCESTRY_UNAVAILABLE_REASON"):
+        if clause not in body:
+            fails.append(f"{GC3_ANCESTRY_HELPER} lost the {clause!r} branch")
+    if "named_head == pair_head" not in body:
+        fails.append(f"{GC3_ANCESTRY_HELPER} accepts an equal head as a descendant")
+    # No network fallback exists: the proof is the local object database.
+    for network in ("fetch", "ls-remote", "clone", "http", "origin"):
+        if network in body:
+            fails.append(f"{GC3_ANCESTRY_HELPER} reaches for {network!r}")
+
+    # --- the repository root has no caller or environment override ---------
+    root = next(
+        (node for node in tree.body
+         if isinstance(node, ast.Assign)
+         and any(isinstance(t, ast.Name) and t.id == "REPO_ROOT" for t in node.targets)),
+        None,
+    )
+    if root is None:
+        fails.append("REPO_ROOT is not a module constant")
+    elif ast.unparse(root.value) != "Path(__file__).resolve().parents[3]":
+        fails.append(f"REPO_ROOT is {ast.unparse(root.value)}")
+    if "REPO_ROOT" in source.split("def build_parser", 1)[-1]:
+        fails.append("REPO_ROOT is reachable from the CLI surface")
+
+    # --- who may and may not call it ---------------------------------------
+    def _calls(name: str) -> set:
+        node = functions.get(name)
+        if node is None:
+            return set()
+        return {
+            ast.unparse(call.func) for call in ast.walk(node) if isinstance(call, ast.Call)
+        }
+
+    for runtime in GC3_ANCESTRY_FREE_FUNCTIONS:
+        if runtime not in functions:
+            fails.append(f"{runtime}: missing")
+            continue
+        called = _calls(runtime)
+        if GC3_ANCESTRY_HELPER in called or "verify_carrier_ancestry" in called:
+            fails.append(f"{runtime} spawns Git at benchmark runtime")
+    # BOTH proofs, because they answer different questions: the walker
+    # re-proves every edge already in the base, and the direct call proves the
+    # new edge this invocation is about to add. Either one alone leaves half
+    # the carrier unproved.
+    builder = _calls("build_decision")
+    for proof in (GC3_ANCESTRY_HELPER, "verify_carrier_ancestry"):
+        if proof not in builder:
+            fails.append(f"build_decision does not call {proof}")
+    if "verify_carrier_ancestry" not in functions:
+        fails.append("verify_carrier_ancestry: missing")
+    elif GC3_ANCESTRY_HELPER not in _calls("verify_carrier_ancestry"):
+        fails.append("verify_carrier_ancestry proves no edge")
     return fails
 
 
@@ -3430,12 +3729,14 @@ def _gc3_selector_failures() -> list[str]:
     decide_block = body.split('sub.add_parser("decide"', 1)
     if len(decide_block) != 2:
         return ["the decide subcommand is missing"]
-    # GC-3 rev 0.6: exactly required `--out`, required two-value `--pair`, and
-    # optional `--base`. No positional path, and no other option: one
-    # invocation admits one exact model and merges it into the carrier.
+    # GC-3 rev 0.8: exactly required `--out`, required `--base`, required
+    # two-value `--pair`, and optional single-value `--supersede`, REGISTERED
+    # IN THAT SOURCE ORDER. No positional path, and no other option: one
+    # invocation admits one exact model and merges it into the complete
+    # carrier it was given.
     decide_source = decide_block[1].split("\n\n", 1)[0]
     options = re.findall(r'decide\.add_argument\("([^"]+)"', decide_source)
-    if options != ["--out", "--base", "--pair"]:
+    if options != GC3_DECIDE_OPTION_ORDER:
         fails.append(f"the decide CLI takes {options}")
     if any(not option.startswith("--") for option in options):
         fails.append("the decide CLI accepts a positional path")
@@ -3443,8 +3744,10 @@ def _gc3_selector_failures() -> list[str]:
         fails.append("--out is not required")
     if 'decide.add_argument("--pair", required=True, nargs=2' not in decide_source:
         fails.append("--pair is not a required two-value option")
-    if 'decide.add_argument("--base", default=None)' not in decide_source:
-        fails.append("--base is not an optional carrier to merge into")
+    if 'decide.add_argument("--base", required=True)' not in decide_source:
+        fails.append("--base is not the required complete carrier to merge into")
+    if 'decide.add_argument("--supersede", default=None)' not in decide_source:
+        fails.append("--supersede is not an optional single-value evidence head")
     for forbidden in ("candidate", "threshold", "tie", "topology=", "--force", "--select"):
         if forbidden in decide_block[1]:
             fails.append(f"the decide CLI exposes {forbidden!r}")
@@ -3454,6 +3757,7 @@ def _gc3_selector_failures() -> list[str]:
     # decide parser's own `option_strings`, so it neither misses a flag added
     # through a loop nor fires on a later subcommand's legitimate option.
     fails.extend(_gc3_decide_parser_failures())
+    fails.extend(_gc3_supersession_failures())
     # CPU diagnostics may not enter the ranking.
     score = ast.get_source_segment(
         src, next(n for n in tree.body if isinstance(n, ast.FunctionDef)
@@ -3910,7 +4214,7 @@ def _gc3_scope_failures() -> list[str]:
     return fails
 
 
-def test_gc3_reference_topology_decision_is_evidence_backed():
+def test_gc3_reference_topology_decision_is_evidence_backed(tmp_path):
     """FP-GC3-3: every tracked model entry is the selector's own result, or nothing.
 
     RED BY DESIGN at the probe implementation head, with the named reason
@@ -3938,7 +4242,7 @@ def test_gc3_reference_topology_decision_is_evidence_backed():
     # The carrier is canonical, so the recomputation below reads the same bytes
     # a reviewer does.
     assert gc3.canonical_json(decision) == raw
-    assert decision["schema"] == gc3.DECISION_SCHEMA == 2
+    assert decision["schema"] == gc3.DECISION_SCHEMA == GC3_DECISION_SCHEMA == 3
     assert decision["topologySetVersion"] == gc3.TOPOLOGY_SET_VERSION
     assert sorted(decision) == ["models", "schema", "topologySetVersion"]
     models = decision["models"]
@@ -3986,6 +4290,65 @@ def test_gc3_reference_topology_decision_is_evidence_backed():
                 assert entry[null_field] is None, (model, null_field)
             assert entry["ratifiable"] == []
 
+        # --- FP-GC3-7: the append-only history, and its ancestry ----------
+        # Every replaced decision is a complete decision in its own right: two
+        # embedded same-head artifacts of this exact model, recomputable on
+        # its own, with no nested history. The edges form one chain that ends
+        # at the current head, and every edge is a STRICT Git descent proved
+        # offline from this checkout's own object database.
+        history = entry[GC3_HISTORY_KEY]
+        assert isinstance(history, list), model
+        chain = []
+        for index, record in enumerate(history):
+            assert sorted(record) == GC3_HISTORY_RECORD_KEYS, (model, index)
+            superseded = record["decision"]
+            assert GC3_HISTORY_KEY not in superseded, (model, index)
+            assert superseded["status"] in (
+                gc3.DECISION_SELECTED, gc3.DECISION_UNHOSTABLE
+            ), (model, index)
+            assert superseded == recomputed[model][GC3_HISTORY_KEY][index]["decision"], (
+                model, index
+            )
+            embedded_heads = {
+                wrapper["artifact"]["headSha"] for wrapper in superseded["artifacts"]
+            }
+            assert embedded_heads == {superseded["evidenceHeadSha"]}, (model, index)
+            for wrapper in superseded["artifacts"]:
+                assert wrapper["sha256"] == hashlib.sha256(
+                    gc3.canonical_json(wrapper["artifact"]).encode("utf-8")
+                ).hexdigest(), (model, index)
+                assert wrapper["artifact"]["cpuModel"] == model, (model, index)
+            successor = (
+                history[index + 1]["decision"]["evidenceHeadSha"]
+                if index + 1 < len(history) else entry["evidenceHeadSha"]
+            )
+            assert record["supersededByHeadSha"] == successor, (model, index)
+            chain.append(superseded["evidenceHeadSha"])
+        chain.append(entry["evidenceHeadSha"])
+        assert len(set(chain)) == len(chain), (model, chain)
+        # Every head in the chain is a commit object in THIS checkout -- which
+        # is why the functional job checks out full history -- and every edge
+        # is re-proved here, not taken from a recorded parent-head string.
+        for head in chain:
+            _gc3_require_commit_object(head)
+        for older, newer in zip(chain, chain[1:]):
+            gc3.verify_decision_ancestry(older, newer)
+
+    # The same proof over the whole carrier, through the module's own walker.
+    assert gc3.verify_carrier_ancestry(decision) == sum(
+        len(entry[GC3_HISTORY_KEY]) for entry in models.values()
+    )
+    # ...and the direction of that proof is not decorative: this checkout's own
+    # parent commit is an ancestor of its head, the reverse is refused, and an
+    # equal head is refused. A shallow checkout cannot see HEAD~1 at all, which
+    # is exactly why `fetch-depth: 0` is pinned on the functional job.
+    head = _gc3_git_output("rev-parse", "HEAD")
+    parent = _gc3_git_output("rev-parse", "HEAD~1")
+    gc3.verify_decision_ancestry(parent, head)
+    for older, newer in ((head, parent), (head, head), (parent, parent)):
+        with pytest.raises(gc3.TopologyProbeError):
+            gc3.verify_decision_ancestry(older, newer)
+
     # A hand-written entry is not a decision: mutating any derived field makes
     # the carrier disagree with a fresh selector run over its own evidence.
     for model, entry in models.items():
@@ -3997,6 +4360,62 @@ def test_gc3_reference_topology_decision_is_evidence_backed():
         with pytest.raises(gc3.TopologyProbeError):
             gc3.validate_decision(forged)
         break
+
+    # A hand-written HISTORY record is not provenance: a fabricated record
+    # whose decision duplicates the current one produces a self-edge, and an
+    # unknown key in a record is not a closed record at all. Both are refused
+    # without a Git call.
+    model, entry = next(iter(models.items()))
+    fabricated = {key: value for key, value in entry.items() if key != GC3_HISTORY_KEY}
+    self_edge = json.loads(json.dumps(decision))
+    self_edge["models"][model][GC3_HISTORY_KEY] = [
+        {"supersededByHeadSha": entry["evidenceHeadSha"], "decision": fabricated}
+    ]
+    with pytest.raises(gc3.TopologyProbeError):
+        gc3.validate_decision(self_edge)
+    widened = json.loads(json.dumps(decision))
+    widened["models"][model][GC3_HISTORY_KEY] = [
+        {
+            "supersededByHeadSha": entry["evidenceHeadSha"],
+            "decision": fabricated,
+            "note": "hand written",
+        }
+    ]
+    with pytest.raises(gc3.TopologyProbeError):
+        gc3.validate_decision(widened)
+
+    # FP-GC3-7: re-deriving a tracked entry from its own embedded pair, with
+    # the tracked carrier as the required base and no --supersede, is
+    # byte-idempotent -- and it is the precise two-scratch form, so the base is
+    # read and never rewritten.
+    pair = []
+    for wrapper in entry["artifacts"]:
+        artifact_path = tmp_path / f"artifact-{wrapper['artifact']['githubRunId']}.json"
+        gc3.write_artifact(artifact_path, wrapper["artifact"])
+        pair.append(str(artifact_path))
+    scratch = tmp_path / "scratch.json"
+    retry = tmp_path / "retry.json"
+    assert gc3.main([
+        "decide", "--out", str(scratch), "--base", str(GC3_DECISION), "--pair", *pair
+    ]) == 0
+    assert scratch.read_text(encoding="utf-8") == raw
+    assert gc3.main([
+        "decide", "--out", str(retry), "--base", str(scratch), "--pair", *pair
+    ]) == 0
+    assert retry.read_text(encoding="utf-8") == raw
+    # An aliased base/output, and a supersession naming a head that is not this
+    # model's current one, are both refused with nothing written.
+    before = scratch.read_text(encoding="utf-8")
+    assert gc3.main([
+        "decide", "--out", str(scratch), "--base", str(scratch), "--pair", *pair
+    ]) == 1
+    assert scratch.read_text(encoding="utf-8") == before
+    never = tmp_path / "never-written.json"
+    assert gc3.main([
+        "decide", "--out", str(never), "--base", str(GC3_DECISION), "--pair", *pair,
+        "--supersede", head,
+    ]) == 1
+    assert not never.exists()
 
 
 def test_gc3_reference_topology_scope_and_decision_are_pinned():
@@ -4122,6 +4541,27 @@ def test_gc3_reference_topology_scope_and_decision_are_pinned():
         assert f"topology_unratified_sku:{model}" in notes or (
             "topology_unratified_sku:<model>" in notes
         ), model
+    # FP-GC3-7: the per-model row names the exact CURRENT evidence head and
+    # every superseded head oldest-to-newest, always as the full
+    # 40-lowercase-hex value. A seven-character prefix is not provenance, and a
+    # superseded head is explicitly historical rather than an active route.
+    assert "current evidence head" in notes
+    assert GC3_HISTORY_KEY in notes
+    for model, entry in decision["models"].items():
+        row = _gc3_notes_row(notes, model)
+        assert entry["evidenceHeadSha"] in row, model
+        heads = [
+            record["decision"]["evidenceHeadSha"] for record in entry[GC3_HISTORY_KEY]
+        ]
+        for head in heads:
+            assert head in row, (model, head)
+        offsets = [row.index(head) for head in heads]
+        assert offsets == sorted(offsets), (model, heads)
+        if not heads:
+            assert "superseded: none" in row, model
+    # ...and the carrier's own schema is published, so a reader of the manifest
+    # cannot take a schema-2 entry for a current one.
+    assert f"schema {gc3.DECISION_SCHEMA}" in notes
     # The launcher never names a topology, whatever the carrier decided: the
     # ratified class reaches placement through route -> route-fields ->
     # contract-selected and nowhere else.
@@ -4277,18 +4717,13 @@ GC4_COST_FIELDS = (
     "postgres_wait_observations",
     "postgres_wait_events_pct",
 )
-# GC-3's recorded evidence head. Every current model entry belongs to it, and
-# to no other product head -- GC-4 changes cost, not topology.
-GC4_GC3_EVIDENCE_HEAD = "51e8a3175a4c247ab6afa47a5588bcbb96fafa99"
-GC4_GC3_REQUALIFICATION_PHRASES = (
-    "requalification",
-    "two complete distinct-run artifacts",
-    "at the shipped GC-4 head",
-    # rev 0.5: the manifest states what GC-4 actually changed, narrowly -- the
-    # fused statement's own plan+execute cost, not "the gateway's PostgreSQL
-    # cost", which would read as a whole-container claim this slice disclaims.
-    "the fused statement's plan+execute cost per merge",
-)
+# GC-3 rev 0.8 retires this slice's fixed evidence-head and fixed-status pins:
+# the authoritative head of every current and superseded decision is DERIVED
+# from the carrier by `_gc3_handoff_provenance_failures`, and GC-4 may not
+# assert one. What remains here is what GC-4 itself changed, narrowly -- the
+# fused statement's own plan+execute cost, not "the gateway's PostgreSQL cost",
+# which would read as a whole-container claim this slice disclaims.
+GC4_PRODUCT_COST_WORDING = "the fused statement's plan+execute cost per merge"
 GC4_PRODUCT_SOURCE_DIRS = (
     ("services", "gateway", "gateway"),
     ("services", "worker", "worker"),
@@ -4604,50 +5039,23 @@ def test_gc4_gc3_requalification_handoff_is_head_scoped():
     """FP-GC4-7: the current decision stays evidence for its own product head.
 
     GC-4 records no topology, relabels no SKU and claims no hostability. What
-    it owes GC-3 is a statement, in the tracked manifest, that the recorded
-    entries belong to the head they were measured at and that a later,
-    separately audited requalification at the shipped GC-4 head is what may
-    supersede them.
+    it owes GC-3 is a tracked manifest whose per-model provenance is DERIVED
+    from the carrier -- the exact current evidence head and every superseded
+    head, oldest to newest, as full 40-lowercase-hex values -- rather than a
+    head, a status or an empty declaration map this slice pinned by hand.
     """
-    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
-    models = decision["models"]
-    assert models, "the decision carrier has no model entry"
-
-    # (1) Every current entry is evidence for the recorded product head, and
-    # for no other: both the entry and each embedded artifact say so.
-    for model, entry in models.items():
-        assert entry["evidenceHeadSha"] == GC4_GC3_EVIDENCE_HEAD, model
-        for wrapper in entry["artifacts"]:
-            assert wrapper["artifact"]["headSha"] == GC4_GC3_EVIDENCE_HEAD, model
-
-    # (2) No SKU is relabelled by this slice: every entry is still unhostable,
-    # with no topology, cardinality, schema or score, and the harness declares
-    # no selected model at all.
-    for model, entry in models.items():
-        assert entry["status"] == gc3.DECISION_UNHOSTABLE, (model, entry["status"])
-        assert entry["ratifiable"] == [], model
-        for null_field in ("selected", "cardinality", "placementSchema", "score"):
-            assert entry[null_field] is None, (model, null_field)
-    harness_assigns = _source_assigns(REF_TEST.read_text(encoding="utf-8"))
-    assert ast.literal_eval(
-        harness_assigns["CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"]
-    ) == {}
-    assert ast.literal_eval(
-        harness_assigns["CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"]
-    ) == {}
-
-    # (3) The manifest says the entries are head-specific and names the later
-    # same-head requalification as the only route that may supersede them.
+    # (1)-(2)-(3) The carrier's own provenance, recomputed, head-proved and
+    # published. GC-4 asserts no head and no status of its own.
     thresholds = yaml.safe_load(GC4_THRESHOLDS.read_text(encoding="utf-8"))
     b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
     notes = b1_entry["notes"]
     assert b1_entry["status"] == "covered", "the bar was relabelled"
-    assert GC4_GC3_EVIDENCE_HEAD[:7] in notes or GC4_GC3_EVIDENCE_HEAD in notes
-    for phrase in GC4_GC3_REQUALIFICATION_PHRASES:
-        assert phrase in notes, f"the manifest does not state {phrase!r}"
+    assert _gc3_handoff_provenance_failures(notes) == []
+    models = json.loads(GC3_DECISION.read_text(encoding="utf-8"))["models"]
     for model in models:
         assert model in notes, model
-        assert f"topology_unratified_sku:{model}" in notes, model
+    # ...and the manifest still states what GC-4 itself changed, narrowly.
+    assert GC4_PRODUCT_COST_WORDING in notes
     # The unchanged bar is still stated, and no GC-4 record may be read as it.
     assert "p99<150ms" in notes.replace(" ", "")
     assert CI_SCALE_REF_TEST in notes
@@ -4848,14 +5256,11 @@ GC5_GATE_NODE = "test_gc5_commit_shape_reference_profile"
 GC5_CONTEXT_NODE = "test_gc5_product_record_carries_commit_cost_and_lateness_context"
 GC5_PRODUCT_MARKERS = {"b1_live", "b1_product"}
 #: GC-3's authority, restated: GC-5 changes the product head and nothing about
-#: the decision carrier or its routing.
-GC5_GC3_EVIDENCE_HEAD = "51e8a3175a4c247ab6afa47a5588bcbb96fafa99"
-GC5_GC3_REQUALIFICATION_PHRASES = (
-    "requalification",
-    "two complete distinct-run artifacts",
-    "at the shipped\n    GC-5 head",
-    "how many ingested events share one durable commit",
-)
+#: the decision carrier or its routing. Rev 0.8 retires this slice's fixed
+#: evidence-head and fixed-status pins in favour of the carrier-derived
+#: provenance in `_gc3_handoff_provenance_failures`; what remains here is what
+#: GC-5 itself changed, narrowly.
+GC5_COMMIT_SHAPE_WORDING = "how many ingested events share one durable commit"
 GC5_HOSTABILITY_CLAIMS = (
     "is hostable",
     "now hostable",
@@ -5537,44 +5942,26 @@ def test_gc5_diagnostics_do_not_enter_gc3_verdicts_or_sizing():
 
 
 def test_gc5_gc3_requalification_handoff_is_head_scoped():
-    """FP-GC5-10: GC-5 hands over a head; GC-3 alone decides hostability."""
-    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
-    models = decision["models"]
-    assert models, "the decision carrier has no model entry"
+    """FP-GC5-10: GC-5 hands over a head; GC-3 alone decides hostability.
 
-    # (1) The carrier is unedited: every entry still belongs to the head it
-    # was measured at, is still `unhostable`, and claims no topology.
-    for model, entry in models.items():
-        assert entry["evidenceHeadSha"] == GC5_GC3_EVIDENCE_HEAD, model
-        for wrapper in entry["artifacts"]:
-            assert wrapper["artifact"]["headSha"] == GC5_GC3_EVIDENCE_HEAD, model
-        assert entry["status"] == gc3.DECISION_UNHOSTABLE, (model, entry["status"])
-        assert entry["ratifiable"] == [], model
-        for null_field in ("selected", "cardinality", "placementSchema", "score"):
-            assert entry[null_field] is None, (model, null_field)
+    Rev 0.8: the head and the status are DERIVED from the carrier, current
+    decision and ordered history alike, and re-proved through local Git. GC-5
+    pins neither, and its prose naming a current-head outcome is not decision
+    evidence until the selector has published that head as current.
+    """
     harness_src = REF_TEST.read_text(encoding="utf-8")
-    harness_assigns = _source_assigns(harness_src)
-    assert ast.literal_eval(
-        harness_assigns["CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"]
-    ) == {}
-    assert ast.literal_eval(
-        harness_assigns["CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"]
-    ) == {}
-
-    # (2) The manifest states what GC-5 changed, narrowly, and names the
-    # separate same-head requalification as the only route that may supersede
-    # an entry -- without claiming any SKU.
-    thresholds_text = GC5_THRESHOLDS.read_text(encoding="utf-8")
-    thresholds = yaml.safe_load(thresholds_text)
+    thresholds = yaml.safe_load(GC5_THRESHOLDS.read_text(encoding="utf-8"))
     notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
-    for phrase in GC5_GC3_REQUALIFICATION_PHRASES:
-        assert phrase.replace("\n    ", " ") in notes.replace("\n", " "), (
-            f"the manifest does not state {phrase!r}"
-        )
-    assert "GC-5 head" in notes
+
+    # (1) The carrier is unedited, fully recomputed, head-proved and published:
+    # every current and superseded head appears in that model's manifest row.
+    assert _gc3_handoff_provenance_failures(notes) == []
+    models = json.loads(GC3_DECISION.read_text(encoding="utf-8"))["models"]
     for model in models:
         assert model in notes, model
-        assert f"topology_unratified_sku:{model}" in notes, model
+
+    # (2) The manifest states what GC-5 changed, narrowly, and claims no SKU.
+    assert GC5_COMMIT_SHAPE_WORDING in notes
     for claim in GC5_HOSTABILITY_CLAIMS:
         assert claim not in notes, claim
 
