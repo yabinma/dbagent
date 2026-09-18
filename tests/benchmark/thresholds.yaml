@@ -126,10 +126,34 @@ benchmarks:
     burst certifies no sustained served-rate figure near the offered rate. Serving shape is uvicorn
     workers=4 (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers); no shipped gateway configuration
     value moves for either tier.
-    The ingestGateway sizing basis cpuMsPerRequest=2.427 and its empty observations ledger are
-    unchanged and are owned by the B1-LATENCY-BASIS-1 slice, which must collect five consecutive
-    placement-valid CI-scale runs at one collection head before any ledger row, CPU request or CPU
-    limit changes; no run of either tier here is admitted as a sizing observation.
+    The ingestGateway sizing basis and the chart CPU request/limit derived from it are owned by
+    the B1-LATENCY-BASIS-1 slice and remain UNQUALIFIED: the shipped figure is a historical label
+    with void provenance and nothing in this entry re-certifies it, so no basis number is stated
+    here. That slice closed the ledger schema. ingestGateway.sizingBasis.observations must carry
+    five distinct qualifying CI-scale observations at ONE collection head on the ONE
+    GC-3-selected CPU model, each repeating the signature identity -- collection head, cpus=4,
+    exact cpuModel, exact B1 image fingerprint, worker count, reference topology, placement
+    schema and the current GC-3 decision head -- and each meeting the unchanged CI-scale bar
+    stated above: 15000 offered, 15000 served and committed, 0 errors,
+    served_rate>=CI_SCALE_SUSTAINED_FLOOR=450, due-time p99<150ms, MAX_IN_FLIGHT=500 not reached,
+    platform online, placement_ok=1 and a stable four-worker identity. collection.attempts must
+    carry every benchmark dispatch from the first through the fifth accepted one, each either
+    linked one-to-one to its observation or discarded with its exact recorded GC-3 route reason,
+    failed B1 clause list, signature mismatch or incomplete benchmark step. Collecting that
+    evidence is a coordinator operation that has NOT happened yet: it dispatches this
+    repository's ordinary benchmark workflow at most 20 times at one immutable head after the
+    schema above is reviewed, and no run id, cost, discard or number may be invented, copied from
+    an investigation or written by a tool. Until it does, both carriers stay empty, the
+    signature's collection-time fields stay null, and
+    tests/delivery/test_delivery_sizing_ledger.py::test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run
+    is the single failing actual-state owner of that void. The requalifying CPU-basis oracle
+    FP-IG-18 is isolated in `scripts/integration-test.sh b1_latency_basis`, absent from `all` and
+    from default CI and reachable in CI only through a default-false manual workflow_dispatch
+    input, so it can neither perturb nor decide the merge gate above. Restating the frozen
+    product-local qualifying-run literals onto this unchanged CI-scale operating point is a
+    deliberate deviation specified by design/slices/b1-latency-basis-1/design.md and recorded in
+    design/frozen-deviations.md; it neither weakens the CI-scale bar nor claims product-scale
+    capacity, and no run of either tier here is admitted as a sizing observation.
     Both tiers and the derivation are specified by
     design/slices/gc-1-reference-topology/design.md and recorded in design/frozen-deviations.md;
     the per-exact-cpuModel CI-scale topology decision and its recorded routes are specified by
@@ -169,7 +193,7 @@ benchmarks:
     verdict, a topology-selector input or a sizing observation. GC-5 changed
     how many ingested events share one durable commit
     and nothing else: not this profile, not the CI-scale bar above, not MAX_IN_FLIGHT, workers,
-    limit_concurrency, the pools, the schema, the durability settings or the 2.427 sizing basis. It
+    limit_concurrency, the pools, the schema, the durability settings or the sizing basis. It
     claims no SKU, no p99 result and no hosting outcome: each per-model row above remains evidence
     for its own current evidence head, with every superseded head listed there as provenance, and
     GC-3 alone may change it, through the same selector and the same strict-descendant supersession

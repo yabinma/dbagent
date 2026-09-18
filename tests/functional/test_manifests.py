@@ -151,9 +151,10 @@ GUARDED_STEPS: dict[str, list[int]] = {
     "unit-dashboard-api": [3],
     "unit-go": [7],
     "functional": [9, 10],
-    # 17 is the B1 wrapper `bash scripts/integration-test.sh b1`: it is neither
-    # a pytest nor a go test step, so it is checked by the bash operand grammar
-    # and EXPECTED_BASH_WRAPPER_COMMANDS instead of the guarded-step envelope.
+    # 17 and 21 are the two B1 wrappers (`... b1`, `... b1_latency_basis`):
+    # neither is a pytest nor a go test step, so both are checked by the bash
+    # operand grammar and EXPECTED_BASH_WRAPPER_COMMANDS instead of the
+    # guarded-step envelope.
     "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20],
     "manifest-guard": [5, 6],
 }
@@ -253,11 +254,18 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
 }
 assert set(GUARDED_STEPS) == GO_TEST_JOBS | set(EXPECTED_PYTEST_COMMANDS)
 
-# GC-1 FP-GC1-2: the only bash-wrapper step whose operands are pinned by
-# equality, kept as its own literal inventory rather than folded into the
-# pytest one -- _is_pytest_cmd correctly excludes it from that computation.
+# GC-1 FP-GC1-2: the only bash-wrapper steps whose operands are pinned by
+# equality, kept as their own literal inventory rather than folded into the
+# pytest one -- _is_pytest_cmd correctly excludes them from that computation.
+# B1-LATENCY-BASIS-1 FP-B1LB-6 APPENDED index 21 without renumbering 0..20:
+# index 17 is the unchanged ordinary gate, index 21 the manual, opt-in,
+# conditional CPU-basis oracle that sits strictly after the FP-IG-23
+# provenance gate at index 20.
 EXPECTED_BASH_WRAPPER_COMMANDS: dict[str, list[tuple[int, str]]] = {
-    "benchmark": [(17, "bash scripts/integration-test.sh b1")],
+    "benchmark": [
+        (17, "bash scripts/integration-test.sh b1"),
+        (21, "bash scripts/integration-test.sh b1_latency_basis"),
+    ],
     # GC-3 FP-GC3-2: step 1, between the checkout and the always() upload.
     "b1-topology-probe": [(1, "bash scripts/integration-test.sh b1_topology_probe")],
 }
@@ -401,6 +409,15 @@ CONDITIONAL_STEPS = {
     # last one: `always()` makes a broken sweep surface its invalid artifact
     # without ever masking step 1's exit status.
     "b1-topology-probe": [(2, "always()")],
+    # B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated CPU-basis oracle is the ONLY
+    # conditional step of the benchmark job and the last one. `== true` rather
+    # than a truthiness test: a workflow_dispatch boolean arrives as a real
+    # boolean and a string comparison would run the oracle on "false". The
+    # explicit condition inherits Actions' implicit success(), so step 21
+    # cannot run while the FP-IG-23 provenance gate at step 20 is red.
+    "benchmark": [
+        (21, "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true")
+    ],
 }
 
 
@@ -4947,6 +4964,12 @@ B1_CI_SCALE_LIVE_SELECTION = (
 )
 B1_PRODUCT_SELECTION = "-m b1_product"
 B1_PROBE_SELECTION = "-m b1_topology_probe"
+# B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated oracle's selection. It is the
+# ordinary CI-scale live selection WITHOUT `not b1_latency_basis`, so it adds
+# exactly the FP-IG-18 node and nothing else. Declared beside the other four
+# rather than derived from them: the whole point is that the ordinary
+# selection keeps excluding the marker byte for byte.
+B1_LATENCY_BASIS_SELECTION = "-m 'b1_live and not b1_product and not b1_topology_probe'"
 B1_ROUTING_MARKERS = ("b1_live", "b1_product", "b1_latency_basis", "b1_topology_probe")
 B1_REJECTED_ESCAPES = (
     "runs-on: ubuntu-24.04-8core",
@@ -4962,6 +4985,80 @@ B1_REJECTED_ESCAPES = (
 
 def _b1_launcher_source() -> str:
     return B1_LAUNCHER.read_text(encoding="utf-8")
+
+
+#: The two fail-closed CLI preconditions the isolated oracle runs, exactly as
+#: the launcher spells them (FP-B1LB-6). Declared here as literals so a
+#: silently weakened precondition is a manifest failure, not a green run.
+B1_LATENCY_BASIS_DRIVER = "b1_run_driver driver-latency-basis.sh"
+B1_ORDINARY_LIVE_DRIVER = "b1_run_driver driver-live.sh"
+B1_LATENCY_BASIS_WRAPPER = "bash scripts/integration-test.sh b1_latency_basis"
+B1_LATENCY_BASIS_CONDITION = (
+    "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true"
+)
+
+
+def _b1_latency_basis_failures(workflow: dict, launcher: str) -> list[str]:
+    """FP-B1LB-6: the isolated oracle exists, is isolated, and is opt-in.
+
+    The two live driver lines are counted independently -- one per target --
+    so neither target can quietly acquire the other's selection, and the
+    marker-leak direction has its own named cause rather than being folded
+    into the generic selection-count failures.
+    """
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    ordinary = _b1_target_region(launcher, "b1")
+    region = _b1_target_region(launcher, "b1_latency_basis")
+    if not region:
+        add("latency_basis_target_missing")
+        return fails
+    if region.count(B1_LATENCY_BASIS_DRIVER) != 1:
+        add("latency_basis_target_missing",
+            f"{region.count(B1_LATENCY_BASIS_DRIVER)} latency-basis driver lines")
+    if launcher.count(B1_LATENCY_BASIS_DRIVER) != 1:
+        add("latency_basis_target_missing",
+            f"{launcher.count(B1_LATENCY_BASIS_DRIVER)} latency-basis driver lines in the script")
+    if region.count(B1_LATENCY_BASIS_SELECTION) != 1:
+        add("latency_basis_selection_missing",
+            f"{region.count(B1_LATENCY_BASIS_SELECTION)} in the isolated target")
+    if launcher.count(B1_LATENCY_BASIS_SELECTION) != 1:
+        add("latency_basis_selection_missing",
+            f"{launcher.count(B1_LATENCY_BASIS_SELECTION)} in the whole script")
+
+    # Isolation, both directions: the explicit selection never appears in the
+    # ordinary route, and the ordinary route keeps excluding the marker.
+    if B1_LATENCY_BASIS_SELECTION in ordinary:
+        add("latency_basis_selection_leaked_to_ordinary_b1", "selection")
+    if B1_LATENCY_BASIS_DRIVER in ordinary:
+        add("latency_basis_selection_leaked_to_ordinary_b1", "driver line")
+    if ordinary.count(B1_ORDINARY_LIVE_DRIVER) != 1:
+        add("latency_basis_selection_leaked_to_ordinary_b1",
+            f"{ordinary.count(B1_ORDINARY_LIVE_DRIVER)} ordinary live driver lines")
+    if B1_CI_SCALE_LIVE_SELECTION not in ordinary:
+        add("latency_basis_selection_leaked_to_ordinary_b1", "ordinary live selection")
+    if "not b1_latency_basis" not in B1_COVERAGE_SELECTION:
+        add("latency_basis_selection_leaked_to_ordinary_b1", "coverage selection")
+
+    # Manual, opt-in, and downstream of the provenance gate.
+    steps = ((workflow.get("jobs") or {}).get("benchmark") or {}).get("steps") or []
+    hits = [i for i, step in enumerate(steps)
+            if (step.get("run") or "").strip() == B1_LATENCY_BASIS_WRAPPER]
+    if len(hits) != 1:
+        add("latency_basis_wrapper_missing", str(hits))
+        return fails
+    index = hits[0]
+    if _normalize_ws(steps[index].get("if") or "") != _normalize_ws(B1_LATENCY_BASIS_CONDITION):
+        add("latency_basis_condition_drift", repr(steps[index].get("if")))
+    gate = [i for i, step in enumerate(steps)
+            if "test_delivery_sizing_ledger.py" in (step.get("run") or "")]
+    if gate and not max(gate) < index:
+        add("latency_basis_condition_drift",
+            f"step {index} is not after the provenance gate at {gate}")
+    return fails
 
 
 def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
@@ -5184,6 +5281,7 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
     fails.extend(_b1_mountpoint_failures(launcher))
     fails.extend(_b1_cleanup_failures(launcher))
     fails.extend(_b1_model_keyed_declaration_failures(fixture_src))
+    fails.extend(_b1_latency_basis_failures(workflow, launcher))
     return fails
 
 
@@ -5310,6 +5408,19 @@ GC3_PROBE_INPUT = {
     "default": False,
     "type": "boolean",
 }
+# B1-LATENCY-BASIS-1 FP-B1LB-6 added the second manual input. The inventory
+# stays CLOSED -- an unpinned third input is still a named failure -- and each
+# entry is compared by whole-object equality, so a default flipped to true or a
+# boolean turned into a string is caught for either of them.
+GC3_MANUAL_DISPATCH_INPUTS = {
+    "b1_topology_probe": GC3_PROBE_INPUT,
+    "b1_latency_basis": {
+        "description": "Run the isolated B1 CPU-basis oracle (B1-LATENCY-BASIS-1)",
+        "required": False,
+        "default": False,
+        "type": "boolean",
+    },
+}
 GC3_PROBE_JOB_IF = (
     "github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true"
 )
@@ -5328,7 +5439,7 @@ GC3_PROBE_UPLOAD_IF = "always()"
 # The launcher clauses the discovery route is made of, as independent literals.
 GC3_PROBE_LAUNCHER_CLAUSES: tuple[str, ...] = (
     # allowlisted target, guarded by the same anti-drift check as b1
-    "|b1|b1_product|b1_topology_probe) ;;",
+    "|b1|b1_product|b1_latency_basis|b1_topology_probe) ;;",
     "assert_matches_ci 'bash scripts/integration-test.sh b1_topology_probe'",
     # the outer accumulator and the final artifact live outside any B1_RUN_DIR
     'B1_PROBE_ACCUMULATOR="$(mktemp -d -t dbagent-b1-probe-XXXXXXXXXX)"',
@@ -5513,10 +5624,12 @@ def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> 
         add("dispatch_input_missing", repr(dispatch))
     else:
         inputs = dispatch["inputs"]
-        if set(inputs) != {GC3_PROBE_TARGET}:
+        if set(inputs) != set(GC3_MANUAL_DISPATCH_INPUTS):
             add("dispatch_input_inventory_drift", str(sorted(inputs)))
-        elif inputs[GC3_PROBE_TARGET] != GC3_PROBE_INPUT:
-            add("dispatch_input_drift", str(inputs[GC3_PROBE_TARGET]))
+        else:
+            for name, expected in GC3_MANUAL_DISPATCH_INPUTS.items():
+                if inputs[name] != expected:
+                    add("dispatch_input_drift", f"{name} {inputs[name]}")
 
     # (2) the job envelope
     jobs = workflow.get("jobs") or {}
@@ -5576,8 +5689,19 @@ def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> 
     for clause in GC3_PROBE_LAUNCHER_CLAUSES:
         if clause not in launcher:
             add("probe_clause_missing", repr(clause))
+    # Scoped to the ORDINARY route -- its own target plus the shared
+    # container-free coverage writer it calls -- not to the whole script.
+    # B1-LATENCY-BASIS-1 added a second selected route that legitimately
+    # repeats several of these clauses (FP-B1LB-6), so a whole-file membership
+    # test would survive deleting the ordinary route's own copy.
+    ordinary_route = "\n".join(
+        (
+            _b1_target_region(launcher, "b1"),
+            _b1_target_region(launcher, "b1_write_coverage_driver"),
+        )
+    )
     for clause in GC3_ORDINARY_B1_CLAUSES:
-        if clause not in launcher:
+        if clause not in ordinary_route:
             add("ordinary_b1_clause_missing", repr(clause))
     region = _b1_target_region(launcher, GC3_PROBE_TARGET)
     if not region:
@@ -5822,6 +5946,24 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
     on_key = True if True in mutated else "on"
     mutated[on_key]["workflow_dispatch"]["inputs"][GC3_PROBE_TARGET]["default"] = True
     assert "dispatch_input_drift" in _reasons(workflow=mutated)
+
+    # B1-LATENCY-BASIS-1 FP-B1LB-6: the second manual input is pinned by the
+    # same whole-object equality, and the inventory is still closed.
+    mutated = _copy.deepcopy(wf)
+    mutated[on_key]["workflow_dispatch"]["inputs"]["b1_latency_basis"]["default"] = True
+    assert "dispatch_input_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated[on_key]["workflow_dispatch"]["inputs"]["b1_latency_basis"]["type"] = "string"
+    assert "dispatch_input_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated[on_key]["workflow_dispatch"]["inputs"].pop("b1_latency_basis")
+    assert "dispatch_input_inventory_drift" in _reasons(workflow=mutated)
+
+    mutated = _copy.deepcopy(wf)
+    mutated[on_key]["workflow_dispatch"]["inputs"]["b1_anything_else"] = dict(GC3_PROBE_INPUT)
+    assert "dispatch_input_inventory_drift" in _reasons(workflow=mutated)
 
     mutated = _copy.deepcopy(wf)
     mutated[on_key]["workflow_dispatch"] = None
@@ -6302,6 +6444,21 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("arm_does_not_reset_the_run_dir_flag", "launcher", "arm_does_not_reset_the_run_dir_flag"),
     ("cleanup_drops_the_post_purge_census", "launcher", "cleanup_post_purge_census_missing"),
     ("post_purge_census_is_not_fatal", "launcher", "cleanup_post_purge_flag_missing"),
+    # --- B1-LATENCY-BASIS-1 FP-B1LB-6/7: the isolated oracle route ---
+    # Each of the five named causes is produced by its own mutation; none of
+    # them is reachable through the generic wrapper_body/inventory failures.
+    ("latency_basis_target_removed", "launcher", "latency_basis_target_missing"),
+    ("latency_basis_selection_removed", "launcher", "latency_basis_selection_missing"),
+    ("latency_basis_marker_leaks_into_ordinary_b1", "launcher",
+     "latency_basis_selection_leaked_to_ordinary_b1"),
+    ("ordinary_b1_stops_excluding_the_latency_marker", "launcher",
+     "latency_basis_selection_leaked_to_ordinary_b1"),
+    ("latency_basis_wrapper_removed", "workflow", "latency_basis_wrapper_missing"),
+    ("latency_basis_tail_made_unconditional", "workflow", "latency_basis_condition_drift"),
+    ("latency_basis_tail_condition_made_truthy", "workflow", "latency_basis_condition_drift"),
+    ("latency_basis_tail_moved_before_the_provenance_gate", "workflow",
+     "latency_basis_condition_drift"),
+    ("latency_basis_wrapper_body_gains_a_word", "workflow", "wrapper_body_drift"),
 ]
 
 
@@ -6522,6 +6679,30 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
         fixture = fixture.replace("if len(matches) != 1:", "if len(matches) < 1:", 1)
     elif case_id == "cleanup_drops_the_post_purge_census":
         launcher = launcher.replace(_B1_POST_PURGE_CENSUS, "  return 0\n}", 1)
+    elif case_id == "latency_basis_target_removed":
+        launcher = launcher.replace(
+            '  b1_run_driver driver-latency-basis.sh "$driver_cpus"\n', "", 1)
+    elif case_id == "latency_basis_selection_removed":
+        launcher = launcher.replace(B1_LATENCY_BASIS_SELECTION, "-m b1_live", 1)
+    elif case_id == "latency_basis_marker_leaks_into_ordinary_b1":
+        launcher = launcher.replace(
+            B1_CI_SCALE_LIVE_SELECTION, B1_LATENCY_BASIS_SELECTION, 1)
+    elif case_id == "ordinary_b1_stops_excluding_the_latency_marker":
+        launcher = launcher.replace(
+            B1_CI_SCALE_LIVE_SELECTION,
+            "-m 'b1_live and not b1_product and not b1_topology_probe and not nothing'", 1)
+    elif case_id == "latency_basis_wrapper_removed":
+        steps.pop(21)
+    elif case_id == "latency_basis_tail_made_unconditional":
+        steps[21].pop("if", None)
+    elif case_id == "latency_basis_tail_condition_made_truthy":
+        steps[21]["if"] = (
+            "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis"
+        )
+    elif case_id == "latency_basis_tail_moved_before_the_provenance_gate":
+        steps[20], steps[21] = steps[21], steps[20]
+    elif case_id == "latency_basis_wrapper_body_gains_a_word":
+        steps[21]["run"] = steps[21]["run"].strip() + " --unexpected-option"
     elif case_id == "post_purge_census_is_not_fatal":
         launcher = launcher.replace(
             _B1_POST_PURGE_CENSUS,
@@ -6700,7 +6881,15 @@ def test_b1_entry_matches_its_declared_contract():
         "nested",
         "refutes neither",
         "B1-LATENCY-BASIS-1",
-        "cpuMsPerRequest=2.427",
+        # B1-LATENCY-BASIS-1 FP-B1LB-7: the resolved handoff wording replaces
+        # the stale `cpuMsPerRequest=2.427` / "five consecutive" expectation.
+        # The notes describe the schema and the pending coordinator operation
+        # and state NO basis number before collection.
+        "ingestGateway.sizingBasis.observations",
+        "collection.attempts",
+        "five distinct qualifying CI-scale observations",
+        "`scripts/integration-test.sh b1_latency_basis`",
+        "design/slices/b1-latency-basis-1/design.md",
         "design/slices/gc-1-reference-topology/design.md",
         "design/frozen-deviations.md",
         # retained vocabulary

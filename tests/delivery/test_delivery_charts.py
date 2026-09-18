@@ -1,6 +1,7 @@
 """FP-M6-5..9: Helm chart render matrix and packaging invariants."""
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 
@@ -12,6 +13,27 @@ from delivery_helpers import CHARTS, REPO_ROOT, helm_template, load_versions, pa
 
 DBAGENT = CHARTS / "dbagent"
 DBAGENT_PROBE = CHARTS / "dbagent-probe"
+
+# FP-B1LB-5: the sizing ledger's closed schema, GC-3 binding, Phase A pending
+# branch and derivation live in ONE module. Loaded by file path under its own
+# module name so this file's collection never depends on that file's (the
+# benchmark job collects the gate; the functional job ignores it).
+_LEDGER_PATH = REPO_ROOT / "tests" / "delivery" / "test_delivery_sizing_ledger.py"
+
+
+def _load_ledger_module():
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("b1lb_sizing_ledger", _LEDGER_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["b1lb_sizing_ledger"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ledger = _load_ledger_module()
 
 
 def test_helm_available_or_hard_fail():
@@ -823,38 +845,91 @@ def test_liveness_cannot_fire_before_readiness_sheds():
             assert ok, f"{deploy} fails shed-before-kill: readiness={r} liveness={l}"
 
 
-def test_ingest_gateway_cpu_sizing_is_derived_from_b1():
-    """FP-IG-4: requests.cpu == ceil(basis × 200); limits >= 5×; basis literal."""
-    import math
+def test_fp_b1lb_5_chart_resources_derive_from_five_rows():
+    """FP-B1LB-5: the derivation, on synthetic rows, with no chart at all.
 
-    values = yaml.safe_load((DBAGENT / "values.yaml").read_text(encoding="utf-8"))
-    basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
-    # Literal identity — basis equals the test's own constant (FP-IG-4).
-    # Five-run collection 2026-08-12: 2.031, 1.983, 2.205, 2.102, 2.096 →
-    # max+(max−min) = 2.427.
-    INGEST_GATEWAY_CPU_MS_PER_REQUEST = 2.427
-    assert basis == INGEST_GATEWAY_CPU_MS_PER_REQUEST
+    cpuMsPerRequest = max + (max - min) over exactly five valid rows;
+    requests.cpu = ceil(that x 200) m; limits.cpu = EXACTLY 5 x requests.cpu.
+    The fixture identities and costs are unmistakably synthetic and never
+    enter values.yaml, the threshold notes or acceptance evidence.
+    """
+    ig = ledger._filled_ledger()
+    rows = ig["sizingBasis"]["observations"]
+    assert len(rows) == 5
+    costs = [row["cpuMsPerRequest"] for row in rows]
+    basis = ledger.derive_basis(costs)
+    assert basis == max(costs) + (max(costs) - min(costs))
+    assert float(ig["sizingBasis"]["cpuMsPerRequest"]) == basis
 
-    out = helm_template(DBAGENT)
-    docs = parse_manifests(out)
-    dep = next(
-        d
-        for d in docs
-        if d.get("kind") == "Deployment" and "ingest-gateway" in d["metadata"]["name"]
+    request, limit = ledger.chart_resource_expectations(ig)
+    assert (request, limit) == ledger.derive_chart_millicores(basis)
+    assert limit == 5 * request
+    assert request == math.ceil(basis * 200)
+
+    # A wider limit is not "at least 5x": the multiple is exact.
+    assert ledger.derive_chart_millicores(basis)[1] != 6 * request
+
+    # ...and the RENDERED-resource leg is real, not decorative: the shipped
+    # chart does not render this fixture's numbers, so validating it against
+    # the live renderer must go red. This is the "incorrect request/limit"
+    # mutation, driven by the actual helm output rather than a stub.
+    rendered_request, rendered_limit = ledger.rendered_ingest_gateway_cpu()
+    assert (rendered_request, rendered_limit) != (request, limit), (
+        "the fixture accidentally matches the shipped chart; it cannot "
+        "discriminate a wrong rendered resource"
     )
-    res = dep["spec"]["template"]["spec"]["containers"][0]["resources"]
-    req_cpu = res["requests"]["cpu"]
-    lim_cpu = res["limits"]["cpu"]
+    try:
+        ledger.validate_sizing_ledger(ig, check_rendered_cpu=True)
+    except AssertionError as exc:
+        assert "requests.cpu" in str(exc), str(exc)
+    else:
+        raise AssertionError(
+            "a ledger whose derivation disagrees with the rendered chart stayed green"
+        )
+    # And a row set that is not five, or not valid, derives nothing at all.
+    for mutate in (
+        lambda one: one["sizingBasis"]["observations"].pop(),
+        lambda one: one["sizingBasis"]["observations"][0].__setitem__("errors", 1),
+    ):
+        try:
+            ledger.chart_resource_expectations(ledger._filled_ledger(mutate=mutate))
+        except AssertionError:
+            continue
+        raise AssertionError("an unqualified ledger still derived chart resources")
 
-    def millicores(v) -> int:
-        s = str(v)
-        if s.endswith("m"):
-            return int(s[:-1])
-        return int(float(s) * 1000)
 
-    expected = math.ceil(basis * 200)
-    assert millicores(req_cpu) == expected, f"requests.cpu={req_cpu} want {expected}m"
-    assert millicores(lim_cpu) >= 5 * millicores(req_cpu)
+def test_ingest_gateway_cpu_sizing_is_derived_from_b1():
+    """FP-IG-4 / FP-B1LB-5: the RENDERED chart equals the qualified ledger.
+
+    No stale 2.427 constant and no duplicated observation cost: the expected
+    request/limit pair comes from the validated ledger, which this test does
+    not re-implement.
+
+    Phase A (§3.7): while - and only while - `observations == []` and
+    `collection.attempts == []`, this node recognises the pending
+    B1-LATENCY-BASIS-1 handoff and makes NO claim that the shipped basis or
+    CPU resources are derived from anything. FP-IG-23 is the sole actual-state
+    owner that rejects the void carrier. Any other ledger state, including a
+    non-empty invalid one, goes through the validator and fails there.
+    """
+    values = yaml.safe_load((DBAGENT / "values.yaml").read_text(encoding="utf-8"))
+    ig = values["ingestGateway"]
+    expected = ledger.chart_resource_expectations(ig)
+    if expected is None:
+        basis = ig["sizingBasis"]
+        assert basis["observations"] == []
+        assert basis["collection"]["attempts"] == []
+        # Not a skip and not a pass-by-weakening: the node RAN, found both
+        # carriers empty, and therefore asserts nothing about the shipped
+        # numbers. The void is rejected by
+        # tests/delivery/test_delivery_sizing_ledger.py
+        # ::test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run,
+        # which is red until the five real rows are recorded.
+        return
+    expected_request, expected_limit = expected
+    request, limit = ledger.rendered_ingest_gateway_cpu()
+    assert request == expected_request, f"requests.cpu={request}m want {expected_request}m"
+    assert limit == expected_limit, f"limits.cpu={limit}m want {expected_limit}m"
 
 
 def test_probe_tuning_template_renders_all_four_keys():

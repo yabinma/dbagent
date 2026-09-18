@@ -54,6 +54,14 @@ on:
         required: false
         default: false
         type: boolean
+      # B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated CPU-basis oracle. Default
+      # false, so push, pull-request, scheduled and ordinary manual runs
+      # behave exactly as before and the ordinary B1 gate is untouched.
+      b1_latency_basis:
+        description: Run the isolated B1 CPU-basis oracle (B1-LATENCY-BASIS-1)
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   lint:
@@ -475,6 +483,16 @@ jobs:
         run: |
           services/worker/.venv/bin/python -m pytest \
             tests/delivery/test_delivery_sizing_ledger.py -v
+      # B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated CPU-basis oracle, appended
+      # AFTER the FP-IG-23 provenance gate at step 20 and never before it.
+      # The explicit condition inherits Actions' implicit success(), so this
+      # step cannot run while the provenance gate is red -- the basis it would
+      # compare against would be exactly the unqualified one. On an enabled
+      # manual dispatch this is a SECOND live B1 run in this job: the ordinary
+      # gate at step 17 has already produced its own, unperturbed result.
+      - name: B1-LATENCY-BASIS-1 -- isolated CPU-basis oracle (manual, opt-in)
+        if: github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true
+        run: bash scripts/integration-test.sh b1_latency_basis
       # v1.5 manifest honesty rule (design.md Section 14.4): a
       # thresholds.yaml entry cannot stay `deferred` once its hot-path code
       # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14; M4 flipped B12.

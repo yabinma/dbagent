@@ -91,14 +91,14 @@ cd "$REPO_ROOT" || exit 1
 WHAT="${1:-all}"
 
 case "$WHAT" in
-  all|go|py|python|preflight|smoke|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run|b1|b1_product|b1_topology_probe) ;;
+  all|go|py|python|preflight|smoke|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run|b1|b1_product|b1_latency_basis|b1_topology_probe) ;;
   -h|--help|help)
     # QUOTED heredoc: this block contains backticks and angle brackets that must print
     # literally. Unquoted, bash treats `go test -exec <anything>` as a command
     # substitution and the line renders empty with a syntax error on stderr. (The
     # refusal message below is deliberately UNquoted -- it interpolates $REPO_ROOT.)
     cat <<'EOF'
-usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_topology_probe|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run]
+usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_latency_basis|b1_topology_probe|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run]
 
   all  (default)  go + py + b1 + b1_product -- the local acceptance route
   b1              the resource-declared CI-scale B1 benchmark (gating; the
@@ -114,6 +114,16 @@ usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_t
                   the target rather than reading as an unratified model.
   b1_product      the recorded, non-gating 1000 req/s product-promise run on
                   measured-role-exclusive cores; needs >= 8 logical CPUs
+  b1_latency_basis
+                  the isolated CPU-basis oracle (B1-LATENCY-BASIS-1). The same
+                  selected CI-scale route, plus the FP-IG-18 node that compares
+                  measured gateway CPU per request against the recorded chart
+                  basis. Explicit only: never part of `all`, never part of the
+                  ordinary `b1` result, and in CI only behind a manual
+                  workflow_dispatch input. It exits 3 with
+                  basis_oracle_unobserved:<reason> and starts no workload when
+                  the ledger is unrecorded/invalid or this runner is not the
+                  recorded signature identity.
   b1_topology_probe
                   GC-3 topology discovery: the 28 closed placements of the
                   CI-scale burst, measured once each and recorded. Manual only
@@ -136,7 +146,7 @@ Must run OUTSIDE the Claude Code sandbox -- see the header of this file.
 EOF
     exit 0 ;;
   *)
-    echo "integration-test.sh: unknown target '$WHAT' (want: all | go | py | preflight | smoke | b1 | b1_product | b1_topology_probe | d0_2a | d0_2c | d0_2d | d0_3a | d0_3b | d0_3c | d0_4 | d0_4_workers | sp_1 | sp_1_run | sp_1_sg4 | rm_1 | rm_1_run | lv_1 | lv_1_run)" >&2
+    echo "integration-test.sh: unknown target '$WHAT' (want: all | go | py | preflight | smoke | b1 | b1_product | b1_latency_basis | b1_topology_probe | d0_2a | d0_2c | d0_2d | d0_3a | d0_3b | d0_3c | d0_4 | d0_4_workers | sp_1 | sp_1_run | sp_1_sg4 | rm_1 | rm_1_run | lv_1 | lv_1_run)" >&2
     exit 2 ;;
 esac
 
@@ -781,6 +791,38 @@ b1_run_driver() {
     taskset -c "$cpuset" bash "$B1_RUN_MOUNT/$script"
 }
 
+# The container-free coverage phase, written ONCE and used by BOTH selected
+# routes: the ordinary gating `b1` and the explicit `b1_latency_basis`
+# oracle run the same traced selection, over the same files, at the same
+# bar. It is factored here rather than duplicated so the two can never
+# become two different coverage contracts -- the delivery pin counts
+# exactly one traced pytest command and exactly one report per covered
+# file in this whole script.
+b1_write_coverage_driver() {
+  # Container-free coverage phase. No live fixture and no full-window
+  # self-witness ever runs under the tracer: its unmeasured overhead would
+  # consume the driver's single declared CPU.
+  #
+  # Coverage is reported over the four files this slice changes -- first as
+  # one aggregate, then file by file, all at --fail-under=81. The aggregate is
+  # scoped to the same four files on purpose: an unscoped report also counts
+  # gateway/ingest.py, rca_common and the e2e profile copy, which this
+  # harness-unit selection imports but is not the instrument for (the
+  # unit-gateway job owns those, at its own --cov-fail-under=81). Counting them
+  # here would make the number a statement about product code that no test in
+  # this phase exercises.
+  cat > "$B1_RUN_DIR/driver-coverage.sh" <<'B1_CI_SCALE_COVERAGE'
+set -uo pipefail
+cd /workspace
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage run --branch --data-file=/run/dbagent-b1/coverage/.coverage -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_reference_profile.py,/workspace/services/gateway/tests/test_b1_ingest_burst.py,/workspace/scripts/b1-affinity-helper.py,/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_reference_profile.py || exit $?
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/test_b1_ingest_burst.py || exit $?
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/scripts/b1-affinity-helper.py || exit $?
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
+B1_CI_SCALE_COVERAGE
+}
+
 # The ordinary CI-scale route: an UNCONDITIONAL container-free coverage phase,
 # then a model-routed live phase.
 #
@@ -808,28 +850,7 @@ b1() {
     return 1
   fi
   b1_prepare || return 1
-  # Container-free coverage phase. No live fixture and no full-window
-  # self-witness ever runs under the tracer: its unmeasured overhead would
-  # consume the driver's single declared CPU.
-  #
-  # Coverage is reported over the four files this slice changes -- first as
-  # one aggregate, then file by file, all at --fail-under=81. The aggregate is
-  # scoped to the same four files on purpose: an unscoped report also counts
-  # gateway/ingest.py, rca_common and the e2e profile copy, which this
-  # harness-unit selection imports but is not the instrument for (the
-  # unit-gateway job owns those, at its own --cov-fail-under=81). Counting them
-  # here would make the number a statement about product code that no test in
-  # this phase exercises.
-  cat > "$B1_RUN_DIR/driver-coverage.sh" <<'B1_CI_SCALE_COVERAGE'
-set -uo pipefail
-cd /workspace
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage run --branch --data-file=/run/dbagent-b1/coverage/.coverage -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_reference_profile.py,/workspace/services/gateway/tests/test_b1_ingest_burst.py,/workspace/scripts/b1-affinity-helper.py,/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_reference_profile.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/test_b1_ingest_burst.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/scripts/b1-affinity-helper.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
-B1_CI_SCALE_COVERAGE
+  b1_write_coverage_driver
   b1_run_driver driver-coverage.sh "${cpus[0]}"
   local rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -926,6 +947,130 @@ cd /workspace
 env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
 B1_CI_SCALE_LIVE
   b1_run_driver driver-live.sh "$driver_cpus"
+  rc=$?
+  b1_cleanup
+  trap - EXIT TERM INT
+  if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
+  return "$rc"
+}
+
+# B1-LATENCY-BASIS-1 (FP-B1LB-6) -- the ISOLATED CPU-basis oracle.
+#
+# Same GC-3 route file, same selected topology contract, same container
+# ownership, same verified cleanup and the same container-free coverage phase
+# as `b1`. The ONE difference is the live marker expression: it adds the
+# `b1_latency_basis` node (FP-IG-18) to the ordinary CI-scale selection. That
+# node compares a measured gateway CPU cost against the RECORDED chart basis,
+# which is a requalification question, not the merge gate -- coupling it to
+# `b1` would recreate exactly the perturbation GC-1 isolated it from.
+#
+# It is absent from `all` and from default CI; ci.yml reaches it only through
+# a `workflow_dispatch` whose `b1_latency_basis` input is explicitly true.
+#
+# It FAILS CLOSED twice, and neither failure is a skip:
+#   * before any container exists, when the sizing ledger is unrecorded or
+#     invalid -- there is no right-hand side to compare against; and
+#   * immediately after routing, when this runner is not the exact recorded
+#     signature identity -- a measurement of another CPU model, topology or
+#     image is not a measurement of the recorded basis's population.
+# Both print `basis_oracle_unobserved:<reason>` and exit 3, so a rotated
+# runner is reported as unobserved rather than counted as an oracle pass.
+b1_latency_basis() {
+  assert_matches_ci 'bash scripts/integration-test.sh b1_latency_basis' || return 1
+  local -a cpus=()
+  mapfile -t cpus < <(b1_available_cpus)
+  if [ "${#cpus[@]}" -lt 1 ]; then
+    echo "integration-test.sh: b1_latency_basis needs a usable scheduler-affinity operation (taskset)" >&2
+    return 1
+  fi
+  # Precondition 1: a recorded, fully qualified ledger, BEFORE b1_prepare.
+  "$REPO_ROOT/services/worker/.venv/bin/python" "$REPO_ROOT/tests/delivery/test_delivery_sizing_ledger.py" basis-oracle-preflight --values "$REPO_ROOT/deploy/charts/dbagent/values.yaml" --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json"
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "integration-test.sh: b1_latency_basis did not observe the CPU-basis oracle; no workload ran" >&2
+    return "$rc"
+  fi
+  b1_prepare || return 1
+  b1_write_coverage_driver
+  b1_run_driver driver-coverage.sh "${cpus[0]}"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    b1_cleanup
+    trap - EXIT TERM INT
+    return "$rc"
+  fi
+
+  local route_disposition route_topology
+  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
+  python3 "$B1_PROBE_PLANNER" route \
+    --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \
+    --out "$B1_ROUTE_RECORD"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    b1_cleanup
+    trap - EXIT TERM INT
+    return "$rc"
+  fi
+  IFS=$'\t' read -r route_disposition route_topology < <(
+    python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"
+  )
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$route_disposition" ]; then
+    echo "integration-test.sh: b1_latency_basis could not read the route record $B1_ROUTE_RECORD" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  # Precondition 2: this runner IS the recorded signature identity. A recorded
+  # GC-3 route reports its own canonical reason here, before pair discovery and
+  # before any live fixture.
+  "$REPO_ROOT/services/worker/.venv/bin/python" "$REPO_ROOT/tests/delivery/test_delivery_sizing_ledger.py" basis-oracle-route --values "$REPO_ROOT/deploy/charts/dbagent/values.yaml" --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" --route "$B1_ROUTE_RECORD"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "integration-test.sh: b1_latency_basis did not observe the CPU-basis oracle; no workload ran" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return "$rc"
+  fi
+  if [ "$route_disposition" != "gating" ] || [ -z "$route_topology" ] || [ "$route_topology" = "none" ]; then
+    echo "integration-test.sh: b1_latency_basis read an unusable route ($route_disposition/$route_topology)" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  if [ "${#cpus[@]}" -lt 4 ]; then
+    echo "integration-test.sh: b1_latency_basis needs at least 4 available logical CPUs, this host offers ${#cpus[@]}" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  local -a sibling_pairs=()
+  mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")
+  if [ "${#sibling_pairs[@]}" -lt 2 ]; then
+    echo "integration-test.sh: b1_latency_basis needs two complete two-thread SMT sibling pairs inside its allowed CPU set ($(b1_canonical_cpu_list "${cpus[@]}")); this host offers ${#sibling_pairs[@]}" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  local driver_cpus
+  driver_cpus="$(python3 "$B1_PROBE_PLANNER" contract-selected \
+    --topology "$route_topology" \
+    --pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \
+    --run-id "$B1_RUN_ID" \
+    --out "$B1_RUN_DIR/placement.json")"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$driver_cpus" ]; then
+    echo "integration-test.sh: b1_latency_basis could not render the selected topology $route_topology" >&2
+    b1_cleanup
+    trap - EXIT TERM INT
+    return 1
+  fi
+  cat > "$B1_RUN_DIR/driver-latency-basis.sh" <<'B1_LATENCY_BASIS_LIVE'
+set -uo pipefail
+cd /workspace
+env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'b1_live and not b1_product and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
+B1_LATENCY_BASIS_LIVE
+  b1_run_driver driver-latency-basis.sh "$driver_cpus"
   rc=$?
   b1_cleanup
   trap - EXIT TERM INT
@@ -1195,6 +1340,7 @@ case "$WHAT" in
   lv_1_run)  run_step "LV-1 leg witness: the real session (diagnostic)" lv_1_run ;;
   b1)        run_step "B1 CI-scale (resource-declared, gating)" b1 ;;
   b1_product) run_step "B1 product promise (recorded, non-gating)" b1_product ;;
+  b1_latency_basis) run_step "B1 CPU-basis oracle (isolated, explicit)" b1_latency_basis ;;
   b1_topology_probe) run_step "B1 topology discovery (28 arms, recorded, manual)" b1_topology_probe ;;
 esac
 

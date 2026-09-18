@@ -1965,8 +1965,17 @@ def _gc1_cardinality_map_failures(test_assigns: "dict[str, ast.AST]") -> list[st
     ) != GC1_AFFINITY_CARDINALITIES["product-exclusive"]:
         fails.append("the product-local 4/3/1 cardinality moved")
     return fails
+# The historical, VOID basis label. Retained as a NAMED value so the pins
+# below can say what they no longer require: B1-LATENCY-BASIS-1 owns the
+# replacement, and no GC-* pin may re-assert this number or the empty ledger.
 GC1_BASIS_MS_PER_REQUEST = 2.427
 GC1_BASIS_OWNER = "B1-LATENCY-BASIS-1"
+#: The single actual-state owner of the unqualified basis. Every GC-* handoff
+#: pin routes to it instead of duplicating its scheduled failure.
+GC1_BASIS_GATE = (
+    "tests/delivery/test_delivery_sizing_ledger.py"
+    "::test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run"
+)
 # Top-level directories the FP-GC1-6 guard may open. The gitignored
 # specification tree is deliberately absent: the guard must stay
 # collectable in CI, where that tree does not exist.
@@ -2445,7 +2454,15 @@ def test_b1_placement_fingerprint_surface_is_pinned():
 
 
 def test_gc1_preserves_and_routes_unqualified_cpu_basis():
-    """FP-GC1-6: the stale 2.427 basis stays visible, unchanged and routed.
+    """FP-GC1-6 / FP-B1LB-7: the basis handoff is RESOLVED by schema and owner.
+
+    GC-1 deferred the CPU basis; B1-LATENCY-BASIS-1 owns it. What this guard
+    preserves is the handoff itself -- the named owner, the closed ledger
+    carriers, and the two oracles that decide it -- NOT the void state. It no
+    longer pins `observations == []` or the literal 2.427: those are exactly
+    what the owning slice's collection replaces, and duplicating its scheduled
+    empty-before-collection failure here would produce a second red for one
+    fact. FP-IG-23's own actual-state gate is the single owner of that void.
 
     Reads only tracked carriers, deliberately: this guard must stay collectable
     in CI, where the gitignored design tree does not exist.
@@ -2455,9 +2472,12 @@ def test_gc1_preserves_and_routes_unqualified_cpu_basis():
     values_path = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
     values = _yaml.safe_load(values_path.read_text(encoding="utf-8"))
     basis = values["ingestGateway"]["sizingBasis"]
-    assert float(basis["cpuMsPerRequest"]) == GC1_BASIS_MS_PER_REQUEST
-    assert basis["observations"] == []
-    assert "cpuMsPerRequest: 2.427" in values_path.read_text(encoding="utf-8")
+    # The closed carriers the owning slice reads and writes, and nothing about
+    # what they currently hold.
+    assert set(basis) == {"cpuMsPerRequest", "signature", "collection", "observations"}
+    assert set(basis["collection"]) == {"attempts"}
+    assert isinstance(basis["observations"], list)
+    assert isinstance(basis["collection"]["attempts"], list)
 
     thresholds = _yaml.safe_load(
         (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(encoding="utf-8")
@@ -2465,8 +2485,8 @@ def test_gc1_preserves_and_routes_unqualified_cpu_basis():
     b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
     notes = b1_entry["notes"]
     assert GC1_BASIS_OWNER in notes, "B1 notes must route the basis to its owning slice"
-    assert "cpuMsPerRequest=2.427" in notes
-    assert "five consecutive" in notes
+    assert GC1_BASIS_GATE in notes, "B1 notes must name the actual-state gate"
+    assert "collection.attempts" in notes
 
     # Both oracle carriers keep their names and their comparisons.
     ref_src = REF_TEST.read_text(encoding="utf-8")
@@ -2917,8 +2937,10 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
     values_text = GC2_VALUES_PATH.read_text(encoding="utf-8")
     values = _yaml.safe_load(values_text)
     basis = values["ingestGateway"]["sizingBasis"]
-    assert float(basis["cpuMsPerRequest"]) == GC1_BASIS_MS_PER_REQUEST == 2.427
-    assert "cpuMsPerRequest: 2.427" in values_text
+    # FP-B1LB-7: the basis VALUE is B1-LATENCY-BASIS-1's to move, so this pin
+    # no longer requires 2.427 or an empty ledger. What stays GC-2's is its
+    # own investigation numbers: they may never become a sizing observation,
+    # however the ledger is populated.
     for observation in basis["observations"] or []:
         rendered = str(observation)
         assert GC2_INVESTIGATION_CPU_MS not in rendered, rendered
@@ -2934,7 +2956,7 @@ def test_gc2_write_path_scope_and_fixed_bar_are_pinned():
     )
     b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
     assert GC1_BASIS_OWNER in b1_entry["notes"]
-    assert "cpuMsPerRequest=2.427" in b1_entry["notes"]
+    assert GC1_BASIS_GATE in b1_entry["notes"]
 
     # (7) The three GC-2 diagnostics are appended, reported-only, and escaped.
     assert GC3_PRODUCT_DIAGNOSTIC_PLACEMENT_FIELDS[-3:] == GC3_PRODUCT_DIAGNOSTIC_TAIL
@@ -3179,6 +3201,12 @@ GC3_LIVE_SELECTION = (
 )
 GC3_PROBE_SELECTION = "-m b1_topology_probe"
 GC3_PRODUCT_SELECTION = "-m b1_product"
+# B1-LATENCY-BASIS-1 FP-B1LB-6: the fifth selection, declared beside the four
+# GC-3 pinned above rather than derived from any of them. It is the ordinary
+# CI-scale live selection WITHOUT `not b1_latency_basis`, so it adds exactly
+# the FP-IG-18 oracle node -- and it must appear exactly once, only in the
+# isolated target, while all four above stay byte-exact.
+GC3_LATENCY_BASIS_SELECTION = "-m 'b1_live and not b1_product and not b1_topology_probe'"
 GC3_PROBE_JOB = "b1-topology-probe"
 # The GC-2 RCA's own diagnostics. Neither may become a sizing observation nor a
 # selection threshold: mean CPU explains a result and cannot prove due-time
@@ -3938,7 +3966,14 @@ def _gc3_route_surface_failures() -> list[str]:
     region = launcher.split("\nb1() {", 1)
     if len(region) != 2:
         return fails + ["the ordinary b1 target is missing"]
-    b1_region = region[1].split("\n# The product promise", 1)[0]
+    # The ORDINARY target only. B1-LATENCY-BASIS-1 appended a second selected
+    # route after it (FP-B1LB-6), which runs the same planner calls; folding
+    # the two together would make "exactly one route-fields read" and "the
+    # carrier is read only by route" say something about both at once, which
+    # is not what GC-3 pinned. The isolated target has its own pins.
+    b1_region = region[1].split("\n# B1-LATENCY-BASIS-1", 1)[0].split(
+        "\n# The product promise", 1
+    )[0]
     for clause in (
         'b1_run_driver driver-coverage.sh "${cpus[0]}"',
         'python3 "$B1_PROBE_PLANNER" route \\',
@@ -4198,10 +4233,10 @@ def _gc3_scope_failures() -> list[str]:
     if "os.environ.get" in probe_live or "getenv" in probe_live:
         fails.append("the probe live module reads the environment")
 
-    # (9) The sizing ledger is untouched and carries none of the RCA values.
-    values_text = GC2_VALUES_PATH.read_text(encoding="utf-8")
-    if "cpuMsPerRequest: 2.427" not in values_text:
-        fails.append("cpuMsPerRequest moved")
+    # (9) The sizing ledger carries none of this slice's RCA values. FP-B1LB-7:
+    # the basis VALUE itself is B1-LATENCY-BASIS-1's to move, so it is no
+    # longer pinned here; what GC-3 keeps is that no topology-probe arm and no
+    # RCA diagnostic may become a sizing observation.
     for parts in GC3_SIZING_CARRIERS:
         carrier = REPO_ROOT.joinpath(*parts)
         if not carrier.is_file():
@@ -5017,22 +5052,22 @@ def test_gc4_fixed_bars_and_sizing_boundaries_are_pinned():
         assert field not in gc3.VERDICT_FIELDS, field
         assert field not in gc3.RECORD_KEYS, field
 
-    # (6) The sizing basis, its empty ledger and the prohibited diagnostics.
+    # (6) The prohibited diagnostics. FP-B1LB-7: the basis VALUE and the
+    # emptiness of the ledger are B1-LATENCY-BASIS-1's to move, so neither is
+    # pinned here any more -- and the blanket "no long integer in the sizing
+    # block" rule is narrowed to THIS slice's own run id, because a qualified
+    # ledger legitimately carries five real GitHub run identities.
     values = yaml.safe_load(GC4_VALUES_PATH.read_text(encoding="utf-8"))
     basis = values["ingestGateway"]["sizingBasis"]
-    assert float(basis["cpuMsPerRequest"]) == 2.427
-    assert GC4_BASIS_MS_PER_REQUEST in GC4_VALUES_PATH.read_text(encoding="utf-8")
-    assert basis["observations"] == [], basis["observations"]
     for parts in GC4_SIZING_CARRIERS:
         carrier = REPO_ROOT.joinpath(*parts)
         assert carrier.is_file(), parts[-1]
         text = carrier.read_text(encoding="utf-8")
         for value in GC4_RCA_DIAGNOSTICS:
             assert value not in text, f"{parts[-1]} carries the diagnostic {value}"
-    # No investigation or CI run id may enter a sizing observation. Scoped to
-    # the sizing block itself: the manifest legitimately cites GC-3 discovery
-    # run ids as evidence in its prose, which is not a sizing carrier value.
-    assert not re.search(r"\b\d{9,}\b", yaml.safe_dump(basis)), basis
+    rendered_basis = yaml.safe_dump(basis)
+    for value in GC4_RCA_DIAGNOSTICS + (GC3_RCA_RUN_ID, GC2_INVESTIGATION_RUN_ID):
+        assert value not in rendered_basis, f"the sizing block carries {value}"
 
 
 def test_gc4_gc3_requalification_handoff_is_head_scoped():
@@ -5689,14 +5724,16 @@ def test_gc5_fixed_workload_pool_schema_and_sizing_boundaries():
         "a workflow is started for a grouped hit"
     )
 
-    # (6) The sizing basis, the ledger owner and the runner classes.
+    # (6) The ledger owner and the runner classes. FP-B1LB-7: neither the
+    # basis value nor the ledger's emptiness is pinned here any more; GC-5's
+    # own claim is the transaction ratio, and its own diagnostics stay out of
+    # the sizing block however that block is populated.
     values_text = GC5_VALUES_PATH.read_text(encoding="utf-8")
     values = yaml.safe_load(values_text)
     basis = values["ingestGateway"]["sizingBasis"]
-    assert float(basis["cpuMsPerRequest"]) == GC5_BASIS_MS_PER_REQUEST == 2.427
-    assert f"cpuMsPerRequest: {GC5_BASIS_MS_PER_REQUEST}" in values_text
-    assert basis["observations"] == [], basis["observations"]
-    assert not re.search(r"\b\d{9,}\b", yaml.safe_dump(basis)), basis
+    rendered_basis = yaml.safe_dump(basis)
+    for field in GC5_COMMIT_FIELDS + (GC5_RATIO_CONSTANT,):
+        assert field not in rendered_basis, f"the sizing block carries {field}"
     thresholds = yaml.safe_load(GC5_THRESHOLDS.read_text(encoding="utf-8"))
     b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
     assert b1_entry["status"] == "covered", "the bar was relabelled"
@@ -5704,6 +5741,7 @@ def test_gc5_fixed_workload_pool_schema_and_sizing_boundaries():
         "the B1 threshold string moved"
     )
     assert GC1_BASIS_OWNER in b1_entry["notes"]
+    assert GC1_BASIS_GATE in b1_entry["notes"]
     assert "p99<150ms" in b1_entry["notes"].replace(" ", "")
     # Every other benchmark entry keeps its own threshold and status: this
     # slice appended prose to B1's notes and touched nothing else.
@@ -6016,3 +6054,663 @@ def test_gc5_gc3_requalification_handoff_is_head_scoped():
     validator_src = ast.get_source_segment(harness_src, validator) or ""
     for forbidden in ("postgres_commit", "xact_commit", "wal_"):
         assert forbidden not in validator_src, forbidden
+
+
+# ---------------------------------------------------------------------------
+# B1-LATENCY-BASIS-1 — the isolated CPU-basis oracle, the resolved basis
+# handoff, and this slice's fixed scope.
+#
+# Every literal below is declared here, independently of the files it pins.
+# What this slice adds is ONE explicit target and ONE closed ledger schema; the
+# thing it must never do is change the ordinary CI-scale gate, so the ordinary
+# selections, the workload, the placement and the frozen knobs are all pinned
+# byte for byte alongside the new surface.
+# ---------------------------------------------------------------------------
+B1LB_LEDGER_MODULE = REPO_ROOT / "tests" / "delivery" / "test_delivery_sizing_ledger.py"
+B1LB_VALUES = REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml"
+B1LB_THRESHOLDS = REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml"
+B1LB_TARGET = "b1_latency_basis"
+B1LB_WRAPPER = "bash scripts/integration-test.sh b1_latency_basis"
+B1LB_CONDITION = (
+    "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true"
+)
+B1LB_LIVE_DRIVER = 'b1_run_driver driver-latency-basis.sh "$driver_cpus"'
+B1LB_ORDINARY_LIVE_DRIVER = 'b1_run_driver driver-live.sh "$driver_cpus"'
+B1LB_COVERAGE_DRIVER = 'b1_run_driver driver-coverage.sh "${cpus[0]}"'
+#: The two fail-closed CLI preconditions, exactly as §3.6 fixes them.
+B1LB_PREFLIGHT_CALL = (
+    '"$REPO_ROOT/services/worker/.venv/bin/python" '
+    '"$REPO_ROOT/tests/delivery/test_delivery_sizing_ledger.py" basis-oracle-preflight '
+    '--values "$REPO_ROOT/deploy/charts/dbagent/values.yaml" '
+    '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json"'
+)
+B1LB_ROUTE_CALL = (
+    '"$REPO_ROOT/services/worker/.venv/bin/python" '
+    '"$REPO_ROOT/tests/delivery/test_delivery_sizing_ledger.py" basis-oracle-route '
+    '--values "$REPO_ROOT/deploy/charts/dbagent/values.yaml" '
+    '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" '
+    '--route "$B1_ROUTE_RECORD"'
+)
+B1LB_UNOBSERVED_PREFIX = "basis_oracle_unobserved:"
+B1LB_UNOBSERVED_EXIT = 3
+#: The frozen surfaces this slice may not have moved (FP-B1LB-8).
+B1LB_FROZEN_LAUNCHER_CLAUSES = (
+    "-m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'",
+    "-m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'",
+    "-m b1_product",
+    "-m b1_topology_probe",
+)
+B1LB_ESCAPES = GC3_WEAKENINGS
+
+b1lb = _load(B1LB_LEDGER_MODULE, "b1lb_sizing_ledger_profile")
+
+
+def _b1lb_region(launcher: str, target: str) -> str:
+    """One shell target's body, delimited by top-level function headers."""
+    lines = launcher.splitlines()
+    starts = [
+        (index, match.group(1))
+        for index, match in (
+            (i, re.match(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z", line))
+            for i, line in enumerate(lines)
+        )
+        if match
+    ]
+    for position, (index, name) in enumerate(starts):
+        if name != target:
+            continue
+        stop = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        return "\n".join(lines[index + 1:stop])
+    return ""
+
+
+def _b1lb_target_failures(launcher: str, workflow: dict) -> list[str]:
+    """FP-B1LB-6/8: the isolated target exists, is isolated, and fails closed."""
+    fails: list[str] = []
+
+    def add(reason: str, detail: str = "") -> None:
+        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
+
+    region = _b1lb_region(launcher, B1LB_TARGET)
+    ordinary = _b1lb_region(launcher, "b1")
+    if not region:
+        add("latency_basis_target_missing")
+        return fails
+    if B1LB_LIVE_DRIVER not in region:
+        add("latency_basis_target_missing", "no live driver line")
+    if B1LB_COVERAGE_DRIVER not in region:
+        add("latency_basis_target_missing", "no container-free coverage phase")
+    if GC3_PRODUCER_REL not in region:
+        add("latency_basis_target_missing", "collects no producer")
+
+    # The selection: exactly once, only here, and the four GC-3 ones untouched.
+    if region.count(GC3_LATENCY_BASIS_SELECTION) != 1:
+        add("latency_basis_selection_missing",
+            f"{region.count(GC3_LATENCY_BASIS_SELECTION)} in the isolated target")
+    if launcher.count(GC3_LATENCY_BASIS_SELECTION) != 1:
+        add("latency_basis_selection_missing",
+            f"{launcher.count(GC3_LATENCY_BASIS_SELECTION)} in the whole script")
+    if GC3_LATENCY_BASIS_SELECTION in ordinary:
+        add("latency_basis_selection_leaked_to_ordinary_b1", "selection")
+    if B1LB_LIVE_DRIVER in ordinary:
+        add("latency_basis_selection_leaked_to_ordinary_b1", "driver line")
+    # Ordinary `b1` never calls either fail-closed entry point: the merge gate
+    # must not acquire a dependency on the sizing ledger's recorded state.
+    for other in ("b1", "b1_product", "b1_topology_probe", "b1_topology_probe_arm"):
+        if "basis-oracle-" in _b1lb_region(launcher, other):
+            add("latency_basis_selection_leaked_to_ordinary_b1", f"entry point in {other}")
+    for command in ("basis-oracle-preflight", "basis-oracle-route"):
+        if launcher.count(command) != 1:
+            add("latency_basis_selection_leaked_to_ordinary_b1",
+                f"{launcher.count(command)} x {command}")
+    for literal in B1LB_FROZEN_LAUNCHER_CLAUSES:
+        if literal not in launcher:
+            add("ordinary_selection_drift", literal)
+    if launcher.count(GC3_LIVE_SELECTION) != 1 or GC3_LIVE_SELECTION not in ordinary:
+        add("ordinary_selection_drift", "the ordinary CI-scale live selection moved")
+    if launcher.count(GC3_COVERAGE_SELECTION) != 1:
+        add("ordinary_selection_drift", "the container-free coverage selection moved")
+
+    # Fail closed, in order: ledger before any container, identity after the
+    # route and before pair discovery or a live fixture.
+    if B1LB_PREFLIGHT_CALL not in region:
+        add("latency_basis_preflight_missing")
+    if B1LB_ROUTE_CALL not in region:
+        add("latency_basis_route_check_missing")
+    positions = {
+        "preflight": region.find(B1LB_PREFLIGHT_CALL),
+        "prepare": region.find("b1_prepare || return 1"),
+        "route_fields": region.find('route-fields --route "$B1_ROUTE_RECORD"'),
+        "route_check": region.find(B1LB_ROUTE_CALL),
+        "pairs": region.find("b1_complete_sibling_pairs"),
+        "live": region.find(B1LB_LIVE_DRIVER),
+    }
+    if any(value < 0 for value in positions.values()):
+        add("latency_basis_precondition_order_drift", str(positions))
+    elif not (
+        positions["preflight"] < positions["prepare"] < positions["route_fields"]
+        < positions["route_check"] < positions["pairs"] < positions["live"]
+    ):
+        add("latency_basis_precondition_order_drift", str(positions))
+
+    # Same container ownership and the same verified cleanup as the ordinary
+    # route: a second live B1 run may not leave containers or a run directory.
+    # The exact post-live stanza, as one literal: "b1_cleanup appears
+    # somewhere" would survive removing the one that matters, since every
+    # early-return path calls it too.
+    for clause in (
+        B1LB_LIVE_DRIVER + "\n  rc=$?\n  b1_cleanup\n  trap - EXIT TERM INT\n",
+        'if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi',
+    ):
+        if clause not in region:
+            add("latency_basis_cleanup_missing", repr(clause[:48]))
+    for escape in B1LB_ESCAPES:
+        if escape in region:
+            add("latency_basis_escape_hatch", escape)
+
+    # Absent from `all` and from every default CI route.
+    all_case = launcher.split("  all)", 1)[1].split(";;", 1)[0]
+    if B1LB_TARGET in all_case:
+        add("latency_basis_in_default_route", "all")
+    jobs = (workflow.get("jobs") or {})
+    for job_name, job in jobs.items():
+        for index, step in enumerate((job.get("steps") or [])):
+            body = (step.get("run") or "").strip()
+            if B1LB_TARGET not in body:
+                continue
+            if job_name != "benchmark":
+                add("latency_basis_in_default_route", f"{job_name}[{index}]")
+                continue
+            if body != B1LB_WRAPPER:
+                add("latency_basis_in_default_route", f"body {body!r}")
+            if (step.get("if") or "").strip() != B1LB_CONDITION:
+                add("latency_basis_in_default_route", f"condition {step.get('if')!r}")
+    return fails
+
+
+def _b1lb_run_cli(*args, cwd=None) -> subprocess.CompletedProcess:
+    import sys as _sys
+
+    return subprocess.run(
+        [_sys.executable, str(B1LB_LEDGER_MODULE), *args],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def _b1lb_values_file(tmp_path, ig: dict, name: str = "values.yaml"):
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump({"ingestGateway": ig}), encoding="utf-8")
+    return path
+
+
+def test_b1_latency_basis_target_is_isolated_and_fail_closed():
+    """FP-B1LB-6: one explicit target, isolated from the gate, failing closed.
+
+    Two legs. The launcher/workflow surface says the target exists, carries the
+    explicit selection exactly once, leaves the four GC-3 selections byte-exact,
+    runs both preconditions in the fixed order and is absent from `all` and
+    from every default CI route. The CLI leg then EXERCISES the preconditions
+    against the shipped carriers and requires the documented
+    `basis_oracle_unobserved:<reason>` on stderr with exit 3 -- not a skip, not
+    a zero, and not an ordinary error.
+    """
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(GC3_CI_YML.read_text(encoding="utf-8"))
+    assert _b1lb_target_failures(launcher, workflow) == []
+
+    # The shipped, pre-collection state: unrecorded, and it says so exactly.
+    result = _b1lb_run_cli(
+        "basis-oracle-preflight",
+        "--values", str(B1LB_VALUES),
+        "--decision", str(GC3_DECISION),
+    )
+    assert result.returncode == B1LB_UNOBSERVED_EXIT, result
+    assert result.stderr.strip() == f"{B1LB_UNOBSERVED_PREFIX}ledger_unrecorded", result.stderr
+    assert result.stdout == "", result.stdout
+
+    # Ordinary CLI misuse keeps an ordinary status and never looks unobserved.
+    misuse = _b1lb_run_cli("basis-oracle-preflight", "--values", str(B1LB_VALUES))
+    assert misuse.returncode not in (0, B1LB_UNOBSERVED_EXIT), misuse
+    assert B1LB_UNOBSERVED_PREFIX not in misuse.stderr
+
+
+def test_b1_latency_basis_preconditions_reject_every_unobservable_route(tmp_path):
+    """FP-B1LB-6: each unobservable route reports ITS OWN reason, and exits 3.
+
+    The qualified fixture is synthetic and never enters values.yaml; it exists
+    only to reach the route branch, which an unrecorded ledger cannot.
+    """
+    qualified = b1lb._filled_ledger()
+    values = _b1lb_values_file(tmp_path, qualified)
+    signature = qualified["sizingBasis"]["signature"]
+
+    def _preflight(path):
+        return _b1lb_run_cli(
+            "basis-oracle-preflight", "--values", str(path), "--decision", str(GC3_DECISION)
+        )
+
+    def _route(path, route_path):
+        return _b1lb_run_cli(
+            "basis-oracle-route", "--values", str(path), "--decision", str(GC3_DECISION),
+            "--route", str(route_path),
+        )
+
+    assert _preflight(values).returncode == 0, _preflight(values)
+
+    # An invalid, non-empty ledger is a DIFFERENT reason from an unrecorded one.
+    broken = b1lb._filled_ledger(
+        mutate=lambda ig: ig["sizingBasis"]["observations"][0].__setitem__("errors", 1)
+    )
+    broken_values = _b1lb_values_file(tmp_path, broken, "broken.yaml")
+    result = _preflight(broken_values)
+    assert result.returncode == B1LB_UNOBSERVED_EXIT, result
+    assert result.stderr.strip() == f"{B1LB_UNOBSERVED_PREFIX}ledger_invalid", result.stderr
+
+    def _write_route(name, record):
+        path = tmp_path / name
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path
+
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    matching = gc3.route_host(GC3_DECISION, cpu_model=signature["cpuModel"])
+    assert matching["disposition"] == gc3.ROUTE_GATING, matching
+    ok = _route(values, _write_route("route-ok.json", matching))
+    assert ok.returncode == 0, ok
+    assert ok.stdout == "" and ok.stderr == "", ok
+
+    # A recorded GC-3 route reports the canonical route reason, unchanged.
+    unhostable = next(
+        model for model, entry in decision["models"].items()
+        if entry.get("status") == "unhostable"
+    )
+    recorded = gc3.route_host(GC3_DECISION, cpu_model=unhostable)
+    assert recorded["disposition"] == gc3.ROUTE_RECORDED, recorded
+    result = _route(values, _write_route("route-recorded.json", recorded))
+    assert result.returncode == B1LB_UNOBSERVED_EXIT, result
+    assert result.stderr.strip() == B1LB_UNOBSERVED_PREFIX + recorded["reason"], result.stderr
+
+    # A gating route on another identity is a NAMED signature mismatch.
+    other_topology = next(
+        t for t in gc3.TOPOLOGY_IDS if t != signature["referenceTopology"]
+    )
+    for field, key, replacement, expected in (
+        ("cpuModel", "cpuModel", "Other Vendor CPU @ 0.00GHz", "cpuModel"),
+        ("topology", "topology", other_topology, "referenceTopology"),
+    ):
+        mutated = dict(matching)
+        mutated[key] = replacement
+        if key == "topology":
+            # Keep the record VALID: only the identity may differ, or the CLI
+            # would report an unusable route instead of a signature mismatch.
+            mutated["cardinality"] = gc3.topology_cardinality(replacement)
+        result = _route(values, _write_route(f"route-{field}.json", mutated))
+        assert result.returncode == B1LB_UNOBSERVED_EXIT, (field, result)
+        assert result.stderr.strip() == (
+            f"{B1LB_UNOBSERVED_PREFIX}signature_mismatch:{expected}"
+        ), (field, result.stderr)
+
+    # The remaining two route-visible identity fields cannot be expressed by a
+    # VALID route record on the current carrier -- the route schema pins
+    # placementSchema and the decision head is read from that same carrier --
+    # so they are proved on the pure comparison the CLI delegates to. Defence
+    # in depth is exactly what they are for; they are not dropped.
+    identity = b1lb.gc3_selected_identity(b1lb.load_gc3_decision(GC3_DECISION))
+    assert b1lb.route_signature_mismatch(signature, matching, identity) == []
+    assert b1lb.route_signature_mismatch(
+        {**signature, "placementSchema": 2}, matching, identity
+    ) == ["placementSchema"]
+    assert b1lb.route_signature_mismatch(
+        {**signature, "topologyDecisionHeadSha": "f" * 40}, matching, identity
+    ) == ["topologyDecisionHeadSha"]
+    assert b1lb.route_signature_mismatch(
+        {**signature, "cpuModel": "x", "referenceTopology": "y"}, matching, identity
+    ) == ["cpuModel", "referenceTopology"]
+
+    # An unusable route record is an ordinary failure, never an unobserved one.
+    garbage = tmp_path / "route-garbage.json"
+    garbage.write_text("{not json", encoding="utf-8")
+    result = _route(values, garbage)
+    assert result.returncode not in (0, B1LB_UNOBSERVED_EXIT), result
+    assert B1LB_UNOBSERVED_PREFIX not in result.stderr
+
+
+def test_b1_latency_basis_target_mutations_are_rejected():
+    """FP-B1LB-6/8: one mutation per named cause, each independently red."""
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(GC3_CI_YML.read_text(encoding="utf-8"))
+    assert _b1lb_target_failures(launcher, workflow) == [], "positive control"
+
+    def _expect(name, *, mutate_launcher=None, mutate_workflow=None):
+        import copy as _copy
+
+        mutated_launcher = mutate_launcher(launcher) if mutate_launcher else launcher
+        mutated_workflow = _copy.deepcopy(workflow)
+        if mutate_workflow:
+            mutate_workflow(mutated_workflow)
+        if mutate_launcher:
+            assert mutated_launcher != launcher, f"{name}: launcher mutation was a no-op"
+        if mutate_workflow:
+            assert mutated_workflow != workflow, f"{name}: workflow mutation was a no-op"
+        fails = _b1lb_target_failures(mutated_launcher, mutated_workflow)
+        assert any(f.split(" ", 1)[0] == name for f in fails), (name, fails)
+
+    _expect(
+        "latency_basis_target_missing",
+        mutate_launcher=lambda src: src.replace("\n" + B1LB_TARGET + "() {\n", "\nb1_retired() {\n", 1),
+    )
+    _expect(
+        "latency_basis_selection_missing",
+        mutate_launcher=lambda src: src.replace(GC3_LATENCY_BASIS_SELECTION, "-m b1_live", 1),
+    )
+    _expect(
+        "latency_basis_selection_leaked_to_ordinary_b1",
+        mutate_launcher=lambda src: src.replace(
+            GC3_LIVE_SELECTION, GC3_LATENCY_BASIS_SELECTION, 1
+        ),
+    )
+    _expect(
+        "ordinary_selection_drift",
+        mutate_launcher=lambda src: src.replace(
+            GC3_COVERAGE_SELECTION, "-m 'not b1_live and not b1_product'", 1
+        ),
+    )
+    _expect(
+        "latency_basis_selection_leaked_to_ordinary_b1",
+        mutate_launcher=lambda src: src.replace(
+            "  b1_prepare || return 1\n  b1_write_coverage_driver\n",
+            "  " + B1LB_PREFLIGHT_CALL + "\n  b1_prepare || return 1\n"
+            "  b1_write_coverage_driver\n", 1),
+    )
+    _expect(
+        "latency_basis_preflight_missing",
+        mutate_launcher=lambda src: src.replace(B1LB_PREFLIGHT_CALL, "true", 1),
+    )
+    _expect(
+        "latency_basis_route_check_missing",
+        mutate_launcher=lambda src: src.replace(B1LB_ROUTE_CALL, "true", 1),
+    )
+    _expect(
+        "latency_basis_precondition_order_drift",
+        mutate_launcher=lambda src: src.replace(
+            "  " + B1LB_PREFLIGHT_CALL + "\n", "", 1
+        ).replace(
+            "  " + B1LB_LIVE_DRIVER + "\n",
+            "  " + B1LB_PREFLIGHT_CALL + "\n  " + B1LB_LIVE_DRIVER + "\n", 1
+        ),
+    )
+    _expect(
+        "latency_basis_cleanup_missing",
+        mutate_launcher=lambda src: src.replace(
+            '  b1_run_driver driver-latency-basis.sh "$driver_cpus"\n  rc=$?\n  b1_cleanup\n',
+            '  b1_run_driver driver-latency-basis.sh "$driver_cpus"\n  rc=$?\n', 1),
+    )
+    _expect(
+        "latency_basis_escape_hatch",
+        mutate_launcher=lambda src: src.replace(
+            '  b1_run_driver driver-latency-basis.sh "$driver_cpus"\n',
+            '  b1_run_driver driver-latency-basis.sh "$driver_cpus" || true\n', 1),
+    )
+    _expect(
+        "latency_basis_in_default_route",
+        mutate_workflow=lambda wf: wf["jobs"]["benchmark"]["steps"][-1].pop("if"),
+    )
+    _expect(
+        "latency_basis_in_default_route",
+        mutate_workflow=lambda wf: wf["jobs"]["e2e"]["steps"].append(
+            {"run": B1LB_WRAPPER}
+        ),
+    )
+    _expect(
+        "latency_basis_in_default_route",
+        mutate_launcher=lambda src: src.replace(
+            '             run_step "B1 product promise (recorded, non-gating)" b1_product ;;',
+            '             run_step "B1 product promise (recorded, non-gating)" b1_product\n'
+            '             run_step "B1 CPU-basis oracle" b1_latency_basis ;;', 1),
+    )
+
+
+def test_gc1_gc2_gc3_gc4_gc5_basis_handoffs_route_to_the_qualified_ledger():
+    """FP-B1LB-7: every stale empty/2.427 handoff pin is retired, once.
+
+    The five earlier slices deferred the CPU basis to this one. Each of them
+    used to hold the void in place by asserting `observations == []` or the
+    literal 2.427 -- which would make the collection this slice exists to
+    perform fail in five places at once, for one fact. They now route to
+    FP-IG-23's single actual-state gate instead. This is checked from the
+    SOURCE of those tests, so a reintroduced pin is caught even when the
+    ledger happens to still be empty.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    retired_owners = (
+        "test_gc1_preserves_and_routes_unqualified_cpu_basis",
+        "test_gc2_write_path_scope_and_fixed_bar_are_pinned",
+        "test_gc3_reference_topology_scope_and_decision_are_pinned",
+        "test_gc4_fixed_bars_and_sizing_boundaries_are_pinned",
+        "test_gc5_fixed_workload_pool_schema_and_sizing_boundaries",
+    )
+    functions = {
+        node.name: node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in retired_owners:
+        assert name in functions, f"{name} is missing; the handoff owner moved"
+
+    # Every assertion reachable from those owners, plus the helpers the GC-3
+    # and GC-5 owners delegate to, must be free of the two retired pins.
+    helper_names = ("_gc3_scope_failures", "_gc3_route_surface_failures")
+    rendered: list[str] = []
+    for name in retired_owners + helper_names:
+        node = functions.get(name)
+        assert node is not None, name
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assert):
+                rendered.append(ast.unparse(child.test))
+            elif isinstance(child, ast.Compare):
+                rendered.append(ast.unparse(child))
+    for text in rendered:
+        assert "2.427" not in text, f"a retired 2.427 pin survives: {text}"
+        assert "GC1_BASIS_MS_PER_REQUEST" not in text, text
+        assert "GC4_BASIS_MS_PER_REQUEST" not in text, text
+        assert "GC5_BASIS_MS_PER_REQUEST" not in text, text
+        assert "['observations'] == []" not in text, (
+            f"a retired empty-ledger pin survives: {text}"
+        )
+
+    # ...and exactly one owner still rejects the void: the FP-IG-23 gate.
+    ledger_src = B1LB_LEDGER_MODULE.read_text(encoding="utf-8")
+    assert (
+        "def test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run(" in ledger_src
+    )
+    assert "want exactly five observations, got" in ledger_src
+
+    # The handoff is ROUTED, not merely dropped: the owner and the gate are
+    # both named in the manifest the five slices share.
+    thresholds = yaml.safe_load(B1LB_THRESHOLDS.read_text(encoding="utf-8"))
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    assert GC1_BASIS_OWNER in b1_entry["notes"]
+    assert GC1_BASIS_GATE in b1_entry["notes"]
+    assert "2.427" not in b1_entry["notes"], "the notes state a basis number again"
+
+    # The two FP-IG-18 carriers keep their names, markers and comparison.
+    ref_src = REF_TEST.read_text(encoding="utf-8")
+    basis_fn = next(
+        n for n in ast.parse(ref_src).body
+        if isinstance(n, ast.FunctionDef) and n.name == GC1_PRESERVED_ORACLES[0]
+    )
+    body = ast.get_source_segment(ref_src, basis_fn) or ""
+    assert "assert measured <= basis" in body
+    assert "b1_latency_basis" in _decorator_markers(basis_fn)
+
+
+def test_prior_slice_sizing_exclusions_survive_qualified_ledger():
+    """FP-B1LB-7/8: the older slices' real boundaries survive the migration.
+
+    Retiring the empty/2.427 pins must not retire what those slices actually
+    own: their own investigation numbers and run ids stay inadmissible as
+    sizing observations, and a topology-probe arm or a product-local run can
+    still never become one. Proved against a POPULATED synthetic ledger, which
+    is exactly the state the retired pins could not express.
+    """
+    qualified = b1lb._filled_ledger()
+    b1lb.validate_sizing_ledger(qualified, check_rendered_cpu=False)
+    signature = qualified["sizingBasis"]["signature"]
+
+    # (1) Ineligible authorities and profiles, on a ledger that is otherwise
+    # complete: the probe arms and the product-local tier are not this
+    # warrant's population, whatever they measured.
+    for field, value in (
+        ("measurementAuthority", "product-local-reference"),
+        ("measurementAuthority", "local-replica"),
+        ("profile", "product-exclusive"),
+        ("profile", gc3.PROBE_PROFILE_NAME),
+    ):
+        candidate = b1lb._filled_ledger(
+            mutate=lambda ig, f=field, v=value: ig["sizingBasis"]["observations"][0]
+            .__setitem__(f, v)
+        )
+        with pytest.raises(AssertionError):
+            b1lb.validate_sizing_ledger(candidate, check_rendered_cpu=False)
+
+    # (2) A product-scale row cannot be re-encoded under the restated point.
+    product_row = b1lb._filled_ledger(
+        mutate=lambda ig: ig["sizingBasis"]["observations"][0].update(
+            {"offered": 30000, "served": 30000, "committed": 30000, "servedRate": 999.0}
+        )
+    )
+    with pytest.raises(AssertionError):
+        b1lb.validate_sizing_ledger(product_row, check_rendered_cpu=False)
+
+    # (3) The earlier slices' own diagnostic values and run ids are still
+    # absent from every sizing carrier -- INCLUDING the synthetic fixtures in
+    # the ledger module, which is where a convenient copy would land first.
+    forbidden = (
+        GC2_INVESTIGATION_CPU_MS, GC2_INVESTIGATION_RUN_ID,
+        GC3_RCA_POSTGRES_MS, GC3_RCA_GATEWAY_MS, GC3_RCA_RUN_ID,
+    ) + GC4_RCA_DIAGNOSTICS
+    for parts in GC4_SIZING_CARRIERS:
+        carrier = REPO_ROOT.joinpath(*parts)
+        assert carrier.is_file(), parts[-1]
+        text = carrier.read_text(encoding="utf-8")
+        for value in forbidden:
+            assert value not in text, f"{parts[-1]} carries {value}"
+
+    # (4) The shipped ledger carries no synthetic fixture value either: the
+    # fixtures are mutation operands, never recorded evidence.
+    shipped = yaml.safe_load(B1LB_VALUES.read_text(encoding="utf-8"))
+    rendered = yaml.safe_dump(shipped["ingestGateway"]["sizingBasis"])
+    for value in (
+        b1lb.FIXTURE_HEAD_SHA, b1lb.FIXTURE_IMAGE, b1lb.FIXTURE_OTHER_MODEL,
+    ) + tuple(b1lb.FIXTURE_RUN_IDS):
+        assert value not in rendered, f"the shipped ledger carries the fixture {value!r}"
+    assert signature["cpuModel"] not in rendered, (
+        "the shipped signature already names a collected model"
+    )
+
+
+def test_b1_latency_basis_scope_and_frozen_knobs_are_pinned():
+    """FP-B1LB-8: sizing only. Every excluded surface is checked here.
+
+    This slice adds one explicit target, one closed ledger schema and one
+    manual CI step. It changes no workload, no concurrency, no pool, no
+    durability setting, no write path, no topology decision, no public API and
+    no product source at all -- and none of its own text claims hostability or
+    predicts product capacity.
+    """
+    launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
+    harness = REF_TEST.read_text(encoding="utf-8")
+    profile_src = REF_PATH.read_text(encoding="utf-8")
+    main_src = GC2_MAIN_PATH.read_text(encoding="utf-8")
+    session_src = GC2_SESSION_PATH.read_text(encoding="utf-8")
+    ingest_src = GC2_INGEST_PATH.read_text(encoding="utf-8")
+
+    # (1) The unchanged CI-scale bar and workload, from the profile module.
+    profile_assigns = _module_assigns(REF_PATH)
+    for name, expected in GC2_FIXED_CI_SCALE_LITERALS.items():
+        assert _eval_simple_constant(profile_assigns[name], profile_assigns) == expected, name
+    assert "MAX_IN_FLIGHT = BURST_RATE" in profile_src
+    harness_assigns = _source_assigns(harness)
+    for name, expected in (
+        ("CI_SCALE_P99_MS", 150.0),
+        ("CI_SCALE_SUSTAINED_FLOOR", 450),
+        ("CI_SCALE_MAX_IN_FLIGHT", 500),
+        ("CI_SCALE_TOTAL_REQUESTS", 15000),
+    ):
+        assert ast.literal_eval(harness_assigns[name]) == expected, name
+
+    # (2) Concurrency, pools, threadpool, engine and durability.
+    main_assigns = _source_assigns(main_src)
+    assert ast.literal_eval(
+        main_assigns["DEFAULT_MAX_CONNECTIONS_PER_WORKER"]
+    ) == GC4_MAX_CONNECTIONS_PER_WORKER
+    assert ast.literal_eval(main_assigns["BACKLOG"]) == GC4_BACKLOG
+    assert f'"DBAGENT_GATEWAY_WORKERS", "{GC4_GATEWAY_WORKERS}"' in main_src
+    assert "limit_concurrency=max_connections" in main_src
+    assert GC4_THREADPOOL_BOUNDARY in ingest_src
+    assert "create_engine(dsn, future=True, **kwargs)" in session_src
+    for token in GC4_DURABILITY_TOKENS:
+        for label, text in (("main", main_src), ("session", session_src),
+                            ("ingest", ingest_src)):
+            assert token not in text, f"{label} touches {token}"
+
+    # (3) The GC-3 decision and placements: read, never decided, here.
+    decision = json.loads(GC3_DECISION.read_text(encoding="utf-8"))
+    selected = {
+        model: entry for model, entry in decision["models"].items()
+        if entry.get("status") == "selected"
+    }
+    assert len(selected) == 1, sorted(selected)
+    assert _gc1_cardinality_map_failures(_source_assigns(harness)) == []
+    assert ast.literal_eval(
+        harness_assigns["PRODUCT_AFFINITY_CARDINALITY"]
+    ) == GC1_AFFINITY_CARDINALITIES["product-exclusive"]
+
+    # (4) This slice touches no product source: its whole footprint is tests,
+    # the launcher, the workflow, the chart ledger and the manifest.
+    for parts in (
+        ("services", "gateway", "gateway", "ingest.py"),
+        ("services", "gateway", "gateway", "main.py"),
+        ("libs", "py", "rca_common", "rca_common", "investigation_repo.py"),
+        ("libs", "py", "rca_common", "rca_common", "db", "session.py"),
+    ):
+        text = REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+        for token in ("b1_latency_basis", "sizingBasis", "basis_oracle", "B1-LATENCY-BASIS-1"):
+            assert token not in text, f"{parts[-1]} carries {token}"
+
+    # (5) No claim beyond this slice's own FPs, in any text it owns. Naming
+    # the product-local tier as INELIGIBLE is required content, so the
+    # forbidden patterns are claim words, word-bounded: `unhostable` is GC-3's
+    # recorded route state and is legitimate here, a hostability claim is not.
+    for parts in (
+        ("tests", "delivery", "test_delivery_sizing_ledger.py"),
+        ("deploy", "charts", "dbagent", "values.yaml"),
+    ):
+        text = REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8").lower()
+        # A bare "product capacity" substring cannot tell an assertion from a
+        # denial -- both carriers must DISCUSS the product tier to declare it
+        # ineligible -- so the absence test is limited to the two words that
+        # only ever appear in a claim, and the positive disclaimers below do
+        # the rest of the work.
+        for claim in (r"\bhostable\b", r"\bhostability\b"):
+            assert re.search(claim, text) is None, f"{parts[-1]} claims {claim!r}"
+    ledger_text = B1LB_LEDGER_MODULE.read_text(encoding="utf-8")
+    disclaimer = "neither weakens the CI-scale bar nor claims product-scale capacity"
+    assert disclaimer in " ".join(ledger_text.split())
+    assert "INELIGIBLE" in ledger_text, (
+        "the ledger module must say which tiers cannot be a sizing observation"
+    )
+    values_text = B1LB_VALUES.read_text(encoding="utf-8")
+    assert "VOID as provenance" in values_text, (
+        "the chart must still say the shipped basis certifies nothing"
+    )
+    thresholds_notes = next(
+        e for e in yaml.safe_load(B1LB_THRESHOLDS.read_text(encoding="utf-8"))["benchmarks"]
+        if e["id"] == "B1"
+    )["notes"]
+    assert disclaimer in " ".join(thresholds_notes.split())
+
+    # (6) The launcher's frozen selections and the product-local route.
+    for literal in B1LB_FROZEN_LAUNCHER_CLAUSES:
+        assert literal in launcher, literal
+    assert 'if [ "${#cpus[@]}" -lt 8 ]; then' in launcher
+    assert '"minimumHostLogicalCpus": 8,' in launcher

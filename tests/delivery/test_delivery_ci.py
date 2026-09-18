@@ -1073,11 +1073,22 @@ def test_gc1_wrapper_target_resolves_b1_producer_only():
             for root in invocation[0]
         ]
         assert _GC1_B1_PRODUCER in roots, (target, roots)
-    # The workflow step resolves to the benchmark job, and the FP-IG-26
-    # topology still holds: producer strictly before the ledger gate.
+    # The workflow steps resolve to the benchmark job and to no other, and the
+    # FP-IG-26 topology still holds: the PRODUCING step is strictly before the
+    # ledger gate. B1-LATENCY-BASIS-1 appended a second wrapper (index 21, the
+    # manual, conditional CPU-basis oracle), so the producer is now reached by
+    # two steps of the one job; both indices are pinned rather than counted.
     workflow = _load()
     hits = _jobs_collecting(workflow, _GC1_B1_PRODUCER, resolve_workdir=True)
-    assert [name for name, _ in hits] == ["benchmark"], hits
+    assert {name for name, _ in hits} == {"benchmark"}, hits
+    assert hits == [("benchmark", 17), ("benchmark", 21)], hits
+    for target in ("b1", "b1_latency_basis"):
+        roots = [
+            root
+            for invocation in _launcher_target_invocations(target)
+            for root in invocation[0]
+        ]
+        assert _GC1_B1_PRODUCER in roots, (target, roots)
     consumer, producer = check_sizing_ledger_gate_topology(workflow)
     assert consumer == producer == "benchmark"
 
@@ -1117,12 +1128,25 @@ def test_gc1_wrapper_target_resolves_b1_producer_only():
         finally:
             globals()["REPO_ROOT"] = original
 
-    # A workflow that replaces the B1 wrapper with any other bash command loses
-    # its producer, and the FP-IG-26 gate says so rather than passing vacuously.
+    # A workflow that replaces the B1 wrappers with any other bash command
+    # loses its producer, and the FP-IG-26 gate says so rather than passing
+    # vacuously. Rerouting only the GATING step at 17 is NOT enough any more
+    # and the control says so explicitly: the appended oracle at 21 still
+    # resolves the producer, and the gate then reports the order inversion
+    # rather than a silent pass.
     import copy
 
+    half = copy.deepcopy(workflow)
+    half["jobs"]["benchmark"]["steps"][17]["run"] = "bash scripts/gen-proto.sh"
+    assert _jobs_collecting(half, _GC1_B1_PRODUCER, resolve_workdir=True) == [
+        ("benchmark", 21)
+    ]
+    with pytest.raises(AssertionError, match="same-job order"):
+        check_sizing_ledger_gate_topology(half)
+
     rerouted = copy.deepcopy(workflow)
-    rerouted["jobs"]["benchmark"]["steps"][17]["run"] = "bash scripts/gen-proto.sh"
+    for index in (17, 21):
+        rerouted["jobs"]["benchmark"]["steps"][index]["run"] = "bash scripts/gen-proto.sh"
     assert _jobs_collecting(rerouted, _GC1_B1_PRODUCER, resolve_workdir=True) == []
     with pytest.raises(AssertionError, match="exactly one job"):
         check_sizing_ledger_gate_topology(rerouted)
@@ -1133,3 +1157,129 @@ def test_gc1_wrapper_target_resolves_b1_producer_only():
         {"run": f"services/worker/.venv/bin/python -m pytest {_GC1_B1_PRODUCER} -v"},
     ]}}}
     assert _jobs_collecting(direct, _GC1_B1_PRODUCER, resolve_workdir=True) == [("benchmark", 0)]
+
+
+# ---------------------------------------------------------------------------
+# B1-LATENCY-BASIS-1 FP-B1LB-6 — the isolated CPU-basis oracle's CI wiring
+# ---------------------------------------------------------------------------
+_LATENCY_BASIS_INPUT = "b1_latency_basis"
+_LATENCY_BASIS_WRAPPER = "bash scripts/integration-test.sh b1_latency_basis"
+_LATENCY_BASIS_CONDITION = (
+    "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true"
+)
+_LATENCY_BASIS_STEP_INDEX = 21
+_PROVENANCE_GATE_STEP_INDEX = 20
+_ORDINARY_B1_STEP_INDEX = 17
+
+
+def test_b1_latency_basis_manual_tail_is_opt_in_and_downstream_of_provenance():
+    """FP-B1LB-6: manual, default-false, last, and after the provenance gate.
+
+    Four independent facts, none inferred from the others:
+
+    1. the `workflow_dispatch` input exists, is a boolean and defaults to
+       false, so push, pull-request, scheduled and ORDINARY manual runs invoke
+       only the unchanged B1 gate at step 17;
+    2. the tail step's index, body and condition are exact, and `== true`
+       rather than a truthiness test -- a string comparison would run the
+       oracle on the literal "false";
+    3. the step sits strictly after the FP-IG-23 provenance gate at index 20,
+       so GitHub Actions' implicit `success()` in an explicit `if:` keeps it
+       from running while that gate is red; and
+    4. no job gains a needs edge and no other job or `all` route reaches the
+       target, so an enabled dispatch adds a second live B1 run to this one
+       job and changes nothing else.
+    """
+    workflow = _load()
+    on_block = _on_block(workflow)
+    inputs = (on_block.get("workflow_dispatch") or {}).get("inputs") or {}
+    assert _LATENCY_BASIS_INPUT in inputs, sorted(inputs)
+    spec = inputs[_LATENCY_BASIS_INPUT]
+    assert spec.get("type") == "boolean", spec
+    assert spec.get("default") is False, spec
+    assert spec.get("required") is False, spec
+
+    steps = workflow["jobs"]["benchmark"]["steps"]
+    step = steps[_LATENCY_BASIS_STEP_INDEX]
+    assert (step.get("run") or "").strip() == _LATENCY_BASIS_WRAPPER, step.get("run")
+    assert (step.get("if") or "").strip() == _LATENCY_BASIS_CONDITION, step.get("if")
+    assert _LATENCY_BASIS_STEP_INDEX == len(steps) - 1, len(steps)
+
+    # Exactly one such step, and exactly one conditional step in this job.
+    bodies = [(s.get("run") or "").strip() for s in steps]
+    assert bodies.count(_LATENCY_BASIS_WRAPPER) == 1, bodies.count(_LATENCY_BASIS_WRAPPER)
+    conditional = [i for i, s in enumerate(steps) if "if" in s]
+    assert conditional == [_LATENCY_BASIS_STEP_INDEX], conditional
+
+    # Ordering: ordinary B1 gate, then the provenance gate, then the oracle.
+    assert bodies[_ORDINARY_B1_STEP_INDEX] == "bash scripts/integration-test.sh b1"
+    gate = [
+        i for i, s in enumerate(steps)
+        if "tests/delivery/test_delivery_sizing_ledger.py" in (s.get("run") or "")
+    ]
+    assert gate == [_PROVENANCE_GATE_STEP_INDEX], gate
+    assert (
+        _ORDINARY_B1_STEP_INDEX
+        < _PROVENANCE_GATE_STEP_INDEX
+        < _LATENCY_BASIS_STEP_INDEX
+    )
+    # The unconditional steps 0..20 are exactly the ones every ordinary run
+    # executes: the oracle is absent from push, pull-request, schedule and an
+    # ordinary manual dispatch, all of which leave the boolean at its default.
+    for default_event in ("push", "pull_request", "schedule", "workflow_dispatch"):
+        assert default_event in str(on_block) or default_event == "workflow_dispatch"
+        assert _LATENCY_BASIS_WRAPPER not in " ".join(bodies[:_LATENCY_BASIS_STEP_INDEX])
+
+    # The target is reachable from no other job and creates no dependency.
+    for name, job in (workflow.get("jobs") or {}).items():
+        for i, s in enumerate(job.get("steps") or []):
+            if name == "benchmark" and i == _LATENCY_BASIS_STEP_INDEX:
+                continue
+            assert _LATENCY_BASIS_INPUT not in (s.get("run") or ""), (name, i)
+        needs = job.get("needs")
+        listed = [needs] if isinstance(needs, str) else list(needs or [])
+        assert "benchmark" not in listed or name == "benchmark", name
+
+    # Negative controls: each weakening is independently detected.
+    import copy
+
+    def _is_opt_in(wf: dict) -> bool:
+        block = _on_block(wf)
+        got = ((block.get("workflow_dispatch") or {}).get("inputs") or {}).get(
+            _LATENCY_BASIS_INPUT
+        )
+        if not isinstance(got, dict) or got.get("default") is not False:
+            return False
+        if got.get("type") != "boolean":
+            return False
+        tail = wf["jobs"]["benchmark"]["steps"]
+        found = [
+            i for i, s in enumerate(tail)
+            if (s.get("run") or "").strip() == _LATENCY_BASIS_WRAPPER
+        ]
+        if found != [len(tail) - 1]:
+            return False
+        if (tail[found[0]].get("if") or "").strip() != _LATENCY_BASIS_CONDITION:
+            return False
+        gate_at = [
+            i for i, s in enumerate(tail)
+            if "tests/delivery/test_delivery_sizing_ledger.py" in (s.get("run") or "")
+        ]
+        return bool(gate_at) and max(gate_at) < found[0]
+
+    assert _is_opt_in(workflow), "positive control"
+    for case, mutate in (
+        ("default_true", lambda wf: _on_block(wf)["workflow_dispatch"]["inputs"][
+            _LATENCY_BASIS_INPUT].__setitem__("default", True)),
+        ("input_becomes_a_string", lambda wf: _on_block(wf)["workflow_dispatch"]["inputs"][
+            _LATENCY_BASIS_INPUT].__setitem__("type", "string")),
+        ("condition_removed", lambda wf: wf["jobs"]["benchmark"]["steps"][-1].pop("if")),
+        ("condition_made_truthy", lambda wf: wf["jobs"]["benchmark"]["steps"][-1].__setitem__(
+            "if", "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis")),
+        ("moved_before_the_provenance_gate", lambda wf: wf["jobs"]["benchmark"][
+            "steps"].insert(0, wf["jobs"]["benchmark"]["steps"].pop())),
+        ("step_removed", lambda wf: wf["jobs"]["benchmark"]["steps"].pop()),
+    ):
+        mutant = copy.deepcopy(workflow)
+        mutate(mutant)
+        assert not _is_opt_in(mutant), case

@@ -5057,24 +5057,174 @@ def test_gc5_product_record_carries_commit_cost_and_lateness_context(b1_product_
     ), "the gate no longer compares the transaction ratio"
 
 
+# ---------------------------------------------------------------------------
+# FP-IG-18 / FP-B1LB-5 — the isolated CPU-basis oracle and its identity
+# precondition.
+#
+# The comparison itself is untouched and still failure-producing. What
+# B1-LATENCY-BASIS-1 adds in front of it is an IDENTITY test: a measurement
+# taken on a different CPU model, a different reference topology or a
+# different runner image is not a measurement of the recorded basis's
+# population, so comparing the two would be comparing unlike quantities. A
+# mismatch is a FAILURE of this node, never a skip and never a pass: the
+# launcher's fail-closed preflight/route entry points (FP-B1LB-6) are what
+# keep a mismatched runner from reaching it at all.
+# ---------------------------------------------------------------------------
+#: The restated CI-scale operating point this oracle is defined on (§3.1).
+SIZING_LEDGER_PROFILE = CI_SCALE_PROFILE_NAME
+SIZING_LEDGER_AUTHORITY = AUTHORITY_CI_SCALE_REFERENCE
+#: The identity fields the live run must reproduce, in report order.
+SIZING_IDENTITY_FIELDS = (
+    "cpus",
+    "cpuModel",
+    "image",
+    "workers",
+    "referenceTopology",
+    "placementSchema",
+)
+
+
+def sizing_identity_failures(signature: dict, observed: dict) -> list[str]:
+    """Named mismatches between a live run and the recorded ledger signature.
+
+    Pure and container-free on purpose, so the negative control below can
+    prove each mismatch independently without a live fixture.
+    """
+    failures: list[str] = []
+    for field in SIZING_IDENTITY_FIELDS:
+        if observed.get(field) != signature.get(field):
+            failures.append(
+                f"{field}: measured {observed.get(field)!r}, ledger {signature.get(field)!r}"
+            )
+    if observed.get("profile") != SIZING_LEDGER_PROFILE:
+        failures.append(f"profile: measured {observed.get('profile')!r}")
+    if observed.get("measurementAuthority") != SIZING_LEDGER_AUTHORITY:
+        failures.append(
+            f"measurementAuthority: measured {observed.get('measurementAuthority')!r}"
+        )
+    if observed.get("placementOk") is not True:
+        failures.append(f"placementOk: measured {observed.get('placementOk')!r}")
+    return failures
+
+
+def sizing_run_identity(run: dict) -> dict:
+    """The live run's own identity, read from the record it already carries."""
+    return {
+        "cpus": run["host"]["cpus"],
+        "cpuModel": run["host"]["cpu_model"],
+        "image": run["host"]["image"],
+        "workers": b1.INGEST_GATEWAY_WORKERS,
+        "referenceTopology": run["declaration"].topology,
+        "placementSchema": run["declaration"].schema,
+        "profile": run["profile"].name,
+        "measurementAuthority": run["measurement_authority"],
+        "placementOk": run["placement_ok"],
+    }
+
+
 @pytest.mark.b1_live
 @pytest.mark.b1_latency_basis
 def test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis(b1_ci_scale_run):
-    """FP-IG-18: cpu_ms_per_request <= chart basis.
+    """FP-IG-18: cpu_ms_per_request <= chart basis, on the ledger's own identity.
 
-    Unchanged comparison, unchanged 2.427 basis. GC-1 neither selects nor
-    repairs this node: requalifying the basis needs five real post-GC-1 CI
-    runs and would move shipped sizing values, which belongs to the separate
-    ``B1-LATENCY-BASIS-1`` slice. Its red, if it is red, is reported there --
-    never skipped, weakened, or counted as a GC-1 pass.
+    The comparison is unchanged and stays failure-producing. B1-LATENCY-BASIS-1
+    owns the right-hand side: the basis is whatever the recorded five-row
+    ledger derives, and this node first proves the live run is a measurement of
+    THAT population -- same exact CPU model, reference topology, placement
+    schema, runner image, worker count, authority, profile and placement
+    witness. An unrecorded ledger and a mismatched identity are both failures
+    here; neither is skipped, weakened or counted as a pass. It is outside both
+    GC-1 targets and runs only under the explicit `b1_latency_basis` target.
     """
     values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
+    sizing = values["ingestGateway"]["sizingBasis"]
+    assert sizing["observations"], (
+        "the sizing ledger is unrecorded; the CPU basis has no collected "
+        "warrant to compare against (B1-LATENCY-BASIS-1 FP-B1LB-3)"
+    )
+    identity = sizing_identity_failures(
+        sizing["signature"], sizing_run_identity(b1_ci_scale_run)
+    )
+    assert identity == [], (
+        "this run is not a measurement of the recorded basis's population: "
+        f"{identity}; {b1_ci_scale_run['fingerprint']}"
+    )
     basis = float(values["ingestGateway"]["sizingBasis"]["cpuMsPerRequest"])
     measured = b1_ci_scale_run["cpu_ms_per_request"]
     assert measured <= basis, (
         f"cpu_ms_per_request={measured} exceeds basis={basis}; "
         f"{b1_ci_scale_run['fingerprint']}"
     )
+
+
+def test_fp_b1lb_5_identity_mismatch_fails_before_cpu_comparison():
+    """FP-B1LB-5: wrong model, topology or image fails BEFORE the comparison.
+
+    Container-free negative control. Three independent mutations, each named,
+    plus the structural proof that the identity assertion precedes the
+    ``measured <= basis`` comparison inside the oracle and that the oracle
+    contains no skip or xfail escape at all.
+    """
+    signature = {
+        "cpus": 4,
+        "cpuModel": "AMD EPYC 0000 0-Core Processor",
+        "image": "os-release:0000000000000000",
+        "workers": 4,
+        "referenceTopology": "gateway-split",
+        "placementSchema": 3,
+    }
+    matching = dict(signature)
+    matching.update(
+        {
+            "profile": SIZING_LEDGER_PROFILE,
+            "measurementAuthority": SIZING_LEDGER_AUTHORITY,
+            "placementOk": True,
+        }
+    )
+    assert sizing_identity_failures(signature, matching) == [], "positive control"
+
+    for field, replacement in (
+        ("cpuModel", "AMD EPYC 1111 1-Core Processor"),
+        ("referenceTopology", "postgres-isolated"),
+        ("image", "os-release:1111111111111111"),
+        ("cpus", 16),
+        ("workers", 8),
+        ("placementSchema", 2),
+        ("profile", PRODUCT_PROFILE_NAME),
+        ("measurementAuthority", AUTHORITY_PRODUCT_LOCAL),
+        ("placementOk", False),
+    ):
+        mutated = dict(matching)
+        mutated[field] = replacement
+        failures = sizing_identity_failures(signature, mutated)
+        assert len(failures) == 1, (field, failures)
+        assert failures[0].startswith(f"{field}:"), (field, failures)
+
+    # The identity gate is reached first, and nothing weakens the node.
+    source = Path(__file__).read_text(encoding="utf-8")
+    oracle = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis"
+    )
+    rendered = [
+        ast.unparse(node.test) for node in ast.walk(oracle) if isinstance(node, ast.Assert)
+    ]
+    def _index_of(needle: str) -> int:
+        hits = [i for i, text in enumerate(rendered) if needle in text]
+        assert len(hits) == 1, (
+            f"the oracle asserts {needle!r} {len(hits)} times; the identity "
+            f"precondition and the CPU comparison are each exactly one assertion: {rendered}"
+        )
+        return hits[0]
+
+    recorded_at = _index_of("sizing['observations']")
+    identity_at = _index_of("identity == []")
+    compare_at = _index_of("measured <= basis")
+    assert recorded_at < identity_at < compare_at, rendered
+    body = ast.get_source_segment(source, oracle) or ""
+    for weakening in ("pytest." + "mark.skip", "pytest." + "mark.xfail", "pytest.skip("):
+        assert weakening not in body, weakening
 
 
 # ---------------------------------------------------------------------------
