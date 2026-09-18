@@ -1122,10 +1122,28 @@ async def test_run_shed_probe_fired_against_inline_ceiling_server():
 
 
 def _parse_b1_env_field(line: str, field: str) -> str:
+    """One value out of the flat `B1 env=` key/value list.
+
+    The field separator is a comma FOLLOWED BY A NEW `key=` token, not every
+    comma. `*_allowed_cpus`, `reference_cpus` and `unassigned_cpus` carry
+    canonical Linux CPU-list syntax, which spells a non-contiguous set with a
+    comma (`{0,2}` -> `0,2`), so splitting on every comma truncated such a
+    value at its first range. No value carries a raw `=` -- it is absent from
+    `B1_DIAGNOSTIC_SAFE_CHARACTERS` and every free-form diagnostic is
+    percent-encoded -- so a fragment without one continues the value before it,
+    and an empty fragment is the line terminator and continues nothing.
+    """
     prefix = f"{field}="
-    for part in line.split(","):
-        if part.startswith(prefix):
-            return part[len(prefix) :]
+    parts = line.split(",")
+    for index, part in enumerate(parts):
+        if not part.startswith(prefix):
+            continue
+        value = [part[len(prefix) :]]
+        for fragment in parts[index + 1 :]:
+            if not fragment or "=" in fragment:
+                break
+            value.append(fragment)
+        return ",".join(value)
     raise KeyError(field)
 
 
@@ -7456,6 +7474,88 @@ def test_b1_cpu_list_parser_accepts_canonical_kernel_forms():
         b1.format_cpu_list([-1])
     with pytest.raises(b1.B1PlacementParseError):
         b1.format_cpu_list([True])
+
+
+def test_b1_env_field_parser_reads_comma_bearing_cpu_lists():
+    """FP-GC1-4/FP-GC3-5: a `,` opens a new field only before a new `key=`.
+
+    Regression for the CI-scale topology witness. `format_cpu_list` renders
+    canonical Linux list syntax, so a non-contiguous role set carries a raw
+    comma -- `gateway-split` puts the gateway on `{0,2}`, which is spelled
+    `0,2`. Splitting the line on every comma truncated such a value at its
+    first range, and `test_b1_ci_scale_fingerprint_proves_reference_topology`
+    failed with `assert '0' == '0,2'` on the first live `gateway-split` run
+    while the placement itself was correct and the producer had written the
+    whole set. Values never carry a raw `=`, so a fragment without one
+    continues the value before it; an empty fragment ends the line.
+    """
+    # (a) The shape that failed in CI, and the four-CPU non-contiguous
+    # reference set that would fail the same way, parsed directly.
+    line = (
+        "B1 env=placement_ok=1,gateway_allowed_cpus=0,2,postgres_allowed_cpus=1,"
+        "driver_allowed_cpus=3,reference_cpus=0-1,8-9,end=x"
+    )
+    assert _parse_b1_env_field(line, "gateway_allowed_cpus") == "0,2"
+    assert _parse_b1_env_field(line, "postgres_allowed_cpus") == "1"
+    assert _parse_b1_env_field(line, "driver_allowed_cpus") == "3"
+    assert _parse_b1_env_field(line, "reference_cpus") == "0-1,8-9"
+    assert _parse_b1_env_field(line, "end") == "x"
+    # A comma-bearing value neither swallows the next field nor invents one.
+    with pytest.raises(KeyError):
+        _parse_b1_env_field(line, "unassigned_cpus")
+    # The producer's trailing comma terminates the last value, it does not
+    # extend it.
+    assert _parse_b1_env_field("a=1,b=0,2,", "b") == "0,2"
+
+    # (b) The producer's own round trip, on the topology that exposed this.
+    declaration = B1PlacementDeclaration.from_contract(
+        probe.selected_contract(
+            "gateway-split", ("0-1", "2-3"), "0123456789abcdef0123456789abcdef"
+        )
+    )
+    assert declaration.topology == "gateway-split"
+    split_roles = {
+        "gateway": _role("gateway", (0, 2), pids=(11, 12, 13, 14, 15)),
+        "postgres": _role("postgres", (1,)),
+        "driver": _role("driver", (3,)),
+    }
+    for role in B1_ROLES:
+        assert declaration.allowed(role) == split_roles[role].allowed_cpus, role
+    complete = (
+        "usage_usec 12\nuser_usec 7\nsystem_usec 5\nnr_periods 3\n"
+        "nr_throttled 1\nthrottled_usec 9\nnr_bursts 0\n"
+    )
+    later = complete.replace("usage_usec 12", "usage_usec 4012")
+    line = _serialize_topology_placement_fields(
+        declaration,
+        AUTHORITY_CI_SCALE_REFERENCE,
+        split_roles,
+        {role: _role_diagnostics(role, "max 100000", complete, later) for role in B1_ROLES},
+        {0: 10, 2: 20},
+        0.5,
+        1.5,
+        role_thread_siblings={
+            "gateway": "0:0,8+8:0,8", "postgres": "1:1,9", "driver": "3:3,11",
+        },
+    )
+    assert "gateway_allowed_cpus=0,2," in line
+    for role, cpus in (("gateway", {0, 2}), ("postgres", {1}), ("driver", {3})):
+        assert _parse_b1_env_field(line, f"{role}_allowed_cpus") == b1.format_cpu_list(
+            split_roles[role].allowed_cpus
+        ) == b1.format_cpu_list(cpus), role
+    assert _parse_b1_env_field(line, "gateway_allowed_cpus") == "0,2"
+    assert _parse_b1_env_field(line, "reference_cpus") == b1.format_cpu_list({0, 1, 2, 3})
+    assert _parse_b1_env_field(line, "unassigned_cpus") == B1_UNASSIGNED_NONE
+    # Free-form diagnostics keep their own contract: their commas are escaped
+    # at the source, so the continuation rule never sees one.
+    assert _parse_b1_env_field(line, "gateway_thread_siblings_pct") == "0:0%2C8+8:0%2C8"
+    assert _parse_b1_env_field(line, "postgres_thread_siblings_pct") == "1:1%2C9"
+    assert _parse_b1_env_field(line, "spectre_v2_pct") == DIAGNOSTIC_UNAVAILABLE
+    # Every schema-3 field still reads back, in the pinned order.
+    for field_name in B1_TOPOLOGY_PLACEMENT_FIELDS:
+        assert _parse_b1_env_field(line, field_name) != "", field_name
+    positions = [line.index(f"{name}=") for name in B1_TOPOLOGY_PLACEMENT_FIELDS]
+    assert positions == sorted(positions), B1_TOPOLOGY_PLACEMENT_FIELDS
 
 
 def test_b1_cpu_diagnostic_parsers_report_without_gating():
