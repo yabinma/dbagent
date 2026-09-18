@@ -38,33 +38,54 @@ benchmarks:
     and never describes the active route. Per-model decision table at this revision, every entry
     decided from two complete 28-arm discovery artifacts of its own exact model, produced by the
     manual sweep `scripts/integration-test.sh b1_topology_probe`:
-    `AMD EPYC 7763 64-Core Processor` -- status unhostable; current evidence head
-    51e8a3175a4c247ab6afa47a5588bcbb96fafa99; superseded: none; no topology, no role cardinality
-    and no placement schema are claimed for it; it is recorded, non-gating, under reason
-    `topology_unratified_sku:AMD EPYC 7763 64-Core Processor`, and starts no live CI-scale
-    workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35184858860
-    and https://github.com/yabinma/dbagent/actions/runs/35186707903.
+    `AMD EPYC 7763 64-Core Processor` -- status selected; current evidence head
+    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b; superseded, oldest to newest:
+    51e8a3175a4c247ab6afa47a5588bcbb96fafa99 (status unhostable, replaced at
+    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b) -- historical provenance, which does not describe
+    the active route; topology id gateway-split, with its topology-derived role cardinalities
+    gateway=2, postgres=1, driver=1 and placement schema 3; physical relationship over the two
+    reference sibling pairs: the gateway holds one SMT thread of each of the two physical cores,
+    PostgreSQL holds the sibling of the gateway's first thread, the driver holds the sibling of
+    the gateway's second thread, and no reference CPU is intentionally unassigned; its all-role
+    sibling witness, read before warmup and again after the measured window, covers exactly the
+    four reference CPUs as two symmetric two-member classes and is serialized as
+    gateway_thread_siblings_pct, postgres_thread_siblings_pct and driver_thread_siblings_pct;
+    six of the seven classes were ratifiable for this model in this pair (gateway-core,
+    gateway-isolated, gateway-split, postgres-core, postgres-isolated, postgres-split) and the
+    immutable ranking's first operand chose among them -- the carrier's recorded score operands
+    for the winning class are maximum due-time p99 84.04 ms, maximum max_in_flight 75 and
+    minimum served rate 499.56 req/s over its eight records, none of which is a bar, a threshold
+    or a sizing observation; discovery evidence
+    https://github.com/yabinma/dbagent/actions/runs/35271046137 and
+    https://github.com/yabinma/dbagent/actions/runs/35271058579; final gating run: none at this
+    carrier revision yet -- the ordinary benchmark B1 step observed on this exact model at this
+    revision is that record, and until it exists this row publishes only what the discovery pair
+    decided and no CI acceptance result.
     `AMD EPYC 9V74 80-Core Processor` -- status unhostable; current evidence head
-    51e8a3175a4c247ab6afa47a5588bcbb96fafa99; superseded: none; no topology, no role cardinality
-    and no placement schema are claimed for it; it is recorded, non-gating, under reason
+    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b; superseded, oldest to newest:
+    51e8a3175a4c247ab6afa47a5588bcbb96fafa99 (status unhostable, replaced at
+    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b) -- historical provenance, which does not describe
+    the active route; no topology, no role cardinality and no placement schema are claimed for
+    it; in this pair no topology class met every unchanged CI-scale comparison in all eight of
+    its records, so no class is ratifiable for it; it is recorded, non-gating, under reason
     `topology_unratified_sku:AMD EPYC 9V74 80-Core Processor`, and starts no live CI-scale
-    workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35184851198
-    and https://github.com/yabinma/dbagent/actions/runs/35186725808.
-    No row in this revision is `selected`: in each of those two pairs, no topology class met
-    every unchanged CI-scale comparison in all eight of its records, so no class is ratifiable
-    for either model. Those are two per-model negative results against the unchanged bar below,
-    which is neither weakened nor re-derived by them, and they claim nothing about any other
-    exact model. A `selected` row names its topology id, its topology-derived
+    workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35271020778
+    and https://github.com/yabinma/dbagent/actions/runs/35271033101.
+    No row in this revision is decided from anything but two complete same-head 28-arm discovery
+    artifacts of its own exact model, and each row is evidence for its own current evidence head
+    alone. The 9V74 row is a per-model negative result against the unchanged bar below, which is
+    neither weakened nor re-derived by it, and neither row claims anything about any other exact
+    model. A `selected` row names its topology id, its topology-derived
     gateway/PostgreSQL/driver cardinalities, its physical relationship over the two pairs, its
     all-role sibling witness, placement schema 3, the two discovery evidence URLs and its final
     gating run; an `unhostable` row names no topology and no cardinality and cites
     `topology_unratified_sku:<model>`. Every row names its current evidence head as the full
-    40-character commit id and lists every superseded head oldest-to-newest, or `superseded:
-    none`. A valid exact model that is absent from the table follows
+    40-character commit id and lists every superseded head oldest-to-newest, or `superseded: none`.
+    A valid exact model that is absent from the table follows
     that same recorded, non-gating policy under the same reason; a model whose string cannot be
     read or is outside the closed model-string rules records
-    `topology_cpu_model_unavailable`. Both recorded routes run the unconditional container-free
-    coverage phase first, start no live workload afterwards, and are not a pytest skip and not a
+    `topology_cpu_model_unavailable`. A recorded route runs the unconditional container-free
+    coverage phase first, starts no live workload afterwards, and is not a pytest skip and not a
     green benchmark. A missing or corrupt carrier is neither: it fails the target with
     `gc3_decision_missing` or `gc3_decision_invalid`. CI-scale profile:
     open-loop 500 req/s offered for 30 s = 15000 offered requests, due-time latency,

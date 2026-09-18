@@ -5983,10 +5983,13 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
         REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
     ).read_text(encoding="utf-8")
     assert _b1_model_keyed_declaration_failures(fixture_src) == []
+    # Anchored on the declaration's OPENING BRACE, so the mutation names a
+    # model the carrier does not select whether the map is empty or already
+    # carries one: an added entry is a hand-written topology, whatever it says.
     invented_model = fixture_src.replace(
-        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {}',
-        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = '
-        '{"Invented CPU": {"gateway": 2, "postgres": 1, "driver": 1}}', 1)
+        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {',
+        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {\n'
+        '    "Invented CPU": {"gateway": 2, "postgres": 1, "driver": 1},', 1)
     assert invented_model != fixture_src
     assert any(
         f.startswith("model_keyed_declaration_key_drift")
@@ -6041,9 +6044,22 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
         assert "notes_row_omits_current_head" in _provenance_reasons(text=abbreviated)
         row = _gc3_notes_row(notes, model)
         assert row is not None and head in row, model
-        unrecorded = notes.replace(GC3_NO_HISTORY_TEXT, "history is not published")
-        assert unrecorded != notes
-        assert "notes_row_omits_superseded_none" in _provenance_reasons(text=unrecorded)
+        # Dropping this row's provenance is red in whichever shape the row
+        # has: a history-free row loses `superseded: none`, and a superseded
+        # row loses the full head it was replaced at. A seven-character prefix
+        # is not provenance there either.
+        superseded_heads = [
+            record["decision"]["evidenceHeadSha"] for record in entry["superseded"]
+        ]
+        if superseded_heads:
+            older = superseded_heads[0]
+            abridged = notes.replace(older, older[:7])
+            assert abridged != notes
+            assert "notes_row_omits_superseded_head" in _provenance_reasons(text=abridged)
+        else:
+            unrecorded = notes.replace(GC3_NO_HISTORY_TEXT, "history is not published")
+            assert unrecorded != notes
+            assert "notes_row_omits_superseded_none" in _provenance_reasons(text=unrecorded)
         rekeyed = notes.replace(f"`{model}` -- status ", "`Some Other CPU` -- status ", 1)
         assert rekeyed != notes
         assert "notes_row_missing" in _provenance_reasons(text=rekeyed)

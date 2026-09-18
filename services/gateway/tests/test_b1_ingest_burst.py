@@ -141,15 +141,20 @@ CI_SCALE_PROBE_PROFILE_NAME = probe.PROBE_PROFILE_NAME
 # nothing is copied into a scalar default, and one model's entry is never
 # another model's fallback.
 #
-# EMPTY at this head ON PURPOSE: no model has yet earned two complete same-head
-# discovery artifacts, so the carrier does not exist and no CI-scale topology
-# is ratified for any model. The delivery and manifest guards pin this map
-# against the carrier's own `selected` entries, whatever their number.
-CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {}
+# GENERATED ENTRY BY ENTRY FROM THE CARRIER'S `selected` ENTRIES, and pinned
+# against them by the delivery and manifest guards, whatever their number. A
+# model whose current decision is `unhostable`, or which the carrier does not
+# name at all, has no entry here: it has no CI-scale topology, no cardinality
+# and no live gate, and one model's entry is never another model's fallback.
+CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {
+    "AMD EPYC 7763 64-Core Processor": {"gateway": 2, "postgres": 1, "driver": 1},
+}
 #: ...and the placement schema each selected model's ordinary gate launches
 #: under. Always schema 3 for a selected model; the fixed probe schema is 3 and
 #: the fixed product schema is `PRODUCT_PLACEMENT_SCHEMA`.
-CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL: "dict[str, int]" = {}
+CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL: "dict[str, int]" = {
+    "AMD EPYC 7763 64-Core Processor": 3,
+}
 PRODUCT_AFFINITY_CARDINALITY = {"gateway": 4, "postgres": 3, "driver": 1}
 CI_SCALE_REFERENCE_LOGICAL_CPUS = 4
 PRODUCT_MINIMUM_HOST_LOGICAL_CPUS = 8
