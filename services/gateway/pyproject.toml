@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rca-gateway"
+version = "0.1.0"
+description = "Ingest-gateway: HMAC webhook, fingerprint dedup/correlation, start InvestigationWorkflow (design.md Section 3.2, 4.1)."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+    "temporalio>=1.7,<2",
+    "rca-common",
+    # GC-4 (FP-GC4-2): the ingest gateway alone runs its PostgreSQL engine on
+    # SQLAlchemy's synchronous Psycopg 3 dialect, for per-connection automatic
+    # preparation of the unchanged GC-2 fused merge. rca_common, the worker,
+    # dashboard-api, scripts, migrations and the B11 writers keep psycopg2.
+    "psycopg[binary]>=3.2,<4",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "httpx>=0.27,<1",
+    "testcontainers>=4.0,<5",
+    "PyYAML>=6.0,<7",
+]
+
+[tool.setuptools.packages.find]
+include = ["gateway*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# GC-1 FP-GC1-2: the closed routing-marker set. `b1_live` is every consumer of
+# a live B1 fixture (and the full-window instant-server self-witness);
+# `b1_product` narrows that to the product-promise nodes; `b1_latency_basis`
+# routes the unchanged CPU-basis oracle to the B1-LATENCY-BASIS-1 slice, which
+# neither GC-1 target selects.
+markers = [
+    "b1_live: consumes a live B1 fixture or the full-window driver self-witness; never traced",
+    "b1_product: product-promise live node; selected only by scripts/integration-test.sh b1_product",
+    "b1_latency_basis: CPU-basis oracle owned by B1-LATENCY-BASIS-1; outside both GC-1 targets",
+    "b1_topology_probe: GC-3 discovery arm in b1_topology_probe_live.py; selected only by scripts/integration-test.sh b1_topology_probe",
+]

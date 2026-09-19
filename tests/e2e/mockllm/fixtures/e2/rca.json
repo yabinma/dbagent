@@ -1,0 +1,1 @@
+{"status":"concluded","confidence":0.9,"root_cause":{"category":"configuration","summary":"broken.properties has an invalid connection-url"},"rca_compact":"catalog configuration fault"}

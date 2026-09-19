@@ -1,0 +1,18 @@
+{
+  "proposed_actions": [
+    {
+      "kind": "playbook",
+      "playbook_id": "presto.update_config_restart_workers",
+      "playbook_params": {
+        "name": "presto-coordinator-config",
+        "namespace": "dbagent",
+        "patches": [
+          {"key": "connector.name", "value": "hive"}
+        ]
+      },
+      "risk_level": "R2",
+      "description": "replace broken catalog connection-url password=REDACT_SENTINEL_e2e_password_value (operator-denied in E2)"
+    }
+  ],
+  "rca_compact": "configuration fault — broken catalog connection-url"
+}

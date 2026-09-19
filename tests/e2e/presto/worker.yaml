@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: presto-worker
+  labels: { app: presto, role: worker }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: presto, role: worker }
+  template:
+    metadata:
+      labels: { app: presto, role: worker }
+    spec:
+      containers:
+        - name: presto
+          image: prestodb/presto:0.298
+          ports:
+            - containerPort: 8080
+          # Sized for -Xmx1G heap + off-heap/native headroom. Without
+          # resources the pod is BestEffort QoS and is first starved under
+          # node pressure on a 4-vCPU CI runner. No limits.cpu so the JVM
+          # can still burst free cores during startup (rollout timeouts).
+          resources:
+            requests: { cpu: 100m, memory: 1536Mi }
+            limits: { memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            successThreshold: 3
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /v1/info, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /opt/presto-server/etc/config.properties
+              subPath: config.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/jvm.config
+              subPath: jvm.config
+            - name: config
+              mountPath: /opt/presto-server/etc/node.properties
+              subPath: node.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/log.properties
+              subPath: log.properties
+            - name: config
+              mountPath: /opt/presto-server/etc/catalog/tpch.properties
+              subPath: catalog_tpch.properties
+      volumes:
+        - name: config
+          configMap:
+            name: presto-worker-config

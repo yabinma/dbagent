@@ -1,0 +1,1 @@
+{"tool_calls":[{"tool":"presto_cluster_info","args":{},"purpose":"state"},{"tool":"presto_list_catalogs","args":{},"purpose":"catalogs"},{"tool":"presto_config","args":{"component":"coordinator","file":"catalog:broken"},"purpose":"read the failing catalog file (redaction must strip its password)"}],"unresolvable":[]}

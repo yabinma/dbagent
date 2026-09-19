@@ -1,0 +1,10 @@
+# Shared Go↔Python interpolation fixture (design.md §11.1.5 / DW2).
+# Values deliberately include YAML-significant characters that would break
+# raw-byte ${VAR} substitution: " #", ": ", leading "*", embedded newline.
+postgres_dsn: "postgres://u:${HASH_PW}@h/db"
+bootstrap_token: "${COLON_PW}"
+star: "${STAR_TOKEN}"
+multi: "${NL_TOKEN}"
+nested:
+  key: "prefix-${HASH_PW}-suffix"
+plain: ${HASH_PW}

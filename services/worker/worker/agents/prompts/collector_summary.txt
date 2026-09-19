@@ -1,0 +1,12 @@
+Compress the following diagnostic tool output into a summary of at most 400
+tokens for later root cause analysis.
+
+Keep: every error code / exception class / significant numeric value (memory
+sizes, durations, counts) together with the object it belongs to; verbatim
+excerpts of anomalous lines (max 10).
+Drop: repetitive listings of healthy items.
+
+Tool: {{tool}}   Args: {{args}}
+Output: {{payload_head_64kb}}
+
+Output schema: {summary: str, notable_lines: [str], anomaly_detected: bool}
