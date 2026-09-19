@@ -6894,3 +6894,480 @@ def test_b1_latency_basis_scope_and_frozen_knobs_are_pinned():
         assert literal in launcher, literal
     assert 'if [ "${#cpus[@]}" -lt 8 ]; then' in launcher
     assert '"minimumHostLogicalCpus": 8,' in launcher
+
+
+# ---------------------------------------------------------------------------
+# B1-HOST-NOISE (FP-B1HN-1..5) -- ten reported-only host-noise fields appended
+# to the existing `B1 env=` line.
+#
+# The tuple below is INDEPENDENT of the harness: it is retyped here so that
+# renaming, reordering, dropping or inserting a field in the producer turns
+# these guards red rather than silently redefining what they check.
+# ---------------------------------------------------------------------------
+
+B1HN_FIELDS = (
+    "host_steal_usec",
+    "assigned_cpu_steal_usec",
+    "host_psi_cpu_some_usec",
+    "host_psi_cpu_full_usec",
+    "host_psi_io_some_usec",
+    "host_psi_io_full_usec",
+    "host_psi_memory_some_usec",
+    "host_psi_memory_full_usec",
+    "assigned_cpu_freq_open_khz",
+    "assigned_cpu_freq_close_khz",
+)
+#: The exact declared sources, and the two rejected fallbacks that would give
+#: one field environment-dependent semantics.
+B1HN_SOURCES = {
+    "B1_HOST_PROC_STAT_PATH": "/proc/stat",
+    "B1_HOST_PSI_ROOT": "/proc/pressure",
+    "B1_HOST_CPU_SYSFS_ROOT": "/sys/devices/system/cpu",
+    "B1_CPU_FREQUENCY_RELATIVE": "cpufreq/scaling_cur_freq",
+}
+B1HN_REJECTED_SOURCES = ("/proc/cpuinfo", "cpuinfo_cur_freq", "/sys/fs/cgroup/cpu.pressure")
+#: The recorded sizing ledger this slice must leave exactly as it found it
+#: (design S3.5: five observations, eleven attempts, the 1.585 basis and the
+#: 317m/1585m resources derived from it).
+B1HN_LEDGER_BASIS_MS_PER_REQUEST = 1.585
+B1HN_LEDGER_OBSERVATIONS = 5
+B1HN_LEDGER_ATTEMPTS = 11
+B1HN_LEDGER_RESOURCES = {"requests": "317m", "limits": "1585m"}
+B1HN_LEDGER_OBSERVATION_KEYS = (
+    "committed", "cpuModel", "cpuMsPerRequest", "cpus", "errors", "headSha",
+    "image", "maxInFlight", "measurementAuthority", "offered", "p99Ms",
+    "placementOk", "placementSchema", "platformOnline", "profile",
+    "referenceTopology", "runId", "served", "servedRate",
+    "topologyDecisionHeadSha", "workerPidsPost", "workerPidsPre", "workers",
+)
+B1HN_OPEN_HOOK = "_at_window_open"
+B1HN_CLOSE_HOOK = "_after_window"
+B1HN_READER = "_read_host_noise_snapshot"
+B1HN_SERIALIZER = "serialize_host_noise_fields"
+B1HN_COMPAT_READER = "parse_host_noise_fields"
+B1HN_TUPLE = "B1_HOST_NOISE_FIELDS"
+B1HN_GC5_TAIL_FIELD = "postgres_wal_syncs_per_served"
+#: The B1 comparison and the knobs this slice may not move. Restated, not
+#: imported: a pin that reads the value it is guarding proves nothing.
+B1HN_FIXED_CI_SCALE_LITERALS = {
+    "CI_SCALE_BURST_RATE": 500,
+    "CI_SCALE_BURST_SECONDS": 30,
+    "CI_SCALE_TOTAL_REQUESTS": 15000,
+    "CI_SCALE_P99_MS": 150.0,
+    "CI_SCALE_SUSTAINED_FLOOR": 450,
+    "CI_SCALE_MAX_IN_FLIGHT": 500,
+    "BURST_RATE": 1000,
+    "INGEST_GATEWAY_WORKERS": 4,
+}
+B1HN_MASKING_TOKENS = (
+    "continue-on-error",
+    "pytest.mark.xfail",
+    "pytest.mark.skip",
+    "|| true",
+)
+#: Every carrier the slice declares it does not change.
+B1HN_UNCHANGED_CARRIERS = (
+    ("tests", "benchmark", "b1_topology_decision.json"),
+    ("deploy", "charts", "dbagent", "values.yaml"),
+    ("tests", "delivery", "test_delivery_sizing_ledger.py"),
+    ("scripts", "integration-test.sh"),
+    ("scripts", "b1-affinity-helper.py"),
+    ("tests", "functional", "test_manifests.py"),
+)
+
+
+def _b1hn_harness_tree() -> "tuple[str, ast.Module]":
+    src = REF_TEST.read_text(encoding="utf-8")
+    return src, ast.parse(src)
+
+
+def test_b1_host_noise_fields_are_diagnostic_only_and_sizing_neutral():
+    """FP-B1HN-3/4 [function test]: reported-only, bar-neutral, sizing-neutral.
+
+    One test owns all three faces of the same negative boundary -- no
+    host-noise outcome consumer, no changed B1 comparison or knob, and no
+    retry/skip/xfail/masking -- so a mutation in any of them makes the same
+    contract red.
+    """
+    harness_src, harness_tree = _b1hn_harness_tree()
+
+    # (1) The inventory is exactly these ten, in this order, declared once, in
+    # the harness, and disjoint from every earlier reported tail.
+    assert _module_tuple(harness_tree, B1HN_TUPLE) == B1HN_FIELDS
+    assert harness_src.count(f"{B1HN_TUPLE} = (") == 1
+    assert not set(B1HN_FIELDS) & set(GC5_COMMIT_FIELDS)
+    assert not set(B1HN_FIELDS) & set(GC4_COST_FIELDS)
+
+    # (2) The tail location: the one fingerprint constructor appends exactly
+    # one comma and the serialized block AFTER the GC-5 fields, so schema 2
+    # and schema 3 receive byte-identical suffixes and the historical 81-key
+    # prefix does not move.
+    fixture = _gc4_function(harness_tree, "_run_b1_reference")
+    line_assign = next(
+        node for node in ast.walk(fixture)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "fingerprint_line"
+                for t in node.targets)
+    )
+    rendered = ast.get_source_segment(harness_src, line_assign) or ""
+    assert rendered.count("host_noise_fields") == 1, rendered
+    assert (
+        'f"{postgres_commit_fields},"\n'
+        '            f"{host_noise_fields}"' in rendered
+    ), rendered
+    assert rendered.index("postgres_cost_fields") < rendered.index("host_noise_fields")
+    assert rendered.index("placement_fields") < rendered.index("host_noise_fields")
+    for field in B1HN_FIELDS:
+        # No field is spelled into the constructor beside a placement or
+        # cgroup diagnostic; the whole block travels as one serialized value.
+        assert field not in rendered, field
+
+    # (3) No field is a gating field, a product verdict, a GC-3 verdict,
+    # ranking operand or record key, and none reaches the probe helper.
+    gating = set(_module_tuple(harness_tree, "B1_GATING_PLACEMENT_FIELDS"))
+    topology_gating = set(
+        _module_tuple(harness_tree, "B1_TOPOLOGY_GATING_PLACEMENT_FIELDS")
+    )
+    placement = gating | set(
+        _module_tuple(harness_tree, "B1_DIAGNOSTIC_PLACEMENT_FIELDS")
+    )
+    topology_placement = topology_gating | set(
+        _module_tuple(harness_tree, "B1_TOPOLOGY_DIAGNOSTIC_PLACEMENT_FIELDS")
+    )
+    product_verdicts = set(_module_tuple(harness_tree, "PRODUCT_VERDICT_FIELDS"))
+    probe_src = PROBE_HELPER.read_text(encoding="utf-8")
+    for field in B1HN_FIELDS:
+        assert field not in gating, field
+        assert field not in topology_gating, field
+        assert field not in placement, field
+        assert field not in topology_placement, field
+        assert field not in product_verdicts, field
+        assert field not in gc3.VERDICT_FIELDS, field
+        assert field not in gc3.INTEGRITY_VERDICT_FIELDS, field
+        assert field not in gc3.PERFORMANCE_VERDICT_FIELDS, field
+        assert field not in gc3.RECORD_KEYS, field
+        assert field not in probe_src, f"the GC-3 helper names {field}"
+    assert B1HN_TUPLE not in probe_src
+
+    # (4) No record validator, reference-profile assertion body or CPU-basis
+    # oracle reads one. They may be PRINTED -- the whole fingerprint already
+    # is -- but never compared.
+    for consumer in (
+        "commit_shape_record_failures",
+        "postgres_cost_record_failures",
+        "test_b1_ci_scale_reference_profile",
+        "test_gc5_commit_shape_reference_profile",
+        "test_measured_cpu_cost_does_not_exceed_the_recorded_sizing_basis",
+        "sizing_identity_failures",
+        "sizing_run_identity",
+    ):
+        node = _gc4_function(harness_tree, consumer)
+        body = ast.get_source_segment(harness_src, node) or ""
+        for field in B1HN_FIELDS + (B1HN_TUPLE, "host_noise"):
+            assert field not in body, (consumer, field)
+
+    # ...and no assertion ANYWHERE in the harness compares a host-noise value:
+    # the only nodes that may name one are the host-noise tests themselves.
+    comparers: set[str] = set()
+    for node in harness_tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for statement in ast.walk(node):
+            if not isinstance(statement, ast.Assert):
+                continue
+            rendered_assert = ast.unparse(statement.test)
+            if any(field in rendered_assert for field in B1HN_FIELDS) or (
+                "host_noise" in rendered_assert
+            ):
+                comparers.add(node.name)
+    assert comparers <= {
+        "test_b1_host_noise_parsers_compute_declared_window_deltas",
+        "test_b1_host_noise_live_reader_observes_real_proc_stat",
+        "test_b1_host_noise_frequency_reads_exact_assigned_service_cpu_paths",
+        "test_b1_host_noise_fields_serialize_comma_safe_in_pinned_order",
+        "test_b1_host_noise_snapshot_failures_are_field_local_and_nonfatal",
+        "test_b1_host_noise_window_hooks_bracket_the_measured_loop",
+        "test_b1_host_noise_legacy_fingerprint_defaults_only_new_keys",
+        "test_b1_host_noise_snapshot_reads_declared_sources_at_window_boundaries",
+        "test_b1_ci_scale_fingerprint_reports_host_noise_fields",
+        # The two existing TAIL pins: both assert only that the block closes
+        # the line, in its serialized form. Neither reads a value.
+        "test_b1_fingerprint_line_reports_scoped_concurrency_warnings",
+        GC5_CONTEXT_NODE,
+    }, sorted(comparers)
+
+    # (5) The B1 comparison and every fixed knob are exactly where they were.
+    profile_assigns = _module_assigns(REF_PATH)
+    harness_assigns = _source_assigns(harness_src)
+    for name, expected in B1HN_FIXED_CI_SCALE_LITERALS.items():
+        source = profile_assigns if name in profile_assigns else harness_assigns
+        assert ast.literal_eval(source[name]) == expected, name
+    # ...and the product ceiling is still exactly one second of offered load.
+    assert ast.unparse(profile_assigns["MAX_IN_FLIGHT"]) == "BURST_RATE"
+    reference = _gc4_function(harness_tree, "test_b1_ci_scale_reference_profile")
+    body = ast.get_source_segment(harness_src, reference) or ""
+    assert "p99 < CI_SCALE_P99_MS" in body
+    assert "served_rate >= CI_SCALE_SUSTAINED_FLOOR" in body
+    assert "errors == 0" in body
+
+    # (6) No retry, skip, xfail, `continue-on-error` or exit masking entered
+    # any B1 carrier, and the live node carries no new marker.
+    for parts in (
+        ("services", "gateway", "tests", "test_b1_ingest_burst.py"),
+        ("services", "gateway", "tests", "b1_topology_probe_live.py"),
+        ("scripts", "integration-test.sh"),
+        (".github", "workflows", "ci.yml"),
+    ):
+        text = REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+        for token in B1HN_MASKING_TOKENS:
+            assert token not in text, (parts[-1], token)
+    live = _gc4_function(
+        harness_tree, "test_b1_ci_scale_fingerprint_reports_host_noise_fields"
+    )
+    assert _decorator_markers(live) == {"b1_live"}, _decorator_markers(live)
+    live_body = ast.get_source_segment(harness_src, live) or ""
+    for forbidden in ("pytest.skip", "pytest.xfail", "if ", "unavailable\"" ):
+        assert forbidden not in live_body.replace(
+            '("unavailable" if value == DIAGNOSTIC_UNAVAILABLE else "value")', ""
+        ), forbidden
+
+    # (7) Sizing neutrality: the ledger, the chart and the basis never gain a
+    # host-noise column, and no recorded observation is rewritten.
+    for parts in GC4_SIZING_CARRIERS:
+        carrier = REPO_ROOT.joinpath(*parts)
+        assert carrier.is_file(), parts[-1]
+        text = carrier.read_text(encoding="utf-8")
+        if parts[-1] in ("thresholds.yaml", "test_b1_ingest_burst.py"):
+            continue  # the manifest describes them; the harness produces them
+        for field in B1HN_FIELDS + (B1HN_TUPLE,):
+            assert field not in text, f"{parts[-1]} carries {field}"
+    values = yaml.safe_load(GC5_VALUES_PATH.read_text(encoding="utf-8"))
+    sizing = yaml.safe_dump(values["ingestGateway"]["sizingBasis"])
+    for field in B1HN_FIELDS:
+        assert field not in sizing, field
+    basis = values["ingestGateway"]["sizingBasis"]
+    assert float(basis["cpuMsPerRequest"]) == B1HN_LEDGER_BASIS_MS_PER_REQUEST
+    assert len(basis["observations"]) == B1HN_LEDGER_OBSERVATIONS
+    assert len(basis["collection"]["attempts"]) == B1HN_LEDGER_ATTEMPTS
+    resources = values["ingestGateway"]["resources"]
+    assert resources["requests"]["cpu"] == B1HN_LEDGER_RESOURCES["requests"]
+    assert resources["limits"]["cpu"] == B1HN_LEDGER_RESOURCES["limits"]
+    # The row schema is closed: no observation or attempt gained a column.
+    assert {frozenset(row) for row in basis["observations"]} == {
+        frozenset(B1HN_LEDGER_OBSERVATION_KEYS)
+    }
+    for attempt in basis["collection"]["attempts"]:
+        assert set(attempt) == {
+            "runId", "headSha", "cpuModel", "decisionState", "outcome", "reason",
+        }, attempt
+
+    # (8) The carriers the slice declares unchanged carry no host-noise name
+    # at all -- including every fingerprint embedded in the GC-3 decision.
+    for parts in B1HN_UNCHANGED_CARRIERS:
+        text = REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+        for field in B1HN_FIELDS + (B1HN_TUPLE, B1HN_READER):
+            assert field not in text, f"{parts[-1]} carries {field}"
+
+    # (9) The manifest describes them as reported diagnostics, and its
+    # threshold, status and sizing prose are untouched.
+    thresholds = yaml.safe_load(GC5_THRESHOLDS.read_text(encoding="utf-8"))
+    b1_entry = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")
+    # The YAML folds the threshold's line breaks into spaces; compare the
+    # words, so the bar itself is pinned rather than its wrapping.
+    assert " ".join(b1_entry["threshold"].split()) == " ".join(
+        GC5_B1_THRESHOLD.split()
+    )
+    assert b1_entry["status"] == "covered"
+    notes = b1_entry["notes"]
+    for field in B1HN_FIELDS:
+        assert field in notes, field
+    for source in B1HN_SOURCES.values():
+        assert source in notes, source
+    assert "reported diagnostic" in notes
+    assert "unavailable" in notes
+    assert GC5_GATE_NODE in notes
+    assert str(GC5_MAX_COMMITS_PER_SERVED) in notes
+    assert GC1_BASIS_OWNER in notes
+
+
+def test_b1_host_noise_sources_and_window_hooks_are_pinned():
+    """FP-B1HN-1: the exact declared sources and the two window boundaries.
+
+    It makes no assertion about ``--pid host``: that clause belongs to the
+    launcher's socket census and is not evidence that these kernel-global
+    files were read.
+    """
+    harness_src, harness_tree = _b1hn_harness_tree()
+    assigns = _source_assigns(harness_src)
+
+    # (1) Four fixed source constants, each a literal path, declared once.
+    for name, expected in B1HN_SOURCES.items():
+        node = assigns[name]
+        assert isinstance(node, ast.Call), (name, ast.dump(node))
+        assert _call_func_name(node) == "Path", name
+        assert ast.literal_eval(node.args[0]) == expected, name
+        assert harness_src.count(f"{name} = Path(") == 1, name
+
+    # (2) No fallback to a source that would change the field's meaning with
+    # the environment, and no cgroup-pressure substitute.
+    reader = _gc4_function(harness_tree, B1HN_READER)
+    frequency = _gc4_function(harness_tree, "_read_assigned_cpu_frequencies")
+    values_fn = _gc4_function(harness_tree, "_host_noise_field_values")
+    for node in (reader, frequency, values_fn):
+        body = ast.get_source_segment(harness_src, node) or ""
+        for rejected in B1HN_REJECTED_SOURCES:
+            assert rejected not in body, (node.name, rejected)
+        assert "avg10" not in body and "avg60" not in body and "avg300" not in body
+
+    # (3) The reader takes the declared roots as its defaults, so a fixture
+    # root can never become the live source by omission.
+    defaults = {
+        arg.arg: ast.unparse(default)
+        for arg, default in zip(
+            reader.args.kwonlyargs, reader.args.kw_defaults
+        ) if default is not None
+    }
+    assert defaults["proc_stat_path"] == "B1_HOST_PROC_STAT_PATH"
+    assert defaults["psi_root"] == "B1_HOST_PSI_ROOT"
+    assert defaults["cpu_sysfs_root"] == "B1_HOST_CPU_SYSFS_ROOT"
+
+    # (4) The CPU population is the opening witness's gateway-union-PostgreSQL
+    # set: not a range, not a cardinality, not the driver's own affinity.
+    fixture = _gc4_function(harness_tree, "_run_b1_reference")
+    population = next(
+        node for node in ast.walk(fixture)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "assigned_service_cpus"
+                for t in node.targets)
+    )
+    rendered = ast.unparse(population.value)
+    assert rendered == (
+        "frozenset(roles_open['gateway'].allowed_cpus | "
+        "roles_open['postgres'].allowed_cpus)"
+    ), rendered
+    assert "driver" not in rendered
+    assert "sched_getaffinity" not in rendered
+
+    # (5) The opening hook fires before `t0`; the profile module registers it
+    # as a keyword and takes the reading as the last pre-window work.
+    profile_src = REF_PATH.read_text(encoding="utf-8")
+    assert profile_src.count("on_window_open()") == 1
+    assert profile_src.count("t0 = time.perf_counter()") == 1
+    assert profile_src.index("on_window_open()") < profile_src.index(
+        "t0 = time.perf_counter()"
+    )
+    assert profile_src.index("on_window_complete()") < profile_src.index(
+        "= derive_leg_vectors("
+    )
+    run_call = next(
+        node for node in ast.walk(fixture)
+        if isinstance(node, ast.Call) and _call_func_name(node) == "run_open_loop"
+    )
+    hooks = {
+        kw.arg: ast.unparse(kw.value) for kw in run_call.keywords
+        if kw.arg in ("on_window_open", "on_window_complete", "on_prologue_complete")
+    }
+    assert hooks == {
+        "on_prologue_complete": "_after_prologue",
+        "on_window_open": B1HN_OPEN_HOOK,
+        "on_window_complete": B1HN_CLOSE_HOOK,
+    }, hooks
+
+    # (6) The opening callback does the host read and nothing else; the
+    # closing callback does it FIRST, before `wait_sampler.stop` and before
+    # every later close diagnostic.
+    opening = _gc4_function(harness_tree, B1HN_OPEN_HOOK)
+    opening_calls = [
+        _call_func_name(node) for node in ast.walk(opening)
+        if isinstance(node, ast.Call)
+    ]
+    assert opening_calls.count(B1HN_READER) == 1, opening_calls
+    assert set(opening_calls) <= {B1HN_READER, "setdefault"}, opening_calls
+    closing = _gc4_function(harness_tree, B1HN_CLOSE_HOOK)
+    closing_calls = [
+        (node.lineno, _call_func_name(node)) for node in ast.walk(closing)
+        if isinstance(node, ast.Call)
+    ]
+    read_at = min(line for line, name in closing_calls if name == B1HN_READER)
+    stop_at = min(
+        node.lineno for node in ast.walk(closing)
+        if isinstance(node, ast.Attribute) and node.attr == "stop"
+    )
+    assert read_at < stop_at, "the closing host read follows wait_sampler.stop"
+    others = [
+        line for line, name in closing_calls
+        if name not in (B1HN_READER, "setdefault")
+    ]
+    assert others and read_at < min(others), closing_calls
+    # The established sampler-stop-before-CPU-after order survives.
+    collect_at = min(
+        line for line, name in closing_calls if name == "_collect_cpu_diagnostics"
+    )
+    assert stop_at < collect_at
+
+    # (7) No new bind mount, optional-source mount or retry entered the
+    # launcher; `--pid host` keeps its existing socket-census purpose and is
+    # not claimed as the host-noise vantage.
+    launcher = GC5_LAUNCHER.read_text(encoding="utf-8")
+    for token in ("/proc/pressure", "cpufreq", "scaling_cur_freq", B1HN_READER):
+        assert token not in launcher, token
+    assert "--pid host" in launcher
+    manifests = REPO_ROOT.joinpath("tests", "functional", "test_manifests.py").read_text(
+        encoding="utf-8"
+    )
+    assert "host_noise" not in manifests
+    assert "--pid" in manifests
+
+
+def test_b1_host_noise_probe_observation_is_post_write_and_nongating():
+    """FP-B1HN-3: the GC-3 arm observation is post-write and decides nothing."""
+    src = PROBE_TEST.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    node = _gc4_function(tree, "test_b1_ci_scale_topology_probe_record")
+
+    calls = [
+        (element.lineno, _call_func_name(element))
+        for element in ast.walk(node) if isinstance(element, ast.Call)
+    ]
+    write_at = min(line for line, name in calls if name == "write_probe_arm_record")
+    observe_at = min(line for line, name in calls if name == B1HN_COMPAT_READER)
+    assert write_at < observe_at, "the host-noise observation precedes the arm write"
+    serialize_at = min(line for line, name in calls if name == B1HN_SERIALIZER)
+    assert write_at < serialize_at
+
+    # It iterates only the closed host-noise inventory and reads only the
+    # WRITTEN arm's fingerprint.
+    statements = [
+        element for element in ast.walk(node)
+        if isinstance(element, (ast.Assign, ast.Assert, ast.Expr))
+        and element.lineno >= observe_at
+        and element.lineno <= serialize_at
+    ]
+    rendered = "\n".join(ast.unparse(element) for element in statements)
+    assert B1HN_TUPLE in rendered, rendered
+    assert "written['fingerprint']" in rendered, rendered
+    for field in B1HN_FIELDS:
+        assert field not in src, f"the probe route names {field} directly"
+
+    # No availability-conditioned assertion, verdict mutation, rejection,
+    # top-level artifact key or ranking operand was added.
+    for element in ast.walk(node):
+        if not isinstance(element, (ast.If, ast.IfExp)):
+            continue
+        rendered_test = ast.unparse(element.test)
+        assert "host_noise" not in rendered_test, rendered_test
+        assert B1HN_TUPLE not in rendered_test, rendered_test
+    for element in ast.walk(node):
+        if isinstance(element, ast.Assert):
+            rendered_assert = ast.unparse(element.test)
+            if "host_noise" not in rendered_assert:
+                continue
+            # The one admitted assertion is the closed key inventory itself.
+            assert rendered_assert == (
+                f"tuple(host_noise) == harness.{B1HN_TUPLE}"
+            ), rendered_assert
+    assert "DIAGNOSTIC_UNAVAILABLE not in set(host_noise" not in src
+    assert "assert_complete_host_noise_record" not in src
+    for verdict_token in ("VERDICT_MET", "VERDICT_MISSED", "verdicts["):
+        segment = src.split("host_noise = ", 1)[1].split("wait_fields = ", 1)[0]
+        assert verdict_token not in segment, verdict_token

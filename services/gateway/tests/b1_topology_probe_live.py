@@ -116,6 +116,16 @@ def test_b1_ci_scale_topology_probe_record(b1_topology_probe_run):
     # by its note rather than by a fabricated zero.
     written = json.loads(harness.B1_PROBE_RECORD.read_text(encoding="utf-8"))
     assert written["index"] == record["index"]
+
+    # (6a) B1-HOST-NOISE (FP-B1HN-3): the ten host-noise fields of THIS arm,
+    # observed only AFTER the arm was written and unable to void it. They are
+    # read for the declared grammar or the literal `unavailable` and nothing
+    # else: no availability is required, no value is compared, no verdict and
+    # no ranking operand exists for them, and an unexposed kernel source can
+    # never destroy a 28-arm GC-3 sweep's evidence.
+    host_noise = harness.parse_host_noise_fields(written["fingerprint"])
+    assert tuple(host_noise) == harness.B1_HOST_NOISE_FIELDS, host_noise
+    harness.serialize_host_noise_fields(host_noise)
     wait_fields = {
         field: harness._parse_b1_env_field(written["fingerprint"], field)
         for field in harness.B1_POSTGRES_COST_FIELDS[1:]

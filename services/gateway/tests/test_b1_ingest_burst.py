@@ -28,6 +28,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Mapping
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -3422,6 +3423,1080 @@ def assert_complete_commit_shape_record(run: dict) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# B1 host noise (FP-B1HN-1..5) -- ten REPORTED-ONLY fields appended to the
+# existing flat `B1 env=` line.
+#
+# What they are: guest-visible steal for the host and for the assigned service
+# CPUs, the six host-global PSI `some`/`full` totals for CPU, I/O and memory,
+# and the assigned service CPUs' instantaneous frequency at each end of the
+# measured window. What they are NOT: a bar, a gate, a placement verdict, a
+# GC-3 verdict or ranking operand, a qualifying-run predicate, a CPU-basis
+# comparison or a sizing value. Nothing in this file may read one to decide an
+# assertion, and a missing source renders its own field `unavailable` with a
+# named note -- never a zero, never a partial map, never a suppressed line.
+#
+# The readers run in the B1 DRIVER container. `/proc/stat` and
+# `/proc/pressure/*` are kernel-global rather than PID-namespaced, so the
+# driver's view describes the host; `/sys/devices/system/cpu` is the
+# container's read-only sysfs view. No bind mount is added for any of them: an
+# absent optional source must degrade one field, not stop the driver starting.
+# ---------------------------------------------------------------------------
+
+#: The exact declared sources. There is deliberately no `/proc/cpuinfo` MHz,
+#: `cpuinfo_cur_freq`, cgroup-pressure or governor fallback: a field that
+#: changed meaning with the environment would be worse than an honest absence.
+B1_HOST_PROC_STAT_PATH = Path("/proc/stat")
+B1_HOST_PSI_ROOT = Path("/proc/pressure")
+B1_HOST_CPU_SYSFS_ROOT = Path("/sys/devices/system/cpu")
+B1_CPU_FREQUENCY_RELATIVE = Path("cpufreq/scaling_cur_freq")
+#: The three PSI resources, each read once per boundary and then asked for
+#: both of its records independently.
+B1_HOST_PSI_RESOURCES = ("cpu", "io", "memory")
+
+#: The ten fields, in the order the fingerprint carries them -- appended after
+#: the eight GC-5 transaction/WAL fields, never before a gating one.
+B1_HOST_NOISE_FIELDS = (
+    "host_steal_usec",
+    "assigned_cpu_steal_usec",
+    "host_psi_cpu_some_usec",
+    "host_psi_cpu_full_usec",
+    "host_psi_io_some_usec",
+    "host_psi_io_full_usec",
+    "host_psi_memory_some_usec",
+    "host_psi_memory_full_usec",
+    "assigned_cpu_freq_open_khz",
+    "assigned_cpu_freq_close_khz",
+)
+#: The three per-CPU maps, and the two of them whose values must be positive.
+B1_HOST_NOISE_MAP_FIELDS = (
+    "assigned_cpu_steal_usec",
+    "assigned_cpu_freq_open_khz",
+    "assigned_cpu_freq_close_khz",
+)
+B1_HOST_NOISE_POSITIVE_MAP_FIELDS = (
+    "assigned_cpu_freq_open_khz",
+    "assigned_cpu_freq_close_khz",
+)
+#: The closed value grammar. Digits only for a scalar; digits, `:` and `+` for
+#: a map. No raw comma, whitespace, slash, percent sign or `=` can occur in
+#: either, so these values need no percent-encoding -- and a value that does
+#: not match is refused before it reaches the line, rather than encoded after
+#: it has already lost its type.
+_B1_HOST_NOISE_SCALAR_RE = re.compile(r"[0-9]+")
+_B1_HOST_NOISE_MAP_RE = re.compile(r"[0-9]+:[0-9]+(?:\+[0-9]+:[0-9]+)*")
+
+
+@dataclass(frozen=True)
+class B1HostNoiseSnapshot:
+    """One boundary's raw host readings; ``None`` is an unexposed source."""
+
+    host_steal_ticks: "int | None"
+    assigned_cpu_steal_ticks: "dict[int, int] | None"
+    host_psi_cpu_some_usec: "int | None"
+    host_psi_cpu_full_usec: "int | None"
+    host_psi_io_some_usec: "int | None"
+    host_psi_io_full_usec: "int | None"
+    host_psi_memory_some_usec: "int | None"
+    host_psi_memory_full_usec: "int | None"
+    assigned_cpu_freq_khz: "dict[int, int] | None"
+
+
+#: The snapshot a boundary that never ran would have produced. Every member is
+#: absent, so every field renders `unavailable` instead of raising.
+B1_HOST_NOISE_UNREAD = B1HostNoiseSnapshot(*(None,) * 9)
+
+
+def _read_assigned_cpu_frequencies(
+    assigned_cpus, *, cpu_sysfs_root: Path = B1_HOST_CPU_SYSFS_ROOT
+) -> "dict[int, int]":
+    """Every assigned service CPU's instantaneous kHz, or nothing at all.
+
+    The kernel unit is kHz and is neither converted nor averaged. A partial
+    map is refused: two of three service CPUs would read like full role
+    coverage. Each boundary is independent -- an available opening map with an
+    unavailable closing one is a truthful record.
+    """
+    wanted = sorted(frozenset(assigned_cpus))
+    if not wanted:
+        raise b1.B1PlacementParseError("no assigned service CPU to read frequency for")
+    out: "dict[int, int]" = {}
+    for cpu in wanted:
+        path = cpu_sysfs_root / f"cpu{cpu}" / B1_CPU_FREQUENCY_RELATIVE
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw.isdecimal():
+            raise b1.B1PlacementParseError(f"non-decimal {path}: {raw!r}")
+        khz = int(raw)
+        if khz <= 0:
+            raise b1.B1PlacementParseError(f"{path} is not a positive kHz reading: {khz}")
+        out[cpu] = khz
+    return out
+
+
+def _read_host_noise_snapshot(
+    assigned_cpus: "frozenset[int]",
+    *,
+    notes: "list[str]",
+    proc_stat_path: Path = B1_HOST_PROC_STAT_PATH,
+    psi_root: Path = B1_HOST_PSI_ROOT,
+    cpu_sysfs_root: Path = B1_HOST_CPU_SYSFS_ROOT,
+) -> B1HostNoiseSnapshot:
+    """One boundary's host readings, fail-soft at the SMALLEST member.
+
+    Every read and parse is attempted through the established
+    ``_try_diagnostic`` primitive, one independently serializable member at a
+    time, so one unexposed source cannot erase an unrelated reading. Nothing
+    here raises into the live fixture and nothing here touches `placement_ok`.
+    """
+    stat_text = _try_diagnostic(
+        f"host_steal_usec ({proc_stat_path})", notes,
+        lambda: proc_stat_path.read_text(encoding="utf-8"),
+    )
+    host_steal_ticks = None
+    assigned_steal_ticks = None
+    if stat_text is not None:
+        parsed = _try_diagnostic(
+            f"host_steal_usec ({proc_stat_path})", notes,
+            lambda: b1.parse_proc_stat_steal_ticks(stat_text),
+        )
+        if parsed is not None:
+            host_steal_ticks = parsed[0]
+            # Selection is its own step: a missing `cpu<N>` row costs the
+            # assigned map alone and leaves the valid aggregate usable.
+            assigned_steal_ticks = _try_diagnostic(
+                f"assigned_cpu_steal_usec ({proc_stat_path})", notes,
+                lambda: b1.select_cpu_counter_map(parsed[1], frozenset(assigned_cpus)),
+            )
+    psi: "dict[str, int | None]" = {}
+    for resource in B1_HOST_PSI_RESOURCES:
+        path = psi_root / resource
+        text = _try_diagnostic(
+            f"host_psi_{resource}_* ({path})", notes,
+            lambda p=path: p.read_text(encoding="utf-8"),
+        )
+        for record in b1.PSI_RECORD_NAMES:
+            key = f"host_psi_{resource}_{record}_usec"
+            psi[key] = (
+                None if text is None
+                else _try_diagnostic(
+                    f"{key} ({path})", notes,
+                    lambda t=text, r=record: b1.parse_psi_total(t, r),
+                )
+            )
+    freq = _try_diagnostic(
+        f"assigned_cpu_freq_khz ({cpu_sysfs_root}/cpu<N>/{B1_CPU_FREQUENCY_RELATIVE})",
+        notes,
+        lambda: _read_assigned_cpu_frequencies(
+            assigned_cpus, cpu_sysfs_root=cpu_sysfs_root
+        ),
+    )
+    return B1HostNoiseSnapshot(
+        host_steal_ticks=host_steal_ticks,
+        assigned_cpu_steal_ticks=assigned_steal_ticks,
+        assigned_cpu_freq_khz=freq,
+        **psi,
+    )
+
+
+def _host_noise_scalar_field(before_value, after_value, *, label: str, notes, convert=None) -> str:
+    """One scalar field: `unavailable` unless both ends are present and usable."""
+    if before_value is None or after_value is None:
+        return DIAGNOSTIC_UNAVAILABLE
+
+    def _render() -> str:
+        delta = b1.counter_delta(before_value, after_value, label=label)
+        return str(convert(delta) if convert is not None else delta)
+
+    rendered = _try_diagnostic(label, notes, _render)
+    return DIAGNOSTIC_UNAVAILABLE if rendered is None else rendered
+
+
+def _host_noise_map_field(values, *, label: str, notes, positive: bool) -> str:
+    """One per-CPU map field: whole-map `unavailable`, never a partial map."""
+    if values is None:
+        return DIAGNOSTIC_UNAVAILABLE
+    rendered = _try_diagnostic(
+        label, notes,
+        lambda: b1.serialize_cpu_integer_map(values, positive=positive),
+    )
+    return DIAGNOSTIC_UNAVAILABLE if rendered is None else rendered
+
+
+def _host_noise_field_values(
+    before: B1HostNoiseSnapshot,
+    after: B1HostNoiseSnapshot,
+    *,
+    clock_ticks: int,
+    notes: "list[str]",
+) -> "dict[str, str]":
+    """The ten rendered values, in pinned order, each independently fail-soft.
+
+    A ``None`` member, a counter reset or an incomplete map renders ONLY its
+    own field as `unavailable`; steal, each PSI record and each frequency
+    boundary are computed from their own operands alone.
+    """
+    before = B1_HOST_NOISE_UNREAD if before is None else before
+    after = B1_HOST_NOISE_UNREAD if after is None else after
+
+    steal_pair = None
+    if None not in (
+        before.host_steal_ticks, after.host_steal_ticks,
+        before.assigned_cpu_steal_ticks, after.assigned_cpu_steal_ticks,
+    ):
+        try:
+            steal_pair = b1.steal_delta_usec(
+                (before.host_steal_ticks, before.assigned_cpu_steal_ticks),
+                (after.host_steal_ticks, after.assigned_cpu_steal_ticks),
+                clock_ticks=clock_ticks,
+            )
+        except Exception:  # noqa: BLE001 -- each member is retried below, where
+            steal_pair = None  # the failure is attributed to its OWN field.
+    if steal_pair is not None:
+        host_steal = str(steal_pair[0])
+        assigned_steal = b1.serialize_cpu_integer_map(steal_pair[1], positive=False)
+    else:
+        host_steal = _host_noise_scalar_field(
+            before.host_steal_ticks, after.host_steal_ticks,
+            label="host_steal_usec", notes=notes,
+            convert=lambda ticks: b1.steal_ticks_to_usec(ticks, clock_ticks=clock_ticks),
+        )
+        assigned_steal = DIAGNOSTIC_UNAVAILABLE
+        if None not in (before.assigned_cpu_steal_ticks, after.assigned_cpu_steal_ticks):
+            rendered = _try_diagnostic(
+                "assigned_cpu_steal_usec", notes,
+                lambda: b1.serialize_cpu_integer_map(
+                    b1.assigned_steal_delta_usec(
+                        before.assigned_cpu_steal_ticks,
+                        after.assigned_cpu_steal_ticks,
+                        clock_ticks=clock_ticks,
+                    ),
+                    positive=False,
+                ),
+            )
+            if rendered is not None:
+                assigned_steal = rendered
+
+    values = {
+        "host_steal_usec": host_steal,
+        "assigned_cpu_steal_usec": assigned_steal,
+    }
+    for resource in B1_HOST_PSI_RESOURCES:
+        for record in b1.PSI_RECORD_NAMES:
+            key = f"host_psi_{resource}_{record}_usec"
+            values[key] = _host_noise_scalar_field(
+                getattr(before, key), getattr(after, key), label=key, notes=notes,
+            )
+    # Two INSTANTANEOUS readings, not a delta: the opening map is the opening
+    # snapshot's and the closing map is the closing snapshot's, independently.
+    values["assigned_cpu_freq_open_khz"] = _host_noise_map_field(
+        before.assigned_cpu_freq_khz, label="assigned_cpu_freq_open_khz",
+        notes=notes, positive=True,
+    )
+    values["assigned_cpu_freq_close_khz"] = _host_noise_map_field(
+        after.assigned_cpu_freq_khz, label="assigned_cpu_freq_close_khz",
+        notes=notes, positive=True,
+    )
+    return {field: values[field] for field in B1_HOST_NOISE_FIELDS}
+
+
+def host_noise_value_failure(field: str, value: str) -> "str | None":
+    """Why this rendered host-noise value is not of the declared grammar."""
+    if field not in B1_HOST_NOISE_FIELDS:
+        return f"{field!r} is not a host-noise field"
+    if not isinstance(value, str):
+        return f"{field}: value is not a string: {value!r}"
+    if value == DIAGNOSTIC_UNAVAILABLE:
+        return None
+    if field not in B1_HOST_NOISE_MAP_FIELDS:
+        if not _B1_HOST_NOISE_SCALAR_RE.fullmatch(value):
+            return f"{field}: {value!r} is not a base-10 non-negative integer"
+        return None
+    if not _B1_HOST_NOISE_MAP_RE.fullmatch(value):
+        return f"{field}: {value!r} is not an id:value+id:value map"
+    cpus: "list[int]" = []
+    for entry in value.split("+"):
+        raw_cpu, raw_value = entry.split(":")
+        cpus.append(int(raw_cpu))
+        if field in B1_HOST_NOISE_POSITIVE_MAP_FIELDS and int(raw_value) <= 0:
+            return f"{field}: cpu{raw_cpu} carries a non-positive reading {raw_value}"
+    if cpus != sorted(set(cpus)):
+        return f"{field}: {value!r} is not sorted by numeric CPU id, or repeats one"
+    return None
+
+
+def serialize_host_noise_fields(values: "Mapping[str, str]") -> str:
+    """The ten `key=value` entries, in their pinned order, comma-joined.
+
+    The exact key set and order are required, and every value must already be
+    an integer, a per-CPU map or the literal `unavailable`. A value outside
+    that grammar is REFUSED here rather than percent-encoded downstream: by
+    then it has lost its type and an encoded corpse would still occupy a field
+    that claims to be a number.
+    """
+    if tuple(values) != B1_HOST_NOISE_FIELDS:
+        raise b1.B1PlacementParseError(
+            f"host-noise fields are not the closed ordered set: {tuple(values)!r}"
+        )
+    entries = []
+    for field in B1_HOST_NOISE_FIELDS:
+        failure = host_noise_value_failure(field, values[field])
+        if failure is not None:
+            raise b1.B1PlacementParseError(failure)
+        entries.append(f"{field}={values[field]}")
+    return ",".join(entries)
+
+
+def parse_host_noise_fields(line: str) -> "dict[str, str]":
+    """The ten named values of a `B1 env=` line, defaulting only MISSING keys.
+
+    Backward compatibility ONLY (FP-B1HN-4): a pre-slice 81-key line yields
+    ten `unavailable` values instead of being rejected as history. It does not
+    prove current emission -- the live nodes assert each literal `,<key>=`
+    token themselves, so this fallback can never satisfy a presence check.
+    """
+    out: "dict[str, str]" = {}
+    for field in B1_HOST_NOISE_FIELDS:
+        try:
+            out[field] = _parse_b1_env_field(line, field)
+        except KeyError:
+            out[field] = DIAGNOSTIC_UNAVAILABLE
+    return out
+
+
+# ---------------------------------------------------------------------------
+# B1 host noise -- unit and function tests.
+#
+# The readings are diagnostic data, so nothing below asserts that a source is
+# exposed, that a value is high or low, or that one value relates to another.
+# What is asserted is exactly what the fields claim: which file was read, at
+# which boundary, over which CPU set, with which arithmetic, in which exact
+# encoding, and that an unusable source becomes `unavailable` alone.
+# ---------------------------------------------------------------------------
+
+#: A complete synthetic `/proc/stat`: aggregate row plus four CPU rows, with
+#: the steal column (index 7) distinguishable from every neighbour.
+def _proc_stat_text(steal: "dict[str, int]") -> str:
+    lines = []
+    for key, value in steal.items():
+        # user nice system idle iowait irq softirq STEAL guest guest_nice
+        columns = [11, 12, 13, 14, 15, 16, 17, value, 18, 19]
+        lines.append(key + " " + " ".join(str(c) for c in columns))
+    return "\n".join(lines) + "\n"
+
+
+def _psi_text(some: "int | None", full: "int | None") -> str:
+    out = []
+    if some is not None:
+        out.append(f"some avg10=0.00 avg60=1.25 avg300=9.75 total={some}")
+    if full is not None:
+        out.append(f"full avg10=0.00 avg60=0.50 avg300=3.25 total={full}")
+    return "\n".join(out) + "\n"
+
+
+def _write_host_noise_root(
+    root: Path,
+    *,
+    steal: "dict[str, int]",
+    psi: "dict[str, tuple]",
+    freqs: "dict[int, int]",
+    stat_text: "str | None" = None,
+) -> "tuple[Path, Path, Path]":
+    """One synthetic boundary: `/proc/stat`, `/proc/pressure/*` and cpufreq."""
+    proc = root / "proc"
+    proc.mkdir(parents=True, exist_ok=True)
+    stat_path = proc / "stat"
+    stat_path.write_text(
+        _proc_stat_text(steal) if stat_text is None else stat_text, encoding="utf-8"
+    )
+    psi_root = proc / "pressure"
+    psi_root.mkdir(parents=True, exist_ok=True)
+    for resource, (some, full) in psi.items():
+        (psi_root / resource).write_text(_psi_text(some, full), encoding="utf-8")
+    cpu_root = root / "sys" / "devices" / "system" / "cpu"
+    for cpu, khz in freqs.items():
+        cpu_dir = cpu_root / f"cpu{cpu}" / "cpufreq"
+        cpu_dir.mkdir(parents=True, exist_ok=True)
+        (cpu_dir / "scaling_cur_freq").write_text(f"{khz}\n", encoding="utf-8")
+        # A decoy the declared source must never fall back to.
+        (cpu_dir / "cpuinfo_cur_freq").write_text("999999\n", encoding="utf-8")
+    return stat_path, psi_root, cpu_root
+
+
+def _host_noise_current_line_failures(line: str) -> "list[str]":
+    """Why this line does not CURRENTLY emit the ten fields, in tail order.
+
+    Deliberately literal and independent of `parse_host_noise_fields`: it
+    counts the exact `,<key>=` token, so the backward-compatibility default
+    can never make an omitted key look emitted.
+    """
+    fails: list[str] = []
+    at = -1
+    for field in B1_HOST_NOISE_FIELDS:
+        token = f",{field}="
+        count = line.count(token)
+        if count != 1:
+            fails.append(f"{field}: {count} occurrences of {token!r}")
+            continue
+        position = line.index(token)
+        if position <= at:
+            fails.append(f"{field}: out of tail order")
+        at = position
+    return fails
+
+
+def test_b1_host_noise_parsers_compute_declared_window_deltas():
+    """FP-B1HN-1: the declared columns, records and tick-first arithmetic."""
+    text = _proc_stat_text({"cpu": 900, "cpu0": 5, "cpu1": 7, "cpu3": 11})
+    aggregate, per_cpu = b1.parse_proc_stat_steal_ticks(text)
+    # Column 7 exactly: its neighbours (softirq 17, guest 18) are distinct
+    # values in the fixture, so selecting 6 or 8 cannot produce these numbers.
+    assert aggregate == 900
+    assert per_cpu == {0: 5, 1: 7, 3: 11}
+    # The aggregate is the kernel's own row over every host CPU, NOT the sum
+    # of the per-CPU rows (which here would be 23).
+    assert aggregate != sum(per_cpu.values())
+
+    assigned = frozenset({0, 3})
+    assert b1.select_cpu_counter_map(per_cpu, assigned) == {0: 5, 3: 11}
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.select_cpu_counter_map(per_cpu, frozenset({0, 2}))
+
+    # Short, non-decimal, duplicated and aggregate-less inputs are refusals.
+    for bad in (
+        "cpu 1 2 3 4 5 6 7\n",
+        "cpu 1 2 3 4 5 6 7 x 9 10\n",
+        _proc_stat_text({"cpu": 1, "cpu0": 2}) + "cpu0 1 2 3 4 5 6 7 8 9 10\n",
+        _proc_stat_text({"cpu0": 2}),
+        _proc_stat_text({"cpu": 1}),
+    ):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_proc_stat_steal_ticks(bad)
+
+    # Subtraction happens in TICKS; the conversion is applied once, after it.
+    # With three ticks per second the two orders differ by a microsecond, so
+    # converting each snapshot first is visible rather than benign.
+    assert b1.steal_ticks_to_usec(4 - 2, clock_ticks=3) == 666_666
+    assert (4 * 1_000_000 // 3) - (2 * 1_000_000 // 3) == 666_667
+    aggregate_usec, map_usec = b1.steal_delta_usec(
+        (2, {0: 2, 3: 4}), (4, {0: 5, 3: 4}), clock_ticks=3
+    )
+    assert aggregate_usec == 666_666
+    assert map_usec == {0: 1_000_000, 3: 0}
+    # A realistic tick rate, and a window with no steal at all.
+    assert b1.steal_delta_usec((7, {1: 7}), (7, {1: 7}), clock_ticks=100) == (0, {1: 0})
+    # A counter that went backwards is a lost measurement, never a zero.
+    for before, after in (((5, {0: 1}), (4, {0: 1})), ((5, {0: 2}), (5, {0: 1}))):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.steal_delta_usec(before, after, clock_ticks=100)
+
+    # PSI: only `total`, only the exact record, and never an invented class.
+    text = _psi_text(1_234, 56)
+    assert b1.parse_psi_total(text, "some") == 1_234
+    assert b1.parse_psi_total(text, "full") == 56
+    assert "avg10" in text and "1.25" in text  # the averages are present...
+    for rendered in (str(b1.parse_psi_total(text, "some")),
+                     str(b1.parse_psi_total(text, "full"))):
+        assert "." not in rendered  # ...and are never what is parsed.
+    cpu_some_only = _psi_text(90, None)
+    assert b1.parse_psi_total(cpu_some_only, "some") == 90
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.parse_psi_total(cpu_some_only, "full")
+    for bad_class in ("cpu", "io", "memory", "avg10", ""):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_psi_total(text, bad_class)
+    for bad in ("some avg10=0.00\n", "some total=x\n", _psi_text(1, 2) + _psi_text(3, 4)):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.parse_psi_total(bad, "some")
+
+    # Programmer-contract refusals: booleans are not integers, a duplicated
+    # row or key is not evidence, an empty map is not a reading, and a
+    # negative value is not a counter. None of these is a live host state;
+    # each raises here rather than reaching the fail-soft boundary as data.
+    for call in (
+        lambda: b1.parse_proc_stat_steal_ticks(None),
+        lambda: b1.parse_proc_stat_steal_ticks(
+            _proc_stat_text({"cpu": 1, "cpu0": 2}) + "cpu 9 9 9 9 9 9 9 9 9 9\n"
+        ),
+        lambda: b1.parse_proc_stat_steal_ticks(
+            _proc_stat_text({"cpu": 1, "cpu0": 2}) + "cpux 9 9 9 9 9 9 9 9 9 9\n"
+        ),
+        lambda: b1.select_cpu_counter_map([(0, 1)], frozenset({0})),
+        lambda: b1.select_cpu_counter_map({0: 1}, frozenset()),
+        lambda: b1.select_cpu_counter_map({0: 1}, frozenset({True})),
+        lambda: b1.select_cpu_counter_map({0: -1}, frozenset({0})),
+        lambda: b1.select_cpu_counter_map({0: True}, frozenset({0})),
+        lambda: b1.parse_psi_total(None, "some"),
+        lambda: b1.steal_ticks_to_usec(1, clock_ticks=0),
+        lambda: b1.steal_ticks_to_usec(1, clock_ticks=True),
+        lambda: b1.steal_ticks_to_usec(-1, clock_ticks=100),
+        lambda: b1.steal_ticks_to_usec(True, clock_ticks=100),
+        lambda: b1.assigned_steal_delta_usec({}, {}, clock_ticks=100),
+        lambda: b1.assigned_steal_delta_usec(None, {0: 1}, clock_ticks=100),
+        lambda: b1.assigned_steal_delta_usec({0: 1}, {1: 1}, clock_ticks=100),
+        lambda: b1.serialize_cpu_integer_map({}, positive=False),
+        lambda: b1.serialize_cpu_integer_map(None, positive=False),
+        lambda: b1.serialize_cpu_integer_map({True: 1}, positive=False),
+        lambda: b1.serialize_cpu_integer_map({-1: 1}, positive=False),
+        lambda: b1.serialize_cpu_integer_map({0: True}, positive=False),
+        lambda: b1.serialize_cpu_integer_map({0: "1"}, positive=False),
+        lambda: b1.serialize_cpu_integer_map({0: -1}, positive=False),
+        lambda: b1.serialize_cpu_integer_map({0: 0}, positive=True),
+    ):
+        with pytest.raises(b1.B1PlacementParseError):
+            call()
+    # Zero is admitted where it is a real reading, and only there.
+    assert b1.serialize_cpu_integer_map({0: 0}, positive=False) == "0:0"
+
+    # PSI totals are independent non-negative close-minus-open deltas.
+    assert b1.counter_delta(10, 25, label="host_psi_cpu_some_usec") == 15
+    with pytest.raises(b1.B1PlacementParseError):
+        b1.counter_delta(25, 10, label="host_psi_cpu_some_usec")
+    for bad in (True, 1.5, "3", None, -1):
+        with pytest.raises(b1.B1PlacementParseError):
+            b1.counter_delta(bad, 10, label="x")
+
+
+def test_b1_host_noise_live_reader_observes_real_proc_stat():
+    """FP-B1HN-1/2: the LIVE reader, against this host's actual `/proc/stat`.
+
+    Container-free and not a B1 result gate: it asserts no value, only that
+    the shipped reader -- with its own default paths and a real assigned CPU
+    set -- produces numeric steal readings under the declared grammar. A
+    reader that pointed at the wrong root, never read, or turned every stat
+    read into `unavailable` would pass every synthetic test above and fail
+    here.
+    """
+    assigned = frozenset(os.sched_getaffinity(0))
+    assert assigned, "this process has no CPU affinity to read"
+    notes: list[str] = []
+    before = _read_host_noise_snapshot(assigned, notes=notes)
+    after = _read_host_noise_snapshot(assigned, notes=notes)
+    assert before.host_steal_ticks is not None, notes
+    assert after.host_steal_ticks is not None, notes
+    assert set(before.assigned_cpu_steal_ticks or {}) == assigned, notes
+    values = _host_noise_field_values(
+        before, after, clock_ticks=os.sysconf("SC_CLK_TCK"), notes=notes
+    )
+    assert host_noise_value_failure("host_steal_usec", values["host_steal_usec"]) is None
+    assert values["host_steal_usec"] != DIAGNOSTIC_UNAVAILABLE, notes
+    assert values["assigned_cpu_steal_usec"] != DIAGNOSTIC_UNAVAILABLE, notes
+    assert host_noise_value_failure(
+        "assigned_cpu_steal_usec", values["assigned_cpu_steal_usec"]
+    ) is None
+    assert {
+        int(entry.split(":")[0])
+        for entry in values["assigned_cpu_steal_usec"].split("+")
+    } == assigned
+    # Whatever this kernel exposes for the other eight, it is reported
+    # honestly -- the shape is checked, the availability is not.
+    for field, value in values.items():
+        assert host_noise_value_failure(field, value) is None, (field, value)
+    print(
+        "B1 host-noise live reader: "
+        + " ".join(f"{field}={value}" for field, value in values.items()),
+        flush=True,
+    )
+
+
+def test_b1_host_noise_frequency_reads_exact_assigned_service_cpu_paths(tmp_path):
+    """FP-B1HN-1/2: exact cpufreq paths, exact CPU population, whole maps."""
+    # A non-contiguous gateway-union-PostgreSQL population with a driver CPU
+    # and an unassigned CPU present on the host but outside the union.
+    _, _, cpu_root = _write_host_noise_root(
+        tmp_path / "open",
+        steal={"cpu": 1, "cpu0": 1, "cpu2": 1, "cpu3": 1, "cpu5": 1},
+        psi={"cpu": (1, 1), "io": (1, 1), "memory": (1, 1)},
+        freqs={0: 2_100_000, 2: 2_200_000, 3: 2_300_000, 5: 2_500_000},
+    )
+    assigned = frozenset({0, 3})  # gateway {0} union postgres {3}
+    read = _read_assigned_cpu_frequencies(assigned, cpu_sysfs_root=cpu_root)
+    assert read == {0: 2_100_000, 3: 2_300_000}
+    # The driver CPU and the unassigned CPU are not in the map...
+    assert 2 not in read and 5 not in read
+    # ...and the value is `scaling_cur_freq`, never the sibling decoy.
+    assert 999_999 not in read.values()
+    assert (cpu_root / "cpu0" / "cpufreq" / "cpuinfo_cur_freq").is_file()
+    assert str(B1_CPU_FREQUENCY_RELATIVE) == "cpufreq/scaling_cur_freq"
+
+    # A map is usable only when EVERY assigned CPU has one positive integer.
+    for cpu, payload in ((3, None), (3, "0\n"), (3, "  \n"), (3, "2.4GHz\n")):
+        path = cpu_root / f"cpu{cpu}" / "cpufreq" / "scaling_cur_freq"
+        original = path.read_text(encoding="utf-8")
+        if payload is None:
+            path.unlink()
+        else:
+            path.write_text(payload, encoding="utf-8")
+        with pytest.raises(Exception):
+            _read_assigned_cpu_frequencies(assigned, cpu_sysfs_root=cpu_root)
+        path.write_text(original, encoding="utf-8")
+    with pytest.raises(b1.B1PlacementParseError):
+        _read_assigned_cpu_frequencies(frozenset(), cpu_sysfs_root=cpu_root)
+
+    # Each boundary is independent: an opening map with no closing one is a
+    # truthful record, and the whole missing map -- never part of it -- goes.
+    notes: list[str] = []
+    opening = B1HostNoiseSnapshot(
+        *(None,) * 8, assigned_cpu_freq_khz={3: 2_300_000, 0: 2_100_000}
+    )
+    values = _host_noise_field_values(
+        opening, B1_HOST_NOISE_UNREAD, clock_ticks=100, notes=notes
+    )
+    assert values["assigned_cpu_freq_open_khz"] == "0:2100000+3:2300000"
+    assert values["assigned_cpu_freq_close_khz"] == DIAGNOSTIC_UNAVAILABLE
+
+
+def test_b1_host_noise_fields_serialize_comma_safe_in_pinned_order():
+    """FP-B1HN-2 [function test]: the exact closed tail and its grammar."""
+    assert B1_HOST_NOISE_FIELDS == (
+        "host_steal_usec",
+        "assigned_cpu_steal_usec",
+        "host_psi_cpu_some_usec",
+        "host_psi_cpu_full_usec",
+        "host_psi_io_some_usec",
+        "host_psi_io_full_usec",
+        "host_psi_memory_some_usec",
+        "host_psi_memory_full_usec",
+        "assigned_cpu_freq_open_khz",
+        "assigned_cpu_freq_close_khz",
+    )
+    values = {
+        "host_steal_usec": "40000",
+        "assigned_cpu_steal_usec": "0:10000+3:20000",
+        "host_psi_cpu_some_usec": "1500",
+        "host_psi_cpu_full_usec": DIAGNOSTIC_UNAVAILABLE,
+        "host_psi_io_some_usec": "0",
+        "host_psi_io_full_usec": "7",
+        "host_psi_memory_some_usec": "8",
+        "host_psi_memory_full_usec": "9",
+        "assigned_cpu_freq_open_khz": "0:2100000+3:2300000",
+        "assigned_cpu_freq_close_khz": DIAGNOSTIC_UNAVAILABLE,
+    }
+    rendered = serialize_host_noise_fields(values)
+    assert rendered == (
+        "host_steal_usec=40000,"
+        "assigned_cpu_steal_usec=0:10000+3:20000,"
+        "host_psi_cpu_some_usec=1500,"
+        "host_psi_cpu_full_usec=unavailable,"
+        "host_psi_io_some_usec=0,"
+        "host_psi_io_full_usec=7,"
+        "host_psi_memory_some_usec=8,"
+        "host_psi_memory_full_usec=9,"
+        "assigned_cpu_freq_open_khz=0:2100000+3:2300000,"
+        "assigned_cpu_freq_close_khz=unavailable"
+    )
+    # No VALUE carries a raw comma: every comma in the block is a field
+    # separator, so the flat line stays parsable by the existing reader.
+    assert rendered.count(",") == len(B1_HOST_NOISE_FIELDS) - 1
+    for entry in rendered.split(","):
+        assert entry.count("=") == 1
+        key, value = entry.split("=")
+        assert "," not in value and " " not in value
+        assert set(value) <= set("0123456789:+") or value == DIAGNOSTIC_UNAVAILABLE
+
+    # The block appends AFTER the GC-5 tail and round-trips through named
+    # parsing, on a line whose prefix carries the historical keys.
+    line = (
+        "B1 env=cpus=4,cpu_model=AMD EPYC 7763 64-Core Processor,"
+        "gateway_allowed_cpus=0,2,"
+        "postgres_wal_sync_delta=3228,postgres_wal_syncs_per_served=0.215200,"
+        + rendered
+    )
+    assert _host_noise_current_line_failures(line) == []
+    assert line.index(",host_steal_usec=") > line.index("postgres_wal_syncs_per_served=")
+    assert parse_host_noise_fields(line) == values
+    # The comma-bearing CPU list before the block is still read whole.
+    assert _parse_b1_env_field(line, "gateway_allowed_cpus") == "0,2"
+
+    # Rejections: a renamed, omitted, reordered or comma-joined field, an
+    # unsorted or partial map, a zero frequency and a fabricated zero.
+    for mutated in (
+        {**values, "host_steal_usec": "0:1,3:2"},
+        {**values, "assigned_cpu_steal_usec": "0:10000,3:20000"},
+        {**values, "assigned_cpu_steal_usec": "3:20000+0:10000"},
+        {**values, "assigned_cpu_steal_usec": "0:10000+0:20000"},
+        {**values, "assigned_cpu_steal_usec": ""},
+        {**values, "assigned_cpu_freq_open_khz": "0:0+3:2300000"},
+        {**values, "host_psi_io_some_usec": "-1"},
+        {**values, "host_psi_io_some_usec": "1.5"},
+        {**values, "host_psi_io_some_usec": "n/a"},
+        {**values, "host_psi_io_some_usec": 0},
+    ):
+        with pytest.raises(b1.B1PlacementParseError):
+            serialize_host_noise_fields(mutated)
+    with pytest.raises(b1.B1PlacementParseError):
+        serialize_host_noise_fields({k: v for k, v in values.items()
+                                     if k != "host_psi_io_full_usec"})
+    reordered = {field: values[field] for field in reversed(B1_HOST_NOISE_FIELDS)}
+    with pytest.raises(b1.B1PlacementParseError):
+        serialize_host_noise_fields(reordered)
+    renamed = dict(values)
+    renamed["host_psi_cpu_avg10"] = renamed.pop("host_psi_cpu_full_usec")
+    with pytest.raises(b1.B1PlacementParseError):
+        serialize_host_noise_fields(renamed)
+    # Zero is a real steal reading and must NOT become `unavailable`; it is
+    # `unavailable` that must never become a zero.
+    assert serialize_host_noise_fields(
+        {**values, "host_steal_usec": "0"}
+    ).startswith("host_steal_usec=0,")
+
+
+def test_b1_host_noise_snapshot_failures_are_field_local_and_nonfatal(tmp_path):
+    """FP-B1HN-2/3: one unusable source costs its own field and nothing else."""
+    stat_path, psi_root, cpu_root = _write_host_noise_root(
+        tmp_path / "open",
+        steal={"cpu": 100, "cpu0": 10, "cpu1": 20},
+        psi={"cpu": (5, None), "memory": (7, 8)},  # no `io` resource at all
+        freqs={0: 2_100_000},  # cpu1 has no cpufreq directory
+    )
+    assigned = frozenset({0, 1})
+    notes: list[str] = []
+    snapshot = _read_host_noise_snapshot(
+        assigned, notes=notes, proc_stat_path=stat_path,
+        psi_root=psi_root, cpu_sysfs_root=cpu_root,
+    )
+    # A missing PSI resource, a missing `full` record and an incomplete
+    # frequency map each cost exactly their own member.
+    assert snapshot.host_steal_ticks == 100
+    assert snapshot.assigned_cpu_steal_ticks == {0: 10, 1: 20}
+    assert snapshot.host_psi_cpu_some_usec == 5
+    assert snapshot.host_psi_cpu_full_usec is None
+    assert snapshot.host_psi_io_some_usec is None
+    assert snapshot.host_psi_io_full_usec is None
+    assert snapshot.host_psi_memory_some_usec == 7
+    assert snapshot.host_psi_memory_full_usec == 8
+    assert snapshot.assigned_cpu_freq_khz is None  # whole map, never partial
+    for expected in ("host_psi_cpu_full_usec", "host_psi_io_", "assigned_cpu_freq_khz"):
+        assert any(expected in note for note in notes), (expected, notes)
+
+    # An incomplete `/proc/stat` CPU map leaves the valid aggregate usable.
+    partial_stat, partial_psi, partial_cpu = _write_host_noise_root(
+        tmp_path / "partial",
+        steal={"cpu": 900, "cpu0": 10},  # cpu1 row absent
+        psi={"cpu": (5, 6), "io": (1, 2), "memory": (7, 8)},
+        freqs={0: 2_100_000, 1: 2_200_000},
+    )
+    notes = []
+    partial = _read_host_noise_snapshot(
+        assigned, notes=notes, proc_stat_path=partial_stat,
+        psi_root=partial_psi, cpu_sysfs_root=partial_cpu,
+    )
+    assert partial.host_steal_ticks == 900
+    assert partial.assigned_cpu_steal_ticks is None
+    assert any("assigned_cpu_steal_usec" in note for note in notes), notes
+
+    # An unreadable `/proc/stat` is a note, not an exception.
+    notes = []
+    unreadable = _read_host_noise_snapshot(
+        assigned, notes=notes, proc_stat_path=tmp_path / "absent" / "stat",
+        psi_root=partial_psi, cpu_sysfs_root=partial_cpu,
+    )
+    assert unreadable.host_steal_ticks is None
+    assert unreadable.assigned_cpu_steal_ticks is None
+    assert unreadable.host_psi_cpu_some_usec == 5
+    assert any("host_steal_usec" in note for note in notes), notes
+
+    # A reset counter in one member takes ONLY that member's field.
+    notes = []
+    before = B1HostNoiseSnapshot(
+        host_steal_ticks=500, assigned_cpu_steal_ticks={0: 10, 1: 20},
+        host_psi_cpu_some_usec=100, host_psi_cpu_full_usec=200,
+        host_psi_io_some_usec=300, host_psi_io_full_usec=400,
+        host_psi_memory_some_usec=500, host_psi_memory_full_usec=600,
+        assigned_cpu_freq_khz={0: 2_100_000, 1: 2_200_000},
+    )
+    after = B1HostNoiseSnapshot(
+        host_steal_ticks=400,  # the aggregate reset...
+        assigned_cpu_steal_ticks={0: 13, 1: 20},  # ...the per-CPU map did not
+        host_psi_cpu_some_usec=90,  # this PSI record reset...
+        host_psi_cpu_full_usec=260,  # ...this one did not
+        host_psi_io_some_usec=300, host_psi_io_full_usec=400,
+        host_psi_memory_some_usec=500, host_psi_memory_full_usec=600,
+        assigned_cpu_freq_khz={0: 1_900_000, 1: 2_200_000},
+    )
+    values = _host_noise_field_values(before, after, clock_ticks=100, notes=notes)
+    assert values["host_steal_usec"] == DIAGNOSTIC_UNAVAILABLE
+    assert values["assigned_cpu_steal_usec"] == "0:30000+1:0"
+    assert values["host_psi_cpu_some_usec"] == DIAGNOSTIC_UNAVAILABLE
+    assert values["host_psi_cpu_full_usec"] == "60"
+    assert values["host_psi_io_some_usec"] == "0"
+    assert values["assigned_cpu_freq_open_khz"] == "0:2100000+1:2200000"
+    assert values["assigned_cpu_freq_close_khz"] == "0:1900000+1:2200000"
+    assert any("host_steal_usec" in note for note in notes), notes
+    assert any("host_psi_cpu_some_usec" in note for note in notes), notes
+    # Nothing was fabricated as a zero, and the line is never suppressed.
+    assert tuple(values) == B1_HOST_NOISE_FIELDS
+    assert serialize_host_noise_fields(values).count("=") == 10
+
+    # A boundary that produced nothing at all renders ten `unavailable`s.
+    empty = _host_noise_field_values(
+        B1_HOST_NOISE_UNREAD, B1_HOST_NOISE_UNREAD, clock_ticks=100, notes=[],
+    )
+    assert set(empty.values()) == {DIAGNOSTIC_UNAVAILABLE}
+    assert tuple(empty) == B1_HOST_NOISE_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_b1_host_noise_window_hooks_bracket_the_measured_loop():
+    """FP-B1HN-1: the opening read is the last pre-window work; the closing
+    read is the first window-complete work."""
+    order: list[str] = []
+
+    class _RecordingTransport:
+        async def post(self, url, *, content, headers):
+            order.append("request")
+            return 202, b'{"status":"merged"}', None
+
+    n = 3
+    await b1.run_open_loop(
+        endpoint="http://stub/events",
+        requests=[_stub_payload(f"m{i}") for i in range(n)],
+        rate=1000,
+        transport=_RecordingTransport(),
+        max_in_flight=n,
+        warmup=_stub_payload("warm"),
+        prologue=[_stub_payload(f"p{i}") for i in range(2)],
+        include_sync_warmup=True,
+        on_prologue_complete=lambda: order.append("prologue-hook"),
+        on_window_open=lambda: order.append("open"),
+        on_window_complete=lambda: order.append("window"),
+    )
+    assert order == (
+        ["request"] * 3 + ["prologue-hook", "open"] + ["request"] * n + ["window"]
+    ), order
+
+    # Source order: the opening hook fires before `t0` is taken, so its file
+    # I/O cannot enter a measured latency; the closing hook still precedes
+    # the O(N) leg derivation.
+    profile_src = _PROFILE_PATH.read_text(encoding="utf-8")
+    assert profile_src.count("on_window_open()") == 1
+    assert profile_src.count("t0 = time.perf_counter()") == 1
+    assert profile_src.index("on_window_open()") < profile_src.index(
+        "t0 = time.perf_counter()"
+    )
+    assert profile_src.index("on_window_complete()") < profile_src.index(
+        "= derive_leg_vectors("
+    )
+
+    # Consumer order: the fixture registers its own opening callback, whose
+    # single act is the host read, and takes the closing read as the first
+    # statement of `_after_window` -- before `wait_sampler.stop`.
+    src = Path(__file__).read_text(encoding="utf-8")
+    fixture = next(
+        node for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_b1_reference"
+    )
+    run_call = next(
+        node for node in ast.walk(fixture)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run_open_loop"
+    )
+    assert any(
+        kw.arg == "on_window_open" and isinstance(kw.value, ast.Name)
+        and kw.value.id == "_at_window_open" for kw in run_call.keywords
+    ), ast.unparse(run_call)
+    opening = next(
+        node for node in ast.walk(fixture)
+        if isinstance(node, ast.FunctionDef) and node.name == "_at_window_open"
+    )
+    opening_calls = [
+        _call_name(node) for node in ast.walk(opening) if isinstance(node, ast.Call)
+    ]
+    assert "_read_host_noise_snapshot" in opening_calls, opening_calls
+    closing = next(
+        node for node in ast.walk(fixture)
+        if isinstance(node, ast.FunctionDef) and node.name == "_after_window"
+    )
+    closing_calls = [
+        (node.lineno, _call_name(node))
+        for node in ast.walk(closing) if isinstance(node, ast.Call)
+    ]
+    read_at = min(line for line, name in closing_calls
+                  if name == "_read_host_noise_snapshot")
+    # The sampler's `stop` is PASSED to `_try_diagnostic`, so it is an
+    # attribute reference rather than a call; the read must still precede it.
+    sampler_stop_at = min(
+        node.lineno for node in ast.walk(closing)
+        if isinstance(node, ast.Attribute) and node.attr == "stop"
+    )
+    assert read_at < sampler_stop_at, "the closing host read follows wait_sampler.stop"
+    # ...and every other call in the hook. Binding the shared notes list is
+    # the read's own prerequisite, not a host operation, so it is excluded.
+    later_calls = [
+        line for line, name in closing_calls
+        if name not in ("_read_host_noise_snapshot", "setdefault")
+    ]
+    assert later_calls, closing_calls
+    assert read_at < min(later_calls), "the closing host read is not the hook's first"
+
+
+def _call_name(call: ast.Call) -> "str | None":
+    func = call.func
+    return getattr(func, "id", None) or getattr(func, "attr", None)
+
+
+def test_b1_host_noise_legacy_fingerprint_defaults_only_new_keys():
+    """FP-B1HN-4 [function test]: history stays valid; current output cannot
+    omit a key."""
+    carrier = json.loads(
+        (REPO_ROOT / "tests" / "benchmark" / "b1_topology_decision.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def _fingerprints(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "fingerprint" and isinstance(value, str):
+                    yield value
+                else:
+                    yield from _fingerprints(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from _fingerprints(value)
+
+    historical = list(_fingerprints(carrier))
+    assert historical, "the GC-3 decision carrier embeds no fingerprint"
+    for line in historical:
+        # Every old named key still parses off the recorded line...
+        for field in (
+            "cpu_model", "placement_profile", "placement_ok", "p99_ms", "served",
+            "errors", "cpu_ms_per_req", "gateway_allowed_cpus", "max_in_flight",
+            "basis_ms_per_req", "workers",
+        ):
+            assert _parse_b1_env_field(line, field) != ""
+        # ...the narrow compatibility reader returns ten `unavailable`s rather
+        # than rejecting history...
+        legacy = parse_host_noise_fields(line)
+        assert tuple(legacy) == B1_HOST_NOISE_FIELDS
+        assert set(legacy.values()) == {DIAGNOSTIC_UNAVAILABLE}
+        # ...and no exact field count is enforced on it.
+        assert _host_noise_current_line_failures(line)
+    # The carrier holds several VINTAGES side by side -- some arms predate the
+    # GC-5 tail entirely -- and every one of them is accepted as written. No
+    # exact field-count validator exists to reject either.
+    with_gc5 = [
+        line for line in historical if ",postgres_wal_syncs_per_served=" in line
+    ]
+    assert with_gc5 and len(with_gc5) < len(historical), (
+        len(with_gc5), len(historical)
+    )
+    # The generic parser keeps its KeyError contract for a direct ask.
+    with pytest.raises(KeyError):
+        _parse_b1_env_field(historical[0], "host_steal_usec")
+
+    # A CURRENT line proves emission literally, never through the fallback: a
+    # single omitted key is a failure even though the fallback fills it in.
+    complete = dict.fromkeys(B1_HOST_NOISE_FIELDS, "1")
+    complete["assigned_cpu_steal_usec"] = "0:1"
+    complete["assigned_cpu_freq_open_khz"] = "0:2100000"
+    complete["assigned_cpu_freq_close_khz"] = "0:2100000"
+    current = "B1 env=cpus=4,postgres_wal_syncs_per_served=0.2," + (
+        serialize_host_noise_fields(complete)
+    )
+    assert _host_noise_current_line_failures(current) == []
+    truncated = current.replace(",host_psi_io_full_usec=1", "", 1)
+    assert parse_host_noise_fields(truncated)["host_psi_io_full_usec"] == (
+        DIAGNOSTIC_UNAVAILABLE
+    )
+    assert _host_noise_current_line_failures(truncated) == [
+        "host_psi_io_full_usec: 0 occurrences of ',host_psi_io_full_usec='"
+    ]
+    duplicated = current + "," + serialize_host_noise_fields(complete)
+    assert _host_noise_current_line_failures(duplicated)
+    # Present but out of tail order is a failure of its own, distinct from
+    # an omission: the block is a closed ORDERED tail.
+    reordered = "B1 env=cpus=4," + ",".join(
+        f"{field}={complete[field]}" for field in reversed(B1_HOST_NOISE_FIELDS)
+    )
+    assert any(
+        "out of tail order" in failure
+        for failure in _host_noise_current_line_failures(reordered)
+    ), _host_noise_current_line_failures(reordered)
+    # ...and a name outside the closed inventory is not a host-noise value.
+    assert host_noise_value_failure("p99_ms", "1") == (
+        "'p99_ms' is not a host-noise field"
+    )
+    assert host_noise_value_failure("host_steal_usec", 5) is not None
+
+
+def test_b1_host_noise_snapshot_reads_declared_sources_at_window_boundaries(tmp_path):
+    """FP-B1HN-1 [function test]: two boundaries, one synthetic host."""
+    assigned = frozenset({0, 3})  # gateway {0} union postgres {3}
+    open_stat, open_psi, open_cpu = _write_host_noise_root(
+        tmp_path / "open",
+        steal={"cpu": 1_000, "cpu0": 40, "cpu1": 99, "cpu3": 60},
+        psi={"cpu": (10, 20), "io": (30, 40), "memory": (50, 60)},
+        freqs={0: 2_100_000, 1: 1_500_000, 3: 2_300_000},
+    )
+    close_stat, close_psi, close_cpu = _write_host_noise_root(
+        tmp_path / "close",
+        steal={"cpu": 1_300, "cpu0": 45, "cpu1": 999, "cpu3": 62},
+        psi={"cpu": (17, 20), "io": (35, 44), "memory": (50, 66)},
+        freqs={0: 2_900_000, 1: 1_500_000, 3: 1_800_000},
+    )
+    notes: list[str] = []
+    before = _read_host_noise_snapshot(
+        assigned, notes=notes, proc_stat_path=open_stat,
+        psi_root=open_psi, cpu_sysfs_root=open_cpu,
+    )
+    after = _read_host_noise_snapshot(
+        assigned, notes=notes, proc_stat_path=close_stat,
+        psi_root=close_psi, cpu_sysfs_root=close_cpu,
+    )
+    assert notes == [], notes
+    values = _host_noise_field_values(before, after, clock_ticks=100, notes=notes)
+    assert notes == [], notes
+    assert values == {
+        # The aggregate row's own delta (300 ticks), not the assigned sum (7).
+        "host_steal_usec": "3000000",
+        "assigned_cpu_steal_usec": "0:50000+3:20000",
+        "host_psi_cpu_some_usec": "7",
+        "host_psi_cpu_full_usec": "0",
+        "host_psi_io_some_usec": "5",
+        "host_psi_io_full_usec": "4",
+        "host_psi_memory_some_usec": "0",
+        "host_psi_memory_full_usec": "6",
+        # Instantaneous readings at each boundary, not a delta or an average.
+        "assigned_cpu_freq_open_khz": "0:2100000+3:2300000",
+        "assigned_cpu_freq_close_khz": "0:2900000+3:1800000",
+    }
+    # cpu1 is on the host at both boundaries and in neither map: the driver
+    # CPU and every unassigned CPU are outside the assigned population.
+    assert "1:" not in values["assigned_cpu_steal_usec"]
+    assert "1:" not in values["assigned_cpu_freq_open_khz"]
+    assert serialize_host_noise_fields(values).startswith("host_steal_usec=3000000,")
+
+
+@pytest.mark.b1_live
+def test_b1_ci_scale_fingerprint_reports_host_noise_fields(b1_ci_scale_run):
+    """FP-B1HN-5 [function test]: the live record physically carries all ten.
+
+    Emission only. This node requires no source to be exposed, constrains no
+    numeric value, compares nothing with p99, CPU or one another, and infers
+    nothing from the readings: an `unavailable` field is a truthful record of
+    this runner's kernel, and the B1 gate above decides this run by itself.
+    """
+    line = b1_ci_scale_run["fingerprint"]
+    assert _host_noise_current_line_failures(line) == [], line
+    values = parse_host_noise_fields(line)
+    assert tuple(values) == B1_HOST_NOISE_FIELDS
+    for field, value in values.items():
+        assert host_noise_value_failure(field, value) is None, (field, value, line)
+    # The rendered tail is this run's own, and it closes the line.
+    assert values == b1_ci_scale_run["host_noise_values"]
+    assert line.endswith("," + b1_ci_scale_run["host_noise_fields"]), line
+    print(
+        "B1 host-noise exposure: "
+        + " ".join(
+            f"{field}="
+            + ("unavailable" if value == DIAGNOSTIC_UNAVAILABLE else "value")
+            for field, value in values.items()
+        ),
+        flush=True,
+    )
+
+
 def _role_diagnostics(role: str, cpu_max_text, stat_before, stat_after) -> B1RoleDiagnostics:
     """Render one role's reported-only cgroup fields, failing soft to `unavailable`."""
     notes: list[str] = []
@@ -3789,6 +4864,14 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
         # witness so the CPU set is the proven one. Both are reported-only and
         # fail soft to `unavailable`.
         topology_notes: list[str] = marks.setdefault("diagnostic_notes", [])
+        # FP-B1HN-1: the host-noise per-CPU population, computed once from the
+        # SAME proven opening placement witness. Set union of the gateway and
+        # PostgreSQL sets; the driver CPU and every unassigned CPU are outside
+        # it. The closing placement witness still owns the placement verdict --
+        # this reader never creates a second one.
+        assigned_service_cpus = frozenset(
+            roles_open["gateway"].allowed_cpus | roles_open["postgres"].allowed_cpus
+        )
         gateway_thread_siblings = _try_diagnostic(
             "gateway thread_siblings_list", topology_notes,
             lambda: _read_gateway_thread_siblings(roles_open["gateway"].allowed_cpus),
@@ -3842,15 +4925,31 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
                 wait_sampler.start,
             )
 
+        def _at_window_open() -> None:
+            # FP-B1HN-1: the opening host read is the last pre-window work,
+            # immediately before `t0`, so its file I/O is outside every
+            # measured request latency. It is fail-soft in every member.
+            marks["host_noise_before"] = _read_host_noise_snapshot(
+                assigned_service_cpus,
+                notes=marks.setdefault("diagnostic_notes", []),
+            )
+
         def _after_window() -> None:
-            # Stop sampling at window close, BEFORE the CPU-after snapshot, so
-            # the sampler's own backend is not inside the reported interval's
-            # tail. A sampler that cannot be stopped cleanly is a diagnostic
+            # FP-B1HN-1: the closing host read comes FIRST in this hook --
+            # before the sampler stops and before every later close
+            # diagnostic and the leg derivation -- so the two host readings
+            # bracket the measured window and nothing else.
+            # Then stop sampling at window close, BEFORE the CPU-after
+            # snapshot, so the sampler's own backend is not inside the
+            # reported interval's tail. A sampler that cannot be stopped cleanly is a diagnostic
             # failure like any other here: it becomes a note and `unavailable`
             # fields, never a lost record. Then close the reported CPU interval
             # at drain/census stop, before the O(N) leg derivation; the log
             # prefix is taken strictly after it.
             notes = marks.setdefault("diagnostic_notes", [])
+            marks["host_noise_after"] = _read_host_noise_snapshot(
+                assigned_service_cpus, notes=notes
+            )
             sample = _try_diagnostic("postgres wait sampler stop", notes,
                                      wait_sampler.stop)
             marks["postgres_wait_sample"] = sample
@@ -3877,6 +4976,7 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
                 prologue=prologue,
                 include_sync_warmup=True,
                 on_prologue_complete=_after_prologue,
+                on_window_open=_at_window_open,
                 on_window_complete=_after_window,
                 serve_port=port,
                 worker_pids=sorted(workers_pre),
@@ -4015,6 +5115,18 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
                 spectre_v2=spectre_v2,
             )
         cpu_ms_str = f"{cpu_ms:.3f}" if cpu_ms is not None else DIAGNOSTIC_UNAVAILABLE
+        # FP-B1HN-2: the ten reported-only host-noise values of this window,
+        # rendered before the notes are read so a delta failure is printed
+        # with the rest. Each is an integer, a per-CPU map or `unavailable`.
+        host_noise_before = marks.get("host_noise_before")
+        host_noise_after = marks.get("host_noise_after")
+        host_noise_values = _host_noise_field_values(
+            host_noise_before,
+            host_noise_after,
+            clock_ticks=os.sysconf("SC_CLK_TCK"),
+            notes=marks.setdefault("diagnostic_notes", []),
+        )
+        host_noise_fields = serialize_host_noise_fields(host_noise_values)
         diagnostic_notes = list(marks.get("diagnostic_notes", []))
         for note in diagnostic_notes:
             print(f"B1 diagnostic unavailable: {note}", flush=True)
@@ -4064,7 +5176,8 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             f"p99_leg_split={p99_leg_split_str},"
             f"leg_p99s={leg_p99s_str},"
             f"{postgres_cost_fields},"
-            f"{postgres_commit_fields}"
+            f"{postgres_commit_fields},"
+            f"{host_noise_fields}"
         )
         print(fingerprint_line, flush=True)
 
@@ -4122,6 +5235,13 @@ def _run_b1_reference(profile: B1Profile, tmp_path_factory):
             "postgres_commit_before": commit_before,
             "postgres_commit_after": commit_after,
             "postgres_commit_fields": postgres_commit_fields,
+            # B1-HOST-NOISE (FP-B1HN-2): the two raw boundary snapshots and
+            # the rendered tail. Diagnostic transit only; no consumer may
+            # treat one as an outcome input.
+            "host_noise_before": host_noise_before,
+            "host_noise_after": host_noise_after,
+            "host_noise_values": host_noise_values,
+            "host_noise_fields": host_noise_fields,
             "diagnostic_notes": diagnostic_notes,
         }
 
@@ -4998,7 +6118,9 @@ def test_gc5_product_record_carries_commit_cost_and_lateness_context(b1_product_
     # (3) The eight transaction/WAL fields, in their pinned order, after the
     # six GC-4 cost fields -- so no gating field ever moves behind them.
     at = line.index("leg_p99s=")
-    for field in B1_POSTGRES_COST_FIELDS + B1_POSTGRES_COMMIT_FIELDS:
+    for field in (
+        B1_POSTGRES_COST_FIELDS + B1_POSTGRES_COMMIT_FIELDS + B1_HOST_NOISE_FIELDS
+    ):
         position = line.index(f",{field}=")
         assert position > at, f"{field} is out of order"
         at = position
@@ -5007,6 +6129,8 @@ def test_gc5_product_record_carries_commit_cost_and_lateness_context(b1_product_
     assert postgres_commit_snapshot_failure(before, after, result.served) is None
     assert line.endswith(
         serialize_postgres_commit_fields(before, after, result.served)
+        + ","
+        + serialize_host_noise_fields(run["host_noise_values"])
     ), line
     wal_sync_delta = after.wal_sync - before.wal_sync
     print(
@@ -7168,6 +8292,10 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
         n for n in ast.walk(fixture)
         if isinstance(n, ast.FunctionDef) and n.name == "_after_prologue"
     )
+    open_callback = next(
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.FunctionDef) and n.name == "_at_window_open"
+    )
     warning = b"WARNING:  Exceeded concurrency limit.\n"
     log_path = tmp_path / "gateway.log"
     marks = {}
@@ -7217,6 +8345,9 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
             # reported interval, so the sampler's own backend is not in its
             # tail.
             assert "gateway_cpu_stat_after" not in marks
+            # FP-B1HN-1: ...and AFTER the closing host-noise read, which is
+            # the first operation of the window-complete hook.
+            assert "host_noise_after" in marks
             self.stops += 1
             return self.next_sample
 
@@ -7245,10 +8376,36 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
             return self.next_snapshot
 
     stats_reader = _FakeStatsReader()
+
+    host_noise_reads: list[frozenset] = []
+
+    def _fake_host_noise(assigned, *, notes):
+        """B1-HOST-NOISE: records WHICH CPU set each boundary was read for."""
+        host_noise_reads.append(assigned)
+        notes.append("host_noise probe: read")
+        index = len(host_noise_reads)
+        return B1HostNoiseSnapshot(
+            host_steal_ticks=100 * index,
+            assigned_cpu_steal_ticks={cpu: 10 * index for cpu in sorted(assigned)},
+            host_psi_cpu_some_usec=1_000 * index,
+            host_psi_cpu_full_usec=None,
+            host_psi_io_some_usec=2_000 * index,
+            host_psi_io_full_usec=3_000 * index,
+            host_psi_memory_some_usec=4_000 * index,
+            host_psi_memory_full_usec=5_000 * index,
+            assigned_cpu_freq_khz={cpu: 2_000_000 + index for cpu in sorted(assigned)},
+        )
+
+    assigned_service_cpus = frozenset({0, 1, 2})
     namespace = {
         "b1": b1,
+        "os": os,
         "marks": marks,
         "roles_open": roles_open,
+        "assigned_service_cpus": assigned_service_cpus,
+        "_read_host_noise_snapshot": _fake_host_noise,
+        "_host_noise_field_values": _host_noise_field_values,
+        "serialize_host_noise_fields": serialize_host_noise_fields,
         "gateway": gateway_store,
         "postgres": postgres_sentinel,
         "log_path": log_path,
@@ -7261,7 +8418,8 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
         "_try_diagnostic": _try_diagnostic,
         "_snapshot_container_log": _snapshot_container_log,
     }
-    exec(compile(ast.Module(body=[collector, callback, prologue_callback],
+    exec(compile(ast.Module(body=[collector, callback, prologue_callback,
+                                  open_callback],
                             type_ignores=[]),
                  "<fixture-callback>", "exec"), namespace)
 
@@ -7283,7 +8441,17 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     marks.clear()
     stats_reader.snapshot = stats_reader.__class__.snapshot.__get__(stats_reader)
 
+    # FP-B1HN-1: the opening host read, executed from the fixture's own
+    # callback, over the gateway-union-PostgreSQL CPU set and nothing else.
+    namespace["_at_window_open"]()
+    assert host_noise_reads == [assigned_service_cpus], host_noise_reads
+    assert marks["host_noise_before"].host_steal_ticks == 100
+
     namespace["_after_window"]()
+    # ...and the closing read, for the same set, inside the window-complete
+    # hook (the fake sampler above asserted it had already happened).
+    assert host_noise_reads == [assigned_service_cpus] * 2, host_noise_reads
+    assert marks["host_noise_after"].host_steal_ticks == 200
     assert wait_sampler.stops == 1
     assert marks["postgres_wait_sample"].completed == 600
     # A usable sample leaves no sampler note behind...
@@ -7417,6 +8585,47 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     assert namespace["postgres_commit_fields"] == serialize_postgres_commit_fields(
         commit_before, commit_after, 9
     )
+    # B1-HOST-NOISE (FP-B1HN-2): the real rendering statements, over the two
+    # boundary snapshots the fixture's own callbacks just stored in `marks`.
+    host_noise_assigns = [
+        n for n in ast.walk(fixture)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name)
+            and t.id in {
+                "host_noise_before", "host_noise_after",
+                "host_noise_values", "host_noise_fields",
+            }
+            for t in n.targets
+        )
+    ]
+    assert len(host_noise_assigns) == 4, [ast.unparse(n) for n in host_noise_assigns]
+    exec(
+        compile(
+            ast.Module(body=sorted(host_noise_assigns, key=lambda n: n.lineno),
+                       type_ignores=[]),
+            "<fixture-host-noise>", "exec",
+        ),
+        namespace,
+    )
+    host_noise_values = namespace["host_noise_values"]
+    assert tuple(host_noise_values) == B1_HOST_NOISE_FIELDS, host_noise_values
+    # One unread PSI member is `unavailable` and erases nothing around it.
+    assert host_noise_values["host_psi_cpu_full_usec"] == DIAGNOSTIC_UNAVAILABLE
+    assert host_noise_values["host_psi_cpu_some_usec"] == "1000"
+    assert host_noise_values["host_steal_usec"] == str(
+        100 * 1_000_000 // os.sysconf("SC_CLK_TCK")
+    )
+    assert host_noise_values["assigned_cpu_steal_usec"] == "+".join(
+        f"{cpu}:{10 * 1_000_000 // os.sysconf('SC_CLK_TCK')}"
+        for cpu in sorted(assigned_service_cpus)
+    )
+    assert host_noise_values["assigned_cpu_freq_open_khz"] == "+".join(
+        f"{cpu}:2000001" for cpu in sorted(assigned_service_cpus)
+    )
+    assert host_noise_values["assigned_cpu_freq_close_khz"] == "+".join(
+        f"{cpu}:2000002" for cpu in sorted(assigned_service_cpus)
+    )
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), "<fixture-line>", "exec"),
          namespace)
     yielded = eval(compile(ast.Expression(mapping), "<fixture-mapping>", "eval"), namespace)
@@ -7431,12 +8640,16 @@ def test_b1_fingerprint_line_reports_scoped_concurrency_warnings(tmp_path, monke
     # GC-4: the six reported-only cost fields close the line, after both
     # lateness legs, and the sample travels in the yielded mapping too.
     at = yielded["fingerprint"].index("leg_p99s=")
-    for field_name in B1_POSTGRES_COST_FIELDS + B1_POSTGRES_COMMIT_FIELDS:
+    for field_name in (
+        B1_POSTGRES_COST_FIELDS + B1_POSTGRES_COMMIT_FIELDS + B1_HOST_NOISE_FIELDS
+    ):
         position = yielded["fingerprint"].index(f",{field_name}=")
         assert position > at, field_name
         at = position
     assert yielded["fingerprint"].endswith(
         serialize_postgres_commit_fields(commit_before, commit_after, 9)
+        + ","
+        + serialize_host_noise_fields(host_noise_values)
     )
     assert serialize_postgres_cost_fields(
         4500, 9, marks["postgres_wait_sample"]

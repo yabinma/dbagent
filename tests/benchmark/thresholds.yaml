@@ -208,6 +208,34 @@ benchmarks:
     for its own current evidence head, with every superseded head listed there as provenance, and
     GC-3 alone may change it, through the same selector and the same strict-descendant supersession
     proof over a complete same-model pair.
+    B1-HOST-NOISE (host noise) appends ten further reported fields to both B1 fingerprint lines,
+    immediately after those eight and still never before a gating one: host_steal_usec,
+    assigned_cpu_steal_usec, host_psi_cpu_some_usec, host_psi_cpu_full_usec, host_psi_io_some_usec,
+    host_psi_io_full_usec, host_psi_memory_some_usec, host_psi_memory_full_usec,
+    assigned_cpu_freq_open_khz and assigned_cpu_freq_close_khz. The driver container reads them at
+    the two measured-window boundaries -- the opening read is the last work before the clock
+    starts, the closing read the first work after the window drains -- from three declared
+    kernel-global sources and nothing else: the steal column of /proc/stat, the `some` and `full`
+    total= counters of /proc/pressure, and /sys/devices/system/cpu/cpu<N>/cpufreq/scaling_cur_freq
+    for the union of the gateway and PostgreSQL affinity sets. Steal and PSI are non-negative
+    open-to-close deltas in microseconds; the two frequency maps are instantaneous kHz readings,
+    one per boundary. Every scalar is a base-10 integer and every per-CPU map is
+    `id:value+id:value` sorted by numeric CPU id, so no value carries a raw comma. A missing,
+    malformed, incomplete, reset or unreadable source serializes the whole affected field as
+    `unavailable` -- never a zero and never a partial map -- and names the reason in a
+    `B1 diagnostic unavailable:` note; a runner without a cpufreq directory therefore reports both
+    frequency maps as `unavailable`, which is data rather than a failure. The block is append-only:
+    every pre-slice fingerprint stays valid unedited and no exact field count is enforced anywhere.
+    All ten are reported diagnostics in the same sense as max_lateness_ms. None is a bar, a
+    recorded verdict, a topology-selector input, a qualifying-run predicate, a CPU-basis operand or
+    a sizing observation; no node compares one, no run is retried, skipped or exempted because of
+    one, and the CI-scale bar stated above still decides every run by itself. B1-HOST-NOISE changed
+    what the fingerprint reports about host conditions during the window
+    and nothing else: not this profile, not the CI-scale bar above, not MAX_IN_FLIGHT, workers,
+    limit_concurrency, the pools, the schema, the durability settings, the GC-5 commit shape or the
+    sizing basis. It explains no result, predicts no result, claims no SKU and no p99 outcome, and
+    observes neither a governor trace, a thermal reading, noisy-neighbour identity nor
+    guest-invisible SMT contention.
 - id: B2
   description: Fingerprint correlation query against alert_events with 1M rows (dedup index)
   threshold: p99 < 20 ms

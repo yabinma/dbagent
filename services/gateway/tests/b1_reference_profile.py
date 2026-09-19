@@ -1285,6 +1285,7 @@ async def run_open_loop(
     warmup: tuple[bytes, dict[str, str]] | None = None,
     include_sync_warmup: bool = True,
     on_prologue_complete: Callable[[], None] | None = None,
+    on_window_open: Callable[[], None] | None = None,
     on_window_complete: Callable[[], None] | None = None,
     serve_port: int | None = None,
     worker_pids: list[int] | None = None,
@@ -1409,6 +1410,11 @@ async def run_open_loop(
         latencies = [0.0] * n
         outcomes: list[str] = [""] * n
         codes: list[int] = [0] * n
+        # FP-B1HN-1: the LAST pre-window work. Any host reading taken here
+        # describes the instant the window opens, and its file I/O cost is
+        # outside every measured request latency because `t0` is not set yet.
+        if on_window_open is not None:
+            on_window_open()
         t0 = time.perf_counter()
         due0 = t0
         if serve_port is not None or (client is not None and transport is None):
@@ -2033,6 +2039,238 @@ def serialize_cpu_busy(busy: dict[int, int]) -> str:
         if value < 0:
             raise B1PlacementParseError(f"negative busy delta for cpu{cpu}")
     return "+".join(f"{cpu}:{busy[cpu]}" for cpu in sorted(busy))
+
+
+# ---------------------------------------------------------------------------
+# B1 host noise (FP-B1HN-1/2) -- pure readers and encoders for the measured
+# window's host context: guest-visible steal, host-global PSI totals and the
+# assigned service CPUs' instantaneous frequency.
+#
+# Every function here is text/number arithmetic only. The harness opens the
+# files and owns the fail-soft boundary; a contract error raises
+# `B1PlacementParseError` here and is never repaired into a zero. None of
+# these readings is a bar, a verdict, a selector input or a sizing value.
+# ---------------------------------------------------------------------------
+
+#: Zero-based index of the `steal` column in a `/proc/stat` cpu accounting row
+#: (user, nice, system, idle, iowait, irq, softirq, STEAL, guest, guest_nice).
+#: Column 6 is softirq and column 8 is guest; neither is steal.
+PROC_STAT_STEAL_INDEX = 7
+#: The two record names a `/proc/pressure/*` file publishes.
+PSI_RECORD_NAMES = ("some", "full")
+
+
+def parse_proc_stat_steal_ticks(text: str) -> "tuple[int, dict[int, int]]":
+    """``(aggregate_steal_ticks, {cpu: steal_ticks})`` from ``/proc/stat``.
+
+    Raw clock ticks, deliberately: the microsecond conversion is exact only
+    AFTER the window's subtraction, so converting each snapshot first could
+    report a fabricated microsecond that neither end measured.
+
+    The aggregate is the kernel's own ``cpu`` row, over every host-visible
+    logical CPU. It is never the sum of the per-CPU rows -- that would be a
+    different population, silently narrowed to whatever rows this reader
+    happened to select.
+    """
+    if not isinstance(text, str):
+        raise B1PlacementParseError(f"/proc/stat is not a string: {text!r}")
+    aggregate: "int | None" = None
+    per_cpu: "dict[int, int]" = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or not fields[0].startswith("cpu"):
+            continue
+        suffix = fields[0][3:]
+        values = fields[1:]
+        if len(values) <= PROC_STAT_STEAL_INDEX:
+            raise B1PlacementParseError(
+                f"short /proc/stat accounting row for {fields[0]!r}: {line!r}"
+            )
+        raw = values[PROC_STAT_STEAL_INDEX]
+        if not raw.isdecimal():
+            raise B1PlacementParseError(
+                f"non-decimal /proc/stat steal field {raw!r} for {fields[0]!r}"
+            )
+        steal = int(raw)
+        if suffix == "":
+            if aggregate is not None:
+                raise B1PlacementParseError("duplicate aggregate /proc/stat cpu row")
+            aggregate = steal
+            continue
+        if not suffix.isdecimal():
+            raise B1PlacementParseError(f"malformed /proc/stat cpu key {fields[0]!r}")
+        cpu = int(suffix)
+        if cpu in per_cpu:
+            raise B1PlacementParseError(f"duplicate /proc/stat entry for cpu{cpu}")
+        per_cpu[cpu] = steal
+    if aggregate is None:
+        raise B1PlacementParseError("/proc/stat carries no aggregate cpu row")
+    if not per_cpu:
+        raise B1PlacementParseError("/proc/stat carries no per-CPU rows")
+    return aggregate, per_cpu
+
+
+def select_cpu_counter_map(
+    values: "dict[int, int]", assigned_cpus: "frozenset[int]"
+) -> "dict[int, int]":
+    """The assigned-service-CPU slice of a per-CPU counter map.
+
+    Completeness is enforced HERE rather than in the parser, so a missing
+    ``cpu<N>`` row can make only the assigned map unavailable and can never
+    erase an otherwise valid aggregate reading. A partial map is refused
+    outright: it would look like complete role coverage.
+    """
+    if not isinstance(values, dict):
+        raise B1PlacementParseError(f"counter map is not a mapping: {values!r}")
+    wanted = set(assigned_cpus)
+    if not wanted:
+        raise B1PlacementParseError("no assigned service CPU to select")
+    for cpu in sorted(wanted):
+        if isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0:
+            raise B1PlacementParseError(f"not a CPU id: {cpu!r}")
+    missing = sorted(cpu for cpu in wanted if cpu not in values)
+    if missing:
+        raise B1PlacementParseError(
+            f"no counter for assigned service CPUs {missing}"
+        )
+    out: "dict[int, int]" = {}
+    for cpu in sorted(wanted):
+        value = values[cpu]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise B1PlacementParseError(f"not a counter for cpu{cpu}: {value!r}")
+        out[cpu] = value
+    return out
+
+
+def parse_psi_total(text: str, pressure_class: str) -> int:
+    """The cumulative ``total=`` microseconds of one exact PSI record.
+
+    ``pressure_class`` names the record inside one ``/proc/pressure/*`` file --
+    ``some`` or ``full``, never the resource. Only ``total`` is read:
+    ``avg10``/``avg60``/``avg300`` average over time outside this measured
+    window, so no delta of them has a closed-window meaning. A kernel that
+    publishes ``some`` without ``full`` leaves the latter absent, and an
+    absent record is refused rather than invented as a zero.
+    """
+    if not isinstance(text, str):
+        raise B1PlacementParseError(f"PSI file is not a string: {text!r}")
+    if pressure_class not in PSI_RECORD_NAMES:
+        raise B1PlacementParseError(f"not a PSI record name: {pressure_class!r}")
+    found: "int | None" = None
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != pressure_class:
+            continue
+        if found is not None:
+            raise B1PlacementParseError(
+                f"duplicate PSI {pressure_class} record in {text!r}"
+            )
+        totals = [f for f in fields[1:] if f.startswith("total=")]
+        if len(totals) != 1:
+            raise B1PlacementParseError(
+                f"PSI {pressure_class} record carries {len(totals)} total= tokens"
+            )
+        raw = totals[0][len("total=") :]
+        if not raw.isdecimal():
+            raise B1PlacementParseError(
+                f"non-decimal PSI {pressure_class} total {raw!r}"
+            )
+        found = int(raw)
+    if found is None:
+        raise B1PlacementParseError(f"PSI file carries no {pressure_class} record")
+    return found
+
+
+def counter_delta(before: int, after: int, *, label: str) -> int:
+    """``after - before`` for a monotonic kernel counter, or a refusal.
+
+    A decreasing counter means the source reset inside the window; that is a
+    lost measurement, not a zero.
+    """
+    for name, value in (("before", before), ("after", after)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise B1PlacementParseError(
+                f"{label}: {name} is not a counter reading: {value!r}"
+            )
+    delta = after - before
+    if delta < 0:
+        raise B1PlacementParseError(
+            f"{label}: counter decreased across the window ({before} -> {after})"
+        )
+    return delta
+
+
+def steal_ticks_to_usec(delta_ticks: int, *, clock_ticks: int) -> int:
+    """Exact tick-to-microsecond conversion of an already-subtracted delta."""
+    if not isinstance(clock_ticks, int) or isinstance(clock_ticks, bool) or clock_ticks <= 0:
+        raise B1PlacementParseError(f"bad clock tick rate {clock_ticks!r}")
+    if isinstance(delta_ticks, bool) or not isinstance(delta_ticks, int) or delta_ticks < 0:
+        raise B1PlacementParseError(f"not a tick delta: {delta_ticks!r}")
+    return delta_ticks * 1_000_000 // clock_ticks
+
+
+def assigned_steal_delta_usec(
+    before: "dict[int, int]", after: "dict[int, int]", *, clock_ticks: int
+) -> "dict[int, int]":
+    """Per-assigned-CPU steal deltas, in microseconds, over the same CPU set."""
+    for name, values in (("before", before), ("after", after)):
+        if not isinstance(values, dict) or not values:
+            raise B1PlacementParseError(
+                f"assigned steal map ({name}) is empty or not a mapping: {values!r}"
+            )
+    if set(before) != set(after):
+        raise B1PlacementParseError(
+            f"assigned steal CPU set changed across the window: "
+            f"{sorted(before)} -> {sorted(after)}"
+        )
+    return {
+        cpu: steal_ticks_to_usec(
+            counter_delta(before[cpu], after[cpu], label=f"cpu{cpu} steal"),
+            clock_ticks=clock_ticks,
+        )
+        for cpu in sorted(before)
+    }
+
+
+def steal_delta_usec(before, after, *, clock_ticks: int) -> "tuple[int, dict[int, int]]":
+    """Both window steal readings from two ``parse_proc_stat_steal_ticks`` pairs.
+
+    ``before``/``after`` are ``(aggregate_ticks, {cpu: ticks})`` as the parser
+    returns them, already narrowed to the assigned service CPUs by
+    ``select_cpu_counter_map``. The aggregate and the map are computed from
+    their own operands, so neither is ever derived from the other.
+    """
+    aggregate_before, map_before = before
+    aggregate_after, map_after = after
+    return (
+        steal_ticks_to_usec(
+            counter_delta(aggregate_before, aggregate_after, label="host steal"),
+            clock_ticks=clock_ticks,
+        ),
+        assigned_steal_delta_usec(map_before, map_after, clock_ticks=clock_ticks),
+    )
+
+
+def serialize_cpu_integer_map(values: "dict[int, int]", *, positive: bool) -> str:
+    """Numeric-CPU-ID-sorted ``id:value+id:value``; never a raw comma.
+
+    ``positive=False`` admits zero (a window with no steal is a real reading);
+    ``positive=True`` rejects it (a zero kHz frequency is an unusable one).
+    """
+    if not isinstance(values, dict) or not values:
+        raise B1PlacementParseError(
+            f"cannot serialize an empty per-CPU map: {values!r}"
+        )
+    for cpu, value in values.items():
+        if isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0:
+            raise B1PlacementParseError(f"not a CPU id: {cpu!r}")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise B1PlacementParseError(f"not an integer for cpu{cpu}: {value!r}")
+        if value < 0 or (positive and value == 0):
+            raise B1PlacementParseError(
+                f"out-of-range value for cpu{cpu}: {value!r}"
+            )
+    return "+".join(f"{cpu}:{values[cpu]}" for cpu in sorted(values))
 
 
 def create_benchmark_app():
