@@ -408,7 +408,24 @@ benchmarks:
     \ prints a B11 env=cpus=...,serial_commit_ms=...,combined_over_single=...\
     \ fingerprint alongside the writer count, the writer map and the single-writer\
     \ rate, so a storage-class difference and a compute difference between two hosts\
-    \ are distinguishable from a log."
+    \ are distinguishable from a log. The benchmark additionally prints one\
+    \ canonical B11 diagnostics= record on a pass and before a threshold\
+    \ failure: 21 comma-delimited fields in one fixed order -- the combined\
+    \ rate, the two existing commit/concurrency fingerprints, one\
+    \ elapsed-milliseconds and committed-row entry per declared writer\
+    \ instance (plus-joined, so no writer entry can forge a field boundary),\
+    \ aggregate host steal and the six cpu/io/memory PSI some+full totals\
+    \ over the same measured window, and the storage identity at\
+    \ PostgreSQL's own data_directory. The storage view is read\
+    \ unprivileged inside the running PostgreSQL container -- that\
+    \ container's own mount record plus the read-only block sysfs\
+    \ attributes it exposes -- and never from the pytest process's\
+    \ filesystem, a Docker volume class or a host backing path; it is\
+    \ resolved before engine and row warmup, so no diagnostic read touches\
+    \ the measured window. Free-form values are percent-encoded, each field\
+    \ falls back independently to the literal unavailable, and every one of\
+    \ them is reported-only: none conditions the threshold, the writer\
+    \ model, the pool, durability, a retry or a skip."
   concurrency_model:
     writers: 7
     pool: per-writer-independent

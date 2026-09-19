@@ -6,13 +6,15 @@ Hermetic — no database, no benchmark execution.  design.md Section 11.1.3,
 Every rule is a module-level ``check_<ID>`` function taking **plain data** — a
 filename plus source text, an object decoded from the manifest, a set of file
 names, or a directory path — and raising ``AssertionError`` whose message
-**begins with a stable rule ID followed by** ``": "``.  Twenty-nine IDs, one
+**begins with a stable rule ID followed by** ``": "``.  Thirty-four IDs, one
 checker function each:
 
     L0-L3   the loader layers (the width test's part (i))
     W2-W4   the width test's remaining parts
     A1, A2a-A2d, A3-A6, A7a-A7c, A8, A9, A10   the allowlist rules
     C1-C7   the call-site checks
+    B11D1-B11D5   the reported-only host/storage diagnostics
+                  (design/slices/b11-host-diagnostics, FP-B11HD-1..5)
 
 The ID is matched as an **exact token**, never as a prefix: the fourth test
 compares ``message.split(":", 1)[0]`` to the expected ID, so a fixture that
@@ -191,12 +193,15 @@ LOADER_FREE_NAMES = {"yaml", "Path", "__file__"}
 LOADER_ATTRIBUTES = {"safe_load", "with_name", "read_text"}
 
 # consequence 3's four fixed diagnostic prefixes (the fourth added by errata
-# pass 9).  Guard *data*, not a rule ID of their own: W4 asserts all four.
+# pass 9), plus the fifth canonical line added by the B11 host/storage
+# diagnostics slice.  Guard *data*, not a rule ID of their own: W4 asserts all
+# five, and dropping any one of them is red there.
 DIAGNOSTIC_PREFIXES = (
     "B11 writers=",
     "B11 writer_map=",
     "B11 single_writer_rate=",
     "B11 env=",
+    "B11 diagnostics=",
 )
 
 # A2a — the closed (module, name) import inventory of the benchmark tier.
@@ -232,6 +237,20 @@ ALLOWED_BENCHMARK_IMPORTS = {
     # The benchmark imports the pinned loader from its sibling conftest; that
     # import is what consequence 4(b) exists to make unavoidable.
     ("conftest", LOADER_NAME),
+    # B11 host/storage diagnostics slice §3.3/§3.7: eight exact bindings and no
+    # more.  The four host-counter parsers are B1's SHIPPED pure functions,
+    # imported through the ordinary namespace boundary the root conftest
+    # already establishes -- not copied, not loaded dynamically (the tier's
+    # default-deny import inventory still has no `importlib`, no `subprocess`
+    # and no B1 live-test module), and not re-implemented here.
+    ("collections.abc", "Mapping"),
+    ("docker.errors", "DockerException"),
+    ("sqlalchemy.exc", "SQLAlchemyError"),
+    ("urllib.parse", "quote"),
+    ("services.gateway.tests.b1_reference_profile", "counter_delta"),
+    ("services.gateway.tests.b1_reference_profile", "parse_proc_stat_steal_ticks"),
+    ("services.gateway.tests.b1_reference_profile", "parse_psi_total"),
+    ("services.gateway.tests.b1_reference_profile", "steal_ticks_to_usec"),
 }
 
 # A2b — module-scope binding inventory, exact and closed.  One binding each.
@@ -282,10 +301,51 @@ EXPECTED_MODULE_BINDINGS: dict[str, Counter] = {
             ("make_engine", "import"): 1,
             ("make_session_factory", "import"): 1,
             (LOADER_NAME, "import"): 1,
+            # B11 host/storage diagnostics slice §3.7.  Exactly ONE `Path`
+            # binding: every admitted file-read route needs it, a second
+            # binding or a function-local import is A2b/A2c-red, and it adds
+            # no capability the tier did not already allow its sibling.
+            ("Path", "import"): 1,
+            ("Mapping", "import"): 1,
+            ("DockerException", "import"): 1,
+            ("SQLAlchemyError", "import"): 1,
+            ("quote", "import"): 1,
+            ("counter_delta", "import"): 1,
+            ("parse_proc_stat_steal_ticks", "import"): 1,
+            ("parse_psi_total", "import"): 1,
+            ("steal_ticks_to_usec", "import"): 1,
+            ("B11_DIAGNOSTIC_PREFIX", "assign"): 1,
+            ("B11_DIAGNOSTIC_UNAVAILABLE", "assign"): 1,
+            ("B11_DIAGNOSTIC_FIELDS", "assign"): 1,
+            ("B11_CONTAINER_MOUNT_SCRIPT", "assign"): 1,
+            ("B11_CONTAINER_BLOCK_SCRIPT", "assign"): 1,
+            ("_encode_b11_value", "def"): 1,
+            ("_writer_instance_label", "def"): 1,
+            ("_serialize_writer_elapsed_rows", "def"): 1,
+            ("_serialize_b11_diagnostics", "def"): 1,
+            ("_read_b11_host_snapshot", "def"): 1,
+            ("_b11_host_delta_values", "def"): 1,
+            ("_decode_b11_mountinfo_field", "def"): 1,
+            ("_parse_b11_container_mount_output", "def"): 1,
+            ("_mountinfo_record_for_path", "def"): 1,
+            ("_parse_b11_container_block_output", "def"): 1,
+            ("_exec_b11_container_text", "def"): 1,
+            ("_read_b11_container_block_identity", "def"): 1,
+            ("_read_b11_storage_identity", "def"): 1,
             ("_p99", "def"): 1,
             ("test_b2_fingerprint_correlation_p99_under_20ms", "def"): 1,
             ("test_b10_partitioned_list_and_filter_p99", "def"): 1,
             (B11_TEST_NAME, "def"): 1,
+            ("test_b11_host_parser_reuse_is_direct", "def"): 1,
+            ("test_b11_host_diagnostics_read_declared_sources", "def"): 1,
+            ("test_b11_host_reader_observes_real_proc_stat", "def"): 1,
+            ("test_b11_storage_identity_reads_target_postgres_container", "def"): 1,
+            (
+                "test_b11_storage_identity_fails_soft_without_substituting_another_mount",
+                "def",
+            ): 1,
+            ("test_b11_diagnostics_schema_is_canonical_and_comma_safe", "def"): 1,
+            ("test_b11_diagnostic_sampling_brackets_the_timed_window", "def"): 1,
         }
     ),
 }
@@ -293,6 +353,11 @@ EXPECTED_MODULE_BINDINGS: dict[str, Counter] = {
 ALLOWED_BUILTINS = {
     "abs", "dict", "enumerate", "float", "int", "len", "list", "max", "min",
     "print", "range", "reversed", "round", "sorted", "str", "sum", "tuple", "zip",
+    # B11 host/storage diagnostics slice §3.7: the fail-soft readers and the
+    # canonical serializer need these and nothing reflective.  `object` stays
+    # in REFLECTIVE_NAMES, so annotating a container handle with it is still
+    # A2c/A2d-red.
+    "all", "AssertionError", "bytes", "isinstance", "OSError", "set", "ValueError",
 }
 
 _IMPORT_ALIASES = {
@@ -301,6 +366,9 @@ _IMPORT_ALIASES = {
     "ensure_month", "make_engine", "make_session_factory", "actor_system",
     "write_audit", "find_open_by_fingerprint", "LLMCallRecord", "PGTraceStore",
     "dash_services", LOADER_NAME, "annotations",
+    # B11 host/storage diagnostics slice §3.7 (`Path` was already here).
+    "Mapping", "DockerException", "SQLAlchemyError", "quote", "counter_delta",
+    "parse_proc_stat_steal_ticks", "parse_psi_total", "steal_ticks_to_usec",
 }
 ALLOWED_FREE_NAMES = _IMPORT_ALIASES | {"__file__"} | ALLOWED_BUILTINS
 
@@ -341,7 +409,27 @@ ALLOWED_ATTRIBUTES = {
     "shutdown", "join", "cpu_count",
     # product module attribute
     "list_investigations",
+    # B11 host/storage diagnostics slice §3.7.  `sysconf` extends the narrow
+    # `os.cpu_count()` exception to exactly `os.sysconf("SC_CLK_TCK")` (the
+    # diagnostics source guard pins that literal argument, and `os` stays in
+    # REFLECTIVE_NAMES); `one` reads the fixture engine's single
+    # data_directory row; `get_wrapped_container`/`exec_run` are the only
+    # Docker surface, reached only through the two signed handle parameters.
+    # Deliberately NOT admitted: readlink, get_docker_client, reload, attrs,
+    # image, id, client, containers, run, host, cwd.
+    "sysconf", "one", "get", "is_absolute", "relative_to", "splitlines",
+    "split", "strip", "startswith", "isdecimal", "decode",
+    "get_wrapped_container", "exec_run",
+    # Fixture-write locality (A7a): legal only inside
+    # `test_b11_host_diagnostics_read_declared_sources`, which builds its
+    # throwaway proc/PSI inputs under tmp_path.  Production diagnostics and
+    # the storage fixtures write nothing.
+    "mkdir", "write_text",
 }
+
+# A7a locality: the only function in the tier that may call these.
+FIXTURE_WRITE_ATTRIBUTES = {"mkdir", "write_text"}
+FIXTURE_WRITE_FUNCTION = "test_b11_host_diagnostics_read_declared_sources"
 
 # Kept, but demoted from rule to diagnostic (errata pass 4): when an attribute
 # fails A7a *and* is one of these, the message says so.
@@ -606,7 +694,7 @@ def scale_pg():
             conn.execute(text("ANALYZE llm_calls"))
             conn.execute(text("ANALYZE audit_log"))
 
-        yield {"dsn": dsn, "factory": factory, "engine": engine}
+        yield {"dsn": dsn, "factory": factory, "engine": engine, "container": pg}
 """
 
 CLEAN_BENCH = """\
@@ -617,19 +705,119 @@ import os
 import statistics
 import time
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
 
 import pytest
+from docker.errors import DockerException
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from rca_common.audit import actor_system, write_audit
 from rca_common.db.session import make_engine, make_session_factory
 from rca_common.investigation_repo import find_open_by_fingerprint
 from rca_common.llmclient.tracestore import LLMCallRecord, PGTraceStore
+from services.gateway.tests.b1_reference_profile import (
+    counter_delta,
+    parse_proc_stat_steal_ticks,
+    parse_psi_total,
+    steal_ticks_to_usec,
+)
 
 # Sibling conftest (pytest prepends tests/benchmark/ on sys.path for this module).
 from conftest import load_b11_writer_model
+
+# B11's fifth, canonical diagnostic line (design/slices/b11-host-diagnostics
+# §3.2).  The four legacy `B11 ...=` lines keep their exact prefixes and
+# meanings; this one is appended, printed once per completed measurement,
+# before the unchanged threshold assertion.  Every value is reported-only: no
+# field here is read by a branch, a retry, a skip or the bar itself.
+B11_DIAGNOSTIC_PREFIX = "B11 diagnostics="
+B11_DIAGNOSTIC_UNAVAILABLE = "unavailable"
+B11_DIAGNOSTIC_FIELDS = (
+    "combined_rate_per_sec",
+    "serial_commit_ms",
+    "combined_over_single",
+    "writer_elapsed_rows",
+    "host_steal_usec",
+    "host_psi_cpu_some_usec",
+    "host_psi_cpu_full_usec",
+    "host_psi_io_some_usec",
+    "host_psi_io_full_usec",
+    "host_psi_memory_some_usec",
+    "host_psi_memory_full_usec",
+    "storage_pgdata_path",
+    "storage_filesystem",
+    "storage_mount_source",
+    "storage_mount_root",
+    "storage_mount_point",
+    "storage_device_majmin",
+    "storage_block_device",
+    "storage_rotational",
+    "storage_scheduler",
+    "storage_model",
+)
+
+# The two closed scripts B11 runs, unprivileged, as OS user `postgres`, inside
+# the exact PostgreSQL container the seeded fixture is already running.  Docker
+# exec joins that container's mount namespace, which is also the server's own
+# view, so the mount record and block attributes describe the storage under
+# PostgreSQL's data directory -- never the pytest process's filesystem.  Each
+# takes its one container-derived value as a validated positional argument.
+B11_CONTAINER_MOUNT_SCRIPT = r\"\"\"
+pgdata="$1"
+case "$pgdata" in
+    /*) ;;
+    *) exit 2 ;;
+esac
+resolved="$(readlink -f "$pgdata" 2>/dev/null)" || exit 2
+[ -n "$resolved" ] || exit 2
+printf 'pgdata_resolved=%s\\n' "$resolved"
+cat /proc/self/mountinfo
+\"\"\".strip()
+
+B11_CONTAINER_BLOCK_SCRIPT = r\"\"\"
+majmin="$1"
+case "$majmin" in
+    *[!0-9:]*|:*|*:|*:*:*) exit 2 ;;
+    [0-9]*:[0-9]*) ;;
+    *) exit 2 ;;
+esac
+device="$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null)" || exit 0
+[ -n "$device" ] || exit 0
+candidate="$device"
+if [ -f "$candidate/partition" ]; then
+    candidate="$(dirname "$candidate")" || exit 0
+fi
+case "$(basename "$candidate")" in
+    dm-*)
+        # majmin was copied above; replacing $1 here is intentional.
+        set -- "$candidate"/slaves/*
+        if [ "$#" -eq 1 ] && [ -e "$1" ]; then
+            slave="$(readlink -f "$1" 2>/dev/null)" || slave=""
+            if [ -n "$slave" ]; then
+                candidate="$slave"
+                if [ -f "$candidate/partition" ]; then
+                    candidate="$(dirname "$candidate")" || exit 0
+                fi
+            fi
+        fi
+        ;;
+esac
+name="$(basename "$candidate")" || exit 0
+[ -n "$name" ] && printf 'block_device=%s\\n' "$name"
+for spec in rotational:queue/rotational scheduler:queue/scheduler model:device/model; do
+    key="${spec%%:*}"
+    rel="${spec#*:}"
+    [ -r "$candidate/$rel" ] || continue
+    value="$(cat "$candidate/$rel" 2>/dev/null)" || continue
+    [ -n "$value" ] || continue
+    printf '%s=%s\\n' "$key" "$value"
+done
+\"\"\".strip()
 
 
 def _p99(samples: list[float]) -> float:
@@ -702,6 +890,504 @@ def test_b10_partitioned_list_and_filter_p99(scale_pg):
     assert p99_f < 200.0, f"B10 filter p99={p99_f:.2f}ms"
 
 
+def _encode_b11_value(value: str) -> str:
+    \"\"\"Percent-encode one free-form diagnostic value (B1-compatible safe set).
+
+    Uppercase hex, and the only unencoded characters are ``A-Z a-z 0-9 - . _ ~
+    : +``.  Comma, equals, percent, whitespace, slash and newline are all
+    encoded, so no value can forge a field boundary or split the physical line.
+    \"\"\"
+    return quote(value, safe="-._~:+")
+
+
+def _writer_instance_label(entry, index: int) -> str:
+    \"\"\"The percent-encoded label of one writer process instance.
+
+    The safe set here is ``A-Z a-z 0-9 - . _ ~ #`` -- ``:`` and ``+`` are the
+    writer entry's own separators, so they are encoded and a future process
+    name cannot forge an entry boundary.
+    \"\"\"
+    process = entry["process"]
+    label = process + "#" + str(index) if process == "ingest-gateway" else process
+    return quote(label, safe="#")
+
+
+def _serialize_writer_elapsed_rows(
+    instances, writer_elapsed_rows: list[tuple[float, int] | None]
+) -> str:
+    \"\"\"The ``writer_elapsed_rows`` field: seven ordered elapsed/row entries.
+
+    Entries are ``+``-joined, never comma-joined, in the manifest-derived
+    ``instances`` order.  Every slot of the preallocated side channel must have
+    been replaced by exactly one writer, so an added, omitted or duplicated
+    entry raises here rather than being reported.
+    \"\"\"
+    assert len(writer_elapsed_rows) == len(instances), (
+        f"B11 writer side channel has {len(writer_elapsed_rows)} slots for "
+        f"{len(instances)} writer instances"
+    )
+    entries = []
+    labels = []
+    for idx in range(len(instances)):
+        measured = writer_elapsed_rows[idx]
+        assert measured is not None, (
+            f"B11 writer instance {idx} recorded no elapsed/row pair"
+        )
+        elapsed_seconds = measured[0]
+        rows = measured[1]
+        assert elapsed_seconds >= 0 and rows >= 0, (
+            f"B11 writer instance {idx} reported {measured!r}"
+        )
+        label = _writer_instance_label(instances[idx][0], instances[idx][1])
+        rendered = f"{label}:{elapsed_seconds * 1000:.3f}:{rows}"
+        assert "," not in rendered, f"B11 writer entry {rendered!r} carries a comma"
+        labels.append(label)
+        entries.append(rendered)
+    assert len(set(labels)) == len(labels), (
+        f"B11 writer labels are not unique: {labels}"
+    )
+    return "+".join(entries)
+
+
+def _serialize_b11_diagnostics(values: Mapping[str, str]) -> str:
+    \"\"\"The one canonical, comma-safe ``B11 diagnostics=`` line.
+
+    Exactly ``B11_DIAGNOSTIC_FIELDS``, in that order: an extra key, a missing
+    key, a reordered mapping, an empty value or a raw comma/newline inside a
+    value is a harness defect and raises rather than being printed.
+    \"\"\"
+    assert isinstance(values, Mapping), f"B11 diagnostics are not a mapping: {values!r}"
+    assert tuple(values) == B11_DIAGNOSTIC_FIELDS, (
+        f"B11 diagnostic fields {tuple(values)} != {B11_DIAGNOSTIC_FIELDS}"
+    )
+    entries = []
+    for field in B11_DIAGNOSTIC_FIELDS:
+        value = values[field]
+        assert isinstance(value, str) and value, (
+            f"B11 diagnostic field {field!r} has no value"
+        )
+        assert "," not in value and "\\n" not in value, (
+            f"B11 diagnostic field {field!r} value {value!r} is not comma-safe"
+        )
+        entries.append(f"{field}={value}")
+    return B11_DIAGNOSTIC_PREFIX + ",".join(entries)
+
+
+def _read_b11_host_snapshot(
+    *,
+    proc_stat_path: Path = Path("/proc/stat"),
+    psi_root: Path = Path("/proc/pressure"),
+) -> dict[str, int | None]:
+    \"\"\"One boundary sample of the host's steal and PSI counters.
+
+    Parsing is the B1 host-noise slice's shipped pure code, imported directly:
+    the kernel aggregate steal row is read in raw ticks (the microsecond
+    conversion is exact only after the window's subtraction) and each pressure
+    file's exact ``some``/``full`` ``total=`` counter is read separately.  PSI
+    averages are never read: they average over time outside this window.  Every
+    member fails soft on its own -- a missing CPU ``full`` record does not erase
+    CPU ``some``, and a missing memory file does not erase CPU or I/O.
+    \"\"\"
+    snapshot: dict[str, int | None] = {
+        "steal_ticks": None,
+        "psi_cpu_some": None,
+        "psi_cpu_full": None,
+        "psi_io_some": None,
+        "psi_io_full": None,
+        "psi_memory_some": None,
+        "psi_memory_full": None,
+    }
+    try:
+        snapshot["steal_ticks"] = parse_proc_stat_steal_ticks(
+            proc_stat_path.read_text(encoding="utf-8")
+        )[0]
+    except (OSError, ValueError):
+        snapshot["steal_ticks"] = None
+    for resource in ("cpu", "io", "memory"):
+        try:
+            pressure = (psi_root / resource).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        for record in ("some", "full"):
+            try:
+                snapshot["psi_" + resource + "_" + record] = parse_psi_total(
+                    pressure, record
+                )
+            except (OSError, ValueError):
+                snapshot["psi_" + resource + "_" + record] = None
+    return snapshot
+
+
+def _b11_host_delta_values(
+    before: Mapping[str, int | None],
+    after: Mapping[str, int | None],
+    *,
+    clock_ticks: int | None,
+) -> dict[str, str]:
+    \"\"\"Render the seven host fields from two boundary snapshots.
+
+    Subtraction first, conversion after: ``counter_delta`` refuses a counter
+    that decreased inside the window and ``steal_ticks_to_usec`` converts only
+    the already-subtracted tick delta.  A reset, a missing end, a malformed
+    value or an unreadable source renders that one field ``unavailable`` --
+    never zero -- while a real zero delta renders ``0``.  An unusable clock-tick
+    rate costs only ``host_steal_usec``; PSI is already microseconds.
+    \"\"\"
+    values: dict[str, str] = {}
+    for resource in ("cpu", "io", "memory"):
+        for record in ("some", "full"):
+            key = "psi_" + resource + "_" + record
+            start = before.get(key)
+            end = after.get(key)
+            rendered = B11_DIAGNOSTIC_UNAVAILABLE
+            if isinstance(start, int) and isinstance(end, int):
+                try:
+                    rendered = str(counter_delta(start, end, label=key))
+                except (OSError, ValueError):
+                    rendered = B11_DIAGNOSTIC_UNAVAILABLE
+            values["host_" + key + "_usec"] = rendered
+    start = before.get("steal_ticks")
+    end = after.get("steal_ticks")
+    rendered = B11_DIAGNOSTIC_UNAVAILABLE
+    if isinstance(start, int) and isinstance(end, int) and isinstance(clock_ticks, int):
+        try:
+            rendered = str(
+                steal_ticks_to_usec(
+                    counter_delta(start, end, label="steal_ticks"),
+                    clock_ticks=clock_ticks,
+                )
+            )
+        except (OSError, ValueError):
+            rendered = B11_DIAGNOSTIC_UNAVAILABLE
+    values["host_steal_usec"] = rendered
+    return values
+
+
+def _decode_b11_mountinfo_field(value: str) -> str:
+    \"\"\"Decode the four escapes the kernel emits in a mountinfo field.
+
+    ``\\\\040`` space, ``\\\\011`` tab, ``\\\\012`` newline, ``\\\\134`` backslash --
+    and nothing else.  Any other backslash sequence did not come from the
+    kernel's own encoder, so it is refused rather than passed through as a
+    possibly forged path boundary.
+    \"\"\"
+    parts = value.split("\\\\")
+    decoded = parts[0]
+    for part in parts[1:]:
+        if part.startswith("040"):
+            decoded = decoded + " " + part[3:]
+        elif part.startswith("011"):
+            decoded = decoded + "\\t" + part[3:]
+        elif part.startswith("012"):
+            decoded = decoded + "\\n" + part[3:]
+        elif part.startswith("134"):
+            decoded = decoded + "\\\\" + part[3:]
+        else:
+            raise ValueError(f"unknown mountinfo escape in {value!r}")
+    return decoded
+
+
+def _parse_b11_container_mount_output(output: str) -> tuple[str, str]:
+    \"\"\"Split the mount exec's framed response into (resolved path, mountinfo).
+
+    The frame proves the mountinfo bytes arrived in the same closed exec
+    response as the container-resolved PGDATA path: a missing frame, a
+    duplicated frame, content before the frame, a relative/traversing/empty
+    resolved path or an empty mount table is refused.
+    \"\"\"
+    lines = output.splitlines()
+    frame = "pgdata_resolved="
+    if not lines or not lines[0].startswith(frame):
+        raise ValueError(f"B11 mount exec emitted no leading frame: {output!r}")
+    resolved = lines[0][len(frame) :]
+    if (
+        not resolved
+        or not Path(resolved).is_absolute()
+        or ".." in resolved.split("/")
+    ):
+        raise ValueError(f"B11 container-resolved PGDATA path {resolved!r} is unusable")
+    rest = lines[1:]
+    if not rest:
+        raise ValueError("B11 mount exec emitted no mountinfo record")
+    for line in rest:
+        if line.startswith(frame):
+            raise ValueError("B11 mount exec emitted a duplicate frame")
+    return resolved, "\\n".join(rest)
+
+
+def _mountinfo_record_for_path(
+    mountinfo_output: str, container_path: str
+) -> dict[str, str | None]:
+    \"\"\"The target container's own mount record covering ``container_path``.
+
+    Selection is by decoded path components, never by string prefix, so
+    ``/var/lib/postgresql/data-old`` cannot cover ``/var/lib/postgresql/data``,
+    and the unique longest covering mount point wins.  A container ``/`` record
+    is a valid answer here because it was read inside the target container.  A
+    malformed record or a tie is unavailable rather than guessed; an individual
+    unusable root, source, filesystem or major:minor costs only that field.
+    \"\"\"
+    record: dict[str, str | None] = {
+        "storage_mount_root": None,
+        "storage_mount_point": None,
+        "storage_filesystem": None,
+        "storage_mount_source": None,
+        "storage_device_majmin": None,
+    }
+    if not Path(container_path).is_absolute():
+        return record
+    best_pre = None
+    best_post = None
+    best_depth = -1
+    ambiguous = False
+    for line in mountinfo_output.splitlines():
+        if not line.strip():
+            continue
+        halves = line.split(" - ", 1)
+        if len(halves) != 2:
+            return record
+        pre = halves[0].split()
+        post = halves[1].split()
+        if len(pre) < 6 or len(post) < 3:
+            return record
+        try:
+            point = _decode_b11_mountinfo_field(pre[4])
+        except ValueError:
+            return record
+        if not Path(point).is_absolute():
+            return record
+        try:
+            Path(container_path).relative_to(Path(point))
+        except ValueError:
+            continue
+        depth = len([component for component in point.split("/") if component])
+        if depth > best_depth:
+            best_pre = pre
+            best_post = post
+            best_depth = depth
+            ambiguous = False
+        elif depth == best_depth:
+            ambiguous = True
+    if best_pre is None or best_post is None or ambiguous:
+        return record
+    try:
+        root = _decode_b11_mountinfo_field(best_pre[3])
+    except ValueError:
+        root = ""
+    try:
+        point = _decode_b11_mountinfo_field(best_pre[4])
+    except ValueError:
+        point = ""
+    try:
+        filesystem = _decode_b11_mountinfo_field(best_post[0])
+    except ValueError:
+        filesystem = ""
+    try:
+        source = _decode_b11_mountinfo_field(best_post[1])
+    except ValueError:
+        source = ""
+    record["storage_mount_root"] = root if root else None
+    record["storage_mount_point"] = point if point else None
+    record["storage_filesystem"] = filesystem if filesystem else None
+    record["storage_mount_source"] = source if source else None
+    device = best_pre[2].split(":")
+    if len(device) == 2 and device[0].isdecimal() and device[1].isdecimal():
+        record["storage_device_majmin"] = best_pre[2]
+    return record
+
+
+def _parse_b11_container_block_output(output: str) -> dict[str, str]:
+    \"\"\"The four block members of the block exec's response.
+
+    Only ``block_device``, ``rotational``, ``scheduler`` and ``model`` exist;
+    every member starts at ``unavailable`` and an empty, duplicated or invalid
+    one costs only itself.  An unknown key cannot come from the closed script,
+    so it is a harness-schema defect and raises.
+    \"\"\"
+    values = {
+        "storage_block_device": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_rotational": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_scheduler": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_model": B11_DIAGNOSTIC_UNAVAILABLE,
+    }
+    seen = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("=", 1)
+        key = parts[0]
+        assert len(parts) == 2 and key in (
+            "block_device",
+            "rotational",
+            "scheduler",
+            "model",
+        ), f"B11 block script emitted an unknown member {line!r}"
+        value = parts[1].strip()
+        if key in seen:
+            values["storage_" + key] = B11_DIAGNOSTIC_UNAVAILABLE
+            continue
+        seen.append(key)
+        if not value:
+            continue
+        if key == "rotational" and value not in ("0", "1"):
+            continue
+        values["storage_" + key] = value
+    return values
+
+
+def _exec_b11_container_text(wrapped_container, argv: list[str]) -> str:
+    \"\"\"Run one of the two closed scripts in the target container, unprivileged.
+
+    Only the two argv shapes in the slice design reach Docker, each with its one
+    container-derived value already validated as a positional argument; every
+    other argv is a harness defect and raises before the daemon is touched.  A
+    nonzero exit or a non-bytes response is an environmental reading, not a
+    defect, so it raises ``ValueError`` and the caller renders the affected
+    fields unavailable.
+    \"\"\"
+    assert isinstance(argv, list) and len(argv) == 5, f"B11 exec argv {argv!r}"
+    assert argv[0] == "/bin/sh" and argv[1] == "-c", f"B11 exec argv {argv!r}"
+    if argv[3] == "b11-mount":
+        assert argv[2] == B11_CONTAINER_MOUNT_SCRIPT, "B11 mount script replaced"
+        lines = argv[4].splitlines()
+        assert (
+            len(lines) == 1
+            and lines[0] == argv[4]
+            and Path(argv[4]).is_absolute()
+            and ".." not in argv[4].split("/")
+        ), f"B11 mount exec PGDATA argument {argv[4]!r} is not a validated path"
+    else:
+        assert argv[3] == "b11-block", f"B11 exec argv {argv!r}"
+        assert argv[2] == B11_CONTAINER_BLOCK_SCRIPT, "B11 block script replaced"
+        device = argv[4].split(":")
+        assert (
+            len(device) == 2 and device[0].isdecimal() and device[1].isdecimal()
+        ), f"B11 block exec device argument {argv[4]!r} is not major:minor"
+    exit_code, output = wrapped_container.exec_run(
+        argv,
+        stdout=True,
+        stderr=False,
+        stdin=False,
+        tty=False,
+        privileged=False,
+        user="postgres",
+        detach=False,
+        stream=False,
+        socket=False,
+        environment=None,
+        workdir=None,
+        demux=False,
+    )
+    if exit_code != 0:
+        raise ValueError(f"B11 container exec {argv[3]!r} exited {exit_code!r}")
+    if not isinstance(output, bytes):
+        raise ValueError(f"B11 container exec {argv[3]!r} returned {output!r}")
+    return output.decode("utf-8")
+
+
+def _read_b11_container_block_identity(
+    wrapped_container, device_majmin: str
+) -> dict[str, str]:
+    \"\"\"The exposed block attributes for one device, from the same container.\"\"\"
+    values = {
+        "storage_block_device": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_rotational": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_scheduler": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_model": B11_DIAGNOSTIC_UNAVAILABLE,
+    }
+    try:
+        output = _exec_b11_container_text(
+            wrapped_container,
+            [
+                "/bin/sh",
+                "-c",
+                B11_CONTAINER_BLOCK_SCRIPT,
+                "b11-block",
+                device_majmin,
+            ],
+        )
+    except (ValueError, DockerException):
+        return values
+    return _parse_b11_container_block_output(output)
+
+
+def _read_b11_storage_identity(container, pgdata_path: str) -> dict[str, str]:
+    \"\"\"The storage identity PostgreSQL itself sees under its data directory.
+
+    Everything is read by unprivileged exec in the exact running PostgreSQL
+    container: the pytest process's ``/``, ``/proc`` and ``/sys``, the Docker
+    daemon's own mount view and any host backing path are never candidates and
+    are never substituted.  Docker volume class and host path are not claimed at
+    all -- what the container does not expose stays ``unavailable``.
+    \"\"\"
+    values = {
+        "storage_pgdata_path": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_filesystem": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_mount_source": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_mount_root": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_mount_point": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_device_majmin": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_block_device": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_rotational": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_scheduler": B11_DIAGNOSTIC_UNAVAILABLE,
+        "storage_model": B11_DIAGNOSTIC_UNAVAILABLE,
+    }
+    if not pgdata_path or pgdata_path == B11_DIAGNOSTIC_UNAVAILABLE:
+        return values
+    values["storage_pgdata_path"] = _encode_b11_value(pgdata_path)
+    lines = pgdata_path.splitlines()
+    if (
+        len(lines) != 1
+        or lines[0] != pgdata_path
+        or not Path(pgdata_path).is_absolute()
+        or ".." in pgdata_path.split("/")
+    ):
+        return values
+    try:
+        wrapped_container = container.get_wrapped_container()
+        resolved, mountinfo_output = _parse_b11_container_mount_output(
+            _exec_b11_container_text(
+                wrapped_container,
+                [
+                    "/bin/sh",
+                    "-c",
+                    B11_CONTAINER_MOUNT_SCRIPT,
+                    "b11-mount",
+                    pgdata_path,
+                ],
+            )
+        )
+    except (ValueError, DockerException):
+        return values
+    record = _mountinfo_record_for_path(mountinfo_output, resolved)
+    for key in (
+        "storage_mount_root",
+        "storage_mount_point",
+        "storage_filesystem",
+        "storage_mount_source",
+    ):
+        member = record.get(key)
+        if member:
+            values[key] = _encode_b11_value(member)
+    device_majmin = record.get("storage_device_majmin")
+    if not device_majmin:
+        return values
+    values["storage_device_majmin"] = device_majmin
+    if int(device_majmin.split(":")[0]) == 0:
+        return values
+    block = _read_b11_container_block_identity(wrapped_container, device_majmin)
+    for key in (
+        "storage_block_device",
+        "storage_rotational",
+        "storage_scheduler",
+        "storage_model",
+    ):
+        member = block.get(key)
+        if member and member != B11_DIAGNOSTIC_UNAVAILABLE:
+            values[key] = _encode_b11_value(member)
+    return values
+
+
 def test_b11_audit_llm_insert_throughput(scale_pg):
     \"\"\"Combined audit + llm_calls insert rate under durable Postgres.
 
@@ -709,6 +1395,10 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     (design.md §11.1.3 / FP-M6-22 / FP-IG-21): four writer *services*, seven
     process *instances* in the default deployment, each with an independent
     make_engine-default pool. Threads proxy process instances.
+
+    The fifth, canonical `B11 diagnostics=` line is reported-only: it is
+    printed on a pass and before a threshold failure and changes no knob, no
+    branch and no outcome (design/slices/b11-host-diagnostics §3.6).
     \"\"\"
     dsn = scale_pg["dsn"]
     writers = load_b11_writer_model()
@@ -720,7 +1410,23 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     n_iters = 800
     now = datetime.now(timezone.utc)
 
-    # One independent engine per writer at make_engine defaults.
+    # Storage identity first: PostgreSQL's own effective data_directory, then
+    # the mount record and exposed block attributes at that path read *inside
+    # the running server's own container*.  Both execs and all parsing finish
+    # before any B11 engine, connection or row warmup, so no diagnostic I/O is
+    # adjacent to the timed window (§3.4/§3.5).
+    try:
+        with scale_pg["engine"].connect() as conn:
+            pgdata_row = conn.execute(
+                text("SELECT current_setting('data_directory')")
+            ).one()
+        pgdata_path = pgdata_row[0]
+    except SQLAlchemyError:
+        pgdata_path = B11_DIAGNOSTIC_UNAVAILABLE
+    storage_values = _read_b11_storage_identity(scale_pg["container"], pgdata_path)
+    writer_elapsed_rows = [None] * len(instances)
+
+    # One independent engine per process instance at make_engine defaults.
     # Built and warmed *outside* the timed window so we measure insert rate only.
     engines = []
     factories = []
@@ -735,16 +1441,22 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         stores.append(PGTraceStore(session_factory=fac))
 
     def _run_writer(idx: int) -> int:
-        \"\"\"Return rows committed by writers[idx].
+        \"\"\"Return rows committed by instances[idx].
 
         One commit per row — production shape for write_audit / insert_llm_call.
         Session is held open across commits (same connection from the pool),
         matching a long-lived process rather than open/close per row.
+
+        The two boundary clock reads and the one distinct-index side-channel
+        assignment are the only added writer-path operations; both lie outside
+        the counted row loop, and the recorded row count is the same bare
+        counter this function returns.
         \"\"\"
         factory = factories[idx]
         store = stores[idx]
         process = instances[idx][0]["process"]
         rows = 0
+        writer_t0 = time.perf_counter()
         with factory() as session:
             for i in range(n_iters):
                 if process == "temporal-worker" and i % 2 == 1:
@@ -775,6 +1487,7 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
                     )
                     session.commit()
                 rows += 1
+        writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, rows)
         return rows
 
     writer_map = ",".join(
@@ -800,13 +1513,22 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     pool = ThreadPoolExecutor(max_workers=len(instances))
     try:
         list(pool.map(_warmup, range(len(instances))))
+        try:
+            clock_ticks = os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError):
+            clock_ticks = None
+        host_before = _read_b11_host_snapshot()
         t0 = time.perf_counter()
         committed = list(pool.map(_run_writer, range(len(instances))))
         elapsed = time.perf_counter() - t0
+        host_after = _read_b11_host_snapshot()
     finally:
         pool.shutdown(wait=True)
     total_rows = sum(committed)
     rate = total_rows / elapsed if elapsed > 0 else 0.0
+    host_values = _b11_host_delta_values(
+        host_before, host_after, clock_ticks=clock_ticks
+    )
 
     # Single-writer diagnostic on a pre-warmed engine (printed; not the bar).
     t_sw = time.perf_counter()
@@ -830,15 +1552,909 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
         f"serial_commit_ms={serial_commit_ms:.3f},"
         f"combined_over_single={combined_over_single:.2f}"
     )
+    diagnostic_values = {
+        "combined_rate_per_sec": f"{rate:.1f}",
+        "serial_commit_ms": f"{serial_commit_ms:.3f}",
+        "combined_over_single": f"{combined_over_single:.2f}",
+        "writer_elapsed_rows": _serialize_writer_elapsed_rows(
+            instances, writer_elapsed_rows
+        ),
+        "host_steal_usec": host_values["host_steal_usec"],
+        "host_psi_cpu_some_usec": host_values["host_psi_cpu_some_usec"],
+        "host_psi_cpu_full_usec": host_values["host_psi_cpu_full_usec"],
+        "host_psi_io_some_usec": host_values["host_psi_io_some_usec"],
+        "host_psi_io_full_usec": host_values["host_psi_io_full_usec"],
+        "host_psi_memory_some_usec": host_values["host_psi_memory_some_usec"],
+        "host_psi_memory_full_usec": host_values["host_psi_memory_full_usec"],
+        "storage_pgdata_path": storage_values["storage_pgdata_path"],
+        "storage_filesystem": storage_values["storage_filesystem"],
+        "storage_mount_source": storage_values["storage_mount_source"],
+        "storage_mount_root": storage_values["storage_mount_root"],
+        "storage_mount_point": storage_values["storage_mount_point"],
+        "storage_device_majmin": storage_values["storage_device_majmin"],
+        "storage_block_device": storage_values["storage_block_device"],
+        "storage_rotational": storage_values["storage_rotational"],
+        "storage_scheduler": storage_values["storage_scheduler"],
+        "storage_model": storage_values["storage_model"],
+    }
     print(f"B11 writers={len(instances)}")
     print(f"B11 writer_map={writer_map}")
     print(f"B11 single_writer_rate={single_writer_rate:.1f}/s")
     print(env_line)
+    print(_serialize_b11_diagnostics(diagnostic_values))
     assert rate >= 1000.0, (
         f"B11 combined insert rate={rate:.1f}/s (threshold 1000); "
         f"B11 writers={len(instances)}; B11 writer_map={writer_map}; "
         f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"
     )
+
+
+def test_b11_host_parser_reuse_is_direct():
+    \"\"\"FP-B11HD-2: the four host-counter helpers are B1's shipped pure code.
+
+    Every imported binding is exercised here against fixed inputs; the
+    independent source guard requires their literal
+    `services.gateway.tests.b1_reference_profile` import provenance, so a copy,
+    a redefinition or a dynamic load is rejected there rather than drifting.
+    \"\"\"
+    aggregate, per_cpu = parse_proc_stat_steal_ticks(
+        "cpu  10 0 20 30 0 0 0 800 0 0\\n"
+        "cpu0 5 0 10 15 0 0 0 500 0 0\\n"
+        "cpu1 5 0 10 15 0 0 0 300 0 0\\n"
+        "intr 1 2 3\\n"
+    )
+    assert aggregate == 800, aggregate
+    assert per_cpu == {0: 500, 1: 300}, per_cpu
+    pressure = (
+        "some avg10=1.00 avg60=2.00 avg300=3.00 total=1234\\n"
+        "full avg10=4.00 avg60=5.00 avg300=6.00 total=56\\n"
+    )
+    assert parse_psi_total(pressure, "some") == 1234
+    assert parse_psi_total(pressure, "full") == 56
+    assert counter_delta(10, 25, label="steal") == 15
+    assert steal_ticks_to_usec(15, clock_ticks=100) == 150000
+
+
+def test_b11_host_diagnostics_read_declared_sources(tmp_path):
+    \"\"\"FP-B11HD-2: exact steal and PSI deltas from the declared paths.
+
+    Deterministic files prove the aggregate steal row (not the per-CPU sum),
+    both PSI records of all three resources, tick-first subtraction through
+    `os.sysconf("SC_CLK_TCK")`'s rate, a numeric zero delta, and field-local
+    failure: a reset, a malformed value, a missing record, a missing file or an
+    unusable clock rate costs only the member it belongs to.
+    \"\"\"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    psi_root = tmp_path / "pressure"
+    psi_root.mkdir()
+    partial_root = tmp_path / "pressure-partial"
+    partial_root.mkdir()
+    stat_path = proc_root / "stat"
+
+    def _stat(steal):
+        return (
+            f"cpu  10 0 20 30 0 0 0 {steal} 0 0\\n"
+            f"cpu0 5 0 10 15 0 0 0 {steal} 0 0\\n"
+        )
+
+    def _psi(some_total, full_total, average):
+        return (
+            f"some avg10={average} avg60=0.00 avg300=0.00 total={some_total}\\n"
+            f"full avg10={average} avg60=0.00 avg300=0.00 total={full_total}\\n"
+        )
+
+    def _snapshot(stat_body, cpu_body, io_body, memory_body):
+        stat_path.write_text(stat_body, encoding="utf-8")
+        (psi_root / "cpu").write_text(cpu_body, encoding="utf-8")
+        (psi_root / "io").write_text(io_body, encoding="utf-8")
+        (psi_root / "memory").write_text(memory_body, encoding="utf-8")
+        return _read_b11_host_snapshot(proc_stat_path=stat_path, psi_root=psi_root)
+
+    before = _snapshot(
+        _stat(1000), _psi(100, 10, "9.99"), _psi(200, 20, "9.99"), _psi(300, 30, "9.99")
+    )
+    after = _snapshot(
+        _stat(1007), _psi(123, 10, "0.00"), _psi(255, 26, "0.00"), _psi(300, 37, "0.00")
+    )
+    assert before["steal_ticks"] == 1000, before
+    assert before["psi_cpu_some"] == 100, before
+    values = _b11_host_delta_values(before, after, clock_ticks=100)
+    # 7 ticks at 100 Hz = 70_000 us: subtraction first, conversion after.
+    assert values["host_steal_usec"] == "70000", values
+    assert values["host_psi_cpu_some_usec"] == "23", values
+    assert values["host_psi_cpu_full_usec"] == "0", values
+    assert values["host_psi_io_some_usec"] == "55", values
+    assert values["host_psi_io_full_usec"] == "6", values
+    assert values["host_psi_memory_some_usec"] == "0", values
+    assert values["host_psi_memory_full_usec"] == "7", values
+    assert tuple(sorted(values)) == (
+        "host_psi_cpu_full_usec",
+        "host_psi_cpu_some_usec",
+        "host_psi_io_full_usec",
+        "host_psi_io_some_usec",
+        "host_psi_memory_full_usec",
+        "host_psi_memory_some_usec",
+        "host_steal_usec",
+    ), tuple(sorted(values))
+
+    # A different tick rate changes only the steal conversion.
+    assert _b11_host_delta_values(before, after, clock_ticks=1000)[
+        "host_steal_usec"
+    ] == "7000"
+    # An unusable tick rate costs the steal field alone.
+    no_rate = _b11_host_delta_values(before, after, clock_ticks=None)
+    assert no_rate["host_steal_usec"] == B11_DIAGNOSTIC_UNAVAILABLE, no_rate
+    assert no_rate["host_psi_cpu_some_usec"] == "23", no_rate
+
+    # A counter that reset inside the window is unavailable, never zero.
+    reset = _b11_host_delta_values(after, before, clock_ticks=100)
+    assert reset["host_steal_usec"] == B11_DIAGNOSTIC_UNAVAILABLE, reset
+    assert reset["host_psi_cpu_some_usec"] == B11_DIAGNOSTIC_UNAVAILABLE, reset
+    assert reset["host_psi_memory_some_usec"] == "0", reset
+
+    # A missing `full` record leaves `some` intact.
+    half = _snapshot(
+        _stat(1007),
+        "some avg10=0.00 avg60=0.00 avg300=0.00 total=123\\n",
+        _psi(255, 26, "0.00"),
+        _psi(300, 37, "0.00"),
+    )
+    assert half["psi_cpu_some"] == 123, half
+    assert half["psi_cpu_full"] is None, half
+    half_values = _b11_host_delta_values(before, half, clock_ticks=100)
+    assert half_values["host_psi_cpu_some_usec"] == "23", half_values
+    assert (
+        half_values["host_psi_cpu_full_usec"] == B11_DIAGNOSTIC_UNAVAILABLE
+    ), half_values
+
+    # A malformed steal field costs steal alone; the PSI members survive.
+    malformed = _snapshot(
+        "cpu  10 0 20 30 0 0 0 seven 0 0\\ncpu0 1 0 1 1 0 0 0 1 0 0\\n",
+        _psi(123, 10, "0.00"),
+        _psi(255, 26, "0.00"),
+        _psi(300, 37, "0.00"),
+    )
+    assert malformed["steal_ticks"] is None, malformed
+    malformed_values = _b11_host_delta_values(before, malformed, clock_ticks=100)
+    assert (
+        malformed_values["host_steal_usec"] == B11_DIAGNOSTIC_UNAVAILABLE
+    ), malformed_values
+    assert malformed_values["host_psi_io_some_usec"] == "55", malformed_values
+
+    # A missing pressure file costs only its own resource.
+    (partial_root / "cpu").write_text(_psi(123, 10, "0.00"), encoding="utf-8")
+    partial = _read_b11_host_snapshot(proc_stat_path=stat_path, psi_root=partial_root)
+    assert partial["psi_cpu_some"] == 123, partial
+    assert partial["psi_io_some"] is None, partial
+    assert partial["psi_memory_full"] is None, partial
+
+    # A missing /proc/stat costs only steal.
+    absent = _read_b11_host_snapshot(
+        proc_stat_path=proc_root / "absent", psi_root=psi_root
+    )
+    assert absent["steal_ticks"] is None, absent
+    assert absent["psi_cpu_some"] == 123, absent
+
+
+def test_b11_host_reader_observes_real_proc_stat():
+    \"\"\"FP-B11HD-2: the default reader reads this host's real /proc.
+
+    Container-free, and deliberately assertion-free about the values: what is
+    required is that a readable source produces a reading, so an implementation
+    whose synthetic fixtures pass while its live reader always reports
+    `unavailable` is red here.
+    \"\"\"
+    before = _read_b11_host_snapshot()
+    after = _read_b11_host_snapshot()
+    values = _b11_host_delta_values(before, after, clock_ticks=100)
+    assert values["host_steal_usec"].isdecimal(), values
+    for resource in ("cpu", "io", "memory"):
+        try:
+            Path("/proc/pressure/" + resource).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        assert values[
+            "host_psi_" + resource + "_some_usec"
+        ].isdecimal(), values
+
+
+def test_b11_storage_identity_reads_target_postgres_container():
+    \"\"\"FP-B11HD-3: the mount and block identity at PostgreSQL's own PGDATA.
+
+    The fake is the exact target container: its mountinfo carries a decoy
+    `/workspace` mount, an always-covering `/` record and a sibling
+    `...-old` mount, so a first-record choice, a string-prefix match or a
+    substituted test-process mount table cannot produce these values.  The two
+    unprivileged exec calls are asserted argument by argument.
+    \"\"\"
+    calls = []
+    mount_bytes = (
+        b"pgdata_resolved=/var/lib/postgresql/data/pgdata\\n"
+        b"23 1 0:24 / / rw,relatime - overlay overlay rw\\n"
+        b"27 23 0:26 / /workspace rw,relatime - fuse.fuse-overlayfs fuse-overlayfs rw\\n"
+        b"41 23 259:3 /volumes/pg\\\\040data /var/lib/postgresql/data rw shared:1 - ext4 /dev/nvme0n1p3 rw\\n"
+        b"44 23 259:3 /volumes/old /var/lib/postgresql/data-old rw - ext4 /dev/nvme0n1p3 rw\\n"
+    )
+    block_bytes = (
+        b"block_device=nvme0n1\\n"
+        b"rotational=0\\n"
+        b"scheduler=[none] mq-deadline\\n"
+        b"model=Amazon Elastic Block Store\\n"
+    )
+
+    class _Wrapped:
+        def exec_run(
+            self,
+            cmd,
+            stdout,
+            stderr,
+            stdin,
+            tty,
+            privileged,
+            user,
+            detach,
+            stream,
+            socket,
+            environment,
+            workdir,
+            demux,
+        ):
+            calls.append(
+                (
+                    cmd,
+                    stdout,
+                    stderr,
+                    stdin,
+                    tty,
+                    privileged,
+                    user,
+                    detach,
+                    stream,
+                    socket,
+                    environment,
+                    workdir,
+                    demux,
+                )
+            )
+            if cmd[3] == "b11-mount":
+                return (0, mount_bytes)
+            return (0, block_bytes)
+
+    class _Container:
+        def get_wrapped_container(self):
+            return _Wrapped()
+
+    values = _read_b11_storage_identity(
+        _Container(), "/var/lib/postgresql/data/pgdata"
+    )
+    assert len(calls) == 2, calls
+    assert calls[0][0] == [
+        "/bin/sh",
+        "-c",
+        B11_CONTAINER_MOUNT_SCRIPT,
+        "b11-mount",
+        "/var/lib/postgresql/data/pgdata",
+    ], calls[0][0]
+    assert calls[0][1:] == (
+        True,
+        False,
+        False,
+        False,
+        False,
+        "postgres",
+        False,
+        False,
+        False,
+        None,
+        None,
+        False,
+    ), calls[0][1:]
+    assert calls[1][0] == [
+        "/bin/sh",
+        "-c",
+        B11_CONTAINER_BLOCK_SCRIPT,
+        "b11-block",
+        "259:3",
+    ], calls[1][0]
+    assert calls[1][1:] == calls[0][1:], calls[1][1:]
+    assert values["storage_pgdata_path"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata%2Fpgdata"
+    assert values["storage_filesystem"] == "ext4", values
+    assert values["storage_mount_source"] == "%2Fdev%2Fnvme0n1p3", values
+    assert values["storage_mount_root"] == "%2Fvolumes%2Fpg%20data", values
+    assert values["storage_mount_point"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata", values
+    assert values["storage_device_majmin"] == "259:3", values
+    assert values["storage_block_device"] == "nvme0n1", values
+    assert values["storage_rotational"] == "0", values
+    assert values["storage_scheduler"] == "%5Bnone%5D%20mq-deadline", values
+    assert values["storage_model"] == "Amazon%20Elastic%20Block%20Store", values
+
+    # A symlinked server path: selection follows the container-resolved path in
+    # the same framed response, while the reported path stays the server's own.
+    linked_calls = []
+
+    class _LinkedWrapped:
+        def exec_run(
+            self,
+            cmd,
+            stdout,
+            stderr,
+            stdin,
+            tty,
+            privileged,
+            user,
+            detach,
+            stream,
+            socket,
+            environment,
+            workdir,
+            demux,
+        ):
+            linked_calls.append(cmd)
+            if cmd[3] == "b11-mount":
+                return (0, mount_bytes)
+            return (0, block_bytes)
+
+    class _LinkedContainer:
+        def get_wrapped_container(self):
+            return _LinkedWrapped()
+
+    linked = _read_b11_storage_identity(_LinkedContainer(), "/srv/pgdata-link")
+    assert linked_calls[0][4] == "/srv/pgdata-link", linked_calls[0]
+    assert linked["storage_pgdata_path"] == "%2Fsrv%2Fpgdata-link", linked
+    assert linked["storage_mount_point"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata", linked
+    assert linked["storage_block_device"] == "nvme0n1", linked
+
+
+def test_b11_storage_identity_fails_soft_without_substituting_another_mount():
+    \"\"\"FP-B11HD-3/5: every unexposed member is unavailable, nothing is invented.
+
+    Overlay2, rootless fuse, a zero major, malformed and ambiguous mount
+    points, a failed exec, absent or masked sysfs, partial and invalid block
+    output, the device-mapper shapes and a Docker API failure each preserve
+    every independently valid reading and substitute nothing.
+    \"\"\"
+    pgdata = "/var/lib/postgresql/data"
+
+    def _fake(responses, calls):
+        class _Wrapped:
+            def exec_run(
+                self,
+                cmd,
+                stdout,
+                stderr,
+                stdin,
+                tty,
+                privileged,
+                user,
+                detach,
+                stream,
+                socket,
+                environment,
+                workdir,
+                demux,
+            ):
+                calls.append(cmd)
+                return responses[len(calls) - 1]
+
+        class _Container:
+            def get_wrapped_container(self):
+                return _Wrapped()
+
+        return _Container()
+
+    # (a) overlay2 root: a valid virtual filesystem, a zero major, no block exec.
+    calls = []
+    overlay = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"23 1 0:24 / / rw,relatime - overlay overlay rw\\n",
+                )
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert len(calls) == 1, calls
+    assert overlay["storage_filesystem"] == "overlay", overlay
+    assert overlay["storage_mount_source"] == "overlay", overlay
+    assert overlay["storage_mount_root"] == "%2F", overlay
+    assert overlay["storage_mount_point"] == "%2F", overlay
+    assert overlay["storage_device_majmin"] == "0:24", overlay
+    assert overlay["storage_block_device"] == B11_DIAGNOSTIC_UNAVAILABLE, overlay
+    assert overlay["storage_rotational"] == B11_DIAGNOSTIC_UNAVAILABLE, overlay
+
+    # (b) rootless fuse-overlayfs.
+    calls = []
+    rootless = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"23 1 0:31 / / rw - fuse.fuse-overlayfs fuse-overlayfs rw\\n",
+                )
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert rootless["storage_filesystem"] == "fuse.fuse-overlayfs", rootless
+    assert rootless["storage_mount_source"] == "fuse-overlayfs", rootless
+    assert len(calls) == 1, calls
+
+    # (c) a malformed mount point prevents an honest selection.
+    calls = []
+    malformed = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"23 1 0:24 / relative rw - ext4 /dev/sda1 rw\\n",
+                )
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert malformed["storage_mount_point"] == B11_DIAGNOSTIC_UNAVAILABLE, malformed
+    assert malformed["storage_filesystem"] == B11_DIAGNOSTIC_UNAVAILABLE, malformed
+    assert (
+        malformed["storage_pgdata_path"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata"
+    ), malformed
+
+    # (d) two equally specific covering records are ambiguous, not guessed.
+    calls = []
+    ambiguous = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"41 23 259:3 /a /var/lib/postgresql/data rw - ext4 /dev/sda1 rw\\n"
+                    b"42 23 259:4 /b /var/lib/postgresql/data rw - xfs /dev/sdb1 rw\\n",
+                )
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert ambiguous["storage_filesystem"] == B11_DIAGNOSTIC_UNAVAILABLE, ambiguous
+    assert (
+        ambiguous["storage_device_majmin"] == B11_DIAGNOSTIC_UNAVAILABLE
+    ), ambiguous
+
+    # (e) malformed root/source/major fields cost only themselves.
+    calls = []
+    fields = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"41 23 25x:3 /volumes\\\\099pg /var/lib/postgresql/data rw - ext4 /dev/sda1 rw\\n",
+                )
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert fields["storage_mount_point"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata", fields
+    assert fields["storage_filesystem"] == "ext4", fields
+    assert fields["storage_mount_source"] == "%2Fdev%2Fsda1", fields
+    assert fields["storage_mount_root"] == B11_DIAGNOSTIC_UNAVAILABLE, fields
+    assert fields["storage_device_majmin"] == B11_DIAGNOSTIC_UNAVAILABLE, fields
+    assert len(calls) == 1, calls
+
+    # (f) a nonzero exec exit preserves only the server's own PGDATA path.
+    calls = []
+    failed = _read_b11_storage_identity(_fake([(2, b"")], calls), pgdata)
+    assert failed["storage_pgdata_path"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata", failed
+    assert failed["storage_mount_point"] == B11_DIAGNOSTIC_UNAVAILABLE, failed
+    assert failed["storage_filesystem"] == B11_DIAGNOSTIC_UNAVAILABLE, failed
+    assert len(calls) == 1, calls
+
+    # (g) an unframed mountinfo response is refused: no proof of provenance.
+    calls = []
+    unframed = _read_b11_storage_identity(
+        _fake([(0, b"41 23 259:3 / /var/lib/postgresql/data rw - ext4 /dev/sda1 rw\\n")], calls),
+        pgdata,
+    )
+    assert unframed["storage_mount_point"] == B11_DIAGNOSTIC_UNAVAILABLE, unframed
+
+    # (h) absent or masked sysfs: every mount member survives.
+    calls = []
+    masked = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"41 23 259:3 / /var/lib/postgresql/data rw - ext4 /dev/sda1 rw\\n",
+                ),
+                (0, b""),
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert len(calls) == 2, calls
+    assert masked["storage_device_majmin"] == "259:3", masked
+    assert masked["storage_filesystem"] == "ext4", masked
+    assert masked["storage_block_device"] == B11_DIAGNOSTIC_UNAVAILABLE, masked
+    assert masked["storage_model"] == B11_DIAGNOSTIC_UNAVAILABLE, masked
+
+    # (i) partial, invalid and duplicated block members, each field-local.
+    calls = []
+    partial = _read_b11_storage_identity(
+        _fake(
+            [
+                (
+                    0,
+                    b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                    b"41 23 259:3 / /var/lib/postgresql/data rw - ext4 /dev/sda1 rw\\n",
+                ),
+                (
+                    0,
+                    b"block_device=dm-0\\nrotational=7\\nmodel=\\nmodel=Fake\\n",
+                ),
+            ],
+            calls,
+        ),
+        pgdata,
+    )
+    assert partial["storage_block_device"] == "dm-0", partial
+    assert partial["storage_rotational"] == B11_DIAGNOSTIC_UNAVAILABLE, partial
+    assert partial["storage_scheduler"] == B11_DIAGNOSTIC_UNAVAILABLE, partial
+    assert partial["storage_model"] == B11_DIAGNOSTIC_UNAVAILABLE, partial
+
+    # (j) the device-mapper shapes the script can return: a kept dm node when
+    # zero or several slaves are exposed, the sole slave's parent when exactly
+    # one is.  The implementation never chooses among several backing devices.
+    for emitted, expected in (
+        (b"block_device=dm-0\\nrotational=1\\n", "dm-0"),
+        (b"block_device=sda\\nrotational=1\\n", "sda"),
+    ):
+        calls = []
+        mapper = _read_b11_storage_identity(
+            _fake(
+                [
+                    (
+                        0,
+                        b"pgdata_resolved=/var/lib/postgresql/data\\n"
+                        b"41 23 253:0 / /var/lib/postgresql/data rw - ext4 /dev/dm-0 rw\\n",
+                    ),
+                    (0, emitted),
+                ],
+                calls,
+            ),
+            pgdata,
+        )
+        assert mapper["storage_block_device"] == expected, mapper
+        assert mapper["storage_rotational"] == "1", mapper
+
+    # (k) an unknown block member is a harness-schema defect, not a reading.
+    rejected = False
+    try:
+        _parse_b11_container_block_output("block_device=sda\\nvendor=ACME\\n")
+    except AssertionError:
+        rejected = True
+    assert rejected, "an unknown block key must raise"
+
+    # (l) a Docker API failure leaves every container-read field unavailable.
+    class _Broken:
+        def get_wrapped_container(self):
+            raise DockerException("no daemon")
+
+    broken = _read_b11_storage_identity(_Broken(), pgdata)
+    assert broken["storage_pgdata_path"] == "%2Fvar%2Flib%2Fpostgresql%2Fdata", broken
+    assert broken["storage_mount_point"] == B11_DIAGNOSTIC_UNAVAILABLE, broken
+    assert broken["storage_block_device"] == B11_DIAGNOSTIC_UNAVAILABLE, broken
+
+    # (m) a failed data_directory query, and a traversing path, read nothing.
+    calls = []
+    unknown = _read_b11_storage_identity(
+        _fake([], calls), B11_DIAGNOSTIC_UNAVAILABLE
+    )
+    assert unknown["storage_pgdata_path"] == B11_DIAGNOSTIC_UNAVAILABLE, unknown
+    assert len(calls) == 0, calls
+    calls = []
+    traversing = _read_b11_storage_identity(_fake([], calls), "/var/lib/../etc")
+    assert traversing["storage_pgdata_path"] == "%2Fvar%2Flib%2F..%2Fetc", traversing
+    assert traversing["storage_mount_point"] == B11_DIAGNOSTIC_UNAVAILABLE, traversing
+    assert len(calls) == 0, calls
+
+    # (n) the exec helper refuses every argv outside the two closed shapes,
+    # before Docker is touched.
+    class _NeverCalled:
+        def exec_run(
+            self,
+            cmd,
+            stdout,
+            stderr,
+            stdin,
+            tty,
+            privileged,
+            user,
+            detach,
+            stream,
+            socket,
+            environment,
+            workdir,
+            demux,
+        ):
+            raise AssertionError("Docker must not be reached")
+
+    for argv in (
+        ["/bin/sh", "-c", "cat /proc/self/mountinfo", "b11-mount", "/data"],
+        ["/bin/sh", "-c", B11_CONTAINER_MOUNT_SCRIPT, "b11-mount", "relative"],
+        ["/bin/sh", "-c", B11_CONTAINER_MOUNT_SCRIPT, "b11-mount", "/a/../b"],
+        ["/bin/sh", "-c", B11_CONTAINER_BLOCK_SCRIPT, "b11-block", "8:0:1"],
+        ["/bin/sh", "-c", B11_CONTAINER_BLOCK_SCRIPT, "b11-block", "sda"],
+        ["nsenter", "-t", "1", "b11-mount", "/data"],
+    ):
+        refused = False
+        try:
+            _exec_b11_container_text(_NeverCalled(), argv)
+        except AssertionError:
+            refused = True
+        assert refused, argv
+
+
+def test_b11_diagnostics_schema_is_canonical_and_comma_safe():
+    \"\"\"FP-B11HD-1: one fixed-prefix physical line, 21 fields, no raw comma.
+
+    The serializer is the only thing that can print the line, and it refuses a
+    missing, extra, reordered or empty field and any raw comma or newline in a
+    value; writer entries are `+`-joined so a writer can never forge a
+    top-level field boundary.
+    \"\"\"
+    instances = [({"process": "ingest-gateway"}, i) for i in range(4)] + [
+        ({"process": "dashboard-api"}, 0),
+        ({"process": "probe-gateway"}, 0),
+        ({"process": "temporal-worker"}, 0),
+    ]
+    measured = [
+        (7.5, 800),
+        (7.25, 800),
+        (7.125, 800),
+        (7.0625, 800),
+        (6.5, 800),
+        (6.25, 800),
+        (6.125, 799),
+    ]
+    writer_field = _serialize_writer_elapsed_rows(instances, measured)
+    assert writer_field == (
+        "ingest-gateway#0:7500.000:800+"
+        "ingest-gateway#1:7250.000:800+"
+        "ingest-gateway#2:7125.000:800+"
+        "ingest-gateway#3:7062.500:800+"
+        "dashboard-api:6500.000:800+"
+        "probe-gateway:6250.000:800+"
+        "temporal-worker:6125.000:799"
+    ), writer_field
+    assert len(writer_field.split("+")) == 7, writer_field
+    assert "," not in writer_field, writer_field
+
+    # A future process name cannot forge an entry or field boundary.
+    forged = _serialize_writer_elapsed_rows(
+        [({"process": "a,b+c:d e"}, 0)], [(1.0, 1)]
+    )
+    assert forged == "a%2Cb%2Bc%3Ad%20e:1000.000:1", forged
+
+    for broken_instances, broken_measured in (
+        (instances, measured[:6]),
+        (instances, [None] + measured[1:]),
+        (
+            [({"process": "dashboard-api"}, 0), ({"process": "dashboard-api"}, 0)],
+            [(1.0, 1), (1.0, 1)],
+        ),
+        (instances, [(-1.0, 800)] + measured[1:]),
+    ):
+        rejected = False
+        try:
+            _serialize_writer_elapsed_rows(broken_instances, broken_measured)
+        except AssertionError:
+            rejected = True
+        assert rejected, broken_measured
+
+    values = {
+        "combined_rate_per_sec": "743.7",
+        "serial_commit_ms": "1.264",
+        "combined_over_single": "0.94",
+        "writer_elapsed_rows": writer_field,
+        "host_steal_usec": "0",
+        "host_psi_cpu_some_usec": "123",
+        "host_psi_cpu_full_usec": B11_DIAGNOSTIC_UNAVAILABLE,
+        "host_psi_io_some_usec": "456",
+        "host_psi_io_full_usec": "7",
+        "host_psi_memory_some_usec": "0",
+        "host_psi_memory_full_usec": "0",
+        "storage_pgdata_path": "%2Fvar%2Flib%2Fpostgresql%2Fdata",
+        "storage_filesystem": "ext4",
+        "storage_mount_source": "%2Fdev%2Fnvme0n1p1",
+        "storage_mount_root": "%2F",
+        "storage_mount_point": "%2Fvar%2Flib%2Fpostgresql%2Fdata",
+        "storage_device_majmin": "259:1",
+        "storage_block_device": "nvme0n1",
+        "storage_rotational": "0",
+        "storage_scheduler": "%5Bnone%5D%20mq-deadline",
+        "storage_model": "Amazon%20Elastic%20Block%20Store",
+    }
+    line = _serialize_b11_diagnostics(values)
+    assert line == (
+        "B11 diagnostics=combined_rate_per_sec=743.7,serial_commit_ms=1.264,"
+        "combined_over_single=0.94,writer_elapsed_rows=" + writer_field + ","
+        "host_steal_usec=0,host_psi_cpu_some_usec=123,"
+        "host_psi_cpu_full_usec=unavailable,host_psi_io_some_usec=456,"
+        "host_psi_io_full_usec=7,host_psi_memory_some_usec=0,"
+        "host_psi_memory_full_usec=0,"
+        "storage_pgdata_path=%2Fvar%2Flib%2Fpostgresql%2Fdata,"
+        "storage_filesystem=ext4,storage_mount_source=%2Fdev%2Fnvme0n1p1,"
+        "storage_mount_root=%2F,"
+        "storage_mount_point=%2Fvar%2Flib%2Fpostgresql%2Fdata,"
+        "storage_device_majmin=259:1,storage_block_device=nvme0n1,"
+        "storage_rotational=0,storage_scheduler=%5Bnone%5D%20mq-deadline,"
+        "storage_model=Amazon%20Elastic%20Block%20Store"
+    ), line
+    assert line.startswith(B11_DIAGNOSTIC_PREFIX), line
+    assert len(line.splitlines()) == 1, line
+    body = line.split("=", 1)[1]
+    fields = body.split(",")
+    assert len(fields) == len(B11_DIAGNOSTIC_FIELDS) == 21, fields
+    for number, entry in enumerate(fields):
+        halves = entry.split("=")
+        assert len(halves) == 2, entry
+        assert halves[0] == B11_DIAGNOSTIC_FIELDS[number], entry
+        assert halves[1], entry
+
+    # Percent-encoding: uppercase hex, and every boundary character encoded.
+    assert _encode_b11_value("Amazon Elastic Block Store") == (
+        "Amazon%20Elastic%20Block%20Store"
+    )
+    assert _encode_b11_value("/dev/nvme0n1p1") == "%2Fdev%2Fnvme0n1p1"
+    assert _encode_b11_value("a,b") == "a%2Cb"
+    assert _encode_b11_value("a=b") == "a%3Db"
+    assert _encode_b11_value("a\\nb") == "a%0Ab"
+    assert _encode_b11_value("a%b") == "a%25b"
+    assert _encode_b11_value("é") == "%C3%A9"
+    assert _encode_b11_value("keep-._~:+") == "keep-._~:+"
+
+    missing = dict(values)
+    del missing["storage_model"]
+    extra = dict(values)
+    extra["storage_zone"] = "eu-west-1a"
+    reordered = {}
+    for name in reversed(B11_DIAGNOSTIC_FIELDS):
+        reordered[name] = values[name]
+    raw_comma = dict(values)
+    raw_comma["storage_model"] = "Amazon, Elastic"
+    raw_newline = dict(values)
+    raw_newline["storage_scheduler"] = "none\\nmq-deadline"
+    empty = dict(values)
+    empty["storage_filesystem"] = ""
+    for broken in (missing, extra, reordered, raw_comma, raw_newline, empty):
+        rejected = False
+        try:
+            _serialize_b11_diagnostics(broken)
+        except AssertionError:
+            rejected = True
+        assert rejected, tuple(broken)
+
+
+def test_b11_diagnostic_sampling_brackets_the_timed_window():
+    \"\"\"FP-B11HD-4/5: every diagnostic read lies outside the measured work.
+
+    A lexical line-order check over this file: PGDATA and both possible storage
+    execs finish before the first engine, connection and row warmup; the
+    in-place `elapsed` assignment follows the map immediately and the closing
+    host read is the next action; the two writer-boundary clock reads and the
+    one side-channel assignment stay outside the counted row loop; and no
+    diagnostic I/O, formatting or printing is inside either timed loop.  The
+    real AST proof and the movement mutations live in the independent guard
+    tests/functional/test_b11_writer_model.py.
+    \"\"\"
+    lines = Path(__file__).read_text(encoding="utf-8").splitlines()
+    opened = None
+    closed = len(lines)
+    for number, body in enumerate(lines):
+        if body.startswith("def test_b11_audit_llm_insert_throughput(scale_pg):"):
+            opened = number
+        elif opened is not None and body.startswith("def "):
+            closed = number
+            break
+    assert opened is not None, "the B11 benchmark function moved"
+
+    def _sole(marker):
+        hits = []
+        for number in range(opened, closed):
+            if lines[number].strip() == marker:
+                hits.append(number)
+        assert len(hits) == 1, f"expected exactly one {marker!r}, found {hits}"
+        return hits[0]
+
+    def _sole_containing(fragment):
+        hits = []
+        for number in range(opened, closed):
+            if fragment in lines[number]:
+                hits.append(number)
+        assert len(hits) == 1, f"expected one line with {fragment!r}, found {hits}"
+        return hits[0]
+
+    def _indent(number):
+        return len(lines[number]) - len(lines[number].strip())
+
+    query = _sole("pgdata_row = conn.execute(")
+    storage = _sole(
+        'storage_values = _read_b11_storage_identity(scale_pg["container"], pgdata_path)'
+    )
+    preallocation = _sole("writer_elapsed_rows = [None] * len(instances)")
+    engine = _sole_containing("= make_engine(")
+    connection_warmup = _sole('conn.execute(text("SELECT 1"))')
+    row_warmup = _sole("list(pool.map(_warmup, range(len(instances))))")
+    tick_rate = _sole('clock_ticks = os.sysconf("SC_CLK_TCK")')
+    host_open = _sole("host_before = _read_b11_host_snapshot()")
+    window_open = _sole("t0 = time.perf_counter()")
+    mapped = _sole("committed = list(pool.map(_run_writer, range(len(instances))))")
+    window_close = _sole("elapsed = time.perf_counter() - t0")
+    host_close = _sole("host_after = _read_b11_host_snapshot()")
+    single_writer = _sole("t_sw = time.perf_counter()")
+    single_close = _sole("sw_elapsed = time.perf_counter() - t_sw")
+    writer_open = _sole("writer_t0 = time.perf_counter()")
+    side_channel = _sole(
+        "writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, rows)"
+    )
+    row_loop = _sole("for i in range(n_iters):")
+    writer_return = _sole("return rows")
+    canonical = _sole("print(_serialize_b11_diagnostics(diagnostic_values))")
+    bar = _sole("assert rate >= 1000.0, (")
+    single_loop = _sole("for i in range(100):")
+    warmup_loop = _sole("for i in range(50):")
+    _sole("n_iters = 800")
+
+    # (1) all storage work precedes every engine, connection and row warmup.
+    assert query < storage < preallocation < engine, (query, storage, engine)
+    assert storage < connection_warmup < row_warmup, (storage, row_warmup)
+
+    # (2) the window opens after the host read and closes in place.
+    assert row_warmup < tick_rate < host_open < window_open, (tick_rate, host_open)
+    assert mapped == window_open + 1, (window_open, mapped)
+    assert window_close == mapped + 1, (mapped, window_close)
+    assert host_close == window_close + 1, (window_close, host_close)
+    assert host_close < single_writer < canonical < bar, (host_close, bar)
+
+    # (3) the writer takes two boundary clocks and writes one slot, both
+    # outside its counted row loop.
+    assert writer_open < row_loop < side_channel < writer_return, (
+        writer_open,
+        side_channel,
+    )
+    assert _indent(writer_open) == _indent(side_channel) == _indent(writer_return)
+    assert _indent(row_loop) > _indent(side_channel), (row_loop, side_channel)
+
+    # (4) neither timed loop contains diagnostic work.
+    for start, stop in ((row_loop, side_channel), (single_loop, single_close)):
+        for number in range(start + 1, stop):
+            for token in (
+                "_read_b11_host_snapshot",
+                "_read_b11_storage_identity",
+                "_exec_b11_container_text",
+                "_parse_b11_container",
+                "_mountinfo_record_for_path",
+                "_serialize_",
+                "_encode_b11_value",
+                "perf_counter",
+                "print(",
+                "read_text",
+                "exec_run",
+                "/proc",
+                "/sys",
+            ):
+                assert token not in lines[number], (number, token, lines[number])
 """
 
 ROOT_CONFTEST_SOURCE = """\
@@ -2642,6 +4258,1203 @@ def check_W4(src: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# B11D1-B11D5 — the reported-only host/storage diagnostics
+# (design/slices/b11-host-diagnostics, FP-B11HD-1..5).  Five more module-level
+# `check_<ID>` functions over plain source text, on exactly the same terms as
+# the rules above: every literal the guard trusts is written HERE, so a matched
+# edit to the benchmark and to CLEAN_BENCH still fails.
+# --------------------------------------------------------------------------
+
+B11_CANONICAL_PREFIX = "B11 diagnostics="
+B11_CANONICAL_UNAVAILABLE = "unavailable"
+B11_CANONICAL_FIELDS = (
+    "combined_rate_per_sec",
+    "serial_commit_ms",
+    "combined_over_single",
+    "writer_elapsed_rows",
+    "host_steal_usec",
+    "host_psi_cpu_some_usec",
+    "host_psi_cpu_full_usec",
+    "host_psi_io_some_usec",
+    "host_psi_io_full_usec",
+    "host_psi_memory_some_usec",
+    "host_psi_memory_full_usec",
+    "storage_pgdata_path",
+    "storage_filesystem",
+    "storage_mount_source",
+    "storage_mount_root",
+    "storage_mount_point",
+    "storage_device_majmin",
+    "storage_block_device",
+    "storage_rotational",
+    "storage_scheduler",
+    "storage_model",
+)
+B11_PARSER_MODULE = "services.gateway.tests.b1_reference_profile"
+B11_HOST_PARSERS = (
+    "counter_delta",
+    "parse_proc_stat_steal_ticks",
+    "parse_psi_total",
+    "steal_ticks_to_usec",
+)
+B11_HOST_SOURCES = ("/proc/stat", "/proc/pressure")
+B11_CLOCK_TICK_NAME = "SC_CLK_TCK"
+B11_STORAGE_FUNCTIONS = (
+    "_decode_b11_mountinfo_field",
+    "_parse_b11_container_mount_output",
+    "_mountinfo_record_for_path",
+    "_parse_b11_container_block_output",
+    "_exec_b11_container_text",
+    "_read_b11_container_block_identity",
+    "_read_b11_storage_identity",
+)
+B11_DIAGNOSTIC_FUNCTIONS = (
+    "_encode_b11_value",
+    "_writer_instance_label",
+    "_serialize_writer_elapsed_rows",
+    "_serialize_b11_diagnostics",
+    "_read_b11_host_snapshot",
+    "_b11_host_delta_values",
+) + B11_STORAGE_FUNCTIONS
+# Calls that must never appear inside a timed loop (B11's own row loop or the
+# single-writer diagnostic loop).
+B11_TIMED_LOOP_FORBIDDEN_CALLS = frozenset(
+    B11_DIAGNOSTIC_FUNCTIONS
+    + ("print", "read_text", "write_text", "exec_run", "get_wrapped_container",
+       "perf_counter", "sysconf", "quote")
+)
+# Only these exception types may be caught in the benchmark tier: a bare
+# `except`/`except Exception` would swallow a serializer or schema defect and
+# report it as an environmental `unavailable`.
+B11_ALLOWED_EXCEPTIONS = frozenset(
+    {"OSError", "ValueError", "DockerException", "SQLAlchemyError", "AssertionError"}
+)
+B11_EXEC_KWARGS = (
+    ("stdout", True),
+    ("stderr", False),
+    ("stdin", False),
+    ("tty", False),
+    ("privileged", False),
+    ("user", "postgres"),
+    ("detach", False),
+    ("stream", False),
+    ("socket", False),
+    ("environment", None),
+    ("workdir", None),
+    ("demux", False),
+)
+B11_FORBIDDEN_STORAGE_TOKENS = (
+    "/proc",
+    "/sys",
+    "nsenter",
+    "pid_mode",
+    "SYS_PTRACE",
+    "security_opt",
+    "cap_add",
+    "GraphDriver",
+    "Mounts",
+    "docker.sock",
+)
+B11_FORBIDDEN_STORAGE_KEYWORDS = frozenset(
+    {"pid_mode", "security_opt", "cap_add", "cap_drop", "privileged", "network_mode",
+     "userns_mode", "devices", "volumes", "mounts"}
+)
+# The guard's own copies of the two closed scripts.  Independent of the
+# benchmark file and of CLEAN_BENCH on purpose: changing the PGDATA
+# validation, the in-container resolution, the framing, the mountinfo path,
+# the major:minor validation, the container sysfs paths, the partition mapping
+# or the unique-device-mapper-slave rule must fail here.
+B11_MOUNT_SCRIPT = r"""
+pgdata="$1"
+case "$pgdata" in
+    /*) ;;
+    *) exit 2 ;;
+esac
+resolved="$(readlink -f "$pgdata" 2>/dev/null)" || exit 2
+[ -n "$resolved" ] || exit 2
+printf 'pgdata_resolved=%s\n' "$resolved"
+cat /proc/self/mountinfo
+""".strip()
+B11_BLOCK_SCRIPT = r"""
+majmin="$1"
+case "$majmin" in
+    *[!0-9:]*|:*|*:|*:*:*) exit 2 ;;
+    [0-9]*:[0-9]*) ;;
+    *) exit 2 ;;
+esac
+device="$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null)" || exit 0
+[ -n "$device" ] || exit 0
+candidate="$device"
+if [ -f "$candidate/partition" ]; then
+    candidate="$(dirname "$candidate")" || exit 0
+fi
+case "$(basename "$candidate")" in
+    dm-*)
+        # majmin was copied above; replacing $1 here is intentional.
+        set -- "$candidate"/slaves/*
+        if [ "$#" -eq 1 ] && [ -e "$1" ]; then
+            slave="$(readlink -f "$1" 2>/dev/null)" || slave=""
+            if [ -n "$slave" ]; then
+                candidate="$slave"
+                if [ -f "$candidate/partition" ]; then
+                    candidate="$(dirname "$candidate")" || exit 0
+                fi
+            fi
+        fi
+        ;;
+esac
+name="$(basename "$candidate")" || exit 0
+[ -n "$name" ] && printf 'block_device=%s\n' "$name"
+for spec in rotational:queue/rotational scheduler:queue/scheduler model:device/model; do
+    key="${spec%%:*}"
+    rel="${spec#*:}"
+    [ -r "$candidate/$rel" ] || continue
+    value="$(cat "$candidate/$rel" 2>/dev/null)" || continue
+    [ -n "$value" ] || continue
+    printf '%s=%s\n' "$key" "$value"
+done
+""".strip()
+
+
+def _module_function(tree: ast.Module, name: str, rule: str) -> ast.FunctionDef:
+    nodes = [
+        n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    ]
+    _require(len(nodes) == 1, rule, f"expected exactly one module-level `def {name}`")
+    node = nodes[0]
+    assert isinstance(node, ast.FunctionDef)
+    return node
+
+
+def _module_constant(tree: ast.Module, name: str, rule: str) -> ast.AST:
+    values = [
+        n.value
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == name
+    ]
+    _require(len(values) == 1, rule, f"expected exactly one `{name} = ...` constant")
+    return values[0]
+
+
+def _stripped_string_constant(node: ast.AST, rule: str, what: str) -> str:
+    """The text of a `\"\"\"...\"\"\".strip()` module constant."""
+    _require(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "strip"
+        and not node.args
+        and not node.keywords
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str),
+        rule,
+        f"{what} must be one string literal followed by .strip()",
+    )
+    assert isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    assert isinstance(node.func.value, ast.Constant)
+    return node.func.value.value.strip()
+
+
+def _block_positions(fn: ast.AST) -> dict[int, tuple[int, int]]:
+    """`id(statement) -> (id(owning block list), index in that block)`."""
+    out: dict[int, tuple[int, int]] = {}
+    for node in ast.walk(fn):
+        for _field, value in ast.iter_fields(node):
+            if not isinstance(value, list):
+                continue
+            for index, item in enumerate(value):
+                if isinstance(item, ast.stmt):
+                    out[id(item)] = (id(value), index)
+    return out
+
+
+def _enclosing_statement(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.stmt:
+    cur: ast.AST | None = node
+    while cur is not None and not isinstance(cur, ast.stmt):
+        cur = parents.get(cur)
+    assert isinstance(cur, ast.stmt)
+    return cur
+
+
+def _docstring_constants(tree: ast.AST) -> set[int]:
+    """Ids of every docstring Constant, so prose about a path is not a read."""
+    out: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            out.add(id(first.value))
+    return out
+
+
+def _own_scope_nodes(fn: ast.AST) -> list[ast.AST]:
+    """Nodes of `fn` itself, excluding every nested function body."""
+    nested = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not fn
+    ]
+    inner = set()
+    for node in nested:
+        for child in ast.walk(node):
+            inner.add(id(child))
+    return [n for n in ast.walk(fn) if id(n) not in inner]
+
+
+def _calls_named(scope: ast.AST, name: str) -> list[ast.Call]:
+    return [
+        n
+        for n in ast.walk(scope)
+        if isinstance(n, ast.Call) and _callee_name(n) == name
+    ]
+
+
+def check_B11D1(src: str) -> None:
+    """FP-B11HD-1: one canonical, comma-safe, fixed-prefix line before the bar."""
+    tree = ast.parse(src)
+    prefix = _module_constant(tree, "B11_DIAGNOSTIC_PREFIX", "B11D1")
+    _require(
+        isinstance(prefix, ast.Constant) and prefix.value == B11_CANONICAL_PREFIX,
+        "B11D1",
+        f"B11_DIAGNOSTIC_PREFIX must be exactly {B11_CANONICAL_PREFIX!r}",
+    )
+    unavailable = _module_constant(tree, "B11_DIAGNOSTIC_UNAVAILABLE", "B11D1")
+    _require(
+        isinstance(unavailable, ast.Constant)
+        and unavailable.value == B11_CANONICAL_UNAVAILABLE,
+        "B11D1",
+        f"B11_DIAGNOSTIC_UNAVAILABLE must be exactly {B11_CANONICAL_UNAVAILABLE!r}",
+    )
+    fields = _module_constant(tree, "B11_DIAGNOSTIC_FIELDS", "B11D1")
+    _require(
+        isinstance(fields, ast.Tuple)
+        and all(
+            isinstance(e, ast.Constant) and isinstance(e.value, str)
+            for e in fields.elts
+        ),
+        "B11D1",
+        "B11_DIAGNOSTIC_FIELDS must be a tuple of string literals",
+    )
+    assert isinstance(fields, ast.Tuple)
+    declared = tuple(e.value for e in fields.elts)
+    _require(
+        declared == B11_CANONICAL_FIELDS,
+        "B11D1",
+        f"B11_DIAGNOSTIC_FIELDS {declared} != the pinned 21-field schema "
+        f"{B11_CANONICAL_FIELDS}",
+    )
+
+    # The two serializers' separators: a comma joins top-level fields, a `+`
+    # joins writer entries.  Comma-joining the writer entries would forge 7
+    # extra top-level fields.
+    for name, separator in (
+        ("_serialize_b11_diagnostics", ","),
+        ("_serialize_writer_elapsed_rows", "+"),
+    ):
+        fn = _module_function(tree, name, "B11D1")
+        joins = _calls_named(fn, "join")
+        _require(
+            len(joins) == 1
+            and isinstance(joins[0].func, ast.Attribute)
+            and isinstance(joins[0].func.value, ast.Constant)
+            and joins[0].func.value.value == separator,
+            "B11D1",
+            f"{name} must join exactly once, on {separator!r}",
+        )
+
+    b11 = _b11_function_in(tree)
+    prints = _calls_named(b11, "print")
+    canonical = [
+        n
+        for n in prints
+        if len(n.args) == 1
+        and isinstance(n.args[0], ast.Call)
+        and _callee_name(n.args[0]) == "_serialize_b11_diagnostics"
+    ]
+    _require(
+        len(prints) == len(DIAGNOSTIC_PREFIXES) and len(canonical) == 1,
+        "B11D1",
+        f"{B11_TEST_NAME} must print exactly {len(DIAGNOSTIC_PREFIXES)} diagnostic "
+        f"lines, exactly one of which is the canonical serializer's; found "
+        f"{len(prints)} prints and {len(canonical)} canonical",
+    )
+    asserts = [n for n in ast.walk(b11) if isinstance(n, ast.Assert)]
+    _require(
+        len(asserts) == 1 and canonical[0].lineno < asserts[0].lineno,
+        "B11D1",
+        "the canonical line must be printed before the threshold assertion, so a "
+        "completed below-threshold measurement emits the identical schema",
+    )
+    serialized = canonical[0].args[0]
+    assert isinstance(serialized, ast.Call)
+    _require(
+        len(serialized.args) == 1
+        and isinstance(serialized.args[0], ast.Name)
+        and not serialized.keywords,
+        "B11D1",
+        "the canonical line is serialized from exactly one mapping name",
+    )
+    mapping_name = serialized.args[0]
+    assert isinstance(mapping_name, ast.Name)
+    assigns = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == mapping_name.id
+    ]
+    _require(
+        len(assigns) == 1 and isinstance(assigns[0].value, ast.Dict),
+        "B11D1",
+        f"{mapping_name.id!r} must be built by exactly one dict literal",
+    )
+    mapping = assigns[0].value
+    assert isinstance(mapping, ast.Dict)
+    _require(
+        all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in mapping.keys),
+        "B11D1",
+        "every canonical field key must be a string literal",
+    )
+    keys = tuple(k.value for k in mapping.keys)
+    _require(
+        keys == B11_CANONICAL_FIELDS,
+        "B11D1",
+        f"the canonical mapping names {keys}, not the pinned schema in order — a "
+        "dropped, duplicated, added or reordered field",
+    )
+
+
+def check_B11D2(src: str) -> None:
+    """FP-B11HD-2: the host readings come from B1's shipped parsers and real /proc."""
+    tree = ast.parse(src)
+    shared = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ImportFrom) and n.module == B11_PARSER_MODULE
+    ]
+    _require(
+        len(shared) == 1,
+        "B11D2",
+        f"expected exactly one `from {B11_PARSER_MODULE} import ...`, found "
+        f"{len(shared)}",
+    )
+    imported = shared[0]
+    _require(
+        imported.level == 0
+        and tuple(sorted(a.name for a in imported.names)) == tuple(sorted(B11_HOST_PARSERS))
+        and all(a.asname is None for a in imported.names),
+        "B11D2",
+        f"the shared import must name exactly {sorted(B11_HOST_PARSERS)}, unaliased "
+        "and absolute",
+    )
+    for node in ast.walk(tree):
+        modules = []
+        if isinstance(node, ast.Import):
+            modules = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        for module in modules:
+            _require(
+                not module.startswith("importlib")
+                and module != "subprocess"
+                and "test_b1_ingest_burst" not in module,
+                "B11D2",
+                f"{module!r} is a dynamic-load or live-B1 route; the shared parsers "
+                "are imported by name and nothing else",
+            )
+    called = {_callee_name(n) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    for parser in B11_HOST_PARSERS:
+        _require(
+            parser in called,
+            "B11D2",
+            f"the shared parser {parser}() is imported but never exercised",
+        )
+    for name, kind, node in collect_binding_occurrences(tree):
+        if name in B11_HOST_PARSERS:
+            _require(
+                kind == "import",
+                "B11D2",
+                f"{name!r} is bound by {kind} at line {getattr(node, 'lineno', '?')}: "
+                "a local copy of a shared parser drifts from the shipped one",
+            )
+    path_bindings = [
+        (name, kind) for name, kind, _n in collect_binding_occurrences(tree) if name == "Path"
+    ]
+    _require(
+        path_bindings == [("Path", "import")],
+        "B11D2",
+        f"exactly one module-scope `Path` import is admitted; found {path_bindings}",
+    )
+
+    reader = _module_function(tree, "_read_b11_host_snapshot", "B11D2")
+    _require(
+        not reader.args.args
+        and not reader.args.posonlyargs
+        and [a.arg for a in reader.args.kwonlyargs] == ["proc_stat_path", "psi_root"],
+        "B11D2",
+        "_read_b11_host_snapshot takes exactly the two keyword-only source paths",
+    )
+    defaults = []
+    for default in reader.args.kw_defaults:
+        _require(
+            isinstance(default, ast.Call)
+            and isinstance(default.func, ast.Name)
+            and default.func.id == "Path"
+            and len(default.args) == 1
+            and isinstance(default.args[0], ast.Constant),
+            "B11D2",
+            "each host source default must be Path(<literal>)",
+        )
+        assert isinstance(default, ast.Call) and isinstance(default.args[0], ast.Constant)
+        defaults.append(default.args[0].value)
+    _require(
+        tuple(defaults) == B11_HOST_SOURCES,
+        "B11D2",
+        f"the declared host sources {tuple(defaults)} != {B11_HOST_SOURCES}; a "
+        "reader pointed at a fixture-only root proves nothing about this host",
+    )
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+        ):
+            _require(
+                node.attr in ("cpu_count", "sysconf"),
+                "B11D2",
+                f"os.{node.attr} at line {node.lineno} is outside the narrow "
+                "os.cpu_count()/os.sysconf(\"SC_CLK_TCK\") exception",
+            )
+    sysconf = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "sysconf"
+    ]
+    _require(
+        len(sysconf) == 1
+        and len(sysconf[0].args) == 1
+        and not sysconf[0].keywords
+        and isinstance(sysconf[0].args[0], ast.Constant)
+        and sysconf[0].args[0].value == B11_CLOCK_TICK_NAME,
+        "B11D2",
+        f"exactly one os.sysconf({B11_CLOCK_TICK_NAME!r}) call is admitted",
+    )
+    b11 = _b11_function_in(tree)
+    _require(
+        any(n is sysconf[0] for n in ast.walk(b11)),
+        "B11D2",
+        "the clock-tick rate must be read inside the benchmark, at its boundary",
+    )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        _require(
+            node.type is not None,
+            "B11D2",
+            f"bare `except` at line {node.lineno}: a harness defect would be "
+            "reported as an environmental `unavailable`",
+        )
+        caught = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+        for entry in caught:
+            _require(
+                isinstance(entry, ast.Name) and entry.id in B11_ALLOWED_EXCEPTIONS,
+                "B11D2",
+                f"caught exception at line {node.lineno} is outside "
+                f"{sorted(B11_ALLOWED_EXCEPTIONS)}",
+            )
+
+
+def check_B11D3(src: str) -> None:
+    """FP-B11HD-3: storage identity comes from the exact target container only."""
+    tree = ast.parse(src)
+    b11 = _b11_function_in(tree)
+    parents = _parent_map(tree)
+
+    def _fixture_subscripts(key: str) -> list[ast.Subscript]:
+        return [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name)
+            and n.value.id == "scale_pg"
+            and isinstance(n.slice, ast.Constant)
+            and n.slice.value == key
+        ]
+
+    handles = _fixture_subscripts("container")
+    _require(
+        len(handles) == 1,
+        "B11D3",
+        f'exactly one scale_pg["container"] read is admitted, found {len(handles)}',
+    )
+    holder = parents.get(handles[0])
+    _require(
+        isinstance(holder, ast.Call)
+        and _callee_name(holder) == "_read_b11_storage_identity"
+        and len(holder.args) == 2
+        and holder.args[0] is handles[0]
+        and not holder.keywords,
+        "B11D3",
+        'scale_pg["container"] may only be the first argument of '
+        "_read_b11_storage_identity(container, pgdata_path)",
+    )
+    _require(
+        any(n is holder for n in ast.walk(b11)),
+        "B11D3",
+        "the storage identity must be resolved inside the benchmark itself",
+    )
+
+    engines = _fixture_subscripts("engine")
+    _require(
+        len(engines) == 1,
+        "B11D3",
+        f'exactly one scale_pg["engine"] read is admitted, found {len(engines)}',
+    )
+    engine_use = parents.get(engines[0])
+    _require(
+        isinstance(engine_use, ast.Attribute)
+        and engine_use.attr == "connect"
+        and engine_use.value is engines[0],
+        "B11D3",
+        'the PGDATA query must open its connection on scale_pg["engine"]',
+    )
+    queries = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, ast.Call)
+        and _callee_name(n) == "text"
+        and n.args
+        and isinstance(n.args[0], ast.Constant)
+        and "current_setting" in str(n.args[0].value)
+    ]
+    _require(
+        len(queries) == 1
+        and queries[0].args[0].value == "SELECT current_setting('data_directory')",
+        "B11D3",
+        "PGDATA must come from the running server's own "
+        "current_setting('data_directory'), not from an assumed image default",
+    )
+
+    wrapped = _calls_named(tree, "get_wrapped_container")
+    _require(
+        len(wrapped) == 1
+        and isinstance(wrapped[0].func, ast.Attribute)
+        and isinstance(wrapped[0].func.value, ast.Name)
+        and wrapped[0].func.value.id == "container"
+        and not wrapped[0].args
+        and not wrapped[0].keywords,
+        "B11D3",
+        "exactly one get_wrapped_container() call, on the signed `container` "
+        "parameter, is admitted",
+    )
+    resolver = _module_function(tree, "_read_b11_storage_identity", "B11D3")
+    _require(
+        [a.arg for a in resolver.args.args] == ["container", "pgdata_path"],
+        "B11D3",
+        "_read_b11_storage_identity(container, pgdata_path) is the signed handle "
+        "boundary",
+    )
+    _require(
+        any(n is wrapped[0] for n in ast.walk(resolver)),
+        "B11D3",
+        "the wrapped container may only be obtained inside "
+        "_read_b11_storage_identity",
+    )
+
+    execs = _calls_named(tree, "exec_run")
+    _require(
+        len(execs) == 1
+        and isinstance(execs[0].func, ast.Attribute)
+        and isinstance(execs[0].func.value, ast.Name)
+        and execs[0].func.value.id == "wrapped_container",
+        "B11D3",
+        "exactly one exec_run call, on the signed `wrapped_container` parameter",
+    )
+    runner = _module_function(tree, "_exec_b11_container_text", "B11D3")
+    _require(
+        [a.arg for a in runner.args.args] == ["wrapped_container", "argv"],
+        "B11D3",
+        "_exec_b11_container_text(wrapped_container, argv) is the only exec route",
+    )
+    _require(
+        any(n is execs[0] for n in ast.walk(runner)),
+        "B11D3",
+        "exec_run may only be called inside _exec_b11_container_text",
+    )
+    call = execs[0]
+    _require(
+        len(call.args) == 1
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "argv",
+        "B11D3",
+        "exec_run takes exactly the validated argv list",
+    )
+    kwargs = []
+    for kw in call.keywords:
+        _require(
+            kw.arg is not None and isinstance(kw.value, ast.Constant),
+            "B11D3",
+            "every exec_run keyword must be a named constant",
+        )
+        assert isinstance(kw.value, ast.Constant)
+        kwargs.append((kw.arg, kw.value.value))
+    _require(
+        tuple(kwargs) == B11_EXEC_KWARGS,
+        "B11D3",
+        f"exec_run keywords {tuple(kwargs)} != the unprivileged pinned set "
+        f"{B11_EXEC_KWARGS}",
+    )
+
+    # Handle closure: neither signed name may be rebound, read anywhere else,
+    # or carry any other attribute.
+    for name, allowed_attr in (
+        ("container", "get_wrapped_container"),
+        ("wrapped_container", "exec_run"),
+    ):
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == name
+            ):
+                continue
+            _require(
+                node.attr == allowed_attr,
+                "B11D3",
+                f"{name}.{node.attr} at line {node.lineno}: the only admitted "
+                f"attribute on that handle is {allowed_attr}",
+            )
+    handle_bindings = sorted(
+        (name, kind)
+        for name, kind, _n in collect_binding_occurrences(tree)
+        if name in ("container", "wrapped_container")
+    )
+    _require(
+        handle_bindings
+        == [
+            ("container", "arg"),
+            ("wrapped_container", "arg"),
+            ("wrapped_container", "arg"),
+            ("wrapped_container", "assign"),
+        ],
+        "B11D3",
+        f"container-handle bindings {handle_bindings} are not exactly the signed "
+        "parameters plus the one get_wrapped_container() result",
+    )
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)):
+            continue
+        if node.id not in ("container", "wrapped_container"):
+            continue
+        holder = parents.get(node)
+        ok = False
+        if isinstance(holder, ast.Attribute):
+            ok = holder.value is node
+        elif isinstance(holder, ast.Call):
+            ok = (
+                bool(holder.args)
+                and holder.args[0] is node
+                and _callee_name(holder)
+                in ("_exec_b11_container_text", "_read_b11_container_block_identity")
+            )
+        _require(
+            ok,
+            "B11D3",
+            f"{node.id!r} at line {node.lineno} escapes the signed route: a handle "
+            "may only be used as the pinned attribute receiver or as the first "
+            "argument of the two signed helpers",
+        )
+
+    mount_script = _stripped_string_constant(
+        _module_constant(tree, "B11_CONTAINER_MOUNT_SCRIPT", "B11D3"),
+        "B11D3",
+        "B11_CONTAINER_MOUNT_SCRIPT",
+    )
+    block_script = _stripped_string_constant(
+        _module_constant(tree, "B11_CONTAINER_BLOCK_SCRIPT", "B11D3"),
+        "B11D3",
+        "B11_CONTAINER_BLOCK_SCRIPT",
+    )
+    _require(
+        mount_script == B11_MOUNT_SCRIPT,
+        "B11D3",
+        "the container mount script drifted from the pinned closed script",
+    )
+    _require(
+        block_script == B11_BLOCK_SCRIPT,
+        "B11D3",
+        "the container block script drifted from the pinned closed script",
+    )
+
+    for owner, script_name, frame in (
+        ("_read_b11_storage_identity", "B11_CONTAINER_MOUNT_SCRIPT", "b11-mount"),
+        ("_read_b11_container_block_identity", "B11_CONTAINER_BLOCK_SCRIPT", "b11-block"),
+    ):
+        fn = _module_function(tree, owner, "B11D3")
+        argvs = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.List)
+            and n.elts
+            and isinstance(n.elts[0], ast.Constant)
+            and n.elts[0].value == "/bin/sh"
+        ]
+        _require(
+            len(argvs) == 1,
+            "B11D3",
+            f"{owner} must build exactly one exec argv, found {len(argvs)}",
+        )
+        elts = argvs[0].elts
+        _require(
+            len(elts) == 5
+            and isinstance(elts[1], ast.Constant)
+            and elts[1].value == "-c"
+            and isinstance(elts[2], ast.Name)
+            and elts[2].id == script_name
+            and isinstance(elts[3], ast.Constant)
+            and elts[3].value == frame
+            and isinstance(elts[4], ast.Name),
+            "B11D3",
+            f"{owner}'s argv must be the exact closed shape "
+            f'["/bin/sh", "-c", {script_name}, "{frame}", <validated value>]',
+        )
+
+    docstrings = _docstring_constants(tree)
+    for name in B11_STORAGE_FUNCTIONS + (B11_TEST_NAME,):
+        fn = (
+            b11
+            if name == B11_TEST_NAME
+            else _module_function(tree, name, "B11D3")
+        )
+        for node in ast.walk(fn):
+            if id(node) in docstrings:
+                continue
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for token in B11_FORBIDDEN_STORAGE_TOKENS:
+                    _require(
+                        token not in node.value,
+                        "B11D3",
+                        f"{name} mentions {token!r} at line {node.lineno}: storage "
+                        "bytes come only from the two closed container scripts, "
+                        "never from the test process or a Docker inspect field",
+                    )
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    _require(
+                        kw.arg not in B11_FORBIDDEN_STORAGE_KEYWORDS
+                        or node is execs[0],
+                        "B11D3",
+                        f"{name} passes {kw.arg!r} at line {node.lineno}: no "
+                        "privilege, capability, namespace or helper-container "
+                        "option is admitted",
+                    )
+
+
+def check_B11D4(src: str) -> None:
+    """FP-B11HD-4: every diagnostic read lies outside the measured work."""
+    tree = ast.parse(src)
+    b11 = _b11_function_in(tree)
+    parents = _parent_map(b11)
+    positions = _block_positions(b11)
+
+    def _statement_of(node: ast.AST) -> ast.stmt:
+        return _enclosing_statement(node, parents)
+
+    storage_calls = _calls_named(b11, "_read_b11_storage_identity")
+    _require(len(storage_calls) == 1, "B11D4", "one storage resolution per run")
+    query_calls = [
+        n for n in ast.walk(b11) if isinstance(n, ast.Call) and _callee_name(n) == "one"
+    ]
+    _require(len(query_calls) == 1, "B11D4", "one data_directory query per run")
+    engine_calls = _calls_named(b11, "make_engine")
+    _require(len(engine_calls) == 1, "B11D4", "one make_engine call site")
+    connect_calls = [
+        n
+        for n in _calls_named(b11, "connect")
+        if not (
+            isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Subscript)
+        )
+    ]
+    warmup_maps = [
+        n
+        for n in _calls_named(b11, "map")
+        if len(n.args) == 2
+        and isinstance(n.args[0], ast.Name)
+        and n.args[0].id == "_warmup"
+    ]
+    _require(len(warmup_maps) == 1, "B11D4", "one row-warmup map call")
+    storage_line = storage_calls[0].lineno
+    _require(
+        query_calls[0].lineno < storage_line,
+        "B11D4",
+        "the server's data_directory must be read before the storage identity",
+    )
+    _require(
+        storage_line < engine_calls[0].lineno,
+        "B11D4",
+        "storage resolution must finish before the first B11 engine is built",
+    )
+    for node in connect_calls:
+        _require(
+            storage_line < node.lineno,
+            "B11D4",
+            "storage resolution must finish before any connection warmup",
+        )
+    _require(
+        storage_line < warmup_maps[0].lineno,
+        "B11D4",
+        "storage resolution must finish before the row warmup",
+    )
+
+    prealloc = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and isinstance(n.value, ast.BinOp)
+        and isinstance(n.value.op, ast.Mult)
+        and isinstance(n.value.left, ast.List)
+        and len(n.value.left.elts) == 1
+        and isinstance(n.value.left.elts[0], ast.Constant)
+        and n.value.left.elts[0].value is None
+    ]
+    _require(
+        len(prealloc) == 1,
+        "B11D4",
+        "exactly one `[None] * <width>` writer side channel must be preallocated",
+    )
+    side_channel_name = prealloc[0].targets[0]
+    assert isinstance(side_channel_name, ast.Name)
+    width = prealloc[0].value
+    assert isinstance(width, ast.BinOp)
+    _require(
+        isinstance(width.right, ast.Call)
+        and isinstance(width.right.func, ast.Name)
+        and width.right.func.id == "len"
+        and len(width.right.args) == 1
+        and isinstance(width.right.args[0], ast.Name),
+        "B11D4",
+        "the side channel must be exactly as wide as the derived writer set",
+    )
+    instances_name = width.right.args[0]
+    assert isinstance(instances_name, ast.Name)
+    _require(
+        storage_line < prealloc[0].lineno < engine_calls[0].lineno,
+        "B11D4",
+        "the side channel is preallocated after storage resolution and before the "
+        "engines",
+    )
+
+    host_reads = _calls_named(b11, "_read_b11_host_snapshot")
+    _require(
+        len(host_reads) == 2,
+        "B11D4",
+        f"exactly two host snapshots bracket the window, found {len(host_reads)}",
+    )
+    maps = [
+        n
+        for n in _calls_named(b11, "map")
+        if len(n.args) == 2
+        and isinstance(n.args[0], ast.Name)
+        and n.args[0].id == WRITER_FUNC_NAME
+    ]
+    _require(len(maps) == 1, "B11D4", "one timed executor map call")
+    map_stmt = _statement_of(maps[0])
+    map_block, map_index = positions[id(map_stmt)]
+    ordered = [
+        (host_reads[0], map_index - 2, "the opening host read"),
+        (None, map_index - 1, "the timer start"),
+        (None, map_index, "the executor map"),
+        (None, map_index + 1, "the in-place elapsed assignment"),
+        (host_reads[1], map_index + 2, "the closing host read"),
+    ]
+    for node, index, what in ordered:
+        if node is None:
+            continue
+        stmt = _statement_of(node)
+        _require(
+            positions[id(stmt)] == (map_block, index),
+            "B11D4",
+            f"{what} must be statement {index} of the timed block, immediately "
+            "adjacent to the window — nothing may lie between the samples",
+        )
+    tick_calls = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "sysconf"
+    ]
+    _require(
+        len(tick_calls) == 1 and tick_calls[0].lineno < host_reads[0].lineno,
+        "B11D4",
+        "the clock-tick rate is read before the opening host snapshot",
+    )
+    _require(
+        host_reads[0].lineno > warmup_maps[0].lineno,
+        "B11D4",
+        "the opening host read follows the row warmup",
+    )
+
+    # The writer: two boundary clocks and one distinct-index assignment, both
+    # outside the counted row loop, and the recorded count is the same bare
+    # counter the writer returns.
+    writer = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == WRITER_FUNC_NAME
+    ][0]
+    assert isinstance(writer, ast.FunctionDef)
+    writer_positions = _block_positions(writer)
+    body = writer.body
+    withs = [n for n in body if isinstance(n, ast.With)]
+    _require(len(withs) == 1, "B11D4", "the writer opens exactly one session block")
+    with_index = body.index(withs[0])
+    _require(
+        with_index >= 1 and len(body) >= with_index + 3,
+        "B11D4",
+        "the writer's session block must be surrounded by its opening clock, its "
+        "one side-channel assignment and the unchanged return",
+    )
+    opening = body[with_index - 1]
+    _require(
+        isinstance(opening, ast.Assign)
+        and len(opening.targets) == 1
+        and isinstance(opening.targets[0], ast.Name)
+        and _is_perf_counter_call(opening.value),
+        "B11D4",
+        "the writer's opening clock must be the statement directly preceding its "
+        "session block",
+    )
+    writer_t0 = opening.targets[0]
+    assert isinstance(writer_t0, ast.Name)
+    closing = body[with_index + 1]
+    returns = [n for n in body if isinstance(n, ast.Return)]
+    _require(
+        len(returns) == 1 and body[with_index + 2] is returns[0],
+        "B11D4",
+        "the writer's side-channel assignment must sit between the closed session "
+        "and the unchanged return",
+    )
+    counter = returns[0].value
+    assert isinstance(counter, ast.Name)
+    _require(
+        isinstance(closing, ast.Assign)
+        and len(closing.targets) == 1
+        and isinstance(closing.targets[0], ast.Subscript)
+        and isinstance(closing.targets[0].value, ast.Name)
+        and closing.targets[0].value.id == side_channel_name.id
+        and isinstance(closing.targets[0].slice, ast.Name)
+        and closing.targets[0].slice.id == writer.args.args[0].arg,
+        "B11D4",
+        f"the writer must write exactly {side_channel_name.id}[<its own index>]",
+    )
+    assert isinstance(closing, ast.Assign)
+    recorded = closing.value
+    _require(
+        isinstance(recorded, ast.Tuple)
+        and len(recorded.elts) == 2
+        and isinstance(recorded.elts[0], ast.BinOp)
+        and isinstance(recorded.elts[0].op, ast.Sub)
+        and _is_perf_counter_call(recorded.elts[0].left)
+        and isinstance(recorded.elts[0].right, ast.Name)
+        and recorded.elts[0].right.id == writer_t0.id
+        and isinstance(recorded.elts[1], ast.Name)
+        and recorded.elts[1].id == counter.id,
+        "B11D4",
+        "the recorded pair must be exactly "
+        "(time.perf_counter() - <opening clock>, <the returned counter>): neither "
+        "member may be fabricated independently",
+    )
+    subscript_assigns = [
+        n
+        for n in ast.walk(writer)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Subscript) for t in n.targets)
+    ]
+    _require(
+        len(subscript_assigns) == 1 and subscript_assigns[0] is closing,
+        "B11D4",
+        "the writer writes the side channel exactly once",
+    )
+    _require(
+        writer_positions[id(closing)][0] == id(body),
+        "B11D4",
+        "the side-channel assignment must stay in the writer's own body, never "
+        "inside the counted row loop",
+    )
+    clocks = [n for n in ast.walk(writer) if _is_perf_counter_call(n)]
+    _require(
+        len(clocks) == 2,
+        "B11D4",
+        f"the writer takes exactly two boundary clock reads, found {len(clocks)}",
+    )
+
+    # Neither timed loop may contain diagnostic work.
+    for loop in [n for n in ast.walk(b11) if isinstance(n, (ast.For, ast.AsyncFor))]:
+        for node in ast.walk(loop):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _callee_name(node) or ""
+            _require(
+                name not in B11_TIMED_LOOP_FORBIDDEN_CALLS,
+                "B11D4",
+                f"{name}() at line {node.lineno} lies inside a timed loop; every "
+                "proc, sysfs, container, formatting and printing operation stays "
+                "outside the measured work",
+            )
+
+    serializers = _calls_named(b11, "_serialize_writer_elapsed_rows")
+    _require(
+        len(serializers) == 1
+        and len(serializers[0].args) == 2
+        and isinstance(serializers[0].args[0], ast.Name)
+        and serializers[0].args[0].id == instances_name.id
+        and isinstance(serializers[0].args[1], ast.Name)
+        and serializers[0].args[1].id == side_channel_name.id,
+        "B11D4",
+        "the per-writer report must be serialized from the manifest-derived "
+        "instances and the preallocated side channel, never from the executor "
+        "result",
+    )
+
+
+def check_B11D5(src: str, notes: str) -> None:
+    """FP-B11HD-5: the readings are reported-only and every fixed value stands."""
+    tree = ast.parse(src)
+    b11 = _b11_function_in(tree)
+    _require(
+        not b11.decorator_list,
+        "B11D5",
+        "the benchmark carries no marker: no skip, xfail, rerun or conditional",
+    )
+    asserts = [n for n in ast.walk(b11) if isinstance(n, ast.Assert)]
+    _require(
+        len(asserts) == 1
+        and isinstance(asserts[0].test, ast.Compare)
+        and isinstance(asserts[0].test.comparators[0], ast.Constant)
+        and asserts[0].test.comparators[0].value == 1000.0,
+        "B11D5",
+        "the only failure-producing expression remains `rate >= 1000.0`",
+    )
+    _require(
+        not [n for n in _own_scope_nodes(b11) if isinstance(n, (ast.Return, ast.Raise))],
+        "B11D5",
+        "the benchmark may not return or raise before its bar",
+    )
+    for node in ast.walk(b11):
+        if isinstance(node, ast.Call):
+            name = _callee_name(node) or ""
+            _require(
+                name not in ("skip", "xfail", "importorskip", "exit", "fail"),
+                "B11D5",
+                f"{name}() at line {node.lineno} would replace the bar with an "
+                "outcome the diagnostics chose",
+            )
+
+    iters = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == "n_iters"
+    ]
+    _require(
+        len(iters) == 1
+        and isinstance(iters[0].value, ast.Constant)
+        and iters[0].value.value == 800,
+        "B11D5",
+        "the timed row count per writer remains 800",
+    )
+    ranges = sorted(
+        n.args[0].value
+        for n in _calls_named(b11, "range")
+        if len(n.args) == 1 and isinstance(n.args[0], ast.Constant)
+    )
+    _require(
+        ranges == [50, 100],
+        "B11D5",
+        f"the fixed warmup and single-writer row counts {ranges} != [50, 100]",
+    )
+
+    # No branch, guard or assertion may read a diagnostic value.
+    diagnostic_names = set()
+    for node in ast.walk(b11):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        produced = [
+            c
+            for c in ast.walk(node.value)
+            if isinstance(c, ast.Call)
+            and (_callee_name(c) or "") in B11_DIAGNOSTIC_FUNCTIONS
+        ]
+        if produced or isinstance(node.value, ast.Dict):
+            diagnostic_names.add(node.targets[0].id)
+    for node in ast.walk(b11):
+        if isinstance(node, ast.Try):
+            for handler in node.handlers:
+                for inner in ast.walk(handler):
+                    if isinstance(inner, ast.Call):
+                        _require(
+                            (_callee_name(inner) or "") not in ("skip", "xfail"),
+                            "B11D5",
+                            "a failed diagnostic read may not skip the benchmark",
+                        )
+    tests = []
+    for node in ast.walk(b11):
+        if isinstance(node, (ast.If, ast.While, ast.IfExp)):
+            tests.append(node.test)
+        elif isinstance(node, ast.Assert):
+            tests.append(node.test)
+    for test in tests:
+        for node in ast.walk(test):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                _require(
+                    node.id not in diagnostic_names,
+                    "B11D5",
+                    f"a diagnostic value {node.id!r} decides a branch or the bar at "
+                    f"line {node.lineno}; `unavailable` is a reportable value, not "
+                    "a skip, a retry or a threshold exemption",
+                )
+
+    for phrase in (
+        "B11 diagnostics=",
+        "inside the running PostgreSQL container",
+        "unavailable",
+        "reported-only",
+    ):
+        _require(
+            phrase in notes,
+            "B11D5",
+            f"the B11 manifest notes must declare {phrase!r}: the provenance and "
+            "the reported-only status of the new fields are part of the entry",
+        )
+
+
+# --------------------------------------------------------------------------
 # A1-A10 — the benchmark tier's configuration surface.
 # --------------------------------------------------------------------------
 
@@ -2947,8 +5760,23 @@ def check_A6(sources: dict[str, str]) -> None:
 
 def check_A7a(sources: dict[str, str]) -> None:
     for fname, src in sources.items():
-        for node in ast.walk(ast.parse(src)):
+        tree = ast.parse(src)
+        parents = _parent_map(tree)
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
+                continue
+            if node.attr in FIXTURE_WRITE_ATTRIBUTES:
+                # Locality, not just membership: a filesystem write is legal
+                # only in the one test that builds throwaway proc/PSI inputs.
+                enclosing = _enclosing_module_function(node, parents)
+                _require(
+                    fname == BENCH_NAME and enclosing == FIXTURE_WRITE_FUNCTION,
+                    "A7a",
+                    f"fixture-write attribute {node.attr!r} in {fname}"
+                    f"{'::' + enclosing if enclosing else ''} at line "
+                    f"{node.lineno} is legal only inside "
+                    f"{FIXTURE_WRITE_FUNCTION}",
+                )
                 continue
             if node.attr in ALLOWED_ATTRIBUTES:
                 continue
@@ -3339,6 +6167,16 @@ def _run_all_checkers(repo_root: Path) -> None:
     for wp in model["writer_processes"]:
         for site in wp["call_sites"]:
             check_call_site(site, wp["process"], repo_root)
+    check_B11D1(sources[BENCH_NAME])
+    check_B11D2(sources[BENCH_NAME])
+    check_B11D3(sources[BENCH_NAME])
+    check_B11D4(sources[BENCH_NAME])
+    check_B11D5(
+        sources[BENCH_NAME],
+        read_manifest_isolated(
+            bench_dir / "thresholds.yaml", key_path="benchmarks[id=B11].notes"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -3413,6 +6251,52 @@ def test_b11_harness_derives_its_width_from_the_manifest_and_widens_nothing():
     check_W4(bench)
 
 
+def test_b11_diagnostics_are_reported_only_and_fixed():
+    """FP-B11HD-1/3/4/5: the independent, unconstrained source guard.
+
+    The benchmark-tier tests are written under the closed §3.7 inventory, so
+    this one owns the real AST proof: the fifth fixed prefix and the exact
+    21-field schema, the direct B1 parser provenance and the single `Path`
+    binding, the honest per-writer side channel with the shipped W2 chain
+    untouched, the target-container exec route with every test-process,
+    privileged and helper-container substitute rejected, storage resolution
+    before warmup, the print before the bar, the unchanged threshold, writer,
+    pool, durability and fixture values, and the absence of any
+    diagnostic-conditioned branch, skip, retry or timed-loop read.
+    """
+    sources = tier_sources()
+    src = sources[BENCH_NAME]
+    notes = read_manifest_isolated(key_path="benchmarks[id=B11].notes")
+    check_B11D1(src)
+    check_B11D2(src)
+    check_B11D3(src)
+    check_B11D4(src)
+    check_B11D5(src, notes)
+    check_W4(src)
+    check_W2(src)
+    check_A6(sources)
+    check_A7a(sources)
+    # The fixture's sole admitted handoff of the exact running container.
+    assert '"container": pg' in sources[CONFTEST_NAME], (
+        "the seeded fixture must yield the running PostgresContainer B11 inspects"
+    )
+
+    # Non-redundancy (slice §3.7): rebinding the handle and reading an
+    # attribute that IS in ALLOWED_ATTRIBUTES keeps A7a green, so the
+    # provenance guard is not restating a rule another checker already owns.
+    rebound = src.replace(
+        '    values["storage_pgdata_path"] = _encode_b11_value(pgdata_path)\n',
+        '    values["storage_pgdata_path"] = _encode_b11_value(pgdata_path)\n'
+        "    handle = container\n"
+        '    handle.get("Id")\n',
+    )
+    assert rebound != src, "fixture precondition: the rebind anchor moved"
+    check_A7a({CONFTEST_NAME: sources[CONFTEST_NAME], BENCH_NAME: rebound})
+    with pytest.raises(AssertionError) as excinfo:
+        check_B11D3(rebound)
+    assert str(excinfo.value).split(":", 1)[0] == "B11D3", str(excinfo.value)
+
+
 def test_b11_benchmark_tier_database_configuration_is_allowlisted():
     sources = tier_sources()
     check_A1(BENCH_DIR)
@@ -3476,6 +6360,16 @@ def _seed_repo(root: Path) -> None:
         dest = root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text((REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    # The four package markers the real tree already carries.  A10(ii) derives
+    # its shadowable set from the tier's own import inventory, which now
+    # includes the top-level name `services`: without these markers the
+    # miniature tree would report a shadowing module the real tree does not
+    # have, and the control would be measuring the seed rather than the rule.
+    # Nothing is exempted here -- removing any one of them is A10-red.
+    for rel in sorted(EXPECTED_PACKAGE_DIRS):
+        marker = root / rel / "__init__.py"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")
     mocks = root / "tests" / "mocks" / "llm"
     mocks.mkdir(parents=True, exist_ok=True)
     (mocks / "mock_llm_server.py").write_text("#\n", encoding="utf-8")
@@ -4714,6 +7608,572 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         _seeded(
             lambda root: (root / GO_GUARD).unlink(),
             lambda root: check_C7(go_site, root),
+        ),
+    )
+
+    # ---- B11 host/storage diagnostics (FP-B11HD-1..5) --------------------
+    def diag_case(old: str, new: str, checker, count: int = -1):
+        return _seeded(
+            lambda root: _replace(root, TIER_BENCH, old, new, count), checker
+        )
+
+    def b11d1(root: Path) -> None:
+        check_B11D1(_bench_src(root))
+
+    def b11d2(root: Path) -> None:
+        check_B11D2(_bench_src(root))
+
+    def b11d3(root: Path) -> None:
+        check_B11D3(_bench_src(root))
+
+    def b11d4(root: Path) -> None:
+        check_B11D4(_bench_src(root))
+
+    def b11d5(root: Path) -> None:
+        check_B11D5(
+            _bench_src(root),
+            read_manifest_isolated(
+                root / "tests" / "benchmark" / "thresholds.yaml",
+                key_path="benchmarks[id=B11].notes",
+            ),
+        )
+
+    # canonical grammar
+    add(
+        "diagnostics_field_deleted",
+        "B11D1",
+        diag_case('    "storage_model",\n)', ")", b11d1),
+    )
+    add(
+        "diagnostics_field_reordered",
+        "B11D1",
+        diag_case(
+            '    "storage_rotational",\n    "storage_scheduler",\n',
+            '    "storage_scheduler",\n    "storage_rotational",\n',
+            b11d1,
+            count=1,
+        ),
+    )
+    add(
+        "diagnostics_prefix_changed",
+        "B11D1",
+        diag_case(
+            'B11_DIAGNOSTIC_PREFIX = "B11 diagnostics="',
+            'B11_DIAGNOSTIC_PREFIX = "B11 diag="',
+            b11d1,
+        ),
+    )
+    add(
+        "diagnostics_unavailable_literal_changed",
+        "B11D1",
+        diag_case(
+            'B11_DIAGNOSTIC_UNAVAILABLE = "unavailable"',
+            'B11_DIAGNOSTIC_UNAVAILABLE = "0"',
+            b11d1,
+        ),
+    )
+    add(
+        "diagnostics_writer_entries_comma_joined",
+        "B11D1",
+        diag_case('return "+".join(entries)', 'return ",".join(entries)', b11d1),
+    )
+    add(
+        "diagnostics_mapping_field_dropped",
+        "B11D1",
+        diag_case(
+            '        "storage_model": storage_values["storage_model"],\n',
+            "",
+            b11d1,
+        ),
+    )
+    add(
+        "diagnostics_mapping_field_duplicated",
+        "B11D1",
+        diag_case(
+            '        "storage_model": storage_values["storage_model"],\n',
+            '        "storage_model": storage_values["storage_model"],\n'
+            '        "storage_model": storage_values["storage_model"],\n',
+            b11d1,
+        ),
+    )
+    add(
+        "diagnostics_canonical_print_removed",
+        "B11D1",
+        diag_case(
+            "    print(_serialize_b11_diagnostics(diagnostic_values))\n", "", b11d1
+        ),
+    )
+
+    def canonical_print_after_the_bar(root: Path) -> None:
+        _replace(
+            root,
+            TIER_BENCH,
+            "    print(_serialize_b11_diagnostics(diagnostic_values))\n",
+            "",
+        )
+        _replace(
+            root,
+            TIER_BENCH,
+            '        f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"\n'
+            "    )\n",
+            '        f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"\n'
+            "    )\n"
+            "    print(_serialize_b11_diagnostics(diagnostic_values))\n",
+        )
+
+    add(
+        "diagnostics_printed_after_the_bar",
+        "B11D1",
+        _seeded(canonical_print_after_the_bar, b11d1),
+    )
+
+    # host readings and their provenance
+    add(
+        "host_parsers_from_another_module",
+        "B11D2",
+        diag_case(
+            "from services.gateway.tests.b1_reference_profile import (",
+            "from services.gateway.tests.b1_topology_probe import (",
+            b11d2,
+        ),
+    )
+    add(
+        "host_parser_aliased",
+        "B11D2",
+        diag_case(
+            "    counter_delta,\n", "    counter_delta as counter_delta,\n", b11d2
+        ),
+    )
+    add(
+        "host_parser_redefined_locally",
+        "B11D2",
+        diag_case(
+            "def _encode_b11_value(value: str) -> str:",
+            "def counter_delta(before, after, *, label):\n"
+            "    return after - before\n"
+            "\n"
+            "\n"
+            "def _encode_b11_value(value: str) -> str:",
+            b11d2,
+        ),
+    )
+    add(
+        "host_proc_stat_source_redirected",
+        "B11D2",
+        diag_case(
+            'proc_stat_path: Path = Path("/proc/stat")',
+            'proc_stat_path: Path = Path("/tmp/b11-fixture-stat")',
+            b11d2,
+        ),
+    )
+    add(
+        "host_psi_root_redirected",
+        "B11D2",
+        diag_case(
+            'psi_root: Path = Path("/proc/pressure")',
+            'psi_root: Path = Path("/tmp/b11-fixture-pressure")',
+            b11d2,
+        ),
+    )
+    add(
+        "host_clock_tick_name_changed",
+        "B11D2",
+        diag_case(
+            'os.sysconf("SC_CLK_TCK")', 'os.sysconf("SC_NPROCESSORS_ONLN")', b11d2
+        ),
+    )
+    add(
+        "host_os_member_widened",
+        "B11D2",
+        diag_case("os.cpu_count()", "os.getloadavg()", b11d2),
+    )
+    add(
+        "host_reader_swallows_every_error",
+        "B11D2",
+        diag_case(
+            "    except (OSError, ValueError):\n        snapshot",
+            "    except Exception:\n        snapshot",
+            b11d2,
+        ),
+    )
+
+    # storage provenance
+    def storage_read_from_the_test_process(root: Path) -> None:
+        _replace(
+            root,
+            TIER_BENCH,
+            "            _exec_b11_container_text(\n"
+            "                wrapped_container,\n"
+            "                [\n"
+            '                    "/bin/sh",\n'
+            '                    "-c",\n'
+            "                    B11_CONTAINER_MOUNT_SCRIPT,\n"
+            '                    "b11-mount",\n'
+            "                    pgdata_path,\n"
+            "                ],\n"
+            "            )\n",
+            '            Path("/proc/self/mountinfo").read_text(encoding="utf-8")\n',
+        )
+
+    add(
+        "storage_read_from_the_test_process",
+        "B11D3",
+        _seeded(storage_read_from_the_test_process, b11d3),
+    )
+    add(
+        "storage_exec_privileged",
+        "B11D3",
+        diag_case("        privileged=False,\n", "        privileged=True,\n", b11d3),
+    )
+    add(
+        "storage_exec_user_changed",
+        "B11D3",
+        diag_case('        user="postgres",\n', '        user="root",\n', b11d3),
+    )
+    add(
+        "storage_exec_gains_a_namespace_option",
+        "B11D3",
+        diag_case(
+            "        demux=False,\n", '        demux=False,\n        pid_mode="host",\n', b11d3
+        ),
+    )
+    add(
+        "storage_mount_script_reads_another_table",
+        "B11D3",
+        diag_case("cat /proc/self/mountinfo", "cat /etc/mtab", b11d3),
+    )
+    add(
+        "storage_block_script_picks_one_of_several_slaves",
+        "B11D3",
+        diag_case(
+            'if [ "$#" -eq 1 ] && [ -e "$1" ]; then',
+            'if [ "$#" -ge 1 ] && [ -e "$1" ]; then',
+            b11d3,
+        ),
+    )
+    add(
+        "storage_pgdata_hard_coded",
+        "B11D3",
+        diag_case(
+            'text("SELECT current_setting(\'data_directory\')")',
+            'text("SELECT \'/var/lib/postgresql/data\'")',
+            b11d3,
+        ),
+    )
+    add(
+        "storage_container_from_another_fixture_key",
+        "B11D3",
+        diag_case(
+            '_read_b11_storage_identity(scale_pg["container"], pgdata_path)',
+            '_read_b11_storage_identity(scale_pg["factory"], pgdata_path)',
+            b11d3,
+        ),
+    )
+    add(
+        "storage_query_from_another_fixture_key",
+        "B11D3",
+        diag_case(
+            '        with scale_pg["engine"].connect() as conn:',
+            '        with scale_pg["factory"]().connect() as conn:',
+            b11d3,
+        ),
+    )
+    add(
+        "storage_argv_frame_changed",
+        "B11D3",
+        diag_case('                    "b11-mount",\n', '                    "mount",\n', b11d3),
+    )
+
+    def container_handle_rebound_and_read(root: Path) -> None:
+        """The non-redundancy mutation: `get` stays in ALLOWED_ATTRIBUTES, so
+        A7a is green while the provenance guard must be red."""
+        _replace(
+            root,
+            TIER_BENCH,
+            "    values[\"storage_pgdata_path\"] = _encode_b11_value(pgdata_path)\n",
+            "    values[\"storage_pgdata_path\"] = _encode_b11_value(pgdata_path)\n"
+            "    handle = container\n"
+            "    handle.get(\"Id\")\n",
+        )
+
+    add(
+        "storage_handle_rebound_then_read",
+        "B11D3",
+        _seeded(container_handle_rebound_and_read, b11d3),
+    )
+    add(
+        "storage_handle_rebound_then_unlisted_attribute",
+        "A7a",
+        _seeded(
+            lambda root: (
+                container_handle_rebound_and_read(root),
+                _replace(
+                    root,
+                    TIER_BENCH,
+                    '    handle.get("Id")\n',
+                    '    handle.get("Id")\n    handle.reload()\n',
+                ),
+            ),
+            lambda root: check_A7a(tier_sources(root)),
+        ),
+    )
+    add(
+        "container_direct_attribute_in_conftest",
+        "A6",
+        _seeded(
+            lambda root: _replace(
+                root,
+                TIER_CONFTEST,
+                "        dsn = pg.get_connection_url()\n",
+                "        dsn = pg.get_connection_url()\n        pg.reload()\n",
+            ),
+            lambda root: check_A6(tier_sources(root)),
+        ),
+    )
+    add(
+        "fixture_write_outside_its_own_test",
+        "A7a",
+        diag_case(
+            "def _encode_b11_value(value: str) -> str:\n"
+            '    """Percent-encode one free-form diagnostic value',
+            "def _encode_b11_value(value: str) -> str:\n"
+            '    Path("/tmp/b11-note").write_text(value, encoding="utf-8")\n'
+            '    """Percent-encode one free-form diagnostic value',
+            lambda root: check_A7a(tier_sources(root)),
+        ),
+    )
+
+    # window ordering and the writer side channel
+    def storage_after_engine_construction(root: Path) -> None:
+        _replace(
+            root,
+            TIER_BENCH,
+            "    storage_values = _read_b11_storage_identity("
+            'scale_pg["container"], pgdata_path)\n',
+            "",
+        )
+        _replace(
+            root,
+            TIER_BENCH,
+            "    def _run_writer(idx: int) -> int:\n",
+            "    storage_values = _read_b11_storage_identity("
+            'scale_pg["container"], pgdata_path)\n\n'
+            "    def _run_writer(idx: int) -> int:\n",
+        )
+
+    add(
+        "storage_resolved_after_the_engines",
+        "B11D4",
+        _seeded(storage_after_engine_construction, b11d4),
+    )
+    add(
+        "host_open_read_after_the_timer",
+        "B11D4",
+        diag_case(
+            "        host_before = _read_b11_host_snapshot()\n"
+            "        t0 = time.perf_counter()\n",
+            "        t0 = time.perf_counter()\n"
+            "        host_before = _read_b11_host_snapshot()\n",
+            b11d4,
+        ),
+    )
+    add(
+        "host_close_read_before_the_elapsed_assignment",
+        "B11D4",
+        diag_case(
+            "        elapsed = time.perf_counter() - t0\n"
+            "        host_after = _read_b11_host_snapshot()\n",
+            "        host_after = _read_b11_host_snapshot()\n"
+            "        elapsed = time.perf_counter() - t0\n",
+            b11d4,
+        ),
+    )
+    add(
+        "side_channel_written_inside_the_row_loop",
+        "B11D4",
+        diag_case(
+            "                rows += 1\n"
+            "        writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, rows)\n",
+            "                rows += 1\n"
+            "                writer_elapsed_rows[idx] = ("
+            "time.perf_counter() - writer_t0, rows)\n",
+            b11d4,
+        ),
+    )
+    add(
+        "side_channel_written_to_a_fixed_slot",
+        "B11D4",
+        diag_case(
+            "        writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, rows)",
+            "        writer_elapsed_rows[0] = (time.perf_counter() - writer_t0, rows)",
+            b11d4,
+        ),
+    )
+    add(
+        "side_channel_row_count_forged",
+        "B11D4",
+        diag_case(
+            "        writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, rows)",
+            "        writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, n_iters)",
+            b11d4,
+        ),
+    )
+    add(
+        "side_channel_elapsed_forged",
+        "B11D4",
+        diag_case(
+            "        writer_elapsed_rows[idx] = (time.perf_counter() - writer_t0, rows)",
+            "        writer_elapsed_rows[idx] = (0.001, rows)",
+            b11d4,
+        ),
+    )
+    add(
+        "side_channel_width_detached_from_the_writer_set",
+        "B11D4",
+        diag_case(
+            "    writer_elapsed_rows = [None] * len(instances)",
+            "    writer_elapsed_rows = [None] * 7",
+            b11d4,
+        ),
+    )
+    add(
+        "writer_opening_clock_moved_into_the_session",
+        "B11D4",
+        diag_case(
+            "        writer_t0 = time.perf_counter()\n"
+            "        with factory() as session:\n",
+            "        with factory() as session:\n"
+            "            writer_t0 = time.perf_counter()\n",
+            b11d4,
+        ),
+    )
+    add(
+        "host_read_inside_the_row_loop",
+        "B11D4",
+        diag_case(
+            "            for i in range(n_iters):\n",
+            "            for i in range(n_iters):\n"
+            "                _read_b11_host_snapshot()\n",
+            b11d4,
+        ),
+    )
+    add(
+        "writer_report_serialized_from_the_executor_result",
+        "B11D4",
+        diag_case(
+            "        \"writer_elapsed_rows\": _serialize_writer_elapsed_rows(\n"
+            "            instances, writer_elapsed_rows\n"
+            "        ),",
+            "        \"writer_elapsed_rows\": _serialize_writer_elapsed_rows(\n"
+            "            instances, committed\n"
+            "        ),",
+            b11d4,
+        ),
+    )
+
+    # reported-only and the fixed B11 model
+    add(
+        "bar_threshold_lowered",
+        "B11D5",
+        diag_case("assert rate >= 1000.0, (", "assert rate >= 500.0, (", b11d5),
+    )
+    add(
+        "timed_row_count_changed",
+        "B11D5",
+        diag_case("    n_iters = 800\n", "    n_iters = 100\n", b11d5),
+    )
+    add(
+        "warmup_row_count_changed",
+        "B11D5",
+        diag_case("            for i in range(50):", "            for i in range(5):", b11d5),
+    )
+    add(
+        "single_writer_row_count_changed",
+        "B11D5",
+        diag_case("        for i in range(100):", "        for i in range(10):", b11d5),
+    )
+    add(
+        "bar_skipped_on_an_unavailable_reading",
+        "B11D5",
+        diag_case(
+            "    assert rate >= 1000.0, (",
+            '    if host_values["host_steal_usec"] == B11_DIAGNOSTIC_UNAVAILABLE:\n'
+            '        pytest.skip("no host counters")\n'
+            "    assert rate >= 1000.0, (",
+            b11d5,
+        ),
+    )
+    add(
+        "bar_conditioned_on_a_storage_reading",
+        "B11D5",
+        diag_case(
+            "    assert rate >= 1000.0, (",
+            '    if storage_values["storage_rotational"] == "1":\n'
+            "        return\n"
+            "    assert rate >= 1000.0, (",
+            b11d5,
+        ),
+    )
+    add(
+        "notes_drop_the_diagnostics_contract",
+        "B11D5",
+        _seeded(
+            lambda root: _replace(
+                root,
+                "tests/benchmark/thresholds.yaml",
+                "canonical B11 diagnostics= record",
+                "canonical record",
+            ),
+            b11d5,
+        ),
+    )
+    add(
+        "seeded_package_marker_removed",
+        "A10",
+        _seeded(
+            lambda root: (
+                root / "services/dashboard-api/dashboard_api/__init__.py"
+            ).unlink(),
+            lambda root: check_A10(root),
+        ),
+    )
+    add(
+        "benchmark_path_import_duplicated",
+        "A2b",
+        diag_case(
+            "from pathlib import Path\n",
+            "from pathlib import Path\nfrom pathlib import Path\n",
+            lambda root: check_A2b(tier_sources(root)),
+            count=1,
+        ),
+    )
+    add(
+        "benchmark_path_import_removed",
+        "A2b",
+        diag_case(
+            "from pathlib import Path\n",
+            "",
+            lambda root: check_A2b(tier_sources(root)),
+            count=1,
+        ),
+    )
+    add(
+        "parser_parameter_renamed_to_reserved_text",
+        "A2c",
+        diag_case(
+            "def _parse_b11_container_mount_output(output: str) -> tuple[str, str]:",
+            "def _parse_b11_container_mount_output(text: str) -> tuple[str, str]:",
+            lambda root: check_A2c(tier_sources(root)),
+        ),
+    )
+    add(
+        "container_handle_annotated_object",
+        "A2d",
+        diag_case(
+            "def _exec_b11_container_text(wrapped_container, argv: list[str]) -> str:",
+            "def _exec_b11_container_text("
+            "wrapped_container: object, argv: list[str]) -> str:",
+            lambda root: check_A2d(tier_sources(root)),
         ),
     )
 

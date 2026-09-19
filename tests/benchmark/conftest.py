@@ -200,4 +200,4 @@ def scale_pg():
             conn.execute(text("ANALYZE llm_calls"))
             conn.execute(text("ANALYZE audit_log"))
 
-        yield {"dsn": dsn, "factory": factory, "engine": engine}
+        yield {"dsn": dsn, "factory": factory, "engine": engine, "container": pg}
