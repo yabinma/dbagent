@@ -6243,29 +6243,69 @@ def _b1lb_values_file(tmp_path, ig: dict, name: str = "values.yaml"):
     return path
 
 
-def test_b1_latency_basis_target_is_isolated_and_fail_closed():
+def test_b1_latency_basis_target_is_isolated_and_fail_closed(tmp_path):
     """FP-B1LB-6: one explicit target, isolated from the gate, failing closed.
 
     Two legs. The launcher/workflow surface says the target exists, carries the
     explicit selection exactly once, leaves the four GC-3 selections byte-exact,
     runs both preconditions in the fixed order and is absent from `all` and
     from every default CI route. The CLI leg then EXERCISES the preconditions
-    against the shipped carriers and requires the documented
-    `basis_oracle_unobserved:<reason>` on stderr with exit 3 -- not a skip, not
-    a zero, and not an ordinary error.
+    and requires the documented `basis_oracle_unobserved:<reason>` on stderr
+    with exit 3 -- not a skip, not a zero, and not an ordinary error.
+
+    PB-C1: `ledger_unrecorded` is BY CONSTRUCTION the verdict for a carrier
+    with no observations and no attempts, so directing it at the shipped
+    `values.yaml` asserted that the coordinator had not recorded anything yet.
+    That is unsatisfiable for every qualified ledger, whatever it measured, so
+    the unrecorded leg now runs against an ephemeral empty carrier under
+    tmp_path and the shipped carrier is no longer asserted empty. All three
+    preflight verdicts stay failure-producing, as the named controls below.
     """
     launcher = GC3_LAUNCHER.read_text(encoding="utf-8")
     workflow = yaml.safe_load(GC3_CI_YML.read_text(encoding="utf-8"))
     assert _b1lb_target_failures(launcher, workflow) == []
 
-    # The shipped, pre-collection state: unrecorded, and it says so exactly.
-    result = _b1lb_run_cli(
-        "basis-oracle-preflight",
-        "--values", str(B1LB_VALUES),
-        "--decision", str(GC3_DECISION),
-    )
+    def _preflight(path):
+        return _b1lb_run_cli(
+            "basis-oracle-preflight",
+            "--values", str(path),
+            "--decision", str(GC3_DECISION),
+        )
+
+    # Control `qualified_preflight_returns_zero`. Preflight PASSES on a
+    # qualified carrier, and the costs are not what it reads: two different
+    # valid cost vectors give the same verdict. This is exactly why the
+    # pre-correction `returncode == 3` on the shipped file could not survive
+    # any recording, and it is decided without consulting a measured value.
+    for label, costs in (("fixture", None), ("other", (2.0, 2.5, 3.0, 2.25, 2.75))):
+        qualified = _b1lb_values_file(
+            tmp_path, b1lb._filled_ledger(cpu_vals=costs), f"qualified-{label}.yaml"
+        )
+        result = _preflight(qualified)
+        assert result.returncode == 0, (label, result)
+        assert (result.stdout, result.stderr) == ("", ""), (label, result)
+
+    # Control `empty_preflight_returns_ledger_unrecorded`. The exact exit and
+    # the exact reason, on a carrier that is empty by construction: the
+    # qualified builder with exactly `observations = []` and
+    # `collection.attempts = []`, and nothing else changed.
+    empty = b1lb._filled_ledger()
+    empty["sizingBasis"]["observations"] = []
+    empty["sizingBasis"]["collection"]["attempts"] = []
+    result = _preflight(_b1lb_values_file(tmp_path, empty, "unrecorded.yaml"))
     assert result.returncode == B1LB_UNOBSERVED_EXIT, result
     assert result.stderr.strip() == f"{B1LB_UNOBSERVED_PREFIX}ledger_unrecorded", result.stderr
+    assert result.stdout == "", result.stdout
+
+    # Control `invalid_nonempty_preflight_returns_ledger_invalid`. A non-empty
+    # but broken carrier is a DIFFERENT reason, so nothing invalid can reach
+    # the unrecorded branch and be read as "not collected yet".
+    broken = b1lb._filled_ledger(
+        mutate=lambda ig: ig["sizingBasis"]["observations"][0].__setitem__("errors", 1)
+    )
+    result = _preflight(_b1lb_values_file(tmp_path, broken, "invalid.yaml"))
+    assert result.returncode == B1LB_UNOBSERVED_EXIT, result
+    assert result.stderr.strip() == f"{B1LB_UNOBSERVED_PREFIX}ledger_invalid", result.stderr
     assert result.stdout == "", result.stdout
 
     # Ordinary CLI misuse keeps an ordinary status and never looks unobserved.
@@ -6597,15 +6637,155 @@ def test_prior_slice_sizing_exclusions_survive_qualified_ledger():
 
     # (4) The shipped ledger carries no synthetic fixture value either: the
     # fixtures are mutation operands, never recorded evidence.
-    shipped = yaml.safe_load(B1LB_VALUES.read_text(encoding="utf-8"))
-    rendered = yaml.safe_dump(shipped["ingestGateway"]["sizingBasis"])
-    for value in (
-        b1lb.FIXTURE_HEAD_SHA, b1lb.FIXTURE_IMAGE, b1lb.FIXTURE_OTHER_MODEL,
-    ) + tuple(b1lb.FIXTURE_RUN_IDS):
-        assert value not in rendered, f"the shipped ledger carries the fixture {value!r}"
-    assert signature["cpuModel"] not in rendered, (
-        "the shipped signature already names a collected model"
+    #
+    # PB-C2/PB-C3: by EXACT field and EXACT identity token, after the carrier
+    # has been validated -- never by searching dumped YAML. The dump search was
+    # wrong in two ways, both provable on fabricated qualified input and
+    # neither dependent on any measured value. `signature["cpuModel"] not in
+    # rendered` cannot hold for ANY qualified ledger, because the signature
+    # model IS GC-3's one selected model and every row repeats it; and
+    # `"11/1" not in rendered` fires on any real GitHub identity that merely
+    # CONTAINS a fixture identity as a proper substring. Exactness restores
+    # what the pins were for: a fixture value, not a value spelled like one.
+    # `FIXTURE_OTHER_TOPOLOGY` is deliberately not an operand -- its value is a
+    # real GC-3 topology, so a legitimately selected ledger could carry it.
+    def _fixture_leak_check(ig: dict) -> list[str]:
+        """Which synthetic fixture operands this ledger carries, fail-closed.
+
+        Validation runs FIRST and raises: an unrecorded or invalid carrier
+        never receives the vacuous "nothing leaked" verdict a token scan would
+        hand it. A sub-assertion construct of this test only.
+        """
+        sb = b1lb.require_ledger_shape(ig)
+        if sb["observations"] == [] and sb["collection"]["attempts"] == []:
+            raise AssertionError(
+                "ledger_unrecorded: an empty carrier gets no leak verdict"
+            )
+        b1lb.validate_sizing_ledger(ig, check_rendered_cpu=False)
+        carriers = [("signature", None, sb["signature"])]
+        carriers += [("observations", i, r) for i, r in enumerate(sb["observations"])]
+        carriers += [
+            ("attempts", i, r) for i, r in enumerate(sb["collection"]["attempts"])
+        ]
+        leaks = []
+        for field, token in (
+            ("headSha", b1lb.FIXTURE_HEAD_SHA),
+            ("image", b1lb.FIXTURE_IMAGE),
+            ("cpuModel", b1lb.FIXTURE_OTHER_MODEL),
+        ):
+            for where, index, row in carriers:
+                if field in row and row[field] == token:
+                    leaks.append(
+                        f"{where}.{field}" if index is None
+                        else f"{where}[{index}].{field}"
+                    )
+        shipped_ids = {row["runId"] for row in sb["observations"]}
+        shipped_ids |= {row["runId"] for row in sb["collection"]["attempts"]}
+        leaks += [
+            f"runId:{value}"
+            for value in sorted(shipped_ids & set(b1lb.FIXTURE_RUN_IDS))
+        ]
+        return sorted(leaks)
+
+    shipped_ig = yaml.safe_load(B1LB_VALUES.read_text(encoding="utf-8"))["ingestGateway"]
+    assert _fixture_leak_check(shipped_ig) == []
+    identity = b1lb.gc3_selected_identity(b1lb.load_gc3_decision(GC3_DECISION))
+    assert shipped_ig["sizingBasis"]["signature"]["cpuModel"] == identity["cpuModel"], (
+        "the shipped signature must name GC-3's one current selected model"
     )
+
+    # Control `qualified_selected_model_is_expected`: the deleted assertion,
+    # applied to a structurally valid ledger. It is red for EVERY qualified
+    # ledger -- the fixture, like any recording, correctly carries the selected
+    # model -- so it was unsatisfiable rather than strict.
+    assert signature["cpuModel"] == identity["cpuModel"]
+    assert signature["cpuModel"] in yaml.safe_dump(qualified["sizingBasis"]), (
+        "the deleted `cpuModel not in rendered` assertion would have to hold here"
+    )
+
+    # Controls `synthetic_signature_exact_token_leak_is_rejected` and
+    # `synthetic_run_id_exact_token_leak_is_rejected`: the untouched synthetic
+    # ledger IS the leak, and every named operand it carries is named back.
+    fixture_leaks = _fixture_leak_check(qualified)
+    assert "signature.headSha" in fixture_leaks, fixture_leaks
+    assert "signature.image" in fixture_leaks, fixture_leaks
+    assert [f"runId:{value}" for value in b1lb.FIXTURE_RUN_IDS] == [
+        leak for leak in fixture_leaks if leak.startswith("runId:")
+    ], fixture_leaks
+
+    # ...including the one operand a ledger can still carry while remaining
+    # fully VALID: a discarded attempt for a model GC-3 never ratified. Exact
+    # field equality finds it; validity alone would not.
+    hidden = b1lb._filled_ledger(
+        mutate=lambda ig: ig["sizingBasis"]["collection"]["attempts"].insert(
+            1,
+            {
+                "runId": "12/1",
+                "headSha": b1lb.FIXTURE_HEAD_SHA,
+                "cpuModel": b1lb.FIXTURE_OTHER_MODEL,
+                "decisionState": b1lb.STATE_UNHOSTABLE,
+                "outcome": b1lb.OUTCOME_DISCARDED,
+                "reason": (
+                    f"{gc3.ROUTE_UNRATIFIED_REASON_PREFIX}{b1lb.FIXTURE_OTHER_MODEL}"
+                ),
+            },
+        )
+    )
+    b1lb.validate_sizing_ledger(hidden, check_rendered_cpu=False)
+    assert "attempts[1].cpuModel" in _fixture_leak_check(hidden)
+
+    # Control `substring_collision_qualified_ledger_control`: a fully
+    # production-shaped qualified ledger whose first identity contains the
+    # fixture identity `11/1` ONLY as a proper substring. It validates; the
+    # deleted substring scan is red on it; the exact-token check is green.
+    # These identities, head and image are fabricated for this control, exist
+    # nowhere but here, and are not any collected run.
+    collision_ids = (
+        "30000000011/1", "30000000123/1", "30000000456/1",
+        "30000000789/1", "30000000999/1",
+    )
+    assert b1lb.FIXTURE_RUN_IDS[0] in collision_ids[0]
+    assert b1lb.FIXTURE_RUN_IDS[0] != collision_ids[0]
+    assert set(collision_ids).isdisjoint(b1lb.FIXTURE_RUN_IDS)
+    production_signature = b1lb._fixture_signature(
+        headSha="a" * 40, image="os-release:abcdef0123456789"
+    )
+
+    def _production_identities(ig):
+        sb = ig["sizingBasis"]
+        for row, run_id in zip(sb["observations"], collision_ids):
+            row["runId"] = run_id
+        for row, run_id in zip(sb["collection"]["attempts"], collision_ids):
+            row["runId"] = run_id
+
+    def _production_ledger(mutate=None):
+        def _mutate(ig):
+            _production_identities(ig)
+            if mutate:
+                mutate(ig)
+        return b1lb._filled_ledger(signature=production_signature, mutate=_mutate)
+
+    collision = _production_ledger()
+    b1lb.validate_sizing_ledger(collision, check_rendered_cpu=False)
+    assert b1lb.FIXTURE_RUN_IDS[0] in yaml.safe_dump(collision["sizingBasis"]), (
+        "the deleted substring scan is red on a ledger holding no fixture identity"
+    )
+    assert _fixture_leak_check(collision) == []
+
+    # Shared controls `fixture_leak_check_rejects_unrecorded` and
+    # `fixture_leak_check_rejects_invalid`: validation FIRST, fail closed.
+    # Both inputs below would score a clean `[]` under a token scan, so a check
+    # that returned a verdict for either would certify nothing.
+    unrecorded = _production_ledger()
+    unrecorded["sizingBasis"]["observations"] = []
+    unrecorded["sizingBasis"]["collection"]["attempts"] = []
+    with pytest.raises(AssertionError, match="ledger_unrecorded"):
+        _fixture_leak_check(unrecorded)
+    invalid = _production_ledger(
+        mutate=lambda ig: ig["sizingBasis"]["observations"][0].__setitem__("errors", 1)
+    )
+    with pytest.raises(AssertionError, match=r"observations\[0\]\.errors"):
+        _fixture_leak_check(invalid)
 
 
 def test_b1_latency_basis_scope_and_frozen_knobs_are_pinned():

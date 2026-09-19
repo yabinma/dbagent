@@ -127,26 +127,36 @@ benchmarks:
     workers=4 (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers); no shipped gateway configuration
     value moves for either tier.
     The ingestGateway sizing basis and the chart CPU request/limit derived from it are owned by
-    the B1-LATENCY-BASIS-1 slice and remain UNQUALIFIED: the shipped figure is a historical label
-    with void provenance and nothing in this entry re-certifies it, so no basis number is stated
-    here. That slice closed the ledger schema. ingestGateway.sizingBasis.observations must carry
-    five distinct qualifying CI-scale observations at ONE collection head on the ONE
-    GC-3-selected CPU model, each repeating the signature identity -- collection head, cpus=4,
-    exact cpuModel, exact B1 image fingerprint, worker count, reference topology, placement
-    schema and the current GC-3 decision head -- and each meeting the unchanged CI-scale bar
-    stated above: 15000 offered, 15000 served and committed, 0 errors,
-    served_rate>=CI_SCALE_SUSTAINED_FLOOR=450, due-time p99<150ms, MAX_IN_FLIGHT=500 not reached,
-    platform online, placement_ok=1 and a stable four-worker identity. collection.attempts must
-    carry every benchmark dispatch from the first through the fifth accepted one, each either
-    linked one-to-one to its observation or discarded with its exact recorded GC-3 route reason,
-    failed B1 clause list, signature mismatch or incomplete benchmark step. Collecting that
-    evidence is a coordinator operation that has NOT happened yet: it dispatches this
-    repository's ordinary benchmark workflow at most 20 times at one immutable head after the
-    schema above is reviewed, and no run id, cost, discard or number may be invented, copied from
-    an investigation or written by a tool. Until it does, both carriers stay empty, the
-    signature's collection-time fields stay null, and
+    the B1-LATENCY-BASIS-1 slice, whose bounded collection is now RECORDED and QUALIFIED.
+    ingestGateway.sizingBasis.cpuMsPerRequest is 1.585 ms per request: max + (max - min) over
+    exactly the five recorded observation costs 1.445, 1.488, 1.475, 1.414 and 1.391, from which
+    the chart renders requests.cpu = ceil(1.585 x 200) = 317m and limits.cpu = 5 x 317 = 1585m.
+    The warrant binds ONE collection head, 9239325e198fba129eb3b7c6cf328090e4da7c5f, to the ONE
+    GC-3-selected CPU model AMD EPYC 7763 64-Core Processor, reference topology gateway-split,
+    placement schema 3, image os-release:59a77b5f2666d9c8, workers=4, cpus=4 and GC-3 decision
+    head 9ffaf346bfc02b973db8c475b57ffd2bf516cd2b. ingestGateway.sizingBasis.observations now
+    carries five distinct qualifying CI-scale observations at that one collection head on that
+    one GC-3-selected CPU model: the accepted ordinary benchmark runs 35372436818/1,
+    35372461217/1, 35372474111/1, 35379959523/1 and 35386251868/1.
+    Each row repeats that signature identity -- collection head, cpus=4, exact cpuModel, exact B1
+    image fingerprint, worker count, reference topology, placement schema and the current GC-3
+    decision head -- and each meets the unchanged CI-scale bar stated above: 15000 offered, 15000
+    served and committed, 0 errors, served_rate>=CI_SCALE_SUSTAINED_FLOOR=450, due-time
+    p99<150ms, MAX_IN_FLIGHT=500 not reached, platform online, placement_ok=1 and a stable
+    four-worker identity. collection.attempts carries all eleven benchmark dispatches at that
+    head from the first through the fifth accepted one, each either linked one-to-one to its
+    observation or discarded with its exact recorded GC-3 route reason, failed B1 clause list,
+    signature mismatch or incomplete benchmark step: three AMD EPYC 9V74 80-Core Processor
+    dispatches and one AMD EPYC 9V45 96-Core Processor dispatch took recorded, non-serving GC-3
+    routes and started no workload, one benchmark job was never reached because an earlier
+    functional step failed, and one serving AMD EPYC 7763 64-Core Processor run was discarded
+    because its due-time p99 was 154.0 ms. Nothing here was invented, copied from an
+    investigation or written by a tool: every cost, service, worker, model, authority and
+    placement fact is copied verbatim from that run's own canonical `B1 env=` line, and every run
+    id and head from GitHub's workflow metadata.
     tests/delivery/test_delivery_sizing_ledger.py::test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run
-    is the single failing actual-state owner of that void. The requalifying CPU-basis oracle
+    remains the single actual-state owner of that ledger and of the void it replaced. The
+    requalifying CPU-basis oracle
     FP-IG-18 is isolated in `scripts/integration-test.sh b1_latency_basis`, absent from `all` and
     from default CI and reachable in CI only through a default-false manual workflow_dispatch
     input, so it can neither perturb nor decide the merge gate above. Restating the frozen
