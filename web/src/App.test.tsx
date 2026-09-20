@@ -160,14 +160,27 @@ describe("App routing + role-gated navigation", () => {
   it("admin can open Admin page with bootstrap + pending guidance", async () => {
     localStorage.setItem("rca_dashboard_token", "t");
     localStorage.setItem("rca_dashboard_role", "admin");
+    // AdminPage paints <h1>Administration</h1> before listPlatforms() commits,
+    // so the heading proves nothing about ca-fingerprint / pending-credentials-guide.
+    // Delay the /platforms branch here so this case fails every time if the
+    // assertions below stop waiting for the fetched nodes (CI 35499107378).
+    const baseFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).includes("/platforms")) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return baseFetch(url);
+    });
     renderApp("/admin");
     await waitFor(() =>
       expect(screen.getByText("Administration")).toBeInTheDocument()
     );
-    expect(screen.getByTestId("ca-fingerprint")).toHaveTextContent("sha256:abc");
-    expect(screen.getByTestId("pending-credentials-guide")).toHaveTextContent(
-      "presto-us1"
+    expect(await screen.findByTestId("ca-fingerprint")).toHaveTextContent(
+      "sha256:abc"
     );
+    expect(
+      await screen.findByTestId("pending-credentials-guide")
+    ).toHaveTextContent("presto-us1");
   });
 
   it("viewer is redirected away from /admin", async () => {

@@ -4404,6 +4404,13 @@ def test_b1_host_noise_legacy_fingerprint_defaults_only_new_keys():
     ]
     duplicated = current + "," + serialize_host_noise_fields(complete)
     assert _host_noise_current_line_failures(duplicated)
+    # The check is VALUE-BLIND: an unexposed kernel source renders
+    # `unavailable` and is still an emitted key, so no reader of this check can
+    # void a line (or a GC-3 arm) over an unavailable reading.
+    all_unavailable = "B1 env=cpus=4," + serialize_host_noise_fields(
+        dict.fromkeys(B1_HOST_NOISE_FIELDS, DIAGNOSTIC_UNAVAILABLE)
+    )
+    assert _host_noise_current_line_failures(all_unavailable) == []
     # Present but out of tail order is a failure of its own, distinct from
     # an omission: the block is a closed ORDERED tail.
     reordered = "B1 env=cpus=4," + ",".join(

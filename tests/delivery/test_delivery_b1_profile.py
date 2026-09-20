@@ -1965,10 +1965,10 @@ def _gc1_cardinality_map_failures(test_assigns: "dict[str, ast.AST]") -> list[st
     ) != GC1_AFFINITY_CARDINALITIES["product-exclusive"]:
         fails.append("the product-local 4/3/1 cardinality moved")
     return fails
-# The historical, VOID basis label. Retained as a NAMED value so the pins
-# below can say what they no longer require: B1-LATENCY-BASIS-1 owns the
-# replacement, and no GC-* pin may re-assert this number or the empty ledger.
-GC1_BASIS_MS_PER_REQUEST = 2.427
+# The historical basis number 2.427 is VOID and no longer has a name here.
+# The retired-owner walk below forbids both the literal and the three constant
+# names that used to carry it inside any GC-* pin, so a definition could only
+# serve to re-wire one: B1-LATENCY-BASIS-1 owns the replacement.
 GC1_BASIS_OWNER = "B1-LATENCY-BASIS-1"
 #: The single actual-state owner of the unqualified basis. Every GC-* handoff
 #: pin routes to it instead of duplicating its scheduled failure.
@@ -3896,6 +3896,31 @@ def _gc3_probe_partition_failures(src: str) -> list[str]:
     return fails
 
 
+def _b1_target_region(launcher: str, target: str) -> str:
+    """The shell text of one target, delimited by top-level function headers.
+
+    Delimiting on headers rather than on a comment between the targets is the
+    point: a comment can be reworded without changing anything the launcher
+    does, and a check that splits on one silently widens its region when that
+    happens. Same splitter as tests/functional/test_manifests.py's.
+    """
+    lines = launcher.splitlines()
+    starts = [
+        (index, match.group(1))
+        for index, match in (
+            (i, re.match(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z", line))
+            for i, line in enumerate(lines)
+        )
+        if match
+    ]
+    for position, (index, name) in enumerate(starts):
+        if name != target:
+            continue
+        stop = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        return "\n".join(lines[index + 1:stop])
+    return ""
+
+
 def _gc3_route_surface_failures() -> list[str]:
     """FP-GC3-4/5: the routing CLI, the launcher flow and the mounted witness.
 
@@ -3963,17 +3988,16 @@ def _gc3_route_surface_failures() -> list[str]:
 
     # The launcher: coverage before route, one closed read, no reason text and
     # no topology literal of its own.
-    region = launcher.split("\nb1() {", 1)
-    if len(region) != 2:
-        return fails + ["the ordinary b1 target is missing"]
     # The ORDINARY target only. B1-LATENCY-BASIS-1 appended a second selected
     # route after it (FP-B1LB-6), which runs the same planner calls; folding
     # the two together would make "exactly one route-fields read" and "the
     # carrier is read only by route" say something about both at once, which
-    # is not what GC-3 pinned. The isolated target has its own pins.
-    b1_region = region[1].split("\n# B1-LATENCY-BASIS-1", 1)[0].split(
-        "\n# The product promise", 1
-    )[0]
+    # is not what GC-3 pinned. The isolated target has its own pins. The region
+    # therefore ends at the NEXT top-level target header, not at the comment
+    # that happens to introduce it.
+    b1_region = _b1_target_region(launcher, "b1")
+    if not b1_region:
+        return fails + ["the ordinary b1 target is missing"]
     for clause in (
         'b1_run_driver driver-coverage.sh "${cpus[0]}"',
         'python3 "$B1_PROBE_PLANNER" route \\',
@@ -4722,7 +4746,6 @@ GC4_THREADPOOL_BOUNDARY = "run_in_threadpool(self._ingest_txn, event)"
 # migration spells it. Dropping it makes candidate selection O(n); it stays.
 GC4_FINGERPRINT_INDEX = "CREATE INDEX ON alert_events (fingerprint, received_at);"
 GC4_DURABILITY_TOKENS = ("synchronous_commit", "fsync", "full_page_writes")
-GC4_BASIS_MS_PER_REQUEST = "cpuMsPerRequest: 2.427"
 # This slice's own diagnostic values. None may become a sizing-carrier value
 # or a B1-LATENCY-BASIS-1 observation; they are evidence and nothing else.
 GC4_RCA_DIAGNOSTICS = ("2.105", "1.901", "2.008")
@@ -5260,7 +5283,6 @@ GC5_MAX_CONNECTIONS_PER_WORKER = 150
 GC5_BACKLOG = 2048
 GC5_GATEWAY_WORKERS = "4"
 GC5_PREPARE_THRESHOLD = 5
-GC5_BASIS_MS_PER_REQUEST = 2.427
 #: The one GC-5 outcome and the diagnostic fields around it.
 GC5_MAX_COMMITS_PER_SERVED = 0.60
 GC5_RATIO_CONSTANT = "B1_COMMIT_SHAPE_MAX_COMMITS_PER_SERVED"
@@ -6945,6 +6967,10 @@ B1HN_CLOSE_HOOK = "_after_window"
 B1HN_READER = "_read_host_noise_snapshot"
 B1HN_SERIALIZER = "serialize_host_noise_fields"
 B1HN_COMPAT_READER = "parse_host_noise_fields"
+#: The value-blind CURRENT-emission check. The compat reader above defaults a
+#: missing key to `unavailable`, so it can never prove that an arm emitted the
+#: block; this one counts the literal `,<key>=` tokens in tail order.
+B1HN_PRESENCE_CHECK = "_host_noise_current_line_failures"
 B1HN_TUPLE = "B1_HOST_NOISE_FIELDS"
 B1HN_GC5_TAIL_FIELD = "postgres_wal_syncs_per_served"
 #: The B1 comparison and the knobs this slice may not move. Restated, not
@@ -7334,6 +7360,14 @@ def test_b1_host_noise_probe_observation_is_post_write_and_nongating():
     assert write_at < observe_at, "the host-noise observation precedes the arm write"
     serialize_at = min(line for line, name in calls if name == B1HN_SERIALIZER)
     assert write_at < serialize_at
+    presence_calls = [line for line, name in calls if name == B1HN_PRESENCE_CHECK]
+    assert presence_calls, (
+        f"the arm observation never calls {B1HN_PRESENCE_CHECK}: the "
+        "backward-compatibility reader alone cannot prove current emission"
+    )
+    presence_at = min(presence_calls)
+    assert write_at < presence_at, "the current-emission check precedes the arm write"
+    assert observe_at <= presence_at <= serialize_at, (observe_at, presence_at, serialize_at)
 
     # It iterates only the closed host-noise inventory and reads only the
     # WRITTEN arm's fingerprint.
@@ -7357,15 +7391,21 @@ def test_b1_host_noise_probe_observation_is_post_write_and_nongating():
         rendered_test = ast.unparse(element.test)
         assert "host_noise" not in rendered_test, rendered_test
         assert B1HN_TUPLE not in rendered_test, rendered_test
-    for element in ast.walk(node):
-        if isinstance(element, ast.Assert):
-            rendered_assert = ast.unparse(element.test)
-            if "host_noise" not in rendered_assert:
-                continue
-            # The one admitted assertion is the closed key inventory itself.
-            assert rendered_assert == (
-                f"tuple(host_noise) == harness.{B1HN_TUPLE}"
-            ), rendered_assert
+    # EXACTLY two admitted assertions, in this order, and both value-blind:
+    # the closed key inventory, and the current-emission presence check that
+    # the backward-compatibility reader cannot satisfy. Requiring the second
+    # one is what stops a constructor that dropped the block from observing as
+    # ten defaulted `unavailable`s; forbidding any third keeps an availability
+    # or value comparison -- the kind that could void an arm -- out.
+    host_noise_asserts = sorted(
+        (element.lineno, ast.unparse(element.test))
+        for element in ast.walk(node)
+        if isinstance(element, ast.Assert) and "host_noise" in ast.unparse(element.test)
+    )
+    assert [rendered for _, rendered in host_noise_asserts] == [
+        f"tuple(host_noise) == harness.{B1HN_TUPLE}",
+        f"harness.{B1HN_PRESENCE_CHECK}(written['fingerprint']) == []",
+    ], host_noise_asserts
     assert "DIAGNOSTIC_UNAVAILABLE not in set(host_noise" not in src
     assert "assert_complete_host_noise_record" not in src
     for verdict_token in ("VERDICT_MET", "VERDICT_MISSED", "verdicts["):

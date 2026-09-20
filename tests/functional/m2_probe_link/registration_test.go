@@ -25,6 +25,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -35,6 +36,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -276,15 +278,79 @@ func startGatewaySubprocess(t *testing.T, gatewayBin, dsn string) *gatewayProces
 	return startGatewaySubprocessOpts(t, gatewayBin, dsn, gatewayStartOpts{})
 }
 
+// maxPortSelectionAttempts caps the port-SELECTION retry in
+// startGatewaySubprocessOpts. Five is a working cap, not a bar: one collision
+// is already rare, and a host that collides five times running has a different
+// problem than this harness can retry around.
+const maxPortSelectionAttempts = 5
+
+// startGatewaySubprocessOpts starts the real probe-gateway child on freshly
+// reserved loopback addresses and returns once every configured listener
+// answers.
+//
+// The ONLY thing retried here is port SELECTION: if the child cannot serve
+// because one of the addresses this harness picked was taken by somebody else
+// between release and bind, the harness reserves new addresses and starts a new
+// child. Every other child failure fails the test on the first attempt, and
+// nothing at all is retried once this function has returned -- a test that
+// fails against a gateway that came up is a real failure (design/fix.md).
 func startGatewaySubprocessOpts(t *testing.T, gatewayBin, dsn string, opts gatewayStartOpts) *gatewayProcess {
+	t.Helper()
+	attempts := 0
+	gw, err := startGatewayWithPortRetry(maxPortSelectionAttempts, func() (*gatewayProcess, error) {
+		attempts++
+		return tryStartGateway(t, gatewayBin, dsn, opts, attempts)
+	})
+	if err != nil {
+		t.Fatalf("start probe-gateway (%d attempt(s)): %v", attempts, err)
+	}
+	return gw
+}
+
+// startGatewayWithPortRetry calls start() until it returns a gateway, retrying
+// ONLY a *portCollisionError and at most maxAttempts times overall. A failure
+// of any other kind is handed straight back to the caller, unretried, as is the
+// last collision once the cap is reached. It takes no *testing.T so that the
+// retry policy itself is directly testable.
+func startGatewayWithPortRetry(maxAttempts int, start func() (*gatewayProcess, error)) (*gatewayProcess, error) {
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var gw *gatewayProcess
+		gw, err = start()
+		if err == nil {
+			return gw, nil
+		}
+		var collision *portCollisionError
+		if !errors.As(err, &collision) {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
+// portSelectionHook, when non-nil, is called with the addresses an attempt
+// reserved, immediately after they are released and before the child is
+// started. Only TestStartGateway_RetriesWhenAReservedPortIsStolen sets it, to
+// occupy one of them and prove the selection retry.
+var portSelectionHook func(attempt int, addrs []string)
+
+// tryStartGateway is one attempt: reserve, configure, start, wait for the
+// listeners. It returns an error (never t.Fatalf) for anything the child does,
+// so the caller can tell a port-selection collision from a real failure.
+func tryStartGateway(t *testing.T, gatewayBin, dsn string, opts gatewayStartOpts, attempt int) (*gatewayProcess, error) {
 	t.Helper()
 	dir := t.TempDir()
 
-	sessionAddr := freePort(t)
-	bootstrapAddr := freePort(t)
+	nPorts := 2
+	if opts.EnableInternalHTTP {
+		nPorts = 3
+	}
+	reserved := reserveGatewayPorts(t, nPorts)
+	sessionAddr := reserved.addrs[0]
+	bootstrapAddr := reserved.addrs[1]
 	var internalAddr string
 	if opts.EnableInternalHTTP {
-		internalAddr = freePort(t)
+		internalAddr = reserved.addrs[2]
 	}
 
 	pubKeyPath := opts.SigningPubKeyPath
@@ -337,60 +403,406 @@ server_cert_sans: ["127.0.0.1"]
 
 	cmd := exec.Command(gatewayBin)
 	cmd.Env = append(os.Environ(), "PROBE_GATEWAY_CONFIG="+cfgPath)
-	logFile, err := os.Create(filepath.Join(dir, "gateway.log"))
+	logPath := filepath.Join(dir, "gateway.log")
+	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create log file: %v", err)
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start probe-gateway: %v", err)
+
+	// Hold the reservations until the last possible moment: the child is the
+	// next thing that binds these addresses.
+	reserved.release()
+	if portSelectionHook != nil {
+		portSelectionHook(attempt, reserved.addrs)
 	}
+
+	startErr := cmd.Start()
+	// The child has its own dup of this descriptor; the parent's copy would
+	// otherwise leak once per attempt.
+	_ = logFile.Close()
+	if startErr != nil {
+		return nil, fmt.Errorf("start probe-gateway: %w", startErr)
+	}
+
+	waitAddrs := []string{sessionAddr, bootstrapAddr}
+	if opts.EnableInternalHTTP {
+		waitAddrs = append(waitAddrs, internalAddr)
+	}
+	for _, addr := range waitAddrs {
+		if err := waitForTCPErr(addr); err != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			gatewayLog := readGatewayLog(logPath)
+			if collided := collidedReservedAddr(gatewayLog, reserved.addrs); collided != "" {
+				return nil, &portCollisionError{addr: collided, gatewayLog: gatewayLog, err: err}
+			}
+			return nil, fmt.Errorf("%w\nprobe-gateway log:\n%s", err, gatewayLog)
+		}
+	}
+
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 		if t.Failed() {
-			if content, err := os.ReadFile(filepath.Join(dir, "gateway.log")); err == nil {
+			if content, err := os.ReadFile(logPath); err == nil {
 				t.Logf("probe-gateway log:\n%s", content)
 			}
 		}
 	})
 
-	waitForTCP(t, sessionAddr)
-	waitForTCP(t, bootstrapAddr)
-	if opts.EnableInternalHTTP {
-		waitForTCP(t, internalAddr)
-	}
-
 	return &gatewayProcess{
 		cmd: cmd, sessionAddr: sessionAddr, bootstrapAddr: bootstrapAddr,
 		internalAddr: internalAddr, stateDir: dir,
-	}
+	}, nil
 }
 
-func freePort(t *testing.T) string {
+// --- gateway port reservation ------------------------------------------------------
+
+// reservedGatewayPorts is a set of loopback addresses held open at the same
+// time. Holding is the whole point: a picker that opens a listener, records its
+// address and closes it before picking the next one can be handed the SAME port
+// twice by the kernel (7 duplicate triples per 20 000, design/fix.md), and the
+// probe-gateway child binds session/bootstrap/internal from overlapping
+// goroutines -- so a duplicate is a certain `bind: address already in use`.
+type reservedGatewayPorts struct {
+	addrs     []string
+	listeners []net.Listener
+}
+
+// release closes every held listener. Call it immediately before starting the
+// child that binds these addresses; the remaining window between release and
+// bind is the TOCTOU the selection retry above covers.
+func (r *reservedGatewayPorts) release() {
+	for _, lis := range r.listeners {
+		_ = lis.Close()
+	}
+	r.listeners = nil
+}
+
+// reserveGatewayPorts picks n distinct free loopback addresses and keeps all n
+// bound until release() is called.
+func reserveGatewayPorts(t *testing.T, n int) *reservedGatewayPorts {
 	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	res := &reservedGatewayPorts{}
+	for i := 0; i < n; i++ {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			res.release()
+			t.Fatalf("reserve loopback port %d of %d: %v", i+1, n, err)
+		}
+		res.listeners = append(res.listeners, lis)
+		res.addrs = append(res.addrs, lis.Addr().String())
+	}
+	return res
+}
+
+// portCollisionError reports that the child could not serve because one of the
+// addresses THIS harness reserved was already bound by something else: a port
+// selection failure, and the only condition startGatewaySubprocessOpts retries.
+// It is built only from the child's own `bind: address already in use` line
+// naming a reserved address, so no other gateway failure can be mistaken for it.
+type portCollisionError struct {
+	addr       string
+	gatewayLog string
+	err        error
+}
+
+func (e *portCollisionError) Error() string {
+	return fmt.Sprintf("probe-gateway could not bind reserved %s (address already in use): %v\nprobe-gateway log:\n%s",
+		e.addr, e.err, e.gatewayLog)
+}
+
+func (e *portCollisionError) Unwrap() error { return e.err }
+
+// collidedReservedAddr returns the first reserved address the gateway log
+// reports as already bound, or "" if the log shows no such failure. A bind
+// failure on an address this harness did not reserve, and any other failure at
+// all, return "" -- they are not selection failures and must not be retried.
+func collidedReservedAddr(gatewayLog string, reserved []string) string {
+	for _, addr := range reserved {
+		if strings.Contains(gatewayLog, addr+": bind: address already in use") {
+			return addr
+		}
+	}
+	return ""
+}
+
+func readGatewayLog(path string) string {
+	content, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("find free port: %v", err)
+		return fmt.Sprintf("(gateway log %s unreadable: %v)", path, err)
 	}
-	addr := lis.Addr().String()
-	lis.Close()
-	return addr
+	return string(content)
 }
 
-func waitForTCP(t *testing.T, addr string) {
-	t.Helper()
+func waitForTCPErr(addr string) error {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
-			return
+			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("nothing listening on %s after 5s", addr)
+	return fmt.Errorf("nothing listening on %s after 5s", addr)
+}
+
+// --- port selection regression tests (design/fix.md, CI 35372449098) ---------------
+
+// TestReserveGatewayPorts_SimultaneouslyBindable pins what this harness needs
+// from its port picker: the addresses handed to one probe-gateway child are
+// distinct, and all of them are bindable at the same instant -- which is what
+// the child does with them, from overlapping goroutines. Against the
+// listen-close-reuse picker this package used before design/fix.md, the loop
+// reports the same address twice (7 triples per 20 000 measured) and the second
+// bind of that address fails with `address already in use`: the CI signature.
+func TestReserveGatewayPorts_SimultaneouslyBindable(t *testing.T) {
+	const trials = 20000
+	for trial := 0; trial < trials; trial++ {
+		res := reserveGatewayPorts(t, 3)
+		addrs := append([]string(nil), res.addrs...)
+
+		seen := make(map[string]int, len(addrs))
+		for i, addr := range addrs {
+			if prev, dup := seen[addr]; dup {
+				res.release()
+				t.Fatalf("trial %d: reserved %s for listener %d and listener %d at once (addrs %v)",
+					trial, addr, prev, i, addrs)
+			}
+			seen[addr] = i
+		}
+
+		// The child binds all three once the harness lets go; do the same.
+		res.release()
+		held := make([]net.Listener, 0, len(addrs))
+		for _, addr := range addrs {
+			lis, err := net.Listen("tcp", addr)
+			if err != nil {
+				for _, h := range held {
+					_ = h.Close()
+				}
+				t.Fatalf("trial %d: reserved addrs %v are not simultaneously bindable: %v", trial, addrs, err)
+			}
+			held = append(held, lis)
+		}
+		for _, h := range held {
+			_ = h.Close()
+		}
+	}
+}
+
+// TestStartGatewayWithPortRetry_RetriesPortSelectionOnly pins the retry policy:
+// a port-selection collision is retried up to the cap, and nothing else ever is.
+func TestStartGatewayWithPortRetry_RetriesPortSelectionOnly(t *testing.T) {
+	collision := func(addr string) error {
+		return &portCollisionError{
+			addr:       addr,
+			gatewayLog: "probe-gateway: listen (bootstrap) " + addr + ": listen tcp " + addr + ": bind: address already in use\n",
+			err:        fmt.Errorf("nothing listening on %s after 5s", addr),
+		}
+	}
+	ready := &gatewayProcess{sessionAddr: "127.0.0.1:1", bootstrapAddr: "127.0.0.1:2"}
+
+	t.Run("a collision is retried until a child comes up", func(t *testing.T) {
+		attempts := 0
+		gw, err := startGatewayWithPortRetry(maxPortSelectionAttempts, func() (*gatewayProcess, error) {
+			attempts++
+			if attempts < 3 {
+				return nil, collision("127.0.0.1:41515")
+			}
+			return ready, nil
+		})
+		if err != nil {
+			t.Fatalf("a recoverable port collision was not retried: %v", err)
+		}
+		if gw != ready {
+			t.Fatalf("returned %+v, want the gateway the third attempt started", gw)
+		}
+		if attempts != 3 {
+			t.Fatalf("attempts = %d, want 3", attempts)
+		}
+	})
+
+	t.Run("a non-collision failure is never retried", func(t *testing.T) {
+		boom := errors.New("probe-gateway: open registry: dial tcp 127.0.0.1:1: connect: connection refused")
+		attempts := 0
+		gw, err := startGatewayWithPortRetry(maxPortSelectionAttempts, func() (*gatewayProcess, error) {
+			attempts++
+			return nil, boom
+		})
+		if gw != nil {
+			t.Fatalf("returned a gateway %+v for a failed start", gw)
+		}
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the child's own failure", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("a failure that is not a port collision was retried: attempts = %d, want 1", attempts)
+		}
+	})
+
+	t.Run("a child that came up is never restarted", func(t *testing.T) {
+		attempts := 0
+		gw, err := startGatewayWithPortRetry(maxPortSelectionAttempts, func() (*gatewayProcess, error) {
+			attempts++
+			return ready, nil
+		})
+		if err != nil || gw != ready {
+			t.Fatalf("gw, err = %+v, %v; want the started gateway and no error", gw, err)
+		}
+		if attempts != 1 {
+			t.Fatalf("attempts = %d, want 1: readiness must end the retry loop", attempts)
+		}
+	})
+
+	t.Run("collisions stop at the cap", func(t *testing.T) {
+		attempts := 0
+		_, err := startGatewayWithPortRetry(maxPortSelectionAttempts, func() (*gatewayProcess, error) {
+			attempts++
+			return nil, collision("127.0.0.1:41515")
+		})
+		if attempts != maxPortSelectionAttempts {
+			t.Fatalf("attempts = %d, want the cap %d", attempts, maxPortSelectionAttempts)
+		}
+		var collided *portCollisionError
+		if !errors.As(err, &collided) {
+			t.Fatalf("err = %v, want the last collision reported to the caller", err)
+		}
+	})
+}
+
+// TestCollidedReservedAddr_OnlyOurOwnAddresses pins the classifier that decides
+// what counts as a selection collision. Anything but "a reserved address of
+// ours is already bound" must read as a real failure.
+func TestCollidedReservedAddr_OnlyOurOwnAddresses(t *testing.T) {
+	reserved := []string{"127.0.0.1:41000", "127.0.0.1:41515", "127.0.0.1:34525"}
+	cases := []struct {
+		name       string
+		gatewayLog string
+		want       string
+	}{
+		{
+			name: "bootstrap address taken (the CI 35372449098 signature)",
+			gatewayLog: "probe-gateway: bootstrap CA fingerprint (bootstrap_ca_pin): sha256:x\n" +
+				"probe-gateway: internal ExecuteTool HTTP listener on 127.0.0.1:34525\n" +
+				"probe-gateway: listen (bootstrap) 127.0.0.1:41515: listen tcp 127.0.0.1:41515: bind: address already in use\n",
+			want: "127.0.0.1:41515",
+		},
+		{
+			name:       "session address taken",
+			gatewayLog: "probe-gateway: listen (session) 127.0.0.1:41000: listen tcp 127.0.0.1:41000: bind: address already in use\n",
+			want:       "127.0.0.1:41000",
+		},
+		{
+			name:       "internal dispatch address taken",
+			gatewayLog: "probe-gateway: internal dispatch listener stopped: listen tcp 127.0.0.1:34525: bind: address already in use\n",
+			want:       "127.0.0.1:34525",
+		},
+		{
+			name:       "a bind failure on an address we did not reserve is not ours",
+			gatewayLog: "probe-gateway: listen (session) 127.0.0.1:39999: listen tcp 127.0.0.1:39999: bind: address already in use\n",
+			want:       "",
+		},
+		{
+			name:       "a failure that is not a bind failure is never a selection failure",
+			gatewayLog: "probe-gateway: open registry: dial tcp 127.0.0.1:41515: connect: connection refused\n",
+			want:       "",
+		},
+		{
+			name:       "an empty log proves nothing",
+			gatewayLog: "",
+			want:       "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := collidedReservedAddr(tc.gatewayLog, reserved); got != tc.want {
+				t.Fatalf("collidedReservedAddr = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStartGateway_NonPortFailureFailsWithoutRetry drives the real starter
+// against a stand-in binary that dies for a reason having nothing to do with
+// port selection. The harness must report that failure after exactly one
+// attempt, carrying the child's own log, instead of picking new ports.
+func TestStartGateway_NonPortFailureFailsWithoutRetry(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "fake-probe-gateway")
+	script := "#!/bin/sh\n" +
+		"echo 'probe-gateway: open registry: dial tcp 127.0.0.1:1: connect: connection refused' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in gateway: %v", err)
+	}
+
+	attempts := 0
+	gw, err := startGatewayWithPortRetry(maxPortSelectionAttempts, func() (*gatewayProcess, error) {
+		attempts++
+		return tryStartGateway(t, bin, "postgres://unused:unused@127.0.0.1:1/unused?sslmode=disable", gatewayStartOpts{}, attempts)
+	})
+	if err == nil {
+		t.Fatalf("starter returned %+v for a child that died", gw)
+	}
+	if attempts != 1 {
+		t.Fatalf("a non-EADDRINUSE child failure was retried: attempts = %d, want 1", attempts)
+	}
+	var collided *portCollisionError
+	if errors.As(err, &collided) {
+		t.Fatalf("a child failure with no bind error was classified as a port collision: %v", err)
+	}
+	if !strings.Contains(err.Error(), "open registry") {
+		t.Fatalf("the child's own log is missing from the reported failure: %v", err)
+	}
+}
+
+// TestStartGateway_RetriesWhenAReservedPortIsStolen reproduces CI 35372449098:
+// something else on the host binds a reserved address between release and the
+// child's bind, and the child dies with `bind: address already in use`. The
+// harness must reserve new addresses and start a new child rather than fail
+// with "nothing listening on ... after 5s".
+func TestStartGateway_RetriesWhenAReservedPortIsStolen(t *testing.T) {
+	dsn, _, gatewayBin := setupSharedInfra(t)
+
+	var stolen net.Listener
+	var firstAttemptAddrs []string
+	attempts := 0
+	portSelectionHook = func(attempt int, addrs []string) {
+		attempts = attempt
+		if attempt != 1 {
+			return
+		}
+		firstAttemptAddrs = append([]string(nil), addrs...)
+		lis, err := net.Listen("tcp", addrs[1]) // the bootstrap address
+		if err != nil {
+			t.Errorf("occupy reserved bootstrap addr %s: %v", addrs[1], err)
+			return
+		}
+		stolen = lis
+	}
+	t.Cleanup(func() {
+		portSelectionHook = nil
+		if stolen != nil {
+			_ = stolen.Close()
+		}
+	})
+
+	gw := startGatewaySubprocess(t, gatewayBin, dsn)
+
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want exactly one selection retry (2)", attempts)
+	}
+	if gw.bootstrapAddr == firstAttemptAddrs[1] {
+		t.Fatalf("the second child reused the occupied bootstrap addr %s", gw.bootstrapAddr)
+	}
+	conn, err := net.DialTimeout("tcp", gw.bootstrapAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("the retried gateway is not serving on %s: %v", gw.bootstrapAddr, err)
+	}
+	_ = conn.Close()
 }
 
 // --- probe subprocess -------------------------------------------------------------

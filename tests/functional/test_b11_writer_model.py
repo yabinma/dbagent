@@ -213,9 +213,11 @@ ALLOWED_BENCHMARK_IMPORTS = {
     ("statistics", None),
     ("time", None),
     ("uuid", None),
-    # `os` is imported for exactly one call, `os.cpu_count()`, which feeds the
-    # `B11 env=cpus=` fingerprint consequence 3 requires (errata pass 9).  A7a
-    # admits `cpu_count` and nothing else, so `os.environ` still fails.
+    # `os` is imported for exactly two admitted calls: `os.cpu_count()`, which
+    # feeds the `B11 env=cpus=` fingerprint consequence 3 requires (errata pass
+    # 9), and `os.sysconf("SC_CLK_TCK")`, the tick rate the host/storage
+    # diagnostics divide by (B11D2 pins that literal argument).  A7a admits
+    # `cpu_count` and `sysconf` and nothing else, so `os.environ` still fails.
     ("os", None),
     ("yaml", None),
     ("concurrent.futures", "ThreadPoolExecutor"),
@@ -4383,7 +4385,8 @@ def check_W3(src: str) -> None:
 
 
 def check_W4(src: str) -> None:
-    """Diagnostics: all four fixed prefixes of consequence 3."""
+    """Diagnostics: every prefix in DIAGNOSTIC_PREFIXES -- consequence 3's four,
+    plus `B11 diagnostics=` from the host/storage diagnostics slice (five)."""
     for prefix in DIAGNOSTIC_PREFIXES:
         _require(
             prefix in src,

@@ -125,6 +125,15 @@ def test_b1_ci_scale_topology_probe_record(b1_topology_probe_run):
     # never destroy a 28-arm GC-3 sweep's evidence.
     host_noise = harness.parse_host_noise_fields(written["fingerprint"])
     assert tuple(host_noise) == harness.B1_HOST_NOISE_FIELDS, host_noise
+    # The reader above is the backward-compatibility one: it DEFAULTS a key it
+    # cannot find, so on its own it would accept an arm whose constructor
+    # dropped the block entirely. The presence check is the same one the live
+    # emission node uses -- it counts the literal `,<key>=` tokens in tail
+    # order and never looks at a value, so `unavailable` still satisfies it and
+    # an unexposed kernel source still cannot void this arm.
+    assert harness._host_noise_current_line_failures(written["fingerprint"]) == [], (
+        written["fingerprint"]
+    )
     harness.serialize_host_noise_fields(host_noise)
     wait_fields = {
         field: harness._parse_b1_env_field(written["fingerprint"], field)
