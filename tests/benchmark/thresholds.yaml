@@ -425,7 +425,50 @@ benchmarks:
     \ the measured window. Free-form values are percent-encoded, each field\
     \ falls back independently to the literal unavailable, and every one of\
     \ them is reported-only: none conditions the threshold, the writer\
-    \ model, the pool, durability, a retry or a skip."
+    \ model, the pool, durability, a retry or a skip.\
+    \ B11 gate policy (design/slices/b11-gate-policy rev 0.3): the >= 1000 inserts/s bar\
+    \ is required-green and merge-blocking on every miss, with no retry, no rerun, no\
+    \ skip, no xfail, no continue-on-error and no exit-code masking. A completed\
+    \ below-threshold measurement whose unrounded host_psi_io_full_usec share of the\
+    \ same measured window is at least 0.20 gains exactly one suffix in its assertion\
+    \ message: failure_classification=io_full_stall_observed together with\
+    \ classification_scope=symptom_only_not_cause and gate_outcome=red. A share below\
+    \ 0.20, an unavailable counter, or a non-positive rate or row count leaves an\
+    \ ordinary unclassified red, which is the state a real product or harness regression\
+    \ on a quiet host must reach. The label claims no cause: PSI I/O full is partly\
+    \ produced by this workload's own fsync waits, so io_full_stall_observed\
+    \ distinguishes slow while waiting on I/O from other slow runs and does not\
+    \ distinguish host from product; a classified run remains a real required-green\
+    \ failure and only its message changes. The warrant is thin-provisional: five\
+    \ mixed-outcome samples in one storage class at evidence head\
+    \ b25349b2859647807237ca53fd7d02f93340e268, two passing and three failing, whose\
+    \ shares are table-rounded percentages (8 and 13 passing; 21, 22 and 26 failing)\
+    \ rather than exact raw extrema. The policy is re-reviewed after 20 additional\
+    \ completed measurements or immediately on the first numeric counterexample -- a\
+    \ pass at or above the 0.20 share, or a failure below it -- and the cutoff may move\
+    \ only through a new audited design revision that updates this object, the guard\
+    \ literals, the ledger and the frozen-deviation row together. Of the 21 canonical\
+    \ fields, 20 remain reported-only; host_psi_io_full_usec is classification-only in\
+    \ the message of an already-red result; all 21 remain outcome-inert."
+  gate_policy:
+    outcome: required-green
+    merge_blocking_on_miss: true
+    retries: 0
+    failure_classification:
+      name: io_full_stall_observed
+      host_psi_io_full_share_at_least: 0.20
+      evidence_head: b25349b2859647807237ca53fd7d02f93340e268
+      mixed_storage_class_samples: 5
+      passing_samples: 2
+      failing_samples: 3
+      observed_table_rounded_share_percent:
+        passing: [8, 13]
+        failing: [21, 22, 26]
+      evidence_precision: table-rounded-percent
+      evidence_strength: thin-provisional
+    review:
+      after_additional_completed_measurements: 20
+      on_first_counterexample: true
   concurrency_model:
     writers: 7
     pool: per-writer-independent
