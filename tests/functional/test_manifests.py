@@ -404,7 +404,11 @@ CONDITIONAL_JOBS = {
 }
 CONDITIONAL_STEPS = {
     "images": [(7, "github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')")],
-    "e2e": [(7, "failure()")],
+    # FP-E2EB1D-9: the success-only B1 diagnostics upload at index 7, and the
+    # byte-identical failure upload shifted to 8. Two conditional steps, both
+    # LAST in the job and both after the pytest step, so neither can convert
+    # the e2e command's exit status into success.
+    "e2e": [(7, "success()"), (8, "failure()")],
     # The upload is the ONLY conditional step of the probe job, and it is the
     # last one: `always()` makes a broken sweep surface its invalid artifact
     # without ever masking step 1's exit status.
@@ -3523,7 +3527,7 @@ def test_threshold_assertion_fixture_count():
     assert len(THRESHOLD_ASSERTION_FIXTURES) == 38
     assert len(THRESHOLD_ASSERTION_POSITIVE_CONTROLS) == 14
     assert len(LINK_LOOP_FIXTURES) == 9
-    assert len(CI_PIN_FIXTURES) == 107
+    assert len(CI_PIN_FIXTURES) == 110
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -4120,6 +4124,22 @@ def _ci_pin_workflow_cases():
         "e2e_needs_rewired_back_to_benchmark",
         "needs_graph_drift",
         lambda wf: wf["jobs"]["e2e"].__setitem__("needs", "benchmark"),
+    )
+    # FP-E2EB1D-9 negative fixtures for the new conditional-step data.
+    add(
+        "e2e_b1_diagnostics_success_upload_condition_widened",
+        "step_envelope_drift",
+        lambda wf: wf["jobs"]["e2e"]["steps"][7].__setitem__("if", "always()"),
+    )
+    add(
+        "e2e_b1_diagnostics_success_upload_removed",
+        "step_envelope_drift",
+        lambda wf: wf["jobs"]["e2e"]["steps"].pop(7),
+    )
+    add(
+        "e2e_failure_upload_condition_replaced_after_the_shift",
+        "step_envelope_drift",
+        lambda wf: wf["jobs"]["e2e"]["steps"][8].__setitem__("if", "always()"),
     )
     add(
         "e2e_if_drops_main_push_clause",

@@ -23,6 +23,7 @@ import importlib.util
 import sys
 
 from tests.e2e.conftest import lookup_platform
+from tests.e2e.b1_e2e_diagnostics import B1E2EDiagnosticSession
 
 _PROFILE_PATH = Path(__file__).resolve().parent / "b1_e2e_profile.py"
 _spec = importlib.util.spec_from_file_location("b1_e2e_profile", _PROFILE_PATH)
@@ -411,6 +412,8 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url):
         marks["cgroup_before"] = _cgroup_cpu_stat()
         marks["restarts_before"] = _gateway_restart_count()
 
+    diagnostics = B1E2EDiagnosticSession()
+
     # --- Baseline phase ---
     baseline = asyncio.run(
         b1.run_open_loop_baseline(
@@ -422,6 +425,8 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url):
             prologue=prologue,
             include_sync_warmup=True,
             on_prologue_complete=_after_prologue,
+            on_window_open=diagnostics.open,
+            on_window_complete=diagnostics.close,
         )
     )
     audit_after_base = _count_ingest_audit_rows(
@@ -461,6 +466,7 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url):
         f"in_flight={baseline.max_in_flight}",
         flush=True,
     )
+    diagnostics.emit(baseline)
     # (2)(3)(4)(5)(6) — locals so the threshold checker sees measured Names
     served = baseline.served
     errors = baseline.errors

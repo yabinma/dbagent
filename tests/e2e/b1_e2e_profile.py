@@ -14,6 +14,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
+# FP-E2EB1D-1 — the three shipped reference helpers this carrier needs while
+# building and querying PhaseResult. Direct pure imports: no copy, no
+# re-export, no dynamic import, and no live reader is imported (design §3.1).
+from services.gateway.tests.b1_reference_profile import (
+    derive_leg_vectors,
+    leg_p99s_of,
+    p99_leg_split_of,
+)
+
 # Profile constants — each bound exactly once at module scope (FP-IG-13).
 BURST_RATE = 1000
 BURST_SECONDS = 30
@@ -105,10 +114,35 @@ class PhaseResult:
     max_backlog: int
     phase: str = "baseline"
     status_codes: list[int] = field(default_factory=list)
+    # FP-E2EB1D-1 — trailing diagnostic carriers. Defaulting to empty keeps
+    # every saturation and synthetic constructor byte-identical; only the
+    # baseline return supplies populated vectors.
+    pre_dispatch_slip_ms: list[float] = field(default_factory=list)
+    start_lag_ms: list[float] = field(default_factory=list)
+    attempt_duration_ms: list[float] = field(default_factory=list)
 
     @property
     def p99(self) -> float:
         return nearest_rank_p99(self.latencies_ms)
+
+    @property
+    def p99_leg_split(self) -> tuple[float, float, float]:
+        """Identity-aligned triple of the p99-index request (reference FP-IG-39)."""
+        return p99_leg_split_of(
+            self.latencies_ms,
+            self.pre_dispatch_slip_ms,
+            self.start_lag_ms,
+            self.attempt_duration_ms,
+        )
+
+    @property
+    def leg_p99s(self) -> tuple[float, float, float]:
+        """Three independent nearest-rank statistics; never a decomposition."""
+        return leg_p99s_of(
+            self.pre_dispatch_slip_ms,
+            self.start_lag_ms,
+            self.attempt_duration_ms,
+        )
 
     @property
     def served_rate(self) -> float:
@@ -679,6 +713,8 @@ async def run_open_loop_baseline(
     max_in_flight: int = MAX_IN_FLIGHT,
     include_sync_warmup: bool = True,
     on_prologue_complete: Callable[[], None] | None = None,
+    on_window_open: Callable[[], None] | None = None,
+    on_window_complete: Callable[[], None] | None = None,
 ) -> PhaseResult:
     """Open-loop baseline at BASE_RATE with due-time latency.
 
@@ -690,10 +726,21 @@ async def run_open_loop_baseline(
     if own_client:
         client = build_httpx_client(max_connections=max_in_flight)
 
+    # FP-E2EB1D-1/7 — per-request stations, in the shipped reference's shape.
+    # Preallocated length-n HERE, before `_one` is defined and before any
+    # warmup/prologue call can occur, and stored under bounds guards, so
+    # warmup (idx = -1) and prologue (idx <= -2) cross only the guard, still
+    # execute the unchanged transport/client branch, and can never index a
+    # measured slot.
+    dispatch_at = [0.0] * n
+    attempt_at = [0.0] * n
+
     async def _one(
         idx: int, raw: bytes, headers: dict[str, str]
     ) -> tuple[int, int | None, bytes | None, BaseException | None, float]:
         try:
+            if 0 <= idx < n:
+                attempt_at[idx] = time.perf_counter()
             if transport is not None:
                 code, body, err = await transport.post(
                     endpoint, content=raw, headers=headers
@@ -732,6 +779,10 @@ async def run_open_loop_baseline(
         latencies = [0.0] * n
         outcomes = [""] * n
         codes = [0] * n
+        # FP-E2EB1D-7 — the LAST operation before the window opens, so every
+        # external boundary read finishes before `t0` exists.
+        if on_window_open is not None:
+            on_window_open()
         t0 = time.perf_counter()
         due0 = t0
         in_flight = 0
@@ -764,6 +815,8 @@ async def run_open_loop_baseline(
                 )
                 for t in done:
                     await _on_done(t)
+            if 0 <= i < n:
+                dispatch_at[i] = time.perf_counter()
             task = asyncio.create_task(_one(i, *requests[i]))
             pending.add(task)
             in_flight += 1
@@ -781,7 +834,27 @@ async def run_open_loop_baseline(
             for t in done:
                 await _on_done(t)
 
+        # FP-E2EB1D-7 — the window is closed and `t_last` is fixed; the first
+        # diagnostic operation after drain, before any O(N) leg arithmetic.
+        if on_window_complete is not None:
+            on_window_complete()
+
         served = sum(1 for o in outcomes if o == "served")
+        # FP-E2EB1D-1 — fail-soft boundary 1: the shipped helper is total for
+        # these internally guaranteed inputs, but future drift must not abort
+        # the baseline. On an exception the three diagnostic vectors are empty
+        # and every core value below is unchanged, so the same p99 assertion
+        # is reached. KeyboardInterrupt / SystemExit are not caught.
+        try:
+            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(
+                latencies,
+                dispatch_at,
+                attempt_at,
+                due0=due0,
+                rate=rate,
+            )
+        except Exception:  # noqa: BLE001 -- diagnostic only, never the oracle
+            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = [], [], []
         return PhaseResult(
             offered=n,
             served=served,
@@ -794,6 +867,9 @@ async def run_open_loop_baseline(
             max_backlog=max_backlog,
             phase="baseline",
             status_codes=codes,
+            pre_dispatch_slip_ms=pre_dispatch_slip_ms,
+            start_lag_ms=start_lag_ms,
+            attempt_duration_ms=attempt_duration_ms,
         )
     finally:
         if own_client and client is not None:

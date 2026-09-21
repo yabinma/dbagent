@@ -589,6 +589,13 @@ jobs:
           chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin/kind
       - name: Run e2e (1500s product budget inside 30m job)
         run: bash tests/e2e/run.sh
+      - name: Upload B1 diagnostics on success
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-b1-diagnostics
+          path: /tmp/rca-e2e/b1-baseline-diagnostics.txt
+          if-no-files-found: ignore
       - name: Upload phase timing and pod logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

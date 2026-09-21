@@ -7411,3 +7411,2154 @@ def test_b1_host_noise_probe_observation_is_post_write_and_nongating():
     for verdict_token in ("VERDICT_MET", "VERDICT_MISSED", "verdicts["):
         segment = src.split("host_noise = ", 1)[1].split("wait_fields = ", 1)[0]
         assert verdict_token not in segment, verdict_token
+
+
+# ---------------------------------------------------------------------------
+# e2e-b1-diagnostics slice — FP-E2EB1D-1 … FP-E2EB1D-9.
+#
+# Reported-only diagnostics on the e2e B1 baseline. Every literal below is
+# declared here, independently of the module it pins: a pin derived from its
+# own subject detects nothing.
+# ---------------------------------------------------------------------------
+
+import io as _io
+import math as _math
+from urllib.parse import quote as _quote
+
+E2EBD_DIAG_PATH = REPO_ROOT / "tests" / "e2e" / "b1_e2e_diagnostics.py"
+E2EBD_CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+e2ediag = _load(E2EBD_DIAG_PATH, "b1_e2e_diagnostics_delivery")
+# The namespace-package module object the two e2e carriers import from. Object
+# identity against THIS module is what proves the imports are direct rather
+# than copied: `ref` above is a separate by-path load of the same file.
+import services.gateway.tests.b1_reference_profile as e2ebd_reference
+
+#: The exact import contract of §3.1 — three helpers in the profile carrier,
+#: six in the diagnostics module, no alias, no re-export, nine in total.
+E2EBD_REFERENCE_MODULE = "services.gateway.tests.b1_reference_profile"
+E2EBD_PROFILE_IMPORTS = ("derive_leg_vectors", "leg_p99s_of", "p99_leg_split_of")
+E2EBD_DIAGNOSTIC_IMPORTS = (
+    "counter_delta",
+    "parse_proc_stat_steal_ticks",
+    "parse_psi_total",
+    "serialize_leg_triple",
+    "serialize_status_histogram",
+    "steal_ticks_to_usec",
+)
+#: Live readers of the reference harness. None of them may be imported or
+#: called from either e2e carrier.
+E2EBD_REFERENCE_LIVE_READERS = (
+    "read_proc_net_tcp_tables",
+    "established_serve_port_inodes",
+    "read_pool_census_sample",
+    "pid_cpu_seconds",
+    "tree_cpu_seconds",
+    "iter_live_descendants",
+    "classify_tree",
+    "wait_for_classified_workers",
+)
+E2EBD_DYNAMIC_IMPORT_TOKENS = ("importlib", "__import__", "eval(", "exec(")
+E2EBD_LIVE_TEST_MODULE = "test_b1_ingest_burst"
+
+#: The 33-field record, declared independently of the module under test.
+E2EBD_PREFIX = "B1 e2e baseline diagnostics="
+E2EBD_UNAVAILABLE = "unavailable"
+E2EBD_ARTIFACT = "/tmp/rca-e2e/b1-baseline-diagnostics.txt"
+E2EBD_FIELDS = (
+    "schema",
+    "offered", "served", "errors", "p99_ms",
+    "p99_leg_split_ms", "leg_p99s_ms", "status_histogram",
+    "max_in_flight",
+    "gateway_pod", "gateway_cpu_usage_usec",
+    "gateway_nr_throttled", "gateway_throttled_usec",
+    "postgres_pod", "postgres_cpu_usage_usec",
+    "postgres_nr_throttled", "postgres_throttled_usec",
+    "kind_node", "runner_steal_usec",
+    "runner_psi_cpu_some_usec", "runner_psi_cpu_full_usec",
+    "runner_psi_io_some_usec", "runner_psi_io_full_usec",
+    "runner_psi_memory_some_usec", "runner_psi_memory_full_usec",
+    "pg_xact_commit_delta", "pg_wal_records_delta",
+    "pg_wal_bytes_delta", "pg_wal_write_delta", "pg_wal_sync_delta",
+    "pg_track_wal_io_timing", "pg_wal_write_time_ms_delta",
+    "pg_wal_sync_time_ms_delta",
+)
+#: The retired procfs naming the schema must never carry again: these counters
+#: are whole-runner-kernel scope, not node-container-cgroup scope.
+E2EBD_RETIRED_FIELD_PREFIX = "node_"
+
+#: Fixed source identities (design §3.3 / §3.4).
+E2EBD_NAMESPACE = "dbagent"
+E2EBD_RELEASE_SELECTOR = "app.kubernetes.io/instance=dbagent"
+E2EBD_COMPONENT_LABEL = "app.kubernetes.io/component"
+E2EBD_GATEWAY_COMPONENT = "ingest-gateway"
+E2EBD_POSTGRES_COMPONENT = "postgresql"
+E2EBD_KIND_CLUSTER = "rca-e2e"
+E2EBD_KIND_NODE = "rca-e2e-control-plane"
+E2EBD_COMMAND_TIMEOUT_S = 5.0
+E2EBD_COMMANDS_PER_BOUNDARY = 6
+E2EBD_TOTAL_COMMANDS = 12
+E2EBD_RUN_KWARGS = {
+    "capture_output": True,
+    "text": True,
+    "check": False,
+    "timeout": E2EBD_COMMAND_TIMEOUT_S,
+}
+
+#: The exact psql invocation, re-typed here rather than read from the module.
+E2EBD_PSQL_TOKENS = (
+    "psql --no-psqlrc --tuples-only --no-align -F '|'",
+    "-U dbagent -d postgres -h /var/run/postgresql",
+    "current_setting('track_wal_io_timing')",
+    "d.xact_commit, d.stats_reset",
+    "w.wal_records, w.wal_bytes::bigint, w.wal_write, w.wal_sync",
+    "w.wal_write_time, w.wal_sync_time, w.stats_reset",
+    "FROM pg_stat_database AS d",
+    "CROSS JOIN pg_stat_wal AS w",
+    "WHERE d.datname = 'dbagent';",
+)
+
+#: Legacy e2e reporting that must stay byte-identical (design §3.7).
+E2EBD_LEGACY_DIGESTS = {
+    "_cgroup_cpu_stat": "52955a0f02fe8da188e24731243fa992f654a6b6f2a0ecdea1ce2c4bf872204a",
+    "_fmt_diag": "1260598b30805846c53144a184ad5ebc72e9888ce66132aaebdffbcace3b6ecb",
+    "_after_prologue": "c851d24f62481856455362484c2849e1479966c5f13db6d2be1dade3cb9cc13d",
+}
+E2EBD_LEGACY_PRINT_DIGESTS = (
+    "0b6ed6a0538a693cfe420aa109c9ea1d8d770f1ccc94b27989231ab484b65ae0",
+    "939c613f06ad6cb11b7520156e7b6a9c3382666d30b33bdb6ba1dfeb0f391471",
+)
+E2EBD_ORACLE_BYTES = '    assert p99 < P99_MS, f"baseline p99={p99}"'
+E2EBD_WIRING_LINES = (
+    "from tests.e2e.b1_e2e_diagnostics import B1E2EDiagnosticSession",
+    "    diagnostics = B1E2EDiagnosticSession()",
+    "            on_window_open=diagnostics.open,",
+    "            on_window_complete=diagnostics.close,",
+    "    diagnostics.emit(baseline)",
+)
+E2EBD_MASKING_TOKENS = (
+    "pytest.skip",
+    "pytest.xfail",
+    "pytest.mark.skip",
+    "pytest.mark.xfail",
+    "continue-on-error",
+    "flaky",
+    "rerun",
+)
+E2EBD_SUCCESS_STEP_NAME = "Upload B1 diagnostics on success"
+E2EBD_FAILURE_STEP_NAME = "Upload phase timing and pod logs on failure"
+E2EBD_FAILURE_PATHS = ("/tmp/rca-e2e/**", "tests/e2e/*.log")
+
+
+def _e2ebd_sources() -> "tuple[str, str, str]":
+    """(profile, diagnostics, live e2e test) sources, read once per call."""
+    return (
+        E2E_PATH.read_text(encoding="utf-8"),
+        E2EBD_DIAG_PATH.read_text(encoding="utf-8"),
+        E2E_TEST.read_text(encoding="utf-8"),
+    )
+
+
+def _e2ebd_reference_imports(src: str) -> "list[tuple[str, str | None]]":
+    """Every ``from <reference module> import ...`` binding in *src*."""
+    out: "list[tuple[str, str | None]]" = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom) and node.module == E2EBD_REFERENCE_MODULE:
+            if node.level:
+                out.append(("<relative import>", None))
+            for alias in node.names:
+                out.append((alias.name, alias.asname))
+    return out
+
+
+def _e2ebd_function(tree: ast.AST, name: str) -> ast.AST:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"function {name!r} not found")
+
+
+def _e2ebd_import_failures(profile_src: str, diag_src: str) -> "list[str]":
+    """Nine direct pure bindings, no copy, no alias, no dynamic route."""
+    fails: list[str] = []
+    for label, src, expected in (
+        ("profile", profile_src, E2EBD_PROFILE_IMPORTS),
+        ("diagnostics", diag_src, E2EBD_DIAGNOSTIC_IMPORTS),
+    ):
+        bindings = _e2ebd_reference_imports(src)
+        names = tuple(sorted(n for n, _a in bindings))
+        if names != tuple(sorted(expected)):
+            fails.append(f"{label}: reference import set {names} want {tuple(sorted(expected))}")
+        if any(asname is not None for _n, asname in bindings):
+            fails.append(f"{label}: a reference helper is imported under an alias")
+        tree = ast.parse(src)
+        defined = {
+            n.name
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        for name in E2EBD_PROFILE_IMPORTS + E2EBD_DIAGNOSTIC_IMPORTS:
+            if name in defined:
+                fails.append(f"{label}: {name} is redefined locally instead of imported")
+        # A re-export of the OTHER carrier's helpers is a second copy route.
+        other = (
+            E2EBD_DIAGNOSTIC_IMPORTS if label == "profile" else E2EBD_PROFILE_IMPORTS
+        )
+        for name in other:
+            if name in dict(bindings):
+                fails.append(f"{label}: re-exports {name}, which it does not own")
+        for token in E2EBD_DYNAMIC_IMPORT_TOKENS:
+            if token in src:
+                fails.append(f"{label}: dynamic import route {token!r}")
+        if E2EBD_LIVE_TEST_MODULE in src:
+            fails.append(f"{label}: imports the live reference test module")
+        for reader in E2EBD_REFERENCE_LIVE_READERS:
+            if reader in src:
+                fails.append(f"{label}: names the reference live reader {reader}")
+    # The nine bindings must be the reference module's own objects.
+    for name in E2EBD_PROFILE_IMPORTS:
+        if getattr(e2e, name, None) is not getattr(e2ebd_reference, name):
+            fails.append(f"profile: {name} is not the reference object")
+    for name in E2EBD_DIAGNOSTIC_IMPORTS:
+        if getattr(e2ediag, name, None) is not getattr(e2ebd_reference, name):
+            fails.append(f"diagnostics: {name} is not the reference object")
+    # Each imported binding is pure over caller-supplied data.
+    ref_tree = ast.parse(REF_PATH.read_text(encoding="utf-8"))
+    ref_globals = {
+        t.id
+        for n in ref_tree.body
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    for name in E2EBD_PROFILE_IMPORTS + E2EBD_DIAGNOSTIC_IMPORTS:
+        fn = _e2ebd_function(ref_tree, name)
+        body = ast.unparse(fn)
+        for token in ("open(", "Path(", "os.", "subprocess", "socket", "print("):
+            if token in body:
+                fails.append(f"{name}: imported helper performs I/O ({token})")
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Global):
+                fails.append(f"{name}: imported helper mutates module state")
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in ref_globals:
+                        fails.append(f"{name}: imported helper rebinds the global {target.id}")
+    return fails
+
+
+def test_e2e_b1_reference_diagnostic_imports_are_pure_and_direct():
+    """FP-E2EB1D-1/2/3: the nine exact bindings, direct and pure."""
+    profile_src, diag_src, _load_src = _e2ebd_sources()
+    assert _e2ebd_import_failures(profile_src, diag_src) == []
+    # All nine are exercised by their owners.
+    n = 8
+    latencies = [float(i) for i in range(n)]
+    dispatch = [1000.0 + i / 200.0 + 0.001 for i in range(n)]
+    attempt = [1000.0 + i / 200.0 + 0.002 for i in range(n)]
+    legs = e2e.derive_leg_vectors(latencies, dispatch, attempt, due0=1000.0, rate=200.0)
+    assert [len(v) for v in legs] == [n, n, n]
+    assert len(e2e.p99_leg_split_of(latencies, *legs)) == 3
+    assert len(e2e.leg_p99s_of(*legs)) == 3
+    assert e2ediag.counter_delta(1, 4, label="x") == 3
+    assert e2ediag.parse_proc_stat_steal_ticks("cpu 1 1 1 1 1 1 1 9 0 0\ncpu0 1 1 1 1 1 1 1 9 0 0\n")[0] == 9
+    assert e2ediag.parse_psi_total("some avg10=0.00 total=1234\n", "some") == 1234
+    assert e2ediag.serialize_leg_triple((1.0, 2.0, 3.0)) == "1.000/2.000/3.000"
+    assert e2ediag.serialize_status_histogram([202, 202, 503]) == "202:2;503:1"
+    assert e2ediag.steal_ticks_to_usec(500, clock_ticks=100) == 5_000_000
+
+    # Negative controls: every forbidden route is red.
+    copied = profile_src.replace(
+        "from services.gateway.tests.b1_reference_profile import (\n"
+        "    derive_leg_vectors,\n"
+        "    leg_p99s_of,\n"
+        "    p99_leg_split_of,\n"
+        ")",
+        "def derive_leg_vectors(*a, **k):\n    return [], [], []\n"
+        "def leg_p99s_of(*a, **k):\n    return (0.0, 0.0, 0.0)\n"
+        "def p99_leg_split_of(*a, **k):\n    return (0.0, 0.0, 0.0)",
+        1,
+    )
+    assert copied != profile_src
+    assert _e2ebd_import_failures(copied, diag_src) != []
+    for mutant in (
+        profile_src.replace("    derive_leg_vectors,\n", "    derive_leg_vectors as _d,\n", 1),
+        profile_src + "\nimportlib.import_module('services.gateway.tests.b1_reference_profile')\n",
+        profile_src + "\nfrom services.gateway.tests import test_b1_ingest_burst\n",
+        profile_src + "\nread_proc_net_tcp_tables()\n",
+    ):
+        assert _e2ebd_import_failures(mutant, diag_src) != [], mutant[-90:]
+    for mutant in (
+        diag_src.replace("    counter_delta,\n", "", 1),
+        diag_src + "\nfrom services.gateway.tests.b1_reference_profile import derive_leg_vectors\n",
+        diag_src + "\nread_pool_census_sample(None)\n",
+    ):
+        assert _e2ebd_import_failures(profile_src, mutant) != []
+
+
+class E2EBDStubTransport:
+    """Counts and orders every request that actually reaches the transport."""
+
+    def __init__(self, delay_s: float = 0.0, status: int = 202):
+        self.delay_s = delay_s
+        self.status = status
+        self.payloads: list[bytes] = []
+        self.times: list[float] = []
+
+    async def post(self, url, *, content, headers):
+        self.payloads.append(content)
+        self.times.append(time.perf_counter())
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        return self.status, b'{"investigation_id":"x"}', None
+
+
+def _e2ebd_exec_profile(src: str, name: str):
+    """Execute a (possibly mutated) copy of the e2e profile carrier."""
+    # Compiled under a synthetic filename on purpose: a mutant must never be
+    # attributed to the real carrier's line numbers by a coverage run.
+    origin = f"<{name}>"
+    module = type(sys)(name)
+    module.__file__ = origin
+    sys.modules[name] = module
+    exec(compile(src, origin, "exec"), module.__dict__)
+    return module
+
+
+def test_e2e_b1_leg_vectors_match_reference_semantics():
+    """FP-E2EB1D-1: exact reference vectors, summaries, histogram and peak."""
+    rate = 200.0
+    due0 = 1000.0
+    n = 6
+    # Deterministic stations: request 3 is the slow one, and requests 1 and 4
+    # tie on total lateness so the smallest-index rule is exercised.
+    slips = [0.001, 0.002, 0.003, 0.010, 0.002, 0.001]
+    lags = [0.0005, 0.0010, 0.0005, 0.0200, 0.0010, 0.0005]
+    durations = [0.004, 0.009, 0.004, 0.500, 0.009, 0.004]
+    dispatch = [due0 + i / rate + slips[i] for i in range(n)]
+    attempt = [dispatch[i] + lags[i] for i in range(n)]
+    response = [attempt[i] + durations[i] for i in range(n)]
+    latencies = [(response[i] - (due0 + i / rate)) * 1000.0 for i in range(n)]
+
+    pre, lag, dur = e2e.derive_leg_vectors(
+        latencies, dispatch, attempt, due0=due0, rate=rate
+    )
+    # Identity: the three raw legs sum to that request's due-time lateness.
+    for i in range(n):
+        assert abs((pre[i] + lag[i] + dur[i]) - latencies[i]) < ref.LEG_SUM_TOLERANCE_MS
+        assert abs(pre[i] - slips[i] * 1000.0) < 1e-6
+        assert abs(lag[i] - lags[i] * 1000.0) < 1e-6
+        assert abs(dur[i] - durations[i] * 1000.0) < 1e-6
+
+    result = e2e.PhaseResult(
+        offered=n, served=n, errors=0, latencies_ms=latencies,
+        t0=due0, t_last_complete=response[-1], due0=due0,
+        max_in_flight=3, max_backlog=0, phase="baseline",
+        status_codes=[202] * (n - 1) + [503],
+        pre_dispatch_slip_ms=pre, start_lag_ms=lag, attempt_duration_ms=dur,
+    )
+    # Identity-aligned triple: the p99 request's own three legs.
+    p99_index = ref.p99_index_of(latencies)
+    assert p99_index == 3
+    assert result.p99_leg_split == (pre[3], lag[3], dur[3])
+    assert abs(sum(result.p99_leg_split) - result.p99) < ref.LEG_SUM_TOLERANCE_MS
+    # Three INDEPENDENT nearest-rank statistics, never a decomposition.
+    assert result.leg_p99s == (
+        ref.nearest_rank_p99(pre), ref.nearest_rank_p99(lag), ref.nearest_rank_p99(dur)
+    )
+    assert result.leg_p99s == (pre[3], lag[3], dur[3])  # same request here
+    # Tie: two identical totals select the smallest request index.
+    tied = [5.0, 9.0, 9.0, 1.0]
+    assert ref.p99_index_of(tied) == 1
+    tied_result = e2e.PhaseResult(
+        offered=4, served=4, errors=0, latencies_ms=tied,
+        t0=0.0, t_last_complete=1.0, due0=0.0, max_in_flight=1, max_backlog=0,
+        pre_dispatch_slip_ms=[0.0, 1.0, 2.0, 3.0],
+        start_lag_ms=[0.0, 1.0, 2.0, 3.0],
+        attempt_duration_ms=[0.0, 1.0, 2.0, 3.0],
+    )
+    assert tied_result.p99_leg_split == (1.0, 1.0, 1.0)
+
+    values = e2ediag.build_e2e_b1_diagnostic_values(
+        result, e2ediag.unavailable_snapshot("open"), e2ediag.unavailable_snapshot("close")
+    )
+    assert values["p99_leg_split_ms"] == e2ediag.serialize_leg_triple(result.p99_leg_split)
+    assert values["leg_p99s_ms"] == e2ediag.serialize_leg_triple(result.leg_p99s)
+    assert values["status_histogram"] == "202:5;503:1"
+    assert values["max_in_flight"] == 3
+    assert values["offered"] == n and values["served"] == n and values["errors"] == 0
+
+    # A live baseline through the shipped generator carries the same shape,
+    # and max_in_flight is still the existing dispatch peak — no new census.
+    transport = E2EBDStubTransport(delay_s=0.01)
+    measured = [(f'{{"m":{i}}}'.encode(), {}) for i in range(24)]
+    live = asyncio.run(
+        e2e.run_open_loop_baseline(
+            endpoint="http://stub/events",
+            requests=measured,
+            transport=transport,
+            rate=400,
+            max_in_flight=1000,
+            include_sync_warmup=False,
+        )
+    )
+    assert len(live.pre_dispatch_slip_ms) == 24
+    assert len(live.start_lag_ms) == 24
+    assert len(live.attempt_duration_ms) == 24
+    for i in range(24):
+        total = (
+            live.pre_dispatch_slip_ms[i] + live.start_lag_ms[i] + live.attempt_duration_ms[i]
+        )
+        assert abs(total - live.latencies_ms[i]) < ref.LEG_SUM_TOLERANCE_MS
+        assert live.pre_dispatch_slip_ms[i] >= 0.0
+        assert live.start_lag_ms[i] >= 0.0
+        assert live.attempt_duration_ms[i] >= 0.0
+    assert 0 < live.max_in_flight <= 24
+    assert e2ediag.serialize_status_histogram(live.status_codes) == "202:24"
+
+
+def _e2ebd_instrumentation_failures(src: str) -> "list[str]":
+    """Structural placement of the two guards, reads, stores and allocations."""
+    fails: list[str] = []
+    tree = ast.parse(src)
+    gen = _e2ebd_function(tree, "run_open_loop_baseline")
+    one = next(
+        (n for n in gen.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_one"),
+        None,
+    )
+    if one is None:
+        return ["run_open_loop_baseline no longer defines _one"]
+    allocations = [
+        stmt
+        for stmt in gen.body
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id in ("dispatch_at", "attempt_at")
+    ]
+    if len(allocations) != 2:
+        fails.append(f"{len(allocations)} top-level timestamp allocations, want 2")
+    for stmt in allocations:
+        if ast.unparse(stmt.value) != "[0.0] * n":
+            fails.append(f"allocation is not a preallocated length-n vector: {ast.unparse(stmt)}")
+        if gen.body.index(stmt) > gen.body.index(one):
+            fails.append(f"{stmt.targets[0].id} is allocated after `_one` is defined")
+    # Exactly two bounds guards, each holding exactly one read and one store.
+    guards = [
+        node
+        for node in ast.walk(gen)
+        if isinstance(node, ast.If) and ast.unparse(node.test) in ("0 <= idx < n", "0 <= i < n")
+    ]
+    if len(guards) != 2:
+        fails.append(f"{len(guards)} bounds guards, want exactly 2")
+    stores = [
+        node
+        for node in ast.walk(gen)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Subscript)
+        and isinstance(node.targets[0].value, ast.Name)
+        and node.targets[0].value.id in ("dispatch_at", "attempt_at")
+    ]
+    if len(stores) != 2:
+        fails.append(f"{len(stores)} timestamp stores, want exactly 2")
+    guarded = [node for guard in guards for node in ast.walk(guard)]
+    for store in stores:
+        if store not in guarded:
+            fails.append(f"unguarded timestamp store: {ast.unparse(store)}")
+        if ast.unparse(store.value) != "time.perf_counter()":
+            fails.append(f"store value is not a monotonic read: {ast.unparse(store)}")
+    for guard in guards:
+        if len(guard.body) != 1 or guard.orelse:
+            fails.append(f"bounds guard carries {len(guard.body)} statements: {ast.unparse(guard)}")
+        body = ast.unparse(guard)
+        for token in ("await", "sleep", "open(", "subprocess", "Lock", "create_task", "for "):
+            if token in body:
+                fails.append(f"bounds guard performs forbidden work ({token})")
+    # The attempt guard is the FIRST statement of `_one`'s existing try.
+    try_stmt = next((n for n in one.body if isinstance(n, ast.Try)), None)
+    if try_stmt is None:
+        fails.append("_one no longer wraps its body in try")
+    else:
+        first = try_stmt.body[0]
+        if not (isinstance(first, ast.If) and ast.unparse(first.test) == "0 <= idx < n"):
+            fails.append(f"_one's first statement is {ast.unparse(first)!r}")
+    # The dispatch store sits immediately before the unchanged create_task.
+    for parent in ast.walk(gen):
+        body = getattr(parent, "body", None)
+        if not isinstance(body, list):
+            continue
+        for index, stmt in enumerate(body):
+            if isinstance(stmt, ast.Assign) and "asyncio.create_task(_one(i, *requests[i]))" in ast.unparse(stmt):
+                previous = body[index - 1] if index else None
+                if not (
+                    isinstance(previous, ast.If)
+                    and ast.unparse(previous.test) == "0 <= i < n"
+                ):
+                    fails.append("the dispatch store is not immediately before create_task")
+    return fails
+
+
+def _e2ebd_run_baseline(module, *, measured: int, prologue: int = 30):
+    """1 warmup + `prologue` prologue + `measured` requests through a stub."""
+    transport = E2EBDStubTransport()
+    marks: dict[str, object] = {}
+
+    def _at_prologue_complete() -> None:
+        marks["after_prologue_calls"] = len(transport.payloads)
+
+    def _at_open() -> None:
+        marks["open_calls"] = len(transport.payloads)
+        marks["open_ts"] = time.perf_counter()
+
+    def _at_complete() -> None:
+        marks["close_calls"] = len(transport.payloads)
+        marks["close_ts"] = time.perf_counter()
+
+    result = asyncio.run(
+        module.run_open_loop_baseline(
+            endpoint="http://stub/events",
+            requests=[(f'{{"m":{i}}}'.encode(), {}) for i in range(measured)],
+            transport=transport,
+            rate=2000,
+            max_in_flight=1000,
+            warmup=(b'{"w":1}', {}),
+            prologue=[(f'{{"p":{i}}}'.encode(), {}) for i in range(prologue)],
+            include_sync_warmup=True,
+            on_prologue_complete=_at_prologue_complete,
+            on_window_open=_at_open,
+            on_window_complete=_at_complete,
+        )
+    )
+    return result, transport, marks
+
+
+def test_e2e_b1_window_hooks_preserve_warmup_and_prologue():
+    """FP-E2EB1D-1/7: every unmeasured request still sends; the hooks bracket."""
+    profile_src, _diag_src, _load_src = _e2ebd_sources()
+    assert _e2ebd_instrumentation_failures(profile_src) == []
+
+    measured = 40
+    result, transport, marks = _e2ebd_run_baseline(e2e, measured=measured)
+    assert len(transport.payloads) == 1 + 30 + measured
+    assert marks["after_prologue_calls"] == 1 + 30
+    # The open hook is the LAST pre-window operation: nothing measured has
+    # been sent yet, and it runs before t0 exists.
+    assert marks["open_calls"] == 1 + 30
+    assert marks["open_ts"] <= result.t0
+    # The close hook is the FIRST post-drain operation: every request is done
+    # and `t_last_complete` is already fixed.
+    assert marks["close_calls"] == 1 + 30 + measured
+    assert marks["close_ts"] >= result.t_last_complete
+    assert result.offered == measured and result.served == measured
+    # No measured slot was polluted by a negative index: a pre-window write
+    # that survived would make that request's start lag negative.
+    assert len(result.start_lag_ms) == measured
+    assert all(v >= 0.0 for v in result.start_lag_ms)
+    assert all(v >= 0.0 for v in result.pre_dispatch_slip_ms)
+    assert all(v >= 0.0 for v in result.attempt_duration_ms)
+
+    # --- required red cases -------------------------------------------------
+    # D1: allocate after warmup/prologue AND store unguarded. The closure's
+    # free variable is unbound while warmup and prologue run, so those 31
+    # requests never reach the transport.
+    late = profile_src.replace(
+        "    dispatch_at = [0.0] * n\n    attempt_at = [0.0] * n\n\n    async def _one(",
+        "    async def _one(",
+        1,
+    ).replace(
+        "        latencies = [0.0] * n\n",
+        "        dispatch_at = [0.0] * n\n        attempt_at = [0.0] * n\n        latencies = [0.0] * n\n",
+        1,
+    ).replace(
+        "            if 0 <= idx < n:\n                attempt_at[idx] = time.perf_counter()\n",
+        "            attempt_at[idx] = time.perf_counter()\n",
+        1,
+    )
+    assert late != profile_src
+    assert _e2ebd_instrumentation_failures(late) != []
+    d1 = _e2ebd_exec_profile(late, "b1_e2e_profile_d1_mutant")
+    _r, d1_transport, _m = _e2ebd_run_baseline(d1, measured=measured)
+    assert len(d1_transport.payloads) == measured, (
+        "the D1 shape must lose warmup and prologue at the transport"
+    )
+
+    # Preallocated but unguarded: a negative index now indexes a measured
+    # slot, and with a measured window shorter than the prologue the wrong
+    # write is a hard IndexError that costs those requests their transport call.
+    unguarded = profile_src.replace(
+        "            if 0 <= idx < n:\n                attempt_at[idx] = time.perf_counter()\n",
+        "            attempt_at[idx] = time.perf_counter()\n",
+        1,
+    )
+    assert unguarded != profile_src
+    assert _e2ebd_instrumentation_failures(unguarded) != []
+    pu = _e2ebd_exec_profile(unguarded, "b1_e2e_profile_unguarded_mutant")
+    _r2, pu_transport, _m2 = _e2ebd_run_baseline(pu, measured=12)
+    assert len(pu_transport.payloads) < 1 + 30 + 12, (
+        "an unguarded store must write a measured slot and be observable"
+    )
+
+
+def _e2ebd_frame(name: str, body: str) -> str:
+    return f"#b1diag-begin:{name}\n{body}\n#b1diag-end:{name}\n"
+
+
+def _e2ebd_cgroup_v2(usage: int, nr_throttled: int, throttled: int) -> str:
+    return (
+        _e2ebd_frame("proc_self_cgroup", "0::/")
+        + _e2ebd_frame(
+            "cpu_stat_v2",
+            f"usage_usec {usage}\nuser_usec 1\nsystem_usec 1\n"
+            f"nr_periods 9\nnr_throttled {nr_throttled}\nthrottled_usec {throttled}",
+        )
+        + _e2ebd_frame("cpuacct_usage_v1", "")
+        + _e2ebd_frame("cpu_stat_v1", "")
+    )
+
+
+def _e2ebd_cgroup_v1(usage_ns: int, nr_throttled: int, throttled_ns: int) -> str:
+    return (
+        _e2ebd_frame("proc_self_cgroup", "3:cpuacct,cpu:/kubepods/podx")
+        + _e2ebd_frame("cpu_stat_v2", "")
+        + _e2ebd_frame("cpuacct_usage_v1", str(usage_ns))
+        + _e2ebd_frame(
+            "cpu_stat_v1",
+            f"nr_periods 9\nnr_throttled {nr_throttled}\nthrottled_time {throttled_ns}",
+        )
+    )
+
+
+def test_e2e_b1_cgroup_parsers_cover_v2_and_v1_units():
+    """FP-E2EB1D-2: exact v2/v1 deltas; every defect is unavailable, not zero."""
+    parse = e2ediag.parse_cgroup_cpu_frames
+    frames = e2ediag.parse_frames
+
+    before = parse(frames(_e2ebd_cgroup_v2(13_000_000, 2, 4_000)))
+    after = parse(frames(_e2ebd_cgroup_v2(13_910_000, 5, 9_500)))
+    assert before.cgroup_version == 2
+    assert e2ediag.cgroup_cpu_delta(before, after, label="gateway") == (910_000, 3, 5_500)
+    # A real zero survives as 0.
+    assert e2ediag.cgroup_cpu_delta(before, before, label="gateway") == (0, 0, 0)
+
+    # v1 nanoseconds are converted only AFTER the subtraction.
+    v1_before = parse(frames(_e2ebd_cgroup_v1(13_000_000_999, 2, 4_000_999)))
+    v1_after = parse(frames(_e2ebd_cgroup_v1(13_910_000_999, 5, 9_500_999)))
+    assert v1_before.cgroup_version == 1
+    assert e2ediag.cgroup_cpu_delta(v1_before, v1_after, label="postgres") == (910_000, 3, 5_500)
+
+    # Every refusal path.
+    for payload, why in (
+        (_e2ebd_cgroup_v2(1, 1, 1).replace("nr_throttled 1\n", ""), "short v2 payload"),
+        (_e2ebd_cgroup_v2(1, 1, 1) + _e2ebd_frame("cpu_stat_v2", "usage_usec 2"), "duplicate frame"),
+        (_e2ebd_cgroup_v2(1, 1, 1).replace("usage_usec 1", "usage_usec -3"), "negative counter"),
+        (_e2ebd_cgroup_v2(1, 1, 1).replace("usage_usec 1", "usage_usec x"), "malformed counter"),
+        (_e2ebd_cgroup_v2(1, 1, 1).replace("#b1diag-end:cpu_stat_v2\n", ""), "unterminated frame"),
+        (_e2ebd_cgroup_v2(1, 1, 1).replace(_e2ebd_frame("proc_self_cgroup", "0::/"),
+                                           _e2ebd_frame("proc_self_cgroup", "")), "no /proc/self/cgroup"),
+    ):
+        with pytest.raises(Exception):
+            parse(frames(payload))
+    # Mixed v1/v2 is refused rather than silently preferred.
+    mixed = (
+        _e2ebd_frame("proc_self_cgroup", "0::/")
+        + _e2ebd_frame("cpu_stat_v2", "usage_usec 1\nnr_throttled 0\nthrottled_usec 0")
+        + _e2ebd_frame("cpuacct_usage_v1", "17")
+        + _e2ebd_frame("cpu_stat_v1", "nr_throttled 0\nthrottled_time 0")
+    )
+    with pytest.raises(Exception):
+        parse(frames(mixed))
+    # A reset (decreasing counter) is a lost measurement, never a zero.
+    reset = parse(frames(_e2ebd_cgroup_v2(1_000, 0, 0)))
+    with pytest.raises(Exception):
+        e2ediag.cgroup_cpu_delta(after, reset, label="gateway")
+    # A cgroup version change inside the window is refused.
+    with pytest.raises(Exception):
+        e2ediag.cgroup_cpu_delta(before, v1_after, label="gateway")
+
+    # At the record level the whole group is `unavailable`, never 0.
+    target = e2ediag.PodTarget(
+        name="dbagent-ingest-gateway-abc", uid="uid-1",
+        node_name=E2EBD_KIND_NODE, container_id="containerd://1",
+        container_name=E2EBD_GATEWAY_COMPONENT,
+    )
+    opening = e2ediag.BoundarySnapshot(label="open", gateway=target, gateway_cpu=after)
+    closing = e2ediag.BoundarySnapshot(label="close", gateway=target, gateway_cpu=reset)
+    values = e2ediag.build_e2e_b1_diagnostic_values(None, opening, closing)
+    for name in (
+        "gateway_pod", "gateway_cpu_usage_usec",
+        "gateway_nr_throttled", "gateway_throttled_usec",
+    ):
+        assert values[name] == E2EBD_UNAVAILABLE, name
+
+
+class E2EBDFakeRunner:
+    """Records every argv and replays canned outputs, in order, once each."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls: list[list[str]] = []
+        self.kwargs: list[dict] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        self.kwargs.append(dict(kwargs))
+        for match, stdout, returncode in self.replies:
+            if match(argv):
+                return subprocess.CompletedProcess(argv, returncode, stdout, "")
+        return subprocess.CompletedProcess(argv, 1, "", "no canned reply")
+
+
+def _e2ebd_is_pod_query(argv) -> bool:
+    return argv[:2] == ["kubectl", "-n"] and "get" in argv and "pods" in argv
+
+
+def _e2ebd_is_exec(component):
+    def match(argv):
+        return "exec" in argv and component in argv
+    return match
+
+
+def _e2ebd_pod_json(
+    *,
+    gateway_name="dbagent-ingest-gateway-5f7",
+    gateway_uid="uid-gw-1",
+    postgres_name="dbagent-postgresql-0",
+    postgres_uid="uid-pg-1",
+    node=E2EBD_KIND_NODE,
+    extra=(),
+) -> str:
+    def pod(name, uid, component, container):
+        return {
+            "metadata": {
+                "name": name,
+                "uid": uid,
+                "labels": {
+                    "app.kubernetes.io/instance": "dbagent",
+                    E2EBD_COMPONENT_LABEL: component,
+                },
+            },
+            "spec": {"nodeName": node},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {"name": container, "ready": True, "containerID": f"containerd://{uid}"}
+                ],
+            },
+        }
+
+    # A plausible decoy is listed FIRST: same release, same container NAME,
+    # Running and Ready -- but a different component. A first-item selector,
+    # or one that matches the component label by prefix, takes this pod and
+    # reports another tenant's cgroup as the gateway's.
+    items = [
+        {
+            "metadata": {
+                "name": "dbagent-ingest-gateway-canary",
+                "uid": "uid-decoy",
+                "labels": {
+                    "app.kubernetes.io/instance": "dbagent",
+                    E2EBD_COMPONENT_LABEL: "ingest-gateway-canary",
+                },
+            },
+            "spec": {"nodeName": node},
+            "status": {"phase": "Running",
+                       "containerStatuses": [
+                           {"name": E2EBD_GATEWAY_COMPONENT, "ready": True,
+                            "containerID": "containerd://decoy"}
+                       ]},
+        },
+        pod(gateway_name, gateway_uid, E2EBD_GATEWAY_COMPONENT, E2EBD_GATEWAY_COMPONENT),
+        pod(postgres_name, postgres_uid, E2EBD_POSTGRES_COMPONENT, E2EBD_POSTGRES_COMPONENT),
+    ]
+    items.extend(extra)
+    return json.dumps({"items": items})
+
+
+class E2EBDClusterRunner:
+    """A whole fake cluster: one canned reply per source, per boundary."""
+
+    def __init__(
+        self,
+        *,
+        pod_json=None,
+        gateway=None,
+        postgres=None,
+        runner=None,
+        kind_stdout=E2EBD_KIND_NODE + "\n",
+        failing=(),
+    ):
+        self.pod_json = list(pod_json or [_e2ebd_pod_json()])
+        self.gateway = list(gateway or [])
+        self.postgres = list(postgres or [])
+        self.runner = list(runner or [])
+        self.kind_stdout = kind_stdout
+        self.failing = set(failing)
+        self.calls: list[list[str]] = []
+        self.kwargs: list[dict] = []
+        self.counts: dict[str, int] = {}
+
+    def _next(self, key, series):
+        index = self.counts.get(key, 0)
+        self.counts[key] = index + 1
+        if not series:
+            return ""
+        return series[min(index, len(series) - 1)]
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append(argv)
+        self.kwargs.append(dict(kwargs))
+        if argv[0] == "kubectl" and "get" in argv and "pods" in argv:
+            key = "pods"
+            stdout = self._next(key, self.pod_json)
+        elif argv[0] == "kubectl" and "exec" in argv and E2EBD_GATEWAY_COMPONENT in argv:
+            key = "gateway"
+            stdout = self._next(key, self.gateway)
+        elif argv[0] == "kubectl" and "exec" in argv and E2EBD_POSTGRES_COMPONENT in argv:
+            key = "postgres"
+            stdout = self._next(key, self.postgres)
+        elif argv[0] == "kind":
+            key = "kind"
+            stdout = self.kind_stdout
+            self.counts[key] = self.counts.get(key, 0) + 1
+        elif argv[0] == "docker":
+            key = "runner"
+            stdout = self._next(key, self.runner)
+        else:
+            return subprocess.CompletedProcess(argv, 127, "", "unknown command")
+        if key in self.failing:
+            return subprocess.CompletedProcess(argv, 1, "", f"{key} unavailable")
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+
+def _e2ebd_proc_stat(steal: int, per_cpu_steal: int = 0) -> str:
+    return (
+        f"cpu  100 0 100 900 0 0 0 {steal} 0 0\n"
+        f"cpu0 50 0 50 450 0 0 0 {per_cpu_steal} 0 0\n"
+        f"cpu1 50 0 50 450 0 0 0 {per_cpu_steal} 0 0\n"
+        "intr 1 2 3\nctxt 999\n"
+    )
+
+
+def _e2ebd_psi(some_total: int, full_total: int | None, avg10: str = "0.00") -> str:
+    text = f"some avg10={avg10} avg60=0.00 avg300=0.00 total={some_total}"
+    if full_total is not None:
+        text += f"\nfull avg10={avg10} avg60=0.00 avg300=0.00 total={full_total}"
+    return text
+
+
+def _e2ebd_runner_payload(
+    *, steal: int, psi_base: int, clk: str = "100", per_cpu_steal: int = 0,
+    avg10: str = "0.00", full: bool = True,
+) -> str:
+    return (
+        _e2ebd_frame("proc_stat", _e2ebd_proc_stat(steal, per_cpu_steal))
+        + _e2ebd_frame("psi_cpu", _e2ebd_psi(psi_base, psi_base + 1 if full else None, avg10))
+        + _e2ebd_frame("psi_io", _e2ebd_psi(psi_base + 2, psi_base + 3 if full else None, avg10))
+        + _e2ebd_frame("psi_memory", _e2ebd_psi(psi_base + 4, psi_base + 5 if full else None, avg10))
+        + _e2ebd_frame("clk_tck", clk)
+    )
+
+
+def _e2ebd_pg_row(
+    *, timing="on", xact=1000, db_reset="", records=10, wal_bytes=2048,
+    writes=5, syncs=4, write_ms=1.5, sync_ms=2.5, wal_reset="",
+) -> str:
+    return (
+        f"{timing}|{xact}|{db_reset}|{records}|{wal_bytes}|{writes}|{syncs}|"
+        f"{write_ms}|{sync_ms}|{wal_reset}"
+    )
+
+
+def _e2ebd_postgres_payload(row: str, cgroup: str, *, label: str) -> str:
+    stats = _e2ebd_frame("pg_stats", row)
+    return stats + cgroup if label == "open" else cgroup + stats
+
+
+def _e2ebd_healthy_runner(**overrides) -> E2EBDClusterRunner:
+    gateway = [_e2ebd_cgroup_v2(13_000_000, 2, 4_000), _e2ebd_cgroup_v2(13_910_000, 5, 9_500)]
+    postgres = [
+        _e2ebd_postgres_payload(
+            _e2ebd_pg_row(xact=1000, records=10, wal_bytes=2048, writes=5, syncs=4,
+                          write_ms=1.5, sync_ms=2.5),
+            _e2ebd_cgroup_v2(7_000_000, 0, 0), label="open",
+        ),
+        _e2ebd_postgres_payload(
+            _e2ebd_pg_row(xact=1600, records=40, wal_bytes=6144, writes=9, syncs=7,
+                          write_ms=4.0, sync_ms=9.0),
+            _e2ebd_cgroup_v2(7_250_000, 0, 0), label="close",
+        ),
+    ]
+    runner = [
+        _e2ebd_runner_payload(steal=1_000, psi_base=100_000),
+        _e2ebd_runner_payload(steal=1_500, psi_base=300_000),
+    ]
+    kwargs = dict(gateway=gateway, postgres=postgres, runner=runner)
+    kwargs.update(overrides)
+    return E2EBDClusterRunner(**kwargs)
+
+
+def _e2ebd_values_from(runner) -> dict:
+    opening = e2ediag.snapshot_e2e_b1_boundary("open", run=runner)
+    closing = e2ediag.snapshot_e2e_b1_boundary("close", run=runner)
+    return e2ediag.build_e2e_b1_diagnostic_values(None, opening, closing)
+
+
+def test_e2e_b1_workload_sources_target_exact_pods_and_containers():
+    """FP-E2EB1D-2: the two named application containers, never a substitute."""
+    runner = _e2ebd_healthy_runner()
+    values = _e2ebd_values_from(runner)
+
+    # Numeric, not `unavailable` -- an always-unavailable reader fails here.
+    assert values["gateway_pod"] == "dbagent-ingest-gateway-5f7@uid-gw-1"
+    assert values["gateway_cpu_usage_usec"] == 910_000
+    assert values["gateway_nr_throttled"] == 3
+    assert values["gateway_throttled_usec"] == 5_500
+    assert values["postgres_pod"] == "dbagent-postgresql-0@uid-pg-1"
+    assert values["postgres_cpu_usage_usec"] == 250_000
+    assert values["postgres_nr_throttled"] == 0
+    assert values["postgres_throttled_usec"] == 0
+
+    # Exact command shapes.
+    pod_queries = [a for a in runner.calls if a[0] == "kubectl" and "pods" in a]
+    assert len(pod_queries) == 4
+    for argv in pod_queries:
+        assert argv == [
+            "kubectl", "-n", E2EBD_NAMESPACE, "get", "pods",
+            "-l", E2EBD_RELEASE_SELECTOR, "-o", "json",
+        ]
+    execs = [a for a in runner.calls if a[0] == "kubectl" and "exec" in a]
+    assert len(execs) == 4
+    for argv in execs:
+        assert argv[:4] == ["kubectl", "-n", E2EBD_NAMESPACE, "exec"]
+        assert argv[4].startswith("pod/")
+        assert argv[5] == "-c"
+        assert argv[6] in (E2EBD_GATEWAY_COMPONENT, E2EBD_POSTGRES_COMPONENT)
+        assert argv[7:10] == ["--", "/bin/sh", "-c"]
+        script = argv[10]
+        assert "/proc/self/cgroup" in script
+        assert "/sys/fs/cgroup/cpu.stat" in script
+        assert "/sys/fs/cgroup/cpuacct/cpuacct.usage" in script
+    assert [a[4] for a in execs] == [
+        "pod/dbagent-ingest-gateway-5f7", "pod/dbagent-postgresql-0",
+        "pod/dbagent-ingest-gateway-5f7", "pod/dbagent-postgresql-0",
+    ]
+    # No local cgroup or procfs read: every command is a cluster/route command.
+    assert {a[0] for a in runner.calls} == {"kubectl", "kind", "docker"}
+    diag_src = E2EBD_DIAG_PATH.read_text(encoding="utf-8")
+    for token in ("Path('/proc", 'Path("/proc', "Path('/sys", 'Path("/sys',
+                  "open('/proc", 'open("/proc', "open('/sys", 'open("/sys'):
+        assert token not in diag_src, token
+
+    # First-item selection is red: the decoy pod is listed first.
+    gateway_target, postgres_target = e2ediag.resolve_b1_pod_targets(_e2ebd_healthy_runner())
+    assert gateway_target.name == "dbagent-ingest-gateway-5f7"
+    assert gateway_target.container_name == E2EBD_GATEWAY_COMPONENT
+    assert postgres_target.container_name == E2EBD_POSTGRES_COMPONENT
+    assert "canary" not in (gateway_target.name + postgres_target.name)
+    assert gateway_target.uid == "uid-gw-1" and gateway_target.container_id.endswith("uid-gw-1")
+
+    # Two pods sharing one component label: no first-item guess.
+    duplicate = json.loads(_e2ebd_pod_json())
+    duplicate["items"].append(json.loads(_e2ebd_pod_json(gateway_name="dbagent-ingest-gateway-2nd",
+                                                         gateway_uid="uid-gw-2"))["items"][1])
+    dup_values = _e2ebd_values_from(
+        _e2ebd_healthy_runner(pod_json=[json.dumps(duplicate)])
+    )
+    assert dup_values["gateway_pod"] == E2EBD_UNAVAILABLE
+    assert dup_values["gateway_cpu_usage_usec"] == E2EBD_UNAVAILABLE
+
+    # Identity churn between the exec and the re-resolution.
+    churn = _e2ebd_healthy_runner(
+        pod_json=[
+            _e2ebd_pod_json(),
+            _e2ebd_pod_json(gateway_uid="uid-gw-RESTARTED"),
+        ]
+    )
+    churn_values = _e2ebd_values_from(churn)
+    assert churn_values["gateway_pod"] == E2EBD_UNAVAILABLE
+    assert churn_values["gateway_cpu_usage_usec"] == E2EBD_UNAVAILABLE
+
+    # A non-Ready container, a non-Running pod and an empty runtime id are all
+    # refused rather than guessed.
+    for mutate in (
+        lambda d: d["items"][1]["status"]["containerStatuses"][0].__setitem__("ready", False),
+        lambda d: d["items"][1]["status"].__setitem__("phase", "Pending"),
+        lambda d: d["items"][1]["status"]["containerStatuses"][0].__setitem__("containerID", ""),
+        lambda d: d["items"][1]["metadata"].__setitem__("uid", ""),
+        lambda d: d["items"][1]["status"]["containerStatuses"][0].__setitem__("name", "sidecar"),
+    ):
+        payload = json.loads(_e2ebd_pod_json())
+        mutate(payload)
+        broken = _e2ebd_values_from(_e2ebd_healthy_runner(pod_json=[json.dumps(payload)]))
+        assert broken["gateway_pod"] == E2EBD_UNAVAILABLE
+        assert broken["gateway_cpu_usage_usec"] == E2EBD_UNAVAILABLE
+        # The PostgreSQL workload is a separate source and survives.
+        assert broken["postgres_cpu_usage_usec"] == 250_000
+
+
+def test_e2e_b1_runner_global_proc_source_is_labelled_and_exact():
+    """FP-E2EB1D-3: whole-runner steal/PSI through the verified kind route."""
+    runner = _e2ebd_healthy_runner()
+    values = _e2ebd_values_from(runner)
+
+    assert values["kind_node"] == E2EBD_KIND_NODE
+    # 1500 - 1000 = 500 ticks at CLK_TCK=100 -> 5,000,000 microseconds.
+    assert values["runner_steal_usec"] == 5_000_000
+    for name in (
+        "runner_psi_cpu_some_usec", "runner_psi_cpu_full_usec",
+        "runner_psi_io_some_usec", "runner_psi_io_full_usec",
+        "runner_psi_memory_some_usec", "runner_psi_memory_full_usec",
+    ):
+        assert values[name] == 200_000, name
+
+    # Exact route commands, and nothing else.
+    kind_calls = [a for a in runner.calls if a[0] == "kind"]
+    docker_calls = [a for a in runner.calls if a[0] == "docker"]
+    assert len(kind_calls) == 2 and len(docker_calls) == 2
+    for argv in kind_calls:
+        assert argv == ["kind", "get", "nodes", "--name", E2EBD_KIND_CLUSTER]
+    for argv in docker_calls:
+        assert argv[:3] == ["docker", "exec", E2EBD_KIND_NODE]
+        assert argv[3:5] == ["/bin/sh", "-c"]
+        script = argv[5]
+        assert "/proc/stat" in script
+        assert "/proc/pressure/cpu" in script
+        assert "/proc/pressure/io" in script
+        assert "/proc/pressure/memory" in script
+        assert "getconf CLK_TCK" in script
+
+    # The schema never claims node-container-cgroup scope.
+    assert all(not name.startswith(E2EBD_RETIRED_FIELD_PREFIX) for name in E2EBD_FIELDS)
+    assert e2ediag.B1_E2E_DIAGNOSTIC_FIELDS == E2EBD_FIELDS
+
+    # Wrong / absent kind node: the route AND every runner field go dark.
+    wrong = _e2ebd_values_from(_e2ebd_healthy_runner(kind_stdout="some-other-cluster-control-plane\n"))
+    assert wrong["kind_node"] == E2EBD_UNAVAILABLE
+    for name in E2EBD_FIELDS:
+        if name.startswith("runner_"):
+            assert wrong[name] == E2EBD_UNAVAILABLE, name
+    # ... while the workload cgroups, a separate source, survive.
+    assert wrong["gateway_cpu_usage_usec"] == 910_000
+
+    # Two nodes returned by `kind get nodes` is not a route.
+    two = _e2ebd_values_from(
+        _e2ebd_healthy_runner(kind_stdout=f"{E2EBD_KIND_NODE}\nother-control-plane\n")
+    )
+    assert two["kind_node"] == E2EBD_UNAVAILABLE
+
+    # Placement disagreement between the two workloads: no route at all.
+    split_json = json.loads(_e2ebd_pod_json())
+    split_json["items"][2]["spec"]["nodeName"] = "rca-e2e-worker"
+    split = _e2ebd_values_from(_e2ebd_healthy_runner(pod_json=[json.dumps(split_json)]))
+    assert split["kind_node"] == E2EBD_UNAVAILABLE
+    assert split["runner_steal_usec"] == E2EBD_UNAVAILABLE
+
+    # No local /proc fallback exists, even though it is equivalent today.
+    diag_src = E2EBD_DIAG_PATH.read_text(encoding="utf-8")
+    for token in ('"/proc/stat"', "'/proc/stat'", '"/proc/pressure', "'/proc/pressure"):
+        assert token not in diag_src, token
+    # PSI averages are never read: only `total=` has a closed-window meaning.
+    assert "avg10" not in diag_src and "avg60" not in diag_src and "avg300" not in diag_src
+    moving = _e2ebd_healthy_runner(
+        runner=[
+            _e2ebd_runner_payload(steal=1_000, psi_base=100_000, avg10="0.00"),
+            _e2ebd_runner_payload(steal=1_000, psi_base=100_000, avg10="97.31"),
+        ]
+    )
+    moved = _e2ebd_values_from(moving)
+    assert moved["runner_steal_usec"] == 0          # a real zero
+    assert moved["runner_psi_cpu_some_usec"] == 0   # averages moved; totals did not
+
+    # The aggregate `cpu` row is the population, never the sum of per-CPU rows.
+    per_cpu = _e2ebd_healthy_runner(
+        runner=[
+            _e2ebd_runner_payload(steal=1_000, psi_base=100_000, per_cpu_steal=10_000),
+            _e2ebd_runner_payload(steal=1_500, psi_base=300_000, per_cpu_steal=90_000),
+        ]
+    )
+    assert _e2ebd_values_from(per_cpu)["runner_steal_usec"] == 5_000_000
+
+    # A missing `full` record affects only the three full fields.
+    partial = _e2ebd_values_from(
+        _e2ebd_healthy_runner(
+            runner=[
+                _e2ebd_runner_payload(steal=1_000, psi_base=100_000, full=False),
+                _e2ebd_runner_payload(steal=1_500, psi_base=300_000, full=False),
+            ]
+        )
+    )
+    assert partial["runner_psi_cpu_some_usec"] == 200_000
+    assert partial["runner_psi_cpu_full_usec"] == E2EBD_UNAVAILABLE
+    assert partial["runner_steal_usec"] == 5_000_000
+
+    # A malformed / missing CLK_TCK darkens only the steal field.
+    for clk in ("", "0", "not-a-number"):
+        bad_clk = _e2ebd_values_from(
+            _e2ebd_healthy_runner(
+                runner=[
+                    _e2ebd_runner_payload(steal=1_000, psi_base=100_000, clk=clk),
+                    _e2ebd_runner_payload(steal=1_500, psi_base=300_000, clk=clk),
+                ]
+            )
+        )
+        assert bad_clk["runner_steal_usec"] == E2EBD_UNAVAILABLE, clk
+        assert bad_clk["runner_psi_io_some_usec"] == 200_000
+
+    # A steal counter reset is a lost measurement, never a zero.
+    reset = _e2ebd_values_from(
+        _e2ebd_healthy_runner(
+            runner=[
+                _e2ebd_runner_payload(steal=9_000, psi_base=100_000),
+                _e2ebd_runner_payload(steal=1_500, psi_base=300_000),
+            ]
+        )
+    )
+    assert reset["runner_steal_usec"] == E2EBD_UNAVAILABLE
+    assert reset["runner_psi_cpu_some_usec"] == 200_000
+
+    # The node exec itself failing leaves the verified route but no counters.
+    failed = _e2ebd_values_from(_e2ebd_healthy_runner(failing={"runner"}))
+    assert failed["kind_node"] == E2EBD_KIND_NODE
+    assert failed["runner_steal_usec"] == E2EBD_UNAVAILABLE
+    assert failed["runner_psi_memory_full_usec"] == E2EBD_UNAVAILABLE
+
+
+def _e2ebd_pg_values(open_row: str, close_row: str) -> dict:
+    """Two PostgreSQL boundary rows against otherwise-healthy sources."""
+    runner = _e2ebd_healthy_runner(
+        postgres=[
+            _e2ebd_postgres_payload(open_row, _e2ebd_cgroup_v2(7_000_000, 0, 0), label="open"),
+            _e2ebd_postgres_payload(close_row, _e2ebd_cgroup_v2(7_250_000, 0, 0), label="close"),
+        ]
+    )
+    return _e2ebd_values_from(runner)
+
+
+E2EBD_PG_FIELDS = (
+    "pg_xact_commit_delta", "pg_wal_records_delta", "pg_wal_bytes_delta",
+    "pg_wal_write_delta", "pg_wal_sync_delta", "pg_track_wal_io_timing",
+    "pg_wal_write_time_ms_delta", "pg_wal_sync_time_ms_delta",
+)
+
+
+def test_e2e_b1_postgres_stats_parse_and_delta():
+    """FP-E2EB1D-4: reset-safe PG/WAL/timing deltas, no in-window sampler."""
+    runner = _e2ebd_healthy_runner()
+    values = _e2ebd_values_from(runner)
+    assert values["pg_xact_commit_delta"] == 600
+    assert values["pg_wal_records_delta"] == 30
+    assert values["pg_wal_bytes_delta"] == 4096
+    assert values["pg_wal_write_delta"] == 4
+    assert values["pg_wal_sync_delta"] == 3
+    assert values["pg_track_wal_io_timing"] == "on"
+    assert values["pg_wal_write_time_ms_delta"] == pytest.approx(2.5)
+    assert values["pg_wal_sync_time_ms_delta"] == pytest.approx(6.5)
+
+    # The literal invocation is pinned token by token, against literals typed
+    # out here rather than read back from the module.
+    postgres_exec = [
+        a for a in runner.calls
+        if a[0] == "kubectl" and "exec" in a and E2EBD_POSTGRES_COMPONENT in a
+    ]
+    assert len(postgres_exec) == 2
+    for argv in postgres_exec:
+        script = argv[10]
+        for token in E2EBD_PSQL_TOKENS:
+            assert token in script, token
+        # The query connects to `postgres`, never to the measured database.
+        assert "-d dbagent" not in script
+        # One statement, no composition from a pod or environment value.
+        assert script.count("psql ") == 1
+        assert "$" not in script and "`" not in script
+    # Open reads statistics FIRST, close reads them LAST.
+    assert postgres_exec[0][10].index("pg_stats") < postgres_exec[0][10].index("cpu_stat_v2")
+    assert postgres_exec[1][10].index("cpu_stat_v2") < postgres_exec[1][10].index("pg_stats")
+    # No in-window sampler exists at all.
+    diag_src = E2EBD_DIAG_PATH.read_text(encoding="utf-8")
+    assert "pg_stat_activity" not in diag_src
+    assert "wait_event" not in diag_src
+    assert "Thread(" not in diag_src and "create_task" not in diag_src
+
+    # An empty (SQL NULL) reset identity at BOTH boundaries is valid.
+    both_empty = _e2ebd_pg_values(_e2ebd_pg_row(xact=10), _e2ebd_pg_row(xact=25))
+    assert both_empty["pg_xact_commit_delta"] == 15
+    # A populated, stable reset identity is equally valid.
+    stamp = "2026-09-21 03:59:00+00"
+    stable = _e2ebd_pg_values(
+        _e2ebd_pg_row(xact=10, db_reset=stamp, wal_reset=stamp),
+        _e2ebd_pg_row(xact=25, db_reset=stamp, wal_reset=stamp),
+    )
+    assert stable["pg_xact_commit_delta"] == 15
+    assert stable["pg_wal_records_delta"] == 0
+
+    # Empty -> timestamp, and a changed timestamp, invalidate their group only.
+    later = "2026-09-21 04:10:00+00"
+    for open_row, close_row, dark, lit in (
+        (_e2ebd_pg_row(xact=10), _e2ebd_pg_row(xact=25, db_reset=stamp),
+         "pg_xact_commit_delta", "pg_wal_records_delta"),
+        (_e2ebd_pg_row(xact=10, db_reset=stamp), _e2ebd_pg_row(xact=25, db_reset=later),
+         "pg_xact_commit_delta", "pg_wal_records_delta"),
+        (_e2ebd_pg_row(xact=10, wal_reset=stamp), _e2ebd_pg_row(xact=25, wal_reset=later),
+         "pg_wal_records_delta", "pg_xact_commit_delta"),
+    ):
+        grouped = _e2ebd_pg_values(open_row, close_row)
+        assert grouped[dark] == E2EBD_UNAVAILABLE, dark
+        assert grouped[lit] != E2EBD_UNAVAILABLE, lit
+    # A WAL reset also darkens the timing fields it carries.
+    wal_reset_values = _e2ebd_pg_values(
+        _e2ebd_pg_row(wal_reset=stamp), _e2ebd_pg_row(wal_reset=later)
+    )
+    assert wal_reset_values["pg_wal_write_time_ms_delta"] == E2EBD_UNAVAILABLE
+
+    # `off` timing is `unavailable`, never a zero.
+    off = _e2ebd_pg_values(
+        _e2ebd_pg_row(timing="off", write_ms=0.0, sync_ms=0.0),
+        _e2ebd_pg_row(timing="off", write_ms=0.0, sync_ms=0.0),
+    )
+    assert off["pg_track_wal_io_timing"] == "off"
+    assert off["pg_wal_write_time_ms_delta"] == E2EBD_UNAVAILABLE
+    assert off["pg_wal_sync_time_ms_delta"] == E2EBD_UNAVAILABLE
+    assert off["pg_xact_commit_delta"] == 0
+    # A setting that changes mid-window darkens the setting and the timings.
+    flipped = _e2ebd_pg_values(_e2ebd_pg_row(timing="on"), _e2ebd_pg_row(timing="off"))
+    assert flipped["pg_track_wal_io_timing"] == E2EBD_UNAVAILABLE
+    assert flipped["pg_wal_write_time_ms_delta"] == E2EBD_UNAVAILABLE
+
+    # A whole SQL / row-shape failure darkens ALL PG-stat fields and nothing
+    # else: the cgroup and runner sources are untouched.
+    for broken_row in (
+        "on|1|||||||",                       # nine columns
+        "",                                  # zero rows
+        _e2ebd_pg_row() + "\n" + _e2ebd_pg_row(),  # two rows
+        _e2ebd_pg_row(xact="NaN"),           # non-counter
+        _e2ebd_pg_row(timing="maybe"),       # not a boolean setting
+        _e2ebd_pg_row(write_ms="-1.0"),      # negative timing
+        _e2ebd_pg_row(db_reset="not-a-timestamp"),
+    ):
+        broken = _e2ebd_pg_values(broken_row, _e2ebd_pg_row(xact=2000))
+        for name in E2EBD_PG_FIELDS:
+            assert broken[name] == E2EBD_UNAVAILABLE, (name, broken_row)
+        assert broken["gateway_cpu_usage_usec"] == 910_000
+        assert broken["postgres_cpu_usage_usec"] == 250_000
+        assert broken["runner_steal_usec"] == 5_000_000
+
+    # A commit counter that goes backwards is a lost measurement.
+    backwards = _e2ebd_pg_values(_e2ebd_pg_row(xact=9000), _e2ebd_pg_row(xact=10))
+    assert backwards["pg_xact_commit_delta"] == E2EBD_UNAVAILABLE
+    assert backwards["pg_wal_records_delta"] == 0
+
+
+def _e2ebd_top_level_fields(line: str) -> "list[tuple[str, str]]":
+    assert line.startswith(E2EBD_PREFIX), line[:60]
+    body = line[len(E2EBD_PREFIX):]
+    out = []
+    for part in body.split(","):
+        name, sep, value = part.partition("=")
+        assert sep, part
+        out.append((name, value))
+    return out
+
+
+def _e2ebd_statement_index(src: str, fn_name: str, needle: str) -> int:
+    fn = _e2ebd_function(ast.parse(src), fn_name)
+    for index, stmt in enumerate(fn.body):
+        if needle in ast.unparse(stmt):
+            return index
+    raise AssertionError(f"{needle!r} not found at the top level of {fn_name}")
+
+
+def test_e2e_b1_diagnostic_schema_is_canonical_and_comma_safe():
+    """FP-E2EB1D-5: one exact 33-field line, before the unchanged oracle."""
+    assert e2ediag.B1_E2E_DIAGNOSTIC_PREFIX == E2EBD_PREFIX
+    assert e2ediag.B1_E2E_DIAGNOSTIC_UNAVAILABLE == E2EBD_UNAVAILABLE
+    assert e2ediag.B1_E2E_DIAGNOSTIC_FIELDS == E2EBD_FIELDS
+    assert len(E2EBD_FIELDS) == 33
+    assert len(set(E2EBD_FIELDS)) == 33
+
+    runner = _e2ebd_healthy_runner()
+    opening = e2ediag.snapshot_e2e_b1_boundary("open", run=runner)
+    closing = e2ediag.snapshot_e2e_b1_boundary("close", run=runner)
+    result = e2e.PhaseResult(
+        offered=6000, served=6000, errors=0,
+        latencies_ms=[1.0] * 5939 + [1441.54] * 61,
+        t0=0.0, t_last_complete=31.0, due0=0.0,
+        max_in_flight=251, max_backlog=0, phase="baseline",
+        status_codes=[202] * 6000,
+        pre_dispatch_slip_ms=[0.1] * 6000,
+        start_lag_ms=[1.2] * 6000,
+        attempt_duration_ms=[1440.24] * 6000,
+    )
+    values = e2ediag.build_e2e_b1_diagnostic_values(result, opening, closing)
+    line = e2ediag.serialize_e2e_b1_diagnostics(values)
+
+    assert "\n" not in line and "\r" not in line
+    fields = _e2ebd_top_level_fields(line)
+    assert [name for name, _v in fields] == list(E2EBD_FIELDS)
+    rendered = dict(fields)
+    assert rendered["schema"] == "1"
+    assert rendered["offered"] == "6000"
+    assert rendered["p99_ms"] == "1441.540"
+    assert rendered["p99_leg_split_ms"] == "0.100/1.200/1440.240"
+    assert rendered["status_histogram"] == "202:6000"
+    assert rendered["max_in_flight"] == "251"
+    assert rendered["kind_node"] == E2EBD_KIND_NODE
+    assert rendered["pg_wal_write_time_ms_delta"] == "2.500"
+
+    # A hostile value cannot forge a top-level boundary.
+    hostile = dict(values)
+    hostile["gateway_pod"] = "pod,x=1\r\n100% 2026-09-21T03:59:00Z MainThread"
+    hostile_line = e2ediag.serialize_e2e_b1_diagnostics(hostile)
+    hostile_fields = _e2ebd_top_level_fields(hostile_line)
+    assert [name for name, _v in hostile_fields] == list(E2EBD_FIELDS)
+    encoded = dict(hostile_fields)["gateway_pod"]
+    for token in ("%2C", "%3D", "%0D", "%0A", "%25", "%20"):
+        assert token in encoded, token
+    assert "," not in encoded and "=" not in encoded
+    assert "\n" not in hostile_line and "\r" not in hostile_line
+    assert encoded == _quote(
+        hostile["gateway_pod"], safe="-._~:+/;@", encoding="utf-8"
+    )
+
+    # Missing, extra, reordered, empty, nonfinite and boolean members are red.
+    for mutant in (
+        {k: v for k, v in values.items() if k != "kind_node"},
+        {**values, "node_steal_usec": 1},
+        dict(reversed(list(values.items()))),
+        {**values, "kind_node": ""},
+        {**values, "p99_ms": float("inf")},
+        {**values, "p99_ms": float("nan")},
+        {**values, "offered": -1},
+        {**values, "offered": True},
+        {**values, "offered": None},
+    ):
+        with pytest.raises((ValueError, TypeError)):
+            e2ediag.serialize_e2e_b1_diagnostics(mutant)
+    # The old node_* naming can never be reintroduced through the field tuple.
+    renamed = {
+        ("node_steal_usec" if k == "runner_steal_usec" else k): v for k, v in values.items()
+    }
+    with pytest.raises(ValueError):
+        e2ediag.serialize_e2e_b1_diagnostics(renamed)
+
+    # Total source failure still yields a complete, well-formed line.
+    blank = e2ediag.build_e2e_b1_diagnostic_values(
+        None, e2ediag.unavailable_snapshot("open"), e2ediag.unavailable_snapshot("close")
+    )
+    blank_line = e2ediag.serialize_e2e_b1_diagnostics(blank)
+    blank_fields = _e2ebd_top_level_fields(blank_line)
+    assert [name for name, _v in blank_fields] == list(E2EBD_FIELDS)
+    assert [v for n, v in blank_fields if n != "schema"] == [E2EBD_UNAVAILABLE] * 32
+    assert blank_line == e2ediag.fallback_e2e_b1_diagnostic_line()
+
+    # The record is printed BEFORE the unchanged oracle and AFTER the legacy
+    # baseline fingerprint print.
+    load_src = E2E_TEST.read_text(encoding="utf-8")
+    emit_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "diagnostics.emit(baseline)")
+    oracle_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "assert p99 < P99_MS")
+    legacy_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "phase=baseline,max_lateness_ms=")
+    assert legacy_at < emit_at < oracle_at
+
+
+class E2EBDRaisingStream:
+    def __init__(self, exc=OSError("stdout is gone")):
+        self.exc = exc
+        self.written: list[str] = []
+
+    def write(self, text):
+        raise self.exc
+
+    def flush(self):
+        raise self.exc
+
+
+def _e2ebd_core(result) -> dict:
+    return {
+        "offered": result.offered,
+        "served": result.served,
+        "errors": result.errors,
+        "status_codes": list(result.status_codes),
+        "latency_count": len(result.latencies_ms),
+        "max_backlog": result.max_backlog,
+    }
+
+
+def test_e2e_b1_diagnostics_fail_soft_at_each_boundary():
+    """FP-E2EB1D-1/2/3/4/7/8: four independent boundaries, none reaching the oracle."""
+    measured = 24
+
+    # --- boundary 1: the in-generator derivation wrapper -------------------
+    control, _t, _m = _e2ebd_run_baseline(e2e, measured=measured, prologue=4)
+    assert len(control.pre_dispatch_slip_ms) == measured
+    control_line = e2ediag.serialize_e2e_b1_diagnostics(
+        e2ediag.build_e2e_b1_diagnostic_values(
+            control, e2ediag.unavailable_snapshot("open"), e2ediag.unavailable_snapshot("close")
+        )
+    )
+    assert "p99_leg_split_ms=unavailable" not in control_line
+    assert "leg_p99s_ms=unavailable" not in control_line
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("helper drift")
+
+    original = e2e.derive_leg_vectors
+    try:
+        e2e.derive_leg_vectors = _raise
+        degraded, _t2, _m2 = _e2ebd_run_baseline(e2e, measured=measured, prologue=4)
+    finally:
+        e2e.derive_leg_vectors = original
+    assert _e2ebd_core(degraded) == _e2ebd_core(control)
+    assert _math.isfinite(degraded.p99) and _math.isfinite(control.p99)
+    assert degraded.pre_dispatch_slip_ms == []
+    assert degraded.start_lag_ms == []
+    assert degraded.attempt_duration_ms == []
+    degraded_values = e2ediag.build_e2e_b1_diagnostic_values(
+        degraded, e2ediag.unavailable_snapshot("open"), e2ediag.unavailable_snapshot("close")
+    )
+    assert degraded_values["p99_leg_split_ms"] == E2EBD_UNAVAILABLE
+    assert degraded_values["leg_p99s_ms"] == E2EBD_UNAVAILABLE
+    assert degraded_values["p99_ms"] == degraded.p99
+    assert degraded_values["status_histogram"] == "202:24"
+
+    # Named red mutation: removing the wrapper lets the exception abort the
+    # baseline, so the unchanged assertions are never reached.
+    profile_src, diag_src, load_src = _e2ebd_sources()
+    unwrapped = profile_src.replace(
+        "        try:\n"
+        "            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(",
+        "        if True:\n"
+        "            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(",
+        1,
+    ).replace(
+        "        except Exception:  # noqa: BLE001 -- diagnostic only, never the oracle\n"
+        "            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = [], [], []\n",
+        "",
+        1,
+    )
+    assert unwrapped != profile_src
+    mutant = _e2ebd_exec_profile(unwrapped, "b1_e2e_profile_unwrapped_mutant")
+    mutant.derive_leg_vectors = _raise
+    with pytest.raises(RuntimeError):
+        _e2ebd_run_baseline(mutant, measured=measured, prologue=4)
+
+    # KeyboardInterrupt and SystemExit are never converted into output.
+    for escalating in (KeyboardInterrupt, SystemExit):
+        def _escalate(*args, **kwargs):
+            raise escalating("stop")
+
+        try:
+            e2e.derive_leg_vectors = _escalate
+            with pytest.raises(escalating):
+                _e2ebd_run_baseline(e2e, measured=4, prologue=1)
+        finally:
+            e2e.derive_leg_vectors = original
+
+    # --- boundary 2: each snapshot callback, independently ------------------
+    def _raising_runner(argv, **kwargs):
+        raise RuntimeError("kubectl exploded")
+
+    for label in ("open", "close"):
+        snapshot = e2ediag.safe_snapshot_e2e_b1_boundary(label, run=_raising_runner)
+        assert snapshot.gateway is None and snapshot.runner is None
+        assert snapshot.postgres_stats is None and snapshot.kind_node is None
+
+    healthy = _e2ebd_healthy_runner()
+    good_open = e2ediag.snapshot_e2e_b1_boundary("open", run=healthy)
+    session = e2ediag.B1E2EDiagnosticSession(run=_raising_runner)
+    session.open()
+    session.close()
+    out = _io.StringIO()
+    line = session.emit(control, stdout=out, artifact_writer=lambda text: True)
+    assert line.startswith(E2EBD_PREFIX)
+    assert out.getvalue() == line + "\n"
+    assert dict(_e2ebd_top_level_fields(line))["gateway_pod"] == E2EBD_UNAVAILABLE
+    assert dict(_e2ebd_top_level_fields(line))["p99_ms"] != E2EBD_UNAVAILABLE
+
+    # One failing boundary never erases the other, and a valid controlled
+    # fixture must still be numeric -- an always-unavailable reader is red.
+    half = e2ediag.B1E2EDiagnosticSession(run=_raising_runner)
+    half._opening = good_open
+    half.close()
+    half_values = e2ediag.build_e2e_b1_diagnostic_values(control, half.opening, half.closing)
+    assert half_values["gateway_pod"] == E2EBD_UNAVAILABLE
+    both = _e2ebd_healthy_runner()
+    full = e2ediag.B1E2EDiagnosticSession(run=both)
+    full.open()
+    full.close()
+    full_values = e2ediag.build_e2e_b1_diagnostic_values(control, full.opening, full.closing)
+    assert full_values["gateway_cpu_usage_usec"] == 910_000
+    assert full_values["runner_steal_usec"] == 5_000_000
+    assert full_values["pg_xact_commit_delta"] == 600
+
+    # --- boundary 3: renderer and stdout ------------------------------------
+    class Exploding:
+        offered = 1
+
+        def __getattr__(self, name):
+            raise RuntimeError("result is poisoned")
+
+    fallback_out = _io.StringIO()
+    fallback_line = full.emit(
+        Exploding(), stdout=fallback_out, artifact_writer=lambda text: True
+    )
+    assert fallback_line == e2ediag.fallback_e2e_b1_diagnostic_line()
+    assert fallback_out.getvalue() == fallback_line + "\n"
+    assert [n for n, _v in _e2ebd_top_level_fields(fallback_line)] == list(E2EBD_FIELDS)
+
+    stdout_line = full.emit(
+        control, stdout=E2EBDRaisingStream(), artifact_writer=lambda text: True
+    )
+    assert stdout_line.startswith(E2EBD_PREFIX)
+
+    # --- boundary 4: the artifact writer ------------------------------------
+    def _raising_writer(text):
+        raise OSError("read-only filesystem")
+
+    writer_out = _io.StringIO()
+    writer_line = full.emit(control, stdout=writer_out, artifact_writer=_raising_writer)
+    assert writer_out.getvalue() == writer_line + "\n"
+    assert e2ediag.write_e2e_b1_diagnostic_artifact(
+        writer_line, path=Path("/proc/definitely-not-writable/x.txt")
+    ) is False
+
+
+def test_e2e_b1_diagnostic_module_has_no_popen_or_environment_read():
+    """FP-E2EB1D-7/8: the new module is bounded, injectable and env-free.
+
+    `test_b1_output_capture_ownership` keeps its fixed three-source list and
+    the existing no-environment loop covers the two profile files, so neither
+    of them sees `b1_e2e_diagnostics.py`. This test applies the same two
+    shipped AST predicates to it directly.
+    """
+    diag_src = E2EBD_DIAG_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(diag_src)
+
+    assert not _source_has_environ_read(diag_src)
+    assert not any(
+        isinstance(n, ast.Call) and _call_func_name(n) == "Popen" for n in ast.walk(tree)
+    )
+    # A Popen or an environment read in this module must be caught here.
+    assert _source_has_environ_read(diag_src + "\nimport os\nX = os.environ.get('E2E')\n")
+    popen_mutant = ast.parse(diag_src + "\nproc = subprocess.Popen(['kubectl'])\n")
+    assert any(
+        isinstance(n, ast.Call) and _call_func_name(n) == "Popen"
+        for n in ast.walk(popen_mutant)
+    )
+    # Token scans run over prose-free source: a comment that explains why a
+    # token is forbidden must not itself trip the scan.
+    code = _gc4_prose_free(diag_src)
+    for token in ("threading", "Thread(", "asyncio", "create_task", "signal.", "os.fork"):
+        assert token not in code, token
+
+    # Exactly one call site invokes the injected runner, and it is not in a
+    # loop: there is no retry anywhere.
+    runner_calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and _call_func_name(n) == "run"
+    ]
+    assert len(runner_calls) == 1, [ast.unparse(n) for n in runner_calls]
+    call = runner_calls[0]
+    kwargs = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert kwargs == {
+        "capture_output": "True",
+        "text": "True",
+        "check": "False",
+        "timeout": "DIAGNOSTIC_COMMAND_TIMEOUT_S",
+    }
+    enclosing = _e2ebd_function(tree, "_run_command")
+    assert call in list(ast.walk(enclosing))
+    assert not any(isinstance(n, (ast.For, ast.While, ast.AsyncFor)) for n in ast.walk(enclosing))
+    for token in ("retry", "retries", "backoff", "attempt_again", "reconnect", "time.sleep"):
+        assert token not in code, token
+    assert e2ediag.DIAGNOSTIC_COMMAND_TIMEOUT_S == E2EBD_COMMAND_TIMEOUT_S
+
+    # Exactly twelve commands for a complete two-boundary collection, each
+    # with the exact keyword set, and a bounded 60 s worst case inside the
+    # pinned 420 s pytest_e2e phase budget.
+    runner = _e2ebd_healthy_runner()
+    session = e2ediag.B1E2EDiagnosticSession(run=runner)
+    session.open()
+    assert len(runner.calls) == E2EBD_COMMANDS_PER_BOUNDARY
+    session.close()
+    assert len(runner.calls) == E2EBD_TOTAL_COMMANDS
+    assert all(kw == E2EBD_RUN_KWARGS for kw in runner.kwargs)
+    assert E2EBD_TOTAL_COMMANDS * E2EBD_COMMAND_TIMEOUT_S == 60.0
+    assert 60.0 < 420.0
+
+    # A timeout is a missing source, not a retry and not an exception.
+    def _timeout_runner(argv, **kwargs):
+        raise subprocess.TimeoutExpired(list(argv), E2EBD_COMMAND_TIMEOUT_S)
+
+    timed_out = e2ediag.snapshot_e2e_b1_boundary("open", run=_timeout_runner)
+    assert timed_out.gateway is None and timed_out.runner is None
+    # The module's own default is the real subprocess.run, injected once.
+    constructor = _e2ebd_function(tree, "__init__")
+    defaults = [ast.unparse(d) for d in constructor.args.kw_defaults if d is not None]
+    assert "subprocess.run" in defaults
+
+
+def _e2ebd_segment_digest(src: str, node: ast.AST) -> str:
+    return hashlib.sha256(
+        ast.get_source_segment(src, node, padded=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _e2ebd_reported_only_failures(load_src: str, profile_src: str, ci_text: str) -> "list[str]":
+    """Nothing diagnostic may touch the verdict, the legacy report or a knob."""
+    fails: list[str] = []
+    try:
+        tree = ast.parse(load_src)
+    except SyntaxError as exc:
+        return [f"live e2e test no longer parses: {exc}"]
+    test_fn = _e2ebd_function(tree, "test_b1_ingest_burst_profile")
+
+    # 1. the exact five live wiring lines, once each
+    for line in E2EBD_WIRING_LINES:
+        if load_src.count(line + "\n") != 1:
+            fails.append(f"wiring line drift: {line!r}")
+
+    # 2. the oracle: byte-identical and unconditional
+    if load_src.count(E2EBD_ORACLE_BYTES + "\n") != 1:
+        fails.append("the p99 assertion bytes changed")
+    oracle_nodes = [
+        n for n in ast.walk(test_fn)
+        if isinstance(n, ast.Assert) and ast.unparse(n).startswith("assert p99 < P99_MS")
+    ]
+    if len(oracle_nodes) != 1:
+        fails.append(f"{len(oracle_nodes)} p99 assertions in the test body")
+    elif oracle_nodes[0] not in test_fn.body:
+        fails.append("the p99 assertion is nested under a condition")
+    else:
+        # The record is printed on a completed PASS or FAIL: it must come
+        # after the legacy baseline fingerprint and before the oracle.
+        order = {"legacy": None, "emit": None}
+        for index, stmt in enumerate(test_fn.body):
+            text = ast.unparse(stmt)
+            if "phase=baseline,max_lateness_ms=" in text and order["legacy"] is None:
+                order["legacy"] = index
+            if "diagnostics.emit(baseline)" in text and order["emit"] is None:
+                order["emit"] = index
+        oracle_index = test_fn.body.index(oracle_nodes[0])
+        if order["emit"] is None:
+            fails.append("the diagnostics record is never emitted")
+        elif order["legacy"] is None:
+            fails.append("the legacy baseline fingerprint print is gone")
+        elif not (order["legacy"] < order["emit"] < oracle_index):
+            fails.append(
+                f"emit order drift: legacy={order['legacy']} emit={order['emit']} "
+                f"oracle={oracle_index}"
+            )
+
+    # 3. legacy readers and both legacy fingerprint prints, byte-identical
+    for name, digest in E2EBD_LEGACY_DIGESTS.items():
+        try:
+            node = _e2ebd_function(tree, name)
+        except AssertionError:
+            fails.append(f"legacy reader {name} is gone")
+            continue
+        if _e2ebd_segment_digest(load_src, node) != digest:
+            fails.append(f"legacy reader {name} changed")
+    prints = [
+        n for n in ast.walk(test_fn)
+        if isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", "") == "print"
+    ]
+    digests = tuple(_e2ebd_segment_digest(load_src, n) for n in prints)
+    if digests != E2EBD_LEGACY_PRINT_DIGESTS:
+        fails.append(f"the legacy `B1 env=` prints changed: {digests}")
+
+    # 4. all twelve FP-IG-19 rows still match one-to-one
+    nodes = _nodes_for_src(load_src, "test_b1_ingest_burst_profile")
+    consumed: set[int] = set()
+    rows = [r for r in B1_INVENTORY if r[0] == E2E_TEST and r[1] == "test_b1_ingest_burst_profile"]
+    if len(rows) != 12:
+        fails.append(f"{len(rows)} e2e inventory rows, want 12")
+    for _path, _name, names, ops, eq_ok in rows:
+        matched = _inventory_match(nodes, names, ops, eq_ok, consumed=consumed)
+        if matched is None:
+            fails.append(f"missing e2e assertion for {sorted(names)}")
+        else:
+            consumed.add(matched)
+
+    # 5. no skip / xfail / retry / mask anywhere on the live surface
+    code = _gc4_prose_free(load_src)
+    for token in E2EBD_MASKING_TOKENS:
+        if token in code:
+            fails.append(f"masking token on the live e2e surface: {token}")
+
+    # 6. no diagnostic value is ever read back into a branch or an assertion
+    for node in ast.walk(test_fn):
+        if isinstance(node, (ast.If, ast.While, ast.Assert, ast.IfExp, ast.Try)):
+            text = ast.unparse(node)
+            if "diagnostics" in text or "B1E2EDiagnosticSession" in text:
+                fails.append(f"a diagnostic value conditions control flow: {text[:60]}")
+    for node in ast.walk(test_fn):
+        if isinstance(node, ast.Assign) and "diagnostics.emit" in ast.unparse(node):
+            fails.append("the emitted record is bound to a name and can be read back")
+
+    # 7. the generator call keeps every fixed argument; only the two callbacks
+    #    are added
+    calls = [
+        n for n in ast.walk(test_fn)
+        if isinstance(n, ast.Call) and "run_open_loop_baseline" in ast.unparse(n.func)
+    ]
+    if len(calls) != 1:
+        fails.append(f"{len(calls)} baseline generator calls")
+    else:
+        kwargs = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+        expected = {
+            "endpoint": "endpoint",
+            "requests": "measured",
+            "rate": "BASE_RATE",
+            "max_in_flight": "MAX_IN_FLIGHT",
+            "warmup": "warmup",
+            "prologue": "prologue",
+            "include_sync_warmup": "True",
+            "on_prologue_complete": "_after_prologue",
+            "on_window_open": "diagnostics.open",
+            "on_window_complete": "diagnostics.close",
+        }
+        if kwargs != expected:
+            fails.append(f"baseline call argument drift: {kwargs}")
+    sat_calls = [
+        n for n in ast.walk(test_fn)
+        if isinstance(n, ast.Call) and "run_closed_loop_saturation" in ast.unparse(n.func)
+    ]
+    if len(sat_calls) != 1:
+        fails.append("the saturation call changed")
+    else:
+        sat_kwargs = {k.arg: ast.unparse(k.value) for k in sat_calls[0].keywords}
+        if sat_kwargs != {
+            "endpoint": "endpoint",
+            "request_factory": "factory",
+            "clients": "SATURATION_CLIENTS",
+            "duration_s": "BURST_SECONDS",
+        }:
+            fails.append(f"saturation call drift: {sat_kwargs}")
+
+    # 8. the fixed profile constants, in both carriers
+    load_assigns = _source_assigns(load_src)
+    profile_assigns = _source_assigns(profile_src)
+    for name, expected_value in (
+        ("BASE_RATE", 200), ("BASE_SECONDS", 30), ("BASE_TOTAL", 6000),
+        ("P99_MS", 150.0), ("MAX_IN_FLIGHT", 1000), ("SATURATION_CLIENTS", 150),
+        ("PROLOGUE_REQUESTS", 30), ("BURST_SECONDS", 30),
+    ):
+        for label, assigns in (("test", load_assigns), ("profile", profile_assigns)):
+            if name not in assigns:
+                fails.append(f"{label}: {name} is gone")
+                continue
+            try:
+                value = _eval_simple_constant(assigns[name], assigns)
+            except AssertionError:
+                continue  # a derived expression is evaluated by its own pin
+            if value != expected_value:
+                fails.append(f"{label}: {name}={value} want {expected_value}")
+
+    # 9. the workflow: the byte-identical failure upload, the exact success
+    #    upload, and no masking anywhere in the e2e job
+    workflow = yaml.safe_load(ci_text)
+    steps = (workflow.get("jobs") or {}).get("e2e", {}).get("steps") or []
+    names = [s.get("name") or s.get("uses") for s in steps]
+    if names.count(E2EBD_SUCCESS_STEP_NAME) != 1:
+        fails.append("the success-only diagnostics upload is not present exactly once")
+    if names.count(E2EBD_FAILURE_STEP_NAME) != 1:
+        fails.append("the failure upload is not present exactly once")
+    else:
+        failure = steps[names.index(E2EBD_FAILURE_STEP_NAME)]
+        if failure.get("if") != "failure()":
+            fails.append("the failure upload condition changed")
+        if failure.get("uses") != "actions/upload-artifact@v4":
+            fails.append("the failure upload action changed")
+        with_block = failure.get("with") or {}
+        if with_block.get("name") != "e2e-failure-logs":
+            fails.append("the failure artifact name changed")
+        if tuple(str(with_block.get("path", "")).split()) != E2EBD_FAILURE_PATHS:
+            fails.append(f"the failure upload paths changed: {with_block.get('path')!r}")
+        if with_block.get("if-no-files-found") != "ignore":
+            fails.append("the failure upload missing-file policy changed")
+    if "            /tmp/rca-e2e/**\n            tests/e2e/*.log\n" not in ci_text:
+        fails.append("the two failure-upload path lines are no longer byte-identical")
+    for step in steps:
+        if "continue-on-error" in step:
+            fails.append("an e2e step masks its own outcome")
+    if "continue-on-error" in ((workflow.get("jobs") or {}).get("e2e") or {}):
+        fails.append("the e2e job masks its own outcome")
+    run_steps = [s.get("run") for s in steps if s.get("run")]
+    if "bash tests/e2e/run.sh" not in run_steps:
+        fails.append("the e2e run command changed")
+    return fails
+
+
+def test_e2e_b1_diagnostics_are_reported_only_and_fixed():
+    """FP-E2EB1D-8: the verdict, the legacy report and every knob stay fixed."""
+    profile_src, _diag_src, load_src = _e2ebd_sources()
+    ci_text = E2EBD_CI_YML.read_text(encoding="utf-8")
+    assert _e2ebd_reported_only_failures(load_src, profile_src, ci_text) == []
+
+    # run.sh and its pinned pytest command are untouched by this slice.
+    run_sh = (REPO_ROOT / "tests" / "e2e" / "run.sh").read_text(encoding="utf-8")
+    assert "python3 -m pytest tests/e2e -v --tb=short" in run_sh
+    assert "tee" not in run_sh.split("python3 -m pytest tests/e2e")[1][:80]
+
+    # --- the §3.7 mutation set: every one of these is red ------------------
+    load_mutants = {
+        "oracle_weakened": load_src.replace("assert p99 < P99_MS", "assert p99 <= P99_MS", 1),
+        "oracle_deleted": load_src.replace(E2EBD_ORACLE_BYTES + "\n", "", 1),
+        "oracle_nested": load_src.replace(
+            E2EBD_ORACLE_BYTES + "\n",
+            "    if diagnostics is not None:\n    " + E2EBD_ORACLE_BYTES + "\n",
+            1,
+        ),
+        "emit_moved_after_the_oracle": load_src.replace(
+            "    diagnostics.emit(baseline)\n", "", 1
+        ).replace(
+            E2EBD_ORACLE_BYTES + "\n",
+            E2EBD_ORACLE_BYTES + "\n    diagnostics.emit(baseline)\n",
+            1,
+        ),
+        "record_bound_and_readable": load_src.replace(
+            "    diagnostics.emit(baseline)\n", "    record = diagnostics.emit(baseline)\n", 1
+        ),
+        "diagnostic_conditions_the_run": load_src.replace(
+            "    diagnostics.emit(baseline)\n",
+            "    diagnostics.emit(baseline)\n    if diagnostics.opening.gateway is None:\n        return\n",
+            1,
+        ),
+        "legacy_print_refed": load_src.replace(
+            "f\"gw_cpu_seconds={_fmt_diag(gw_cpu_seconds)},\"",
+            "f\"gw_cpu_seconds={_fmt_diag(None)},\"",
+            1,
+        ),
+        "legacy_reader_changed": load_src.replace(
+            '    empty = {"usage_usec": None, "throttled_usec": None, "nr_throttled": None}',
+            '    empty = {"usage_usec": 0, "throttled_usec": 0, "nr_throttled": 0}',
+            1,
+        ),
+        "skip_added": load_src.replace(
+            "    diagnostics.emit(baseline)\n",
+            "    diagnostics.emit(baseline)\n    pytest.skip('diagnostics only')\n",
+            1,
+        ),
+        "max_in_flight_changed": load_src.replace("MAX_IN_FLIGHT = 1000", "MAX_IN_FLIGHT = 500", 1),
+        "p99_constant_changed": load_src.replace("P99_MS = 150.0", "P99_MS = 1500.0", 1),
+        "base_rate_changed": load_src.replace("BASE_RATE = 200", "BASE_RATE = 100", 1),
+        "generator_rate_rebound": load_src.replace("            rate=BASE_RATE,", "            rate=100,", 1),
+        "saturation_shortened": load_src.replace(
+            "            duration_s=BURST_SECONDS,", "            duration_s=1,", 1
+        ),
+        "accounting_assertion_deleted": load_src.replace("    assert errors == 0\n", "", 1),
+    }
+    for case, mutant in load_mutants.items():
+        assert mutant != load_src, case
+        assert _e2ebd_reported_only_failures(mutant, profile_src, ci_text) != [], case
+
+    profile_mutants = {
+        "profile_max_in_flight": profile_src.replace("MAX_IN_FLIGHT = BURST_RATE", "MAX_IN_FLIGHT = 500", 1),
+        "profile_p99": profile_src.replace("P99_MS = 150.0", "P99_MS = 1500.0", 1),
+        "profile_base_seconds": profile_src.replace("BASE_SECONDS = 30", "BASE_SECONDS = 5", 1),
+    }
+    for case, mutant in profile_mutants.items():
+        assert mutant != profile_src, case
+        assert _e2ebd_reported_only_failures(load_src, mutant, ci_text) != [], case
+
+    ci_mutants = {
+        "failure_path_line_removed": ci_text.replace("            tests/e2e/*.log\n", "", 1),
+        "failure_condition_widened": ci_text.replace(
+            "      - name: Upload phase timing and pod logs on failure\n        if: failure()",
+            "      - name: Upload phase timing and pod logs on failure\n        if: always()",
+            1,
+        ),
+        "success_upload_removed": ci_text.replace(
+            "      - name: Upload B1 diagnostics on success\n"
+            "        if: success()\n"
+            "        uses: actions/upload-artifact@v4\n"
+            "        with:\n"
+            "          name: e2e-b1-diagnostics\n"
+            "          path: /tmp/rca-e2e/b1-baseline-diagnostics.txt\n"
+            "          if-no-files-found: ignore\n",
+            "",
+            1,
+        ),
+        "e2e_step_masks_its_outcome": ci_text.replace(
+            "      - name: Run e2e (1500s product budget inside 30m job)\n        run: bash tests/e2e/run.sh",
+            "      - name: Run e2e (1500s product budget inside 30m job)\n        continue-on-error: true\n        run: bash tests/e2e/run.sh",
+            1,
+        ),
+        "e2e_command_replaced": ci_text.replace(
+            "        run: bash tests/e2e/run.sh", "        run: bash tests/e2e/run.sh || true", 1
+        ),
+    }
+    for case, mutant in ci_mutants.items():
+        assert mutant != ci_text, case
+        assert _e2ebd_reported_only_failures(load_src, profile_src, mutant) != [], case
+
+
+#: The per-request schedule-path budget, declared here rather than measured
+#: from either subject: two bounds guards, two monotonic reads and two
+#: preallocated-vector stores for a measured request; one guard and nothing
+#: else for a warmup or prologue request.
+E2EBD_MEASURED_BUDGET = {
+    "bounds_guards": 2,
+    "monotonic_reads_in_guards": 2,
+    "preallocated_stores_in_guards": 2,
+    "allocations_before_one": 2,
+    "forbidden_operations_in_guards": 0,
+    "unmeasured_guard_evaluations": 1,
+    "unmeasured_reads": 0,
+    "unmeasured_stores": 0,
+}
+E2EBD_FORBIDDEN_HOT_PATH = (
+    "await", "sleep", "open(", "subprocess", "Lock", "Event", "create_task",
+    "gather", "for ", "while ", "[0.0]", "append", "dict(", "list(",
+)
+
+
+def _e2ebd_operation_budget(src: str, fn_name: str) -> dict:
+    """The AST operation metric of one open-loop generator's schedule path."""
+    tree = ast.parse(src)
+    gen = _e2ebd_function(tree, fn_name)
+    one = next(n for n in gen.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_one")
+    one_index = gen.body.index(one)
+    allocations = [
+        index
+        for index, stmt in enumerate(gen.body)
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id in ("dispatch_at", "attempt_at")
+        and ast.unparse(stmt.value) == "[0.0] * n"
+    ]
+    guards = [
+        node
+        for node in ast.walk(gen)
+        if isinstance(node, ast.If) and ast.unparse(node.test) in ("0 <= idx < n", "0 <= i < n")
+    ]
+    reads = 0
+    stores = 0
+    forbidden = 0
+    for guard in guards:
+        body_text = "\n".join(ast.unparse(stmt) for stmt in guard.body)
+        reads += body_text.count("time.perf_counter()")
+        for stmt in guard.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Subscript)
+                and isinstance(stmt.targets[0].value, ast.Name)
+                and stmt.targets[0].value.id in ("dispatch_at", "attempt_at")
+            ):
+                stores += 1
+        for token in E2EBD_FORBIDDEN_HOT_PATH:
+            if token in body_text:
+                forbidden += 1
+        if guard.orelse:
+            forbidden += 1
+    # A warmup / prologue request (idx < 0) evaluates the `_one` guard only.
+    attempt_guards = [g for g in guards if ast.unparse(g.test) == "0 <= idx < n"]
+    return {
+        "bounds_guards": len(guards),
+        "monotonic_reads_in_guards": reads,
+        "preallocated_stores_in_guards": stores,
+        "allocations_before_one": sum(1 for index in allocations if index < one_index),
+        "forbidden_operations_in_guards": forbidden,
+        "unmeasured_guard_evaluations": len(attempt_guards),
+        "unmeasured_reads": 0 if reads == len(guards) else reads,
+        "unmeasured_stores": 0 if stores == len(guards) else stores,
+    }
+
+
+def test_e2e_b1_leg_instrumentation_operation_budget_matches_reference():
+    """Benchmark (FP-E2EB1D-7): the e2e hot path equals the shipped reference.
+
+    The reference carrier already passes the isolated gate at 500 offered/s --
+    2.5x the e2e offer -- with exactly this placement, so operation-for-
+    operation parity is the non-perturbation evidence. No live on/off run is
+    part of the acceptance bar.
+    """
+    profile_src, _diag_src, _load_src = _e2ebd_sources()
+    ref_src = REF_PATH.read_text(encoding="utf-8")
+
+    e2e_budget = _e2ebd_operation_budget(profile_src, "run_open_loop_baseline")
+    ref_budget = _e2ebd_operation_budget(ref_src, "run_open_loop")
+    assert e2e_budget == E2EBD_MEASURED_BUDGET, e2e_budget
+    assert ref_budget == E2EBD_MEASURED_BUDGET, ref_budget
+    assert e2e_budget == ref_budget
+
+    # The diagnostic work itself is entirely outside the schedule path.
+    gen = _e2ebd_function(ast.parse(profile_src), "run_open_loop_baseline")
+    dispatch_loop = next(
+        n for n in ast.walk(gen)
+        if isinstance(n, ast.For) and "asyncio.create_task(_one(i, *requests[i]))" in ast.unparse(n)
+    )
+    loop_text = ast.unparse(dispatch_loop)
+    for token in ("derive_leg_vectors", "on_window_open", "on_window_complete", "subprocess"):
+        assert token not in loop_text, token
+
+    # Red for both D1 shapes.
+    late = profile_src.replace(
+        "    dispatch_at = [0.0] * n\n    attempt_at = [0.0] * n\n\n    async def _one(",
+        "    async def _one(",
+        1,
+    ).replace(
+        "        latencies = [0.0] * n\n",
+        "        dispatch_at = [0.0] * n\n        attempt_at = [0.0] * n\n        latencies = [0.0] * n\n",
+        1,
+    )
+    assert _e2ebd_operation_budget(late, "run_open_loop_baseline") != E2EBD_MEASURED_BUDGET
+    unguarded = profile_src.replace(
+        "            if 0 <= idx < n:\n                attempt_at[idx] = time.perf_counter()\n",
+        "            attempt_at[idx] = time.perf_counter()\n",
+        1,
+    )
+    assert _e2ebd_operation_budget(unguarded, "run_open_loop_baseline") != E2EBD_MEASURED_BUDGET
+    # An added await, per-request allocation or sampler task inside a guard is
+    # over budget too.
+    for injected in (
+        "            if 0 <= idx < n:\n                await asyncio.sleep(0)\n                attempt_at[idx] = time.perf_counter()\n",
+        "            if 0 <= idx < n:\n                attempt_at[idx] = time.perf_counter()\n                samples = [0.0] * n\n",
+        "            if 0 <= idx < n:\n                asyncio.create_task(_one(0, raw, headers))\n                attempt_at[idx] = time.perf_counter()\n",
+    ):
+        mutant = profile_src.replace(
+            "            if 0 <= idx < n:\n                attempt_at[idx] = time.perf_counter()\n",
+            injected,
+            1,
+        )
+        assert mutant != profile_src
+        budget = _e2ebd_operation_budget(mutant, "run_open_loop_baseline")
+        assert budget["forbidden_operations_in_guards"] > 0, injected
+        assert budget != E2EBD_MEASURED_BUDGET
+
+
+def test_e2e_b1_every_source_failure_is_group_local_and_unavailable():
+    """FP-E2EB1D-2/3/4/5/8 (§3.8): one dark source never darkens another."""
+    # A failing command, a malformed payload and an unparseable JSON document
+    # each darken exactly their own group.
+    for failing, dark, lit in (
+        ({"gateway"}, "gateway_cpu_usage_usec", "postgres_cpu_usage_usec"),
+        ({"postgres"}, "postgres_cpu_usage_usec", "gateway_cpu_usage_usec"),
+        ({"kind"}, "kind_node", "gateway_cpu_usage_usec"),
+        ({"runner"}, "runner_steal_usec", "pg_xact_commit_delta"),
+    ):
+        values = _e2ebd_values_from(_e2ebd_healthy_runner(failing=failing))
+        assert values[dark] == E2EBD_UNAVAILABLE, (failing, dark)
+        assert values[lit] != E2EBD_UNAVAILABLE, (failing, lit)
+    # The whole pod query failing darkens every cluster-sourced field, and the
+    # record is still complete.
+    blind = _e2ebd_values_from(_e2ebd_healthy_runner(failing={"pods"}))
+    for name in E2EBD_FIELDS:
+        if name != "schema":
+            assert blind[name] == E2EBD_UNAVAILABLE, name
+    assert len(e2ediag.serialize_e2e_b1_diagnostics(blind).split(",")) == 33
+
+    # Structurally impossible pod payloads are refused, never guessed at.
+    for payload in ("not json at all", "[]", '{"items": {}}', '{"items": [3]}',
+                    '{"items": [{"metadata": {"labels": 7}}]}'):
+        gateway, postgres = e2ediag.resolve_b1_pod_targets(
+            _e2ebd_healthy_runner(pod_json=[payload])
+        )
+        assert gateway is None and postgres is None, payload
+
+    # Malformed exec output is an unavailable, never a zero.
+    garbled = _e2ebd_values_from(
+        _e2ebd_healthy_runner(
+            gateway=["#b1diag-begin:cpu_stat_v2\nusage_usec 1\n"],  # unterminated
+            postgres=["not framed at all"],
+        )
+    )
+    assert garbled["gateway_cpu_usage_usec"] == E2EBD_UNAVAILABLE
+    assert garbled["postgres_cpu_usage_usec"] == E2EBD_UNAVAILABLE
+    assert garbled["pg_xact_commit_delta"] == E2EBD_UNAVAILABLE
+    assert garbled["runner_steal_usec"] == 5_000_000
+    # A v1 payload missing half of itself, and a non-mapping frame set.
+    for frames in ({"proc_stat": "cpu 1"}, "not a mapping"):
+        with pytest.raises(Exception):
+            e2ediag.parse_cgroup_cpu_frames(frames)
+    with pytest.raises(Exception):
+        e2ediag.parse_runner_frames("not a mapping")
+    with pytest.raises(Exception):
+        e2ediag.parse_runner_frames({"psi_cpu": "some total=1"})
+    with pytest.raises(Exception):
+        e2ediag.parse_frames(None)
+    with pytest.raises(Exception):
+        e2ediag.parse_postgres_stats_row(None)
+    for body in ("17", "nr_throttled 1\nthrottled_time 2"):
+        broken = (
+            _e2ebd_frame("proc_self_cgroup", "0::/")
+            + _e2ebd_frame("cpu_stat_v2", "")
+            + _e2ebd_frame("cpuacct_usage_v1", body if body == "17" else "")
+            + _e2ebd_frame("cpu_stat_v1", "" if body == "17" else body)
+        )
+        with pytest.raises(Exception):
+            e2ediag.parse_cgroup_cpu_frames(e2ediag.parse_frames(broken))
+    bad_usage = (
+        _e2ebd_frame("proc_self_cgroup", "0::/")
+        + _e2ebd_frame("cpu_stat_v2", "")
+        + _e2ebd_frame("cpuacct_usage_v1", "not-a-number")
+        + _e2ebd_frame("cpu_stat_v1", "nr_throttled 1\nthrottled_time 2")
+    )
+    with pytest.raises(Exception):
+        e2ediag.parse_cgroup_cpu_frames(e2ediag.parse_frames(bad_usage))
+    incomplete_v1 = (
+        _e2ebd_frame("proc_self_cgroup", "0::/")
+        + _e2ebd_frame("cpu_stat_v2", "")
+        + _e2ebd_frame("cpuacct_usage_v1", "17")
+        + _e2ebd_frame("cpu_stat_v1", "nr_periods 3")
+    )
+    with pytest.raises(Exception):
+        e2ediag.parse_cgroup_cpu_frames(e2ediag.parse_frames(incomplete_v1))
+    with pytest.raises(Exception):
+        e2ediag.parse_frames("#b1diag-end:cpu_stat_v2\n")
+    with pytest.raises(Exception):
+        e2ediag.parse_frames("#b1diag-begin:a\n#b1diag-begin:b\n")
+
+    # A stable identity whose counters are missing keeps the group dark.
+    target = e2ediag.PodTarget(
+        name="p", uid="u", node_name=E2EBD_KIND_NODE,
+        container_id="c", container_name=E2EBD_GATEWAY_COMPONENT,
+    )
+    half = e2ediag.build_e2e_b1_diagnostic_values(
+        None,
+        e2ediag.BoundarySnapshot(label="open", gateway=target),
+        e2ediag.BoundarySnapshot(label="close", gateway=target),
+    )
+    assert half["gateway_pod"] == E2EBD_UNAVAILABLE
+
+    # An unknown boundary label is a programming error, not a silent reading.
+    with pytest.raises(ValueError):
+        e2ediag.snapshot_e2e_b1_boundary("midpoint", run=_e2ebd_healthy_runner())
+
+    # Incoherent leg vectors render `unavailable`, never a fabricated triple.
+    snapshot = e2ediag.unavailable_snapshot("open")
+    for vectors in (
+        ([], [], []),
+        ([1.0], [1.0, 2.0], [1.0]),
+        ([float("nan")], [1.0], [1.0]),
+        ([float("inf")], [1.0], [1.0]),
+    ):
+        result = e2e.PhaseResult(
+            offered=1, served=1, errors=0, latencies_ms=[1.0],
+            t0=0.0, t_last_complete=1.0, due0=0.0, max_in_flight=1, max_backlog=0,
+            pre_dispatch_slip_ms=vectors[0],
+            start_lag_ms=vectors[1],
+            attempt_duration_ms=vectors[2],
+        )
+        values = e2ediag.build_e2e_b1_diagnostic_values(result, snapshot, snapshot)
+        assert values["p99_leg_split_ms"] == E2EBD_UNAVAILABLE, vectors
+        assert values["leg_p99s_ms"] == E2EBD_UNAVAILABLE, vectors
+    empty = e2e.PhaseResult(
+        offered=0, served=0, errors=0, latencies_ms=[], t0=0.0,
+        t_last_complete=0.0, due0=0.0, max_in_flight=0, max_backlog=0,
+    )
+    empty_values = e2ediag.build_e2e_b1_diagnostic_values(empty, snapshot, snapshot)
+    assert empty_values["p99_ms"] == E2EBD_UNAVAILABLE   # inf is not a reading
+    assert empty_values["status_histogram"] == E2EBD_UNAVAILABLE
+    assert empty_values["offered"] == 0                  # a real zero
+    # An extra member is refused outright rather than silently dropped.
+    with pytest.raises(ValueError):
+        e2ediag.serialize_e2e_b1_diagnostics({**empty_values, "extra": 1})
+    # A concise stderr note is best-effort and never raises.
+    e2ediag._note("b1-e2e-diagnostics: delivery-tier probe")
