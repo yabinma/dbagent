@@ -2695,6 +2695,24 @@ def _covered_py_links(root: Path = REPO_ROOT) -> list[str]:
     return links
 
 
+#: e2e-b1-kind-policy: the nested kind diagnostic test. It is deliberately NOT
+#: one of B1's threshold-bearing links -- its due-time p99 is observational --
+#: so nothing in `thresholds.yaml` would otherwise carry `tests/e2e/` into the
+#: collection-suppression guard below. This constant does, explicitly.
+B1_NESTED_DIAGNOSTIC_LINK = (
+    "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
+)
+
+
+def _collection_guard_links(root: Path = REPO_ROOT) -> list[str]:
+    """Covered threshold links PLUS the nested diagnostic path.
+
+    Collection reachability and threshold-bearingness are different claims: a
+    test that decides nothing numerically must still be collected and run.
+    """
+    return [*_covered_py_links(root), B1_NESTED_DIAGNOSTIC_LINK]
+
+
 def _chain_dirs(root: Path, links: list[str]) -> set[Path]:
     dirs: set[Path] = set()
     for lnk in links:
@@ -4414,7 +4432,8 @@ def test_ci_pins_the_checker_assumptions():
     assert fails == [], fails
     run_sh = (REPO_ROOT / "tests/e2e/run.sh").read_text(encoding="utf-8")
     assert _e2e_runner_failures(run_sh) == []
-    links = _covered_py_links(REPO_ROOT)
+    links = _collection_guard_links(REPO_ROOT)
+    assert B1_NESTED_DIAGNOSTIC_LINK in links
     assert _pytest_collection_failures(REPO_ROOT, links) == []
     env_min = {"PATH": "/usr/bin:/bin", "HOME": "/tmp", "LC_ALL": "C"}
     r0 = subprocess.run(["/bin/bash", "-e", "-c", EXPECTED_E2E_HYGIENE_COMMAND], env=env_min)
@@ -6850,12 +6869,15 @@ def test_b1_entry_matches_its_declared_contract():
     # `covered` is earned by the gating CI-scale tier. It does not reclassify
     # the product link as a gating threshold.
     assert b1["status"] == "covered"
+    # e2e-b1-kind-policy: exactly three genuine threshold links. The nested
+    # kind path left this list when its p99 became observational; it is pinned
+    # in `notes` and by the collection guard instead.
     assert b1["tests"] == [
         "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
-        "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile",
         B1_CI_SCALE_LINK,
         B1_PRODUCT_LINK,
     ]
+    assert B1_NESTED_DIAGNOSTIC_LINK not in b1["tests"]
     assert "concurrency_model" not in b1
     notes = b1["notes"]
     # CI-scale tier: the two allocations and the gating numbers.
@@ -6900,6 +6922,20 @@ def test_b1_entry_matches_its_declared_contract():
         "kind",
         "nested",
         "refutes neither",
+        # e2e-b1-kind-policy: the observational-latency policy and its cost
+        B1_NESTED_DIAGNOSTIC_LINK,
+        "one of the three threshold-bearing links above",
+        "design/slices/e2e-b1-kind-policy/design.md",
+        "recorded as pytest observation",
+        "does not fail the kind job",
+        "Eleven kind comparisons still fail it",
+        "sat_committed==sat_served, and the exact admissible audit-action tuple",
+        "no longer fails e2e",
+        "keeps p99 < 150 ms at full strength",
+        "ratified GC-3 placement",
+        "no CI job fails on ingest latency",
+        "visible only in the uploaded e2e diagnostics artifact",
+        "kind deployment resource",
         "B1-LATENCY-BASIS-1",
         # B1-LATENCY-BASIS-1 FP-B1LB-7: the resolved handoff wording replaces
         # the stale `cpuMsPerRequest=2.427` / "five consecutive" expectation.
@@ -6936,3 +6972,112 @@ def test_b1_entry_matches_its_declared_contract():
         "the first four CPUs available to the launcher, split 2/1/1",
     ):
         assert forbidden not in notes, f"B1 notes must not say {forbidden!r}"
+
+
+#: e2e-b1-kind-policy: every committed carrier of the observational-latency
+#: policy. `design/` is gitignored and absent in CI, so no clause below reads
+#: it: the deviation is pinned as a PATH STRING inside the manifest, never as a
+#: file this test opens.
+B1_KIND_POLICY_NOTES_CLAUSES: tuple[str, ...] = (
+    # the nested path is named, and named as a non-threshold link
+    "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile",
+    "one of the three threshold-bearing links above",
+    # the observational latency policy itself
+    "the kind\ndue-time p99 is still compared with 150 ms",
+    "recorded as pytest observation",
+    "does not fail the kind job",
+    # every retained failure class
+    "Eleven kind comparisons still fail it",
+    "platform\nONLINE",
+    "baseline served+errors==6000, errors==0, served==6000 and committed==served",
+    "sat_served+sat_errors==issued, sat_errors==0, gateway restart delta ==0",
+    "Unhealthy event count",
+    "sat_committed==sat_served, and the exact admissible audit-action tuple",
+    # the accepted cost, stated rather than hidden
+    "Accepted cost",
+    "no longer fails e2e",
+    "keeps p99 < 150 ms at full strength",
+    "ratified GC-3 placement",
+    "no CI job fails on ingest latency",
+    "visible only in the uploaded e2e diagnostics artifact",
+    # resources unchanged and undecided
+    "kind deployment resource",
+    # the routing strings
+    "design/slices/e2e-b1-kind-policy/design.md",
+    "design/frozen-deviations.md",
+)
+
+
+def test_e2e_kind_policy_is_explicit_in_manifest():
+    """FP-E2EB1K-4: B1 lists only threshold gates and states the kind policy in notes."""
+    text = (REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text(encoding="utf-8")
+    data = yaml.safe_load(text)
+    b1 = next(e for e in data["benchmarks"] if e["id"] == "B1")
+
+    # (1) exactly the three genuine threshold links, in their existing order.
+    assert b1["tests"] == [
+        "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
+        B1_CI_SCALE_LINK,
+        B1_PRODUCT_LINK,
+    ]
+    assert B1_NESTED_DIAGNOSTIC_LINK not in b1["tests"]
+    # and the nested path is not smuggled back in through another entry.
+    for entry in data["benchmarks"]:
+        assert B1_NESTED_DIAGNOSTIC_LINK not in (entry.get("tests") or []), entry["id"]
+
+    # (2) the threshold string and status do not move with the policy.
+    assert b1["status"] == "covered"
+    assert b1["threshold"] == (
+        "CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s "
+        "offered for 30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; "
+        "product recorded, non-gating: served == offered, p99 < 150 ms, 0 errors at "
+        "1000 req/s offered for 30s with 4 gateway CPUs exclusive from PG/driver"
+    )
+    assert b1["owning_milestone"] == "M3"
+
+    # (3) every policy fact is stated in notes, including the accepted cost.
+    notes = b1["notes"]
+    for clause in B1_KIND_POLICY_NOTES_CLAUSES:
+        assert clause in notes, f"B1 notes missing {clause!r}"
+    # The nested link is named exactly once, and only in notes.
+    assert notes.count(B1_NESTED_DIAGNOSTIC_LINK) == 1
+    assert text.count(B1_NESTED_DIAGNOSTIC_LINK) == 1
+
+    # (4) the kind-policy paragraph states a policy change, not a weakened bar
+    #     and not a promise that the job turns green. Scoped to that paragraph
+    #     on purpose: the surrounding GC-3 prose legitimately says "pytest
+    #     skip" about a different route.
+    start = "Nested kind latency policy, owner ruling"
+    end = "untouched and undecided here."
+    assert notes.count(start) == 1 and notes.count(end) == 1
+    policy = notes[notes.index(start):notes.index(end) + len(end)]
+    for forbidden in (
+        "skip", "xfail", "quarantine", "retry", "continue-on-error", "mask",
+        "lower", "relax", "weaken", "floor", "expected to pass", "should now pass",
+        "will be gating", "will move to", "turns green",
+    ):
+        assert forbidden not in policy, f"the kind policy paragraph must not say {forbidden!r}"
+
+    # (5) this test never reads a gitignored design file. `design/` is absent
+    #     in CI, so the deviation is pinned as a STRING in the committed
+    #     manifest; the only project file this test opens is thresholds.yaml.
+    src = Path(__file__).read_text(encoding="utf-8")
+    fn = next(
+        n for n in ast.parse(src).body
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "test_e2e_kind_policy_is_explicit_in_manifest"
+    )
+    opened = [
+        ast.unparse(node) for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func).endswith(("read_text", "read_bytes", "open"))
+    ]
+    assert len(opened) == 2, opened
+    assert sum("thresholds.yaml" in call for call in opened) == 1, opened
+    assert all("design" not in call for call in opened), opened
+    assert "design/frozen-deviations.md" in B1_KIND_POLICY_NOTES_CLAUSES
+
+    # (6) the collection guard -- not the threshold list -- is what keeps the
+    #     nested test reachable, and it names the same constant.
+    assert B1_NESTED_DIAGNOSTIC_LINK in _collection_guard_links(REPO_ROOT)
+    assert B1_NESTED_DIAGNOSTIC_LINK not in _covered_py_links(REPO_ROOT)

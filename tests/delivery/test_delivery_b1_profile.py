@@ -1153,10 +1153,16 @@ PRODUCT_FIXTURE = "b1_product_run"
 PROBE_FIXTURE = "b1_topology_probe_run"
 LIVE_RUN_IMPL = "_run_b1_reference"
 
-# Exact twenty-node inventory. Each entry: (test_file, test_name, required_names,
-# required_op_types or None, equality_admitted).
+# Exact nineteen-node FAILURE inventory. Each entry: (test_file, test_name,
+# required_names, required_op_types or None, equality_admitted).
 # Equality is admitted ONLY for B1 accounting clauses.
-B1_INVENTORY: list[tuple[Path, str, frozenset[str], frozenset[type] | None, bool]] = [
+#
+# e2e-b1-kind-policy: the kind due-time p99 comparison is NOT in this inventory
+# because it can no longer fail anything. It is an observation, pinned by
+# `_e2ebd_observation_failures` with its own exact bytes, signature, top-level
+# node, five-way order and outcome-consumer rejection. Admitting the property
+# call here would let a non-failing node be counted as a gate.
+B1_FAILURE_INVENTORY: list[tuple[Path, str, frozenset[str], frozenset[type] | None, bool]] = [
     # --- FP-IG-7 / FP-GC1-1 CI-scale reference: 7 B1 clauses + max_in_flight = 8 ---
     # Renamed, not retired, by the GC-1 slice: same clauses, restated against
     # the CI-scale bar literals for the declared 2/1/1 CPU affinity allocation.
@@ -1168,12 +1174,11 @@ B1_INVENTORY: list[tuple[Path, str, frozenset[str], frozenset[type] | None, bool
     (REF_TEST, CI_SCALE_REF_TEST, frozenset({"committed", "served"}), frozenset({ast.Eq}), True),
     (REF_TEST, CI_SCALE_REF_TEST, frozenset({"served_rate", "CI_SCALE_SUSTAINED_FLOOR"}), frozenset({ast.GtE}), False),
     (REF_TEST, CI_SCALE_REF_TEST, frozenset({"max_in_flight", "CI_SCALE_MAX_IN_FLIGHT"}), frozenset({ast.Lt}), False),
-    # --- FP-IG-9 e2e: twelve clauses ---
+    # --- FP-IG-9 e2e: eleven failure clauses (clause 5's p99 is observational) ---
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"platform_online"}), frozenset({ast.Eq}), True),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"served", "errors"}), frozenset({ast.Eq}), True),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"errors"}), frozenset({ast.Eq}), True),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"served"}), frozenset({ast.Eq}), True),
-    (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"p99", "P99_MS"}), frozenset({ast.Lt}), False),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"committed", "served"}), frozenset({ast.Eq}), True),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"sat_served", "sat_errors", "issued"}), frozenset({ast.Eq}), True),
     (E2E_TEST, "test_b1_ingest_burst_profile", frozenset({"sat_errors"}), frozenset({ast.Eq}), True),
@@ -1197,7 +1202,7 @@ def _inventory_match(
     A node matches only when its name set equals ``required_names`` exactly
     (no superset aliasing: ``{served, errors, offered}`` must not satisfy
     ``{errors}``) and ops agree. Each AST node may be consumed at most once
-    so twenty inventory entries require twenty distinct assertions.
+    so nineteen inventory entries require nineteen distinct assertions.
     Returns the matched node's id, or None.
     """
     for node in nodes:
@@ -1261,11 +1266,11 @@ def _nodes_for_src(src: str, test_name: str) -> list[ast.AST]:
 
 
 def test_every_required_b1_assertion_is_present_in_both_tiers():
-    """FP-IG-19: exact twenty-node inventory via the shared seam (one-to-one)."""
-    assert len(B1_INVENTORY) == 20, f"inventory size {len(B1_INVENTORY)}"
+    """FP-IG-19: exact nineteen-node failure inventory via the shared seam."""
+    assert len(B1_FAILURE_INVENTORY) == 19, f"inventory size {len(B1_FAILURE_INVENTORY)}"
     cache: dict[tuple[str, str], list[ast.AST]] = {}
     consumed_by_key: dict[tuple[str, str], set[int]] = {}
-    for path, test_name, names, ops, eq_ok in B1_INVENTORY:
+    for path, test_name, names, ops, eq_ok in B1_FAILURE_INVENTORY:
         key = (str(path), test_name)
         if key not in cache:
             cache[key] = _nodes_for(path, test_name)
@@ -1410,7 +1415,7 @@ def test_fp_ig19_guard_rejects_required_mutations(mutation_id, path, required_na
     # Find the inventory entry for this mutation's names on this path.
     eq_ok = True
     ops = frozenset({ast.Eq})
-    for p, tn, names, rops, eok in B1_INVENTORY:
+    for p, tn, names, rops, eok in B1_FAILURE_INVENTORY:
         if p == path and names == required_names:
             ops = rops
             eq_ok = eok
@@ -7529,7 +7534,20 @@ E2EBD_LEGACY_PRINT_DIGESTS = (
     "0b6ed6a0538a693cfe420aa109c9ea1d8d770f1ccc94b27989231ab484b65ae0",
     "939c613f06ad6cb11b7520156e7b6a9c3382666d30b33bdb6ba1dfeb0f391471",
 )
-E2EBD_ORACLE_BYTES = '    assert p99 < P99_MS, f"baseline p99={p99}"'
+#: e2e-b1-kind-policy: the successor to the retired kind p99 oracle. The
+#: comparison is unchanged and still evaluated; only its consumer moved from an
+#: assertion to pytest's built-in `record_property` observation fixture.
+E2EBD_OBSERVATION_KEY = "b1_kind_p99_lt_150_ms"
+E2EBD_OBSERVATION_BYTES = (
+    '    record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)'
+)
+#: New exact pin: the built-in property fixture cannot silently disappear or be
+#: replaced by a same-named local.
+E2EBD_OBSERVATION_SIGNATURE = (
+    "def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):"
+)
+#: Any call that would turn p99 back into an outcome, by name.
+E2EBD_P99_OUTCOME_CALLS = ("pytest.fail", "pytest.skip", "pytest.xfail", "pytest.exit")
 E2EBD_WIRING_LINES = (
     "from tests.e2e.b1_e2e_diagnostics import B1E2EDiagnosticSession",
     "    diagnostics = B1E2EDiagnosticSession()",
@@ -7577,6 +7595,133 @@ def _e2ebd_function(tree: ast.AST, name: str) -> ast.AST:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
     raise AssertionError(f"function {name!r} not found")
+
+
+def _e2ebd_name_ids(node: ast.AST) -> "set[str]":
+    """Bare `ast.Name` ids only.
+
+    Deliberately NOT attribute names: the legacy print reads `baseline.p99`,
+    which is not the measured local and must never be mistaken for it.
+    """
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _e2ebd_is_exact_observation(node: ast.AST) -> bool:
+    """One exact `record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)`.
+
+    Every part is pinned: the statement is a bare expression, the callee is the
+    built-in fixture by name, there are exactly two positional arguments and no
+    keywords, the key is that exact string, and the second argument is exactly
+    `p99 < P99_MS` -- one `Lt` over the two measured Names. `<=` is a different
+    comparison and is rejected here, not silently recorded.
+    """
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value
+    if not isinstance(call.func, ast.Name) or call.func.id != "record_property":
+        return False
+    if call.keywords or len(call.args) != 2:
+        return False
+    key, compare = call.args
+    if not (isinstance(key, ast.Constant) and key.value == E2EBD_OBSERVATION_KEY):
+        return False
+    if not isinstance(compare, ast.Compare) or len(compare.ops) != 1:
+        return False
+    if not isinstance(compare.ops[0], ast.Lt):
+        return False
+    if not (isinstance(compare.left, ast.Name) and compare.left.id == "p99"):
+        return False
+    right = compare.comparators[0]
+    return isinstance(right, ast.Name) and right.id == "P99_MS"
+
+
+def _e2ebd_p99_outcome_failures(test_fn: ast.AST) -> "list[str]":
+    """Reject every route that would make the kind p99 decide the job again."""
+    fails: list[str] = []
+    for node in ast.walk(test_fn):
+        if isinstance(node, ast.Assert):
+            names, label = _e2ebd_name_ids(node.test), "p99_outcome_assert"
+        elif isinstance(node, (ast.If, ast.IfExp, ast.While)):
+            names, label = _e2ebd_name_ids(node.test), "p99_outcome_branch"
+        elif isinstance(node, (ast.Raise, ast.Return)):
+            names, label = _e2ebd_name_ids(node), "p99_outcome_exit"
+        elif isinstance(node, ast.Call) and ast.unparse(node.func) in E2EBD_P99_OUTCOME_CALLS:
+            names, label = _e2ebd_name_ids(node), "p99_outcome_call"
+        else:
+            continue
+        if names & {"p99", "P99_MS"}:
+            fails.append(label)
+    return fails
+
+
+def _e2ebd_observation_failures(load_src: str, test_fn: ast.AST) -> "list[str]":
+    """The kind p99 observation: exact, top-level, ordered, and consumed by nothing.
+
+    The five-way order is `legacy print < diagnostics.emit < p99 binding <
+    observation < first baseline correctness assert`, so every coherent
+    completed baseline has already published its record and still evaluates the
+    comparison even when a later retained clause is red.
+    """
+    fails: list[str] = []
+    if load_src.count(E2EBD_OBSERVATION_SIGNATURE + "\n") != 1:
+        fails.append("observation_signature")
+    if load_src.count(E2EBD_OBSERVATION_BYTES + "\n") != 1:
+        fails.append("observation_bytes")
+
+    calls = [
+        n for n in ast.walk(test_fn)
+        if isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", "") == "record_property"
+    ]
+    keyed = [
+        n for n in calls
+        if n.value.args
+        and isinstance(n.value.args[0], ast.Constant)
+        and n.value.args[0].value == E2EBD_OBSERVATION_KEY
+    ]
+    exact = [n for n in keyed if _e2ebd_is_exact_observation(n)]
+    if not calls:
+        fails.append("observation_missing")
+    elif not keyed:
+        fails.append("observation_key")
+    elif not exact:
+        fails.append("exact_observation_compare")
+    elif len(calls) != 1:
+        fails.append(f"observation_not_unique: {len(calls)} property calls")
+    elif exact[0] not in test_fn.body:
+        fails.append("observation_not_top_level")
+    else:
+        legacy = emit = binding = first_assert = None
+        for index, stmt in enumerate(test_fn.body):
+            text = ast.unparse(stmt)
+            if legacy is None and "phase=baseline,max_lateness_ms=" in text:
+                legacy = index
+            if emit is None and "diagnostics.emit(baseline)" in text:
+                emit = index
+            if binding is None and text == "p99 = baseline.p99":
+                binding = index
+        observation = test_fn.body.index(exact[0])
+        if emit is not None:
+            first_assert = next(
+                (
+                    index for index, stmt in enumerate(test_fn.body)
+                    if index > emit and isinstance(stmt, ast.Assert)
+                ),
+                None,
+            )
+        if None in (legacy, emit, binding, first_assert):
+            fails.append(
+                f"observation_order_anchor_missing: legacy={legacy} emit={emit} "
+                f"binding={binding} first_assert={first_assert}"
+            )
+        elif not (legacy < emit < binding < observation < first_assert):
+            fails.append(
+                f"observation_order: legacy={legacy} emit={emit} binding={binding} "
+                f"observation={observation} first_assert={first_assert}"
+            )
+    fails.extend(_e2ebd_p99_outcome_failures(test_fn))
+    return fails
 
 
 def _e2ebd_import_failures(profile_src: str, diag_src: str) -> "list[str]":
@@ -8704,7 +8849,7 @@ def _e2ebd_statement_index(src: str, fn_name: str, needle: str) -> int:
 
 
 def test_e2e_b1_diagnostic_schema_is_canonical_and_comma_safe():
-    """FP-E2EB1D-5: one exact 33-field line, before the unchanged oracle."""
+    """FP-E2EB1D-5: one exact 33-field line, before the kind p99 observation."""
     assert e2ediag.B1_E2E_DIAGNOSTIC_PREFIX == E2EBD_PREFIX
     assert e2ediag.B1_E2E_DIAGNOSTIC_UNAVAILABLE == E2EBD_UNAVAILABLE
     assert e2ediag.B1_E2E_DIAGNOSTIC_FIELDS == E2EBD_FIELDS
@@ -8786,13 +8931,22 @@ def test_e2e_b1_diagnostic_schema_is_canonical_and_comma_safe():
     assert [v for n, v in blank_fields if n != "schema"] == [E2EBD_UNAVAILABLE] * 32
     assert blank_line == e2ediag.fallback_e2e_b1_diagnostic_line()
 
-    # The record is printed BEFORE the unchanged oracle and AFTER the legacy
-    # baseline fingerprint print.
+    # The record is printed BEFORE the p99 binding and its observation, and
+    # AFTER the legacy baseline fingerprint print. The full five-way order is
+    # legacy print < emit < p99 binding < observation < first correctness assert.
     load_src = E2E_TEST.read_text(encoding="utf-8")
     emit_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "diagnostics.emit(baseline)")
-    oracle_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "assert p99 < P99_MS")
+    observation_at = _e2ebd_statement_index(
+        load_src,
+        "test_b1_ingest_burst_profile",
+        "record_property('b1_kind_p99_lt_150_ms', p99 < P99_MS)",
+    )
+    binding_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "p99 = baseline.p99")
     legacy_at = _e2ebd_statement_index(load_src, "test_b1_ingest_burst_profile", "phase=baseline,max_lateness_ms=")
-    assert legacy_at < emit_at < oracle_at
+    first_assert_at = _e2ebd_statement_index(
+        load_src, "test_b1_ingest_burst_profile", "assert served + errors == 6000"
+    )
+    assert legacy_at < emit_at < binding_at < observation_at < first_assert_at
 
 
 class E2EBDRaisingStream:
@@ -9194,37 +9348,12 @@ def _e2ebd_reported_only_failures(load_src: str, profile_src: str, ci_text: str)
         if load_src.count(line + "\n") != 1:
             fails.append(f"wiring line drift: {line!r}")
 
-    # 2. the oracle: byte-identical and unconditional
-    if load_src.count(E2EBD_ORACLE_BYTES + "\n") != 1:
-        fails.append("the p99 assertion bytes changed")
-    oracle_nodes = [
-        n for n in ast.walk(test_fn)
-        if isinstance(n, ast.Assert) and ast.unparse(n).startswith("assert p99 < P99_MS")
-    ]
-    if len(oracle_nodes) != 1:
-        fails.append(f"{len(oracle_nodes)} p99 assertions in the test body")
-    elif oracle_nodes[0] not in test_fn.body:
-        fails.append("the p99 assertion is nested under a condition")
-    else:
-        # The record is printed on a completed PASS or FAIL: it must come
-        # after the legacy baseline fingerprint and before the oracle.
-        order = {"legacy": None, "emit": None}
-        for index, stmt in enumerate(test_fn.body):
-            text = ast.unparse(stmt)
-            if "phase=baseline,max_lateness_ms=" in text and order["legacy"] is None:
-                order["legacy"] = index
-            if "diagnostics.emit(baseline)" in text and order["emit"] is None:
-                order["emit"] = index
-        oracle_index = test_fn.body.index(oracle_nodes[0])
-        if order["emit"] is None:
-            fails.append("the diagnostics record is never emitted")
-        elif order["legacy"] is None:
-            fails.append("the legacy baseline fingerprint print is gone")
-        elif not (order["legacy"] < order["emit"] < oracle_index):
-            fails.append(
-                f"emit order drift: legacy={order['legacy']} emit={order['emit']} "
-                f"oracle={oracle_index}"
-            )
+    # 2. the kind p99 observation: exact bytes and signature, one top-level
+    #    node, the five-way order, and no route back to the verdict. The
+    #    canonical record is still published before the comparison on a
+    #    completed PASS or FAIL; absence or nesting of the observation is a
+    #    named policy failure here, not an accepted removal of an oracle.
+    fails.extend(_e2ebd_observation_failures(load_src, test_fn))
 
     # 3. legacy readers and both legacy fingerprint prints, byte-identical
     for name, digest in E2EBD_LEGACY_DIGESTS.items():
@@ -9245,12 +9374,12 @@ def _e2ebd_reported_only_failures(load_src: str, profile_src: str, ci_text: str)
     if digests != E2EBD_LEGACY_PRINT_DIGESTS:
         fails.append(f"the legacy `B1 env=` prints changed: {digests}")
 
-    # 4. all twelve FP-IG-19 rows still match one-to-one
+    # 4. all eleven FP-IG-19 e2e FAILURE rows still match one-to-one
     nodes = _nodes_for_src(load_src, "test_b1_ingest_burst_profile")
     consumed: set[int] = set()
-    rows = [r for r in B1_INVENTORY if r[0] == E2E_TEST and r[1] == "test_b1_ingest_burst_profile"]
-    if len(rows) != 12:
-        fails.append(f"{len(rows)} e2e inventory rows, want 12")
+    rows = [r for r in B1_FAILURE_INVENTORY if r[0] == E2E_TEST and r[1] == "test_b1_ingest_burst_profile"]
+    if len(rows) != 11:
+        fails.append(f"{len(rows)} e2e inventory rows, want 11")
     for _path, _name, names, ops, eq_ok in rows:
         matched = _inventory_match(nodes, names, ops, eq_ok, consumed=consumed)
         if matched is None:
@@ -9381,18 +9510,32 @@ def test_e2e_b1_diagnostics_are_reported_only_and_fixed():
 
     # --- the §3.7 mutation set: every one of these is red ------------------
     load_mutants = {
-        "oracle_weakened": load_src.replace("assert p99 < P99_MS", "assert p99 <= P99_MS", 1),
-        "oracle_deleted": load_src.replace(E2EBD_ORACLE_BYTES + "\n", "", 1),
-        "oracle_nested": load_src.replace(
-            E2EBD_ORACLE_BYTES + "\n",
-            "    if diagnostics is not None:\n    " + E2EBD_ORACLE_BYTES + "\n",
+        "observation_weakened": load_src.replace(
+            'record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)',
+            'record_property("b1_kind_p99_lt_150_ms", p99 <= P99_MS)',
             1,
         ),
-        "emit_moved_after_the_oracle": load_src.replace(
+        "observation_deleted": load_src.replace(E2EBD_OBSERVATION_BYTES + "\n", "", 1),
+        "observation_nested": load_src.replace(
+            E2EBD_OBSERVATION_BYTES + "\n",
+            "    if diagnostics is not None:\n    " + E2EBD_OBSERVATION_BYTES + "\n",
+            1,
+        ),
+        "emit_moved_after_observation": load_src.replace(
             "    diagnostics.emit(baseline)\n", "", 1
         ).replace(
-            E2EBD_ORACLE_BYTES + "\n",
-            E2EBD_ORACLE_BYTES + "\n    diagnostics.emit(baseline)\n",
+            E2EBD_OBSERVATION_BYTES + "\n",
+            E2EBD_OBSERVATION_BYTES + "\n    diagnostics.emit(baseline)\n",
+            1,
+        ),
+        "observation_signature_dropped": load_src.replace(
+            E2EBD_OBSERVATION_SIGNATURE,
+            "def test_b1_ingest_burst_profile(ingest_url, dashboard_url):",
+            1,
+        ),
+        "p99_assertion_reintroduced": load_src.replace(
+            E2EBD_OBSERVATION_BYTES + "\n",
+            E2EBD_OBSERVATION_BYTES + '\n    assert p99 < P99_MS, f"baseline p99={p99}"\n',
             1,
         ),
         "record_bound_and_readable": load_src.replace(
@@ -9470,6 +9613,607 @@ def test_e2e_b1_diagnostics_are_reported_only_and_fixed():
     for case, mutant in ci_mutants.items():
         assert mutant != ci_text, case
         assert _e2ebd_reported_only_failures(load_src, profile_src, mutant) != [], case
+
+# ---------------------------------------------------------------------------
+# e2e-b1-kind-policy -- the kind due-time p99 is observed, never a verdict.
+#
+# The slice's four delivery function tests. FP-E2EB1K-4 lives in
+# tests/functional/test_manifests.py, beside the manifest it pins.
+# ---------------------------------------------------------------------------
+
+#: The eleven kind comparisons that still fail the nested job, in source order.
+E2EBK_KIND_FAILURE_ROWS: tuple[frozenset[str], ...] = (
+    frozenset({"platform_online"}),
+    frozenset({"served", "errors"}),
+    frozenset({"errors"}),
+    frozenset({"served"}),
+    frozenset({"committed", "served"}),
+    frozenset({"sat_served", "sat_errors", "issued"}),
+    frozenset({"sat_errors"}),
+    frozenset({"restart_delta"}),
+    frozenset({"unhealthy_count"}),
+    frozenset({"sat_committed", "sat_served"}),
+    frozenset({"audit_actions"}),
+)
+#: The reference gate this slice may not touch, in its own bytes.
+E2EBK_REFERENCE_ORACLE = (
+    "    assert p99 < CI_SCALE_P99_MS, f\"p99={p99}; {b1_ci_scale_run['fingerprint']}\""
+)
+
+
+def _e2ebk_load_src() -> str:
+    return E2E_TEST.read_text(encoding="utf-8")
+
+
+def _e2ebk_test_fn(src: str) -> ast.AST:
+    return _e2ebd_function(ast.parse(src), "test_b1_ingest_burst_profile")
+
+
+def _e2ebk_statement_lines(src: str, names: frozenset[str]) -> "tuple[int, int]":
+    """The 1-based line span of the one top-level node that carries ``names``."""
+    fn = _e2ebk_test_fn(src)
+    for node in fn.body:
+        cmp = _node_compare(node)
+        if cmp is not None and _cmp_names(cmp) == names:
+            return node.lineno, node.end_lineno
+    raise AssertionError(f"no top-level comparison for {sorted(names)}")
+
+
+def _e2ebk_delete_statement(src: str, names: frozenset[str]) -> str:
+    start, end = _e2ebk_statement_lines(src, names)
+    lines = src.split("\n")
+    lines[start - 1:end] = [f"    # mutated: deleted {sorted(names)}"]
+    return "\n".join(lines)
+
+
+def _e2ebk_weaken_statement(src: str, names: frozenset[str]) -> str:
+    start, end = _e2ebk_statement_lines(src, names)
+    lines = src.split("\n")
+    block = "\n".join(lines[start - 1:end])
+    assert "==" in block, block
+    lines[start - 1:end] = (block.replace("==", ">=", 1)).split("\n")
+    return "\n".join(lines)
+
+
+def test_e2e_kind_p99_is_observed_not_failure_producing():
+    """FP-E2EB1K-1: the exact comparison is evaluated and recorded, and decides nothing.
+
+    The Boolean goes into pytest's in-process ``TestReport.user_properties``;
+    no shipped reporter persists it, so this exact-bytes/AST pin plus its
+    mutants -- not a durable artifact field -- is what proves the comparison is
+    still a live runtime consumer of ``p99`` rather than a dead local.
+    """
+    load_src = _e2ebk_load_src()
+    profile_src = E2E_PATH.read_text(encoding="utf-8")
+    ref_src = REF_TEST.read_text(encoding="utf-8")
+
+    # (1) the new exact signature pin and the exact observation bytes, once each
+    assert load_src.count(E2EBD_OBSERVATION_SIGNATURE + "\n") == 1
+    assert load_src.count(E2EBD_OBSERVATION_BYTES + "\n") == 1
+    assert E2EBD_OBSERVATION_KEY == "b1_kind_p99_lt_150_ms"
+
+    # (2) the unchanged 150.0 policy constant, in BOTH carriers
+    assert _eval_simple_constant(
+        _source_assigns(load_src)["P99_MS"], _source_assigns(load_src)
+    ) == 150.0
+    assert _eval_simple_constant(
+        _source_assigns(profile_src)["P99_MS"], _source_assigns(profile_src)
+    ) == 150.0
+
+    # (3) exactly one top-level observation node, in the five-way order, with
+    #     no assertion / branch / raise / return / pytest-outcome consumer.
+    test_fn = _e2ebk_test_fn(load_src)
+    assert _e2ebd_observation_failures(load_src, test_fn) == []
+    exact = [n for n in test_fn.body if _e2ebd_is_exact_observation(n)]
+    assert len(exact) == 1
+    assert [n for n in ast.walk(test_fn) if _e2ebd_is_exact_observation(n)] == exact
+    assert _e2ebd_p99_outcome_failures(test_fn) == []
+    # The retired oracle bytes are gone from the live kind test entirely.
+    assert "assert p99 < P99_MS" not in load_src
+
+    # (4) the isolated reference assertion and its constant are byte-identical.
+    assert ref_src.count(E2EBK_REFERENCE_ORACLE + "\n") == 1
+    assert _eval_simple_constant(
+        _source_assigns(ref_src)["CI_SCALE_P99_MS"], _source_assigns(ref_src)
+    ) == 150.0
+    ref_nodes = _nodes_for(REF_TEST, CI_SCALE_REF_TEST)
+    assert _inventory_match(
+        ref_nodes, frozenset({"p99", "CI_SCALE_P99_MS"}), frozenset({ast.Lt}), False
+    ) is not None
+
+    # (4b) every rejection arm of the exact-observation predicate actually
+    #      rejects: a near-miss shape must never be accepted as the pin.
+    for variant in (
+        'record_property(key="b1_kind_p99_lt_150_ms", value=p99 < P99_MS)',
+        'record_property("b1_kind_p99_lt_150_ms")',
+        'record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS, extra)',
+        'record_property("b1_kind_p99_observed", p99 < P99_MS)',
+        'record_property(OBSERVATION_KEY, p99 < P99_MS)',
+        'record_property("b1_kind_p99_lt_150_ms", p99)',
+        'record_property("b1_kind_p99_lt_150_ms", 0 < p99 < P99_MS)',
+        'record_property("b1_kind_p99_lt_150_ms", p99 <= P99_MS)',
+        'record_property("b1_kind_p99_lt_150_ms", 1 < P99_MS)',
+        'record_property("b1_kind_p99_lt_150_ms", p99 < 150.0)',
+        'record_property("b1_kind_p99_lt_150_ms", p99 < baseline.P99_MS)',
+        'other_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)',
+        'self.record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)',
+        "p99 = baseline.p99",
+    ):
+        node = ast.parse(variant).body[0]
+        assert not _e2ebd_is_exact_observation(node), variant
+    assert _e2ebd_is_exact_observation(
+        ast.parse('record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)').body[0]
+    )
+
+    # (5) every named successor mutation is red for its named reason.
+    mutants = {
+        "observation_weakened": (
+            load_src.replace(
+                'record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)',
+                'record_property("b1_kind_p99_lt_150_ms", p99 <= P99_MS)',
+                1,
+            ),
+            "exact_observation_compare",
+        ),
+        "observation_key_renamed": (
+            load_src.replace(E2EBD_OBSERVATION_KEY, "b1_kind_p99_observed", 1),
+            "observation_key",
+        ),
+        "observation_deleted": (
+            load_src.replace(E2EBD_OBSERVATION_BYTES + "\n", "", 1),
+            "observation_missing",
+        ),
+        "observation_nested": (
+            load_src.replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                "    if diagnostics is not None:\n    " + E2EBD_OBSERVATION_BYTES + "\n",
+                1,
+            ),
+            "observation_not_top_level",
+        ),
+        "observation_moved_after_the_first_assert": (
+            load_src.replace(E2EBD_OBSERVATION_BYTES + "\n", "", 1).replace(
+                "    assert served == 6000\n",
+                "    assert served == 6000\n" + E2EBD_OBSERVATION_BYTES + "\n",
+                1,
+            ),
+            "observation_order",
+        ),
+        "emit_moved_after_observation": (
+            load_src.replace("    diagnostics.emit(baseline)\n", "", 1).replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                E2EBD_OBSERVATION_BYTES + "\n    diagnostics.emit(baseline)\n",
+                1,
+            ),
+            "observation_order",
+        ),
+        "fixture_dropped_from_the_signature": (
+            load_src.replace(
+                E2EBD_OBSERVATION_SIGNATURE,
+                "def test_b1_ingest_burst_profile(ingest_url, dashboard_url):",
+                1,
+            ),
+            "observation_signature",
+        ),
+        "p99_assertion_reintroduced": (
+            load_src.replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                E2EBD_OBSERVATION_BYTES + '\n    assert p99 < P99_MS, f"baseline p99={p99}"\n',
+                1,
+            ),
+            "p99_outcome_assert",
+        ),
+        "p99_early_return": (
+            load_src.replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                E2EBD_OBSERVATION_BYTES + "\n    if p99 >= P99_MS:\n        return\n",
+                1,
+            ),
+            "p99_outcome_branch",
+        ),
+        "p99_raised": (
+            load_src.replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                E2EBD_OBSERVATION_BYTES
+                + "\n    if True:\n        raise AssertionError(f'p99={p99}')\n",
+                1,
+            ),
+            "p99_outcome_exit",
+        ),
+        "p99_pytest_fail": (
+            load_src.replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                E2EBD_OBSERVATION_BYTES + "\n    pytest.fail(f'p99={p99}')\n",
+                1,
+            ),
+            "p99_outcome_call",
+        ),
+        "observation_duplicated": (
+            load_src.replace(
+                E2EBD_OBSERVATION_BYTES + "\n",
+                E2EBD_OBSERVATION_BYTES + "\n" + E2EBD_OBSERVATION_BYTES + "\n",
+                1,
+            ),
+            "observation_not_unique",
+        ),
+    }
+    for case, (mutant, reason) in mutants.items():
+        assert mutant != load_src, case
+        fails = _e2ebd_observation_failures(mutant, _e2ebk_test_fn(mutant))
+        assert any(f.startswith(reason) for f in fails), f"{case}: {fails}"
+
+    # ... and the shipped policy guard rejects each of them as a whole.
+    ci_text = E2EBD_CI_YML.read_text(encoding="utf-8")
+    for case, (mutant, _reason) in mutants.items():
+        assert _e2ebd_reported_only_failures(mutant, profile_src, ci_text) != [], case
+
+
+def test_e2e_kind_correctness_clauses_remain_failure_producing():
+    """FP-E2EB1K-2: eleven kind failure nodes, one-to-one, plus the ten-row matrices."""
+    load_src = _e2ebk_load_src()
+
+    # (1) the failure inventory carries exactly these eleven kind rows, and no
+    #     p99 row: a non-failing observation may never be counted as a gate.
+    rows = [
+        r for r in B1_FAILURE_INVENTORY
+        if r[0] == E2E_TEST and r[1] == "test_b1_ingest_burst_profile"
+    ]
+    assert len(rows) == 11
+    assert tuple(r[2] for r in rows) == E2EBK_KIND_FAILURE_ROWS
+    assert frozenset({"p99", "P99_MS"}) not in {r[2] for r in rows}
+    assert len(B1_FAILURE_INVENTORY) == 19
+
+    # (2) each row matches exactly one live node, one-to-one, through the seam.
+    nodes = _nodes_for_src(load_src, "test_b1_ingest_burst_profile")
+    consumed: set[int] = set()
+    for _path, _name, names, ops, eq_ok in rows:
+        matched = _inventory_match(nodes, names, ops, eq_ok, consumed=consumed)
+        assert matched is not None, f"missing kind failure node for {sorted(names)}"
+        consumed.add(matched)
+    assert len(consumed) == 11
+    # The removed p99 comparison is genuinely absent from the failure surface.
+    assert _inventory_match(
+        nodes, frozenset({"p99", "P99_MS"}), frozenset({ast.Lt}), False
+    ) is None
+
+    # (3) deleting or weakening ANY of the eleven is red for that row alone.
+    for _path, _name, names, ops, eq_ok in rows:
+        deleted = _e2ebk_delete_statement(load_src, names)
+        assert deleted != load_src, sorted(names)
+        assert _inventory_match(
+            _nodes_for_src(deleted, "test_b1_ingest_burst_profile"), names, ops, eq_ok
+        ) is None, f"deleting {sorted(names)} still matched"
+        # every retained kind clause is an accounting/identity equality, so
+        # weakening its operator is always a meaningful mutation here.
+        assert ops == frozenset({ast.Eq}) and eq_ok, sorted(names)
+        weakened = _e2ebk_weaken_statement(load_src, names)
+        assert weakened != load_src, sorted(names)
+        assert _inventory_match(
+            _nodes_for_src(weakened, "test_b1_ingest_burst_profile"),
+            names,
+            frozenset({ast.Eq}),
+            True,
+        ) is None, f"weakening {sorted(names)} still matched Eq inventory"
+
+    # ... and the locator those mutations use refuses to guess.
+    with pytest.raises(AssertionError):
+        _e2ebk_statement_lines(load_src, frozenset({"no_such_clause"}))
+
+    # (4) the complete post-change final/superseded matrices, all ten rows.
+    assert len(e2e.ACCEPTANCE_EXPECTED) == 10
+    assert len(e2e.ACCEPTANCE_SUPERSEDED) == 10
+    expected = {
+        "healthy_1000": ("pass", "pass", "pass", "pass", "pass"),
+        "round2_tail": ("pass", "pass", "fail", "fail", "fail"),
+        "late_first_completion": ("pass", "pass", "pass", "fail", "fail"),
+        "sustained_deficit_990": ("pass", "pass", "pass", "fail", "fail"),
+        "sustained_deficit_400": ("fail", "fail", "fail", "fail", "fail"),
+        "round3_997": ("pass", "pass", "pass", "fail", "pass"),
+        "round4_repeated_ramp": ("pass", "pass", "pass", "pass", "pass"),
+        "round5_constant_995": ("pass", "pass", "pass", "fail", "pass"),
+        "round5_burst_credits": ("pass", "pass", "pass", "pass", "pass"),
+        "round6_dispatch_hold": ("pass", "pass", "fail", "fail", "fail"),
+    }
+    for name, (final, f1, f2, f3, f4) in expected.items():
+        matrix = e2e.run_acceptance_matrix(name)
+        verdict, fails = e2e.run_acceptance_case(name)
+        assert (verdict, matrix["final"]) == (final, final), f"{name}: {verdict} {fails}"
+        assert e2e.ACCEPTANCE_EXPECTED[name] == final, name
+        assert (matrix["form1"], matrix["form2"], matrix["form3"], matrix["form4"]) == (
+            f1, f2, f3, f4
+        ), f"{name}: {matrix}"
+        assert e2e.ACCEPTANCE_SUPERSEDED[name] == (f1, f2, f3, f4), name
+
+    # (5) the latency-only schedule now passes; the completion/error control
+    #     is still red, and red for completion and errors rather than latency.
+    latency_only, latency_fails = e2e.run_acceptance_case("sustained_deficit_990")
+    assert (latency_only, latency_fails) == ("pass", [])
+    assert not (e2e._acceptance_schedule("sustained_deficit_990").p99 < e2e.P99_MS)
+    control, control_fails = e2e.run_acceptance_case("sustained_deficit_400")
+    assert control == "fail"
+    # served + errors still equals offered in this schedule: the control is red
+    # for lost work and errors, which is exactly the class p99 must not hide.
+    assert set(control_fails) == {"errors==0", "served==offered"}
+    assert "p99<P99_MS" not in control_fails
+
+    # (6) the base evaluator is the renamed correctness-only one, shared by the
+    #     final oracle and all four superseded forms, so no stale call can
+    #     re-introduce the removed p99 clause.
+    profile_src = E2E_PATH.read_text(encoding="utf-8")
+    assert "def evaluate_baseline_correctness_clauses(" in profile_src
+    assert "evaluate_baseline_clauses" not in profile_src
+    assert profile_src.count("evaluate_baseline_correctness_clauses(result)") == 5
+    assert "p99<P99_MS" not in profile_src
+    for form in ("evaluate_superseded_form1", "evaluate_superseded_form2",
+                 "evaluate_superseded_form3", "evaluate_superseded_form4"):
+        body = ast.unparse(_e2ebd_function(ast.parse(profile_src), form))
+        assert "evaluate_baseline_correctness_clauses(result)" in body, form
+
+    # (7) the classifier still counts every non-200/202 or transport result as
+    #     an error, so "zero errors" keeps its meaning.
+    for status, body, err, expected_outcome in CLASSIFIER_TABLE:
+        assert e2e.classify_response(status, body, err) == expected_outcome
+
+
+def test_e2e_kind_p99_record_route_is_exact_and_non_masking(tmp_path: Path):
+    """FP-E2EB1K-3: a high, bar-missing p99 still reaches print, line, file and artifact."""
+    profile_src, diag_src, load_src = _e2ebd_sources()
+    ci_text = E2EBD_CI_YML.read_text(encoding="utf-8")
+
+    # A coherent completed baseline whose p99 misses the 150 ms bar by an order
+    # of magnitude -- the shape every recorded CI observation had.
+    result = e2e.PhaseResult(
+        offered=6000, served=6000, errors=0,
+        latencies_ms=[1.0] * 5939 + [1389.75] * 61,
+        t0=0.0, t_last_complete=31.0, due0=0.0,
+        max_in_flight=251, max_backlog=0, phase="baseline",
+        status_codes=[202] * 6000,
+        pre_dispatch_slip_ms=[0.1] * 6000,
+        start_lag_ms=[1.2] * 6000,
+        attempt_duration_ms=[1388.45] * 6000,
+    )
+    assert result.p99 == 1389.75 and not (result.p99 < e2e.P99_MS)
+
+    runner = _e2ebd_healthy_runner()
+    session = e2ediag.B1E2EDiagnosticSession(run=runner)
+    session.open()
+    session.close()
+    target = tmp_path / "rca-e2e" / "b1-baseline-diagnostics.txt"
+    stream = io.StringIO()
+    line = session.emit(
+        result,
+        stdout=stream,
+        artifact_writer=lambda text: e2ediag.write_e2e_b1_diagnostic_artifact(text, path=target),
+    )
+
+    # (1) one canonical record: stdout bytes == file bytes, 33 fields in order.
+    assert stream.getvalue() == line + "\n"
+    assert target.read_text(encoding="utf-8") == line + "\n"
+    fields = _e2ebd_top_level_fields(line)
+    assert [name for name, _v in fields] == list(E2EBD_FIELDS)
+    assert len(E2EBD_FIELDS) == 33
+    # (2) the numeric p99 is the measured value, not a bar-derived verdict.
+    assert dict(fields)["p99_ms"] == "1389.750"
+    assert float(dict(fields)["p99_ms"]) == result.p99
+    assert "150" not in dict(fields)["p99_ms"]
+    for token in ("b1_kind_p99_lt_150_ms", "true", "false", "met", "missed"):
+        assert token not in line, token
+    # (3) the legacy print carries the same source expression, unchanged.
+    assert E2EBD_LEGACY_PRINT_DIGESTS == (
+        "0b6ed6a0538a693cfe420aa109c9ea1d8d770f1ccc94b27989231ab484b65ae0",
+        "939c613f06ad6cb11b7520156e7b6a9c3382666d30b33bdb6ba1dfeb0f391471",
+    )
+    assert "p99_ms={baseline.p99:.1f}" in load_src
+    # (4) the fixed file path lives under the failure-artifact root, and the
+    #     success artifact publishes exactly that one file.
+    assert str(e2ediag.B1_E2E_DIAGNOSTIC_ARTIFACT) == E2EBD_ARTIFACT
+    workflow = yaml.safe_load(ci_text)
+    steps = workflow["jobs"]["e2e"]["steps"]
+    names = [s.get("name") or s.get("uses") for s in steps]
+    success = steps[names.index(E2EBD_SUCCESS_STEP_NAME)]
+    failure = steps[names.index(E2EBD_FAILURE_STEP_NAME)]
+    assert success["if"] == "success()" and failure["if"] == "failure()"
+    assert success["with"]["path"] == E2EBD_ARTIFACT
+    assert tuple(str(failure["with"]["path"]).split()) == E2EBD_FAILURE_PATHS
+    assert E2EBD_ARTIFACT.startswith(E2EBD_FAILURE_PATHS[0][: -len("**")])
+    # (5) the shipped guard is green on the unmutated route.
+    assert _e2ebd_reported_only_failures(load_src, profile_src, ci_text) == []
+
+    # --- deletion / hard-coding / masking are red ---------------------------
+    # p99_ms hard-coded in the diagnostics carrier: a direct data-flow proof.
+    hard_coded_src = diag_src.replace(
+        '        values["p99_ms"] = p99\n', '        values["p99_ms"] = 0.0\n', 1
+    )
+    assert hard_coded_src != diag_src
+    hard_coded = _e2ebd_exec_profile(hard_coded_src, "b1_e2e_diagnostics_hardcoded_mutant")
+    hard_values = hard_coded.build_e2e_b1_diagnostic_values(
+        result, session.opening, session.closing
+    )
+    assert hard_values["p99_ms"] != result.p99
+
+    # the file write removed from emit: stdout survives, the artifact does not.
+    unwritten_src = diag_src.replace("            artifact_writer(line)\n", "            pass\n", 1)
+    assert unwritten_src != diag_src
+    unwritten = _e2ebd_exec_profile(unwritten_src, "b1_e2e_diagnostics_unwritten_mutant")
+    gone = tmp_path / "gone" / "b1-baseline-diagnostics.txt"
+    unwritten_session = unwritten.B1E2EDiagnosticSession(run=_e2ebd_healthy_runner())
+    unwritten_session.open()
+    unwritten_session.close()
+    unwritten_session.emit(
+        result,
+        stdout=io.StringIO(),
+        artifact_writer=lambda text: unwritten.write_e2e_b1_diagnostic_artifact(text, path=gone),
+    )
+    assert not gone.exists()
+
+    # every remaining carrier mutation is red under the shipped policy guard.
+    load_mutants = {
+        "emit_deleted": load_src.replace("    diagnostics.emit(baseline)\n", "", 1),
+        "legacy_print_hard_coded": load_src.replace(
+            "p99_ms={baseline.p99:.1f}", "p99_ms=0.0", 1
+        ),
+        "kind_p99_constant_changed": load_src.replace("P99_MS = 150.0", "P99_MS = 1500.0", 1),
+        "skip_added": load_src.replace(
+            "    diagnostics.emit(baseline)\n",
+            "    diagnostics.emit(baseline)\n    pytest.skip('diagnostics only')\n",
+            1,
+        ),
+    }
+    for case, mutant in load_mutants.items():
+        assert mutant != load_src, case
+        assert _e2ebd_reported_only_failures(mutant, profile_src, ci_text) != [], case
+    assert _e2ebd_reported_only_failures(
+        load_src, profile_src.replace("P99_MS = 150.0", "P99_MS = 1500.0", 1), ci_text
+    ) != []
+    ci_mutants = {
+        "success_upload_removed": ci_text.replace(
+            "      - name: Upload B1 diagnostics on success\n"
+            "        if: success()\n"
+            "        uses: actions/upload-artifact@v4\n"
+            "        with:\n"
+            "          name: e2e-b1-diagnostics\n"
+            "          path: /tmp/rca-e2e/b1-baseline-diagnostics.txt\n"
+            "          if-no-files-found: ignore\n",
+            "",
+            1,
+        ),
+        "failure_upload_path_removed": ci_text.replace(
+            "            /tmp/rca-e2e/**\n", "", 1
+        ),
+        "e2e_job_masks_its_outcome": ci_text.replace(
+            "      - name: Run e2e (1500s product budget inside 30m job)\n        run: bash tests/e2e/run.sh",
+            "      - name: Run e2e (1500s product budget inside 30m job)\n        continue-on-error: true\n        run: bash tests/e2e/run.sh",
+            1,
+        ),
+    }
+    for case, mutant in ci_mutants.items():
+        assert mutant != ci_text, case
+        assert _e2ebd_reported_only_failures(load_src, profile_src, mutant) != [], case
+
+
+def test_fp_ig19_policy_guard_rejects_failure_observation_reporting_and_collection_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """FP-E2EB1K-5: 19 failure nodes, the observation, the report route, and reachability."""
+    profile_src, _diag_src, load_src = _e2ebd_sources()
+    ci_text = E2EBD_CI_YML.read_text(encoding="utf-8")
+
+    # (1) nineteen failure rows, eight reference + eleven kind, one-to-one
+    #     through the real `_nodes_for_src` / `_inventory_match` seam.
+    assert len(B1_FAILURE_INVENTORY) == 19
+    by_file: dict[tuple[str, str], list] = {}
+    for row in B1_FAILURE_INVENTORY:
+        by_file.setdefault((str(row[0]), row[1]), []).append(row)
+    assert sorted(len(v) for v in by_file.values()) == [8, 11]
+    for (path_str, test_name), rows in by_file.items():
+        nodes = _nodes_for_src(Path(path_str).read_text(encoding="utf-8"), test_name)
+        consumed: set[int] = set()
+        for _p, _n, names, ops, eq_ok in rows:
+            matched = _inventory_match(nodes, names, ops, eq_ok, consumed=consumed)
+            assert matched is not None, f"{test_name}: missing {sorted(names)}"
+            consumed.add(matched)
+        assert len(consumed) == len(rows)
+
+    # (2) the observation guard and the report route are green as shipped ...
+    assert _e2ebd_observation_failures(load_src, _e2ebk_test_fn(load_src)) == []
+    assert _e2ebd_reported_only_failures(load_src, profile_src, ci_text) == []
+
+    # ... and every named failure / observation / reporting mutation is red.
+    for names in E2EBK_KIND_FAILURE_ROWS:
+        mutant = _e2ebk_delete_statement(load_src, names)
+        assert _e2ebd_reported_only_failures(mutant, profile_src, ci_text) != [], sorted(names)
+    for case, mutant in {
+        "observation_deleted": load_src.replace(E2EBD_OBSERVATION_BYTES + "\n", "", 1),
+        "observation_weakened": load_src.replace(
+            "p99 < P99_MS)", "p99 <= P99_MS)", 1
+        ),
+        "observation_nested": load_src.replace(
+            E2EBD_OBSERVATION_BYTES + "\n",
+            "    if diagnostics is not None:\n    " + E2EBD_OBSERVATION_BYTES + "\n",
+            1,
+        ),
+        "emit_moved_after_observation": load_src.replace(
+            "    diagnostics.emit(baseline)\n", "", 1
+        ).replace(
+            E2EBD_OBSERVATION_BYTES + "\n",
+            E2EBD_OBSERVATION_BYTES + "\n    diagnostics.emit(baseline)\n",
+            1,
+        ),
+        "reporting_deleted": load_src.replace("    diagnostics.emit(baseline)\n", "", 1),
+    }.items():
+        assert mutant != load_src, case
+        assert _e2ebd_reported_only_failures(mutant, profile_src, ci_text) != [], case
+
+    # ... and the row-count guard is live too: an inventory that quietly loses
+    # a kind row is named, rather than absorbed into a smaller expectation.
+    short = [
+        r for r in B1_FAILURE_INVENTORY
+        if not (r[0] == E2E_TEST and r[2] == frozenset({"sat_errors"}))
+    ]
+    assert len(short) == 18
+    monkeypatch.setitem(globals(), "B1_FAILURE_INVENTORY", short)
+    assert "10 e2e inventory rows, want 11" in _e2ebd_reported_only_failures(
+        load_src, profile_src, ci_text
+    )
+    monkeypatch.undo()
+    assert _e2ebd_reported_only_failures(load_src, profile_src, ci_text) == []
+
+    # (3) collection reachability: the nested diagnostic path is carried into
+    #     the collection-suppression guard by the EXPLICIT constant, not by a
+    #     remaining threshold link. Two sides, on the same three-link manifest.
+    assert _manifests.B1_NESTED_DIAGNOSTIC_LINK == (
+        "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
+    )
+    scratch = tmp_path / "scratch_tree"
+    manifest_text = (REPO_ROOT / "tests" / "benchmark" / "thresholds.yaml").read_text(
+        encoding="utf-8"
+    )
+    (scratch / "tests" / "benchmark").mkdir(parents=True)
+    (scratch / "tests" / "benchmark" / "thresholds.yaml").write_text(
+        manifest_text, encoding="utf-8"
+    )
+    bare = _manifests._covered_py_links(scratch)
+    explicit = _manifests._collection_guard_links(scratch)
+    assert _manifests.B1_NESTED_DIAGNOSTIC_LINK not in bare
+    assert explicit == [*bare, _manifests.B1_NESTED_DIAGNOSTIC_LINK]
+    b1_entry = next(
+        e for e in yaml.safe_load(manifest_text)["benchmarks"] if e["id"] == "B1"
+    )
+    assert len(b1_entry["tests"]) == 3
+    assert _manifests.B1_NESTED_DIAGNOSTIC_LINK in b1_entry["notes"]
+
+    # materialise every chain directory with its real config files / conftests
+    dirs = _manifests._chain_dirs(scratch, explicit) | _manifests._chain_dirs(scratch, bare)
+    for directory in sorted(dirs):
+        real = REPO_ROOT / directory.relative_to(scratch.resolve())
+        directory.mkdir(parents=True, exist_ok=True)
+        # Every chain directory must exist in the real repository: a scratch
+        # tree missing one would prove nothing, loudly rather than silently.
+        assert real.is_dir(), real
+        for entry in real.iterdir():
+            if entry.is_file() and (
+                _manifests._is_config_shaped(entry.name) or entry.name == "conftest.py"
+            ):
+                (directory / entry.name).write_text(
+                    entry.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+
+    e2e_dir = (scratch / "tests" / "e2e").resolve()
+    assert e2e_dir in _manifests._chain_dirs(scratch, explicit)
+    assert e2e_dir not in _manifests._chain_dirs(scratch, bare)
+    assert _manifests._pytest_collection_failures(scratch, explicit) == []
+    assert _manifests._pytest_collection_failures(scratch, bare) == []
+
+    conftest = scratch / "tests" / "e2e" / "conftest.py"
+    assert conftest.is_file()
+    conftest.write_text(
+        conftest.read_text(encoding="utf-8") + '\ncollect_ignore = ["test_e2e_load.py"]\n',
+        encoding="utf-8",
+    )
+    assert _manifests._pytest_collection_failures(scratch, explicit) == [
+        "conftest_collection_hook"
+    ]
+    assert _manifests._pytest_collection_failures(scratch, bare) == []
 
 
 #: The per-request schedule-path budget, declared here rather than measured

@@ -954,8 +954,15 @@ async def run_closed_loop_saturation(
             await client.aclose()
 
 
-def evaluate_baseline_clauses(result: PhaseResult) -> list[str]:
-    """Baseline clauses — no rate comparison (FP-IG-9)."""
+def evaluate_baseline_correctness_clauses(result: PhaseResult) -> list[str]:
+    """Baseline correctness clauses — no rate and no p99 comparison.
+
+    FP-IG-9 minus its clause 5: the e2e-b1-kind-policy slice makes the nested
+    kind due-time p99 observational, so the final oracle and every superseded
+    form share this correctness-only base. Forms 2-4 add their own historical
+    latency clauses on top; none of them reaches the removed p99 gate through
+    this call.
+    """
     fails: list[str] = []
     if result.served + result.errors != result.offered:
         fails.append("served+errors==offered")
@@ -963,8 +970,6 @@ def evaluate_baseline_clauses(result: PhaseResult) -> list[str]:
         fails.append("errors==0")
     if result.served != result.offered:
         fails.append("served==offered")
-    if not (result.p99 < P99_MS):
-        fails.append("p99<P99_MS")
     return fails
 
 
@@ -984,12 +989,12 @@ def evaluate_saturation_clauses(result: PhaseResult) -> list[str]:
 
 def evaluate_superseded_form1(result: PhaseResult) -> list[str]:
     """Errata pass 1: completion clauses without a rate floor."""
-    return evaluate_baseline_clauses(result)
+    return evaluate_baseline_correctness_clauses(result)
 
 
 def evaluate_superseded_form2(result: PhaseResult) -> list[str]:
     """Errata pass 2: p99-discounted ratio >= BASE_RATE."""
-    fails = evaluate_baseline_clauses(result)
+    fails = evaluate_baseline_correctness_clauses(result)
     span = result.t_last_complete - result.due0 - (result.p99 / 1000.0)
     ratio = result.served / span if span > 0 else 0.0
     if not (ratio >= BASE_RATE):
@@ -999,7 +1004,7 @@ def evaluate_superseded_form2(result: PhaseResult) -> list[str]:
 
 def evaluate_superseded_form3(result: PhaseResult) -> list[str]:
     """Errata pass 3: p100 + half-window lateness drift pair."""
-    fails = evaluate_baseline_clauses(result)
+    fails = evaluate_baseline_correctness_clauses(result)
     if not (result.max_lateness_ms < P99_MS):
         fails.append("p100<P99_MS")
     a, b = half_window_medians(result.latencies_ms)
@@ -1011,7 +1016,7 @@ def evaluate_superseded_form3(result: PhaseResult) -> list[str]:
 
 def evaluate_superseded_form4(result: PhaseResult) -> list[str]:
     """Errata pass 4: p100 alone."""
-    fails = evaluate_baseline_clauses(result)
+    fails = evaluate_baseline_correctness_clauses(result)
     if not (result.max_lateness_ms < P99_MS):
         fails.append("p100<P99_MS")
     return fails
@@ -1023,7 +1028,7 @@ ACCEPTANCE_SUPERSEDED: dict[str, tuple[str, str, str, str]] = {
     "healthy_1000": ("pass", "pass", "pass", "pass"),
     "round2_tail": ("pass", "fail", "fail", "fail"),
     "late_first_completion": ("pass", "pass", "fail", "fail"),
-    "sustained_deficit_990": ("fail", "fail", "fail", "fail"),
+    "sustained_deficit_990": ("pass", "pass", "fail", "fail"),
     "sustained_deficit_400": ("fail", "fail", "fail", "fail"),
     "round3_997": ("pass", "pass", "fail", "pass"),
     "round4_repeated_ramp": ("pass", "pass", "pass", "pass"),
@@ -1144,13 +1149,14 @@ def _acceptance_schedule(name: str) -> PhaseResult:
     )
 
 
-# Final e2e verdicts: case 10 PASSES (no rate floor); others match reference
-# form1 / completion+p99 behaviour at BASE_RATE.
+# Final e2e verdicts: case 10 PASSES (no rate floor); others follow the
+# correctness-only base evaluator at BASE_RATE. sustained_deficit_990 is the
+# latency-only miss the kind tier now observes instead of failing on.
 ACCEPTANCE_EXPECTED: dict[str, str] = {
     "healthy_1000": "pass",
     "round2_tail": "pass",
     "late_first_completion": "pass",
-    "sustained_deficit_990": "fail",
+    "sustained_deficit_990": "pass",  # latency-only miss: observational at the kind tier
     "sustained_deficit_400": "fail",
     "round3_997": "pass",
     "round4_repeated_ramp": "pass",
@@ -1163,7 +1169,7 @@ ACCEPTANCE_EXPECTED: dict[str, str] = {
 def run_acceptance_case(name: str) -> tuple[str, list[str]]:
     """Return (verdict, failed_clauses) under the e2e baseline oracle."""
     result = _acceptance_schedule(name)
-    fails = evaluate_baseline_clauses(result)
+    fails = evaluate_baseline_correctness_clauses(result)
     return ("pass" if not fails else "fail"), fails
 
 
@@ -1171,7 +1177,7 @@ def run_acceptance_matrix(name: str) -> dict[str, str]:
     """Return final + four superseded verdicts for one acceptance case."""
     result = _acceptance_schedule(name)
     forms = {
-        "final": evaluate_baseline_clauses,
+        "final": evaluate_baseline_correctness_clauses,
         "form1": evaluate_superseded_form1,
         "form2": evaluate_superseded_form2,
         "form3": evaluate_superseded_form3,

@@ -11,7 +11,6 @@ benchmarks:
   status: covered
   tests:
   - services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path
-  - tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile
   - services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile
   - services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile
   notes: |
@@ -115,13 +114,30 @@ benchmarks:
     gating threshold by that status.
     In-process micro-benchmark of the HMAC verify + normalize + fingerprint hot path:
     services/gateway/tests/test_hmac_auth.py.
-    The kind e2e link tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile stays a nested
-    functional/deployment test under its current resource model, exercising the sustained profile
-    (open-loop baseline at 200 req/s) and a closed-loop saturation phase against the shipped image and
-    chart with real kubelet probes, asserting completion/p99/accounting and 0 restarts / no Unhealthy
-    events; three bare-container affinities neither bound nor describe that topology, so it implements
-    neither reference declaration and refutes neither, a green nested run is a sufficient
-    demonstration and a red one is not a refutation.
+    The kind e2e link tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile is deliberately not
+    one of the three threshold-bearing links above; it stays a nested functional/deployment test
+    under its current resource model, exercising the sustained profile (open-loop baseline at
+    200 req/s) and a closed-loop saturation phase against the shipped image and chart with real
+    kubelet probes, asserting completion/accounting and 0 restarts / no Unhealthy events; three
+    bare-container affinities neither bound nor describe that topology, so it implements neither
+    reference declaration and refutes neither, a green nested run is a sufficient demonstration and
+    a red one is not a refutation.
+    Nested kind latency policy, owner ruling 2026-09-21 through slice
+    design/slices/e2e-b1-kind-policy/design.md and logged at design/frozen-deviations.md: the kind
+    due-time p99 is still compared with 150 ms and the Boolean is recorded as pytest observation
+    metadata on every coherent completed baseline, and the measured value still reaches the legacy
+    print, the 33-field canonical diagnostics line, the fixed file and the uploaded artifact -- but
+    that comparison does not fail the kind job. Eleven kind comparisons still fail it: platform
+    ONLINE; baseline served+errors==6000, errors==0, served==6000 and committed==served; saturation
+    sat_served+sat_errors==issued, sat_errors==0, gateway restart delta ==0, Unhealthy event count
+    ==0, sat_committed==sat_served, and the exact admissible audit-action tuple. Accepted cost,
+    stated rather than hidden: a regression visible only as nested kind latency no longer fails e2e.
+    The isolated CI-scale reference assertion keeps p99 < 150 ms at full strength, but it fails on
+    latency only on a runner CPU model with a ratified GC-3 placement, so on an unratified or
+    unhostable runner draw no CI job fails on ingest latency, and a kind/chart-only latency
+    regression is then visible only in the uploaded e2e diagnostics artifact. This policy changes no
+    kind deployment resource: the chart, the e2e values overlay and every pod request/limit are
+    untouched and undecided here.
     max_lateness_ms is a reported diagnostic rather than a bar, and beyond the floor a finite-window
     burst certifies no sustained served-rate figure near the offered rate. Serving shape is uvicorn
     workers=4 (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers); no shipped gateway configuration
