@@ -1,8 +1,10 @@
 """FP-IG-9: B1 e2e link — nested-tier profile against shipped image and chart.
 
-Baseline: open-loop at BASE_RATE for BASE_SECONDS (completion/p99/accounting;
-no rate comparison). Saturation: closed-loop of SATURATION_CLIENTS for
-BURST_SECONDS (0 errors, 0 restarts, no Unhealthy, exact audit accounting).
+Baseline: open-loop at BASE_RATE for BASE_SECONDS, failing on completion,
+errors and exact audit accounting; the p99 is evaluated against P99_MS and
+recorded as an observation, not failure-producing (55ddeff). No rate
+comparison. Saturation: closed-loop of SATURATION_CLIENTS for BURST_SECONDS
+(0 errors, 0 restarts, no Unhealthy, exact audit accounting).
 """
 from __future__ import annotations
 

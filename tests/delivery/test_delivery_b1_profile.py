@@ -1420,8 +1420,10 @@ def test_fp_ig19_guard_rejects_required_mutations(mutation_id, path, required_na
             ops = rops
             eq_ok = eok
             break
-    # For p99 / rate floor use ordering ops.
-    if required_names in (frozenset({"p99", "P99_MS"}), frozenset({"p99", "CI_SCALE_P99_MS"})):
+    # For p99 / rate floor use ordering ops. The kind e2e p99 row is gone
+    # (55ddeff made that comparison an observation), so only the CI-scale
+    # reference p99 is normalised here.
+    if required_names == frozenset({"p99", "CI_SCALE_P99_MS"}):
         ops, eq_ok = frozenset({ast.Lt}), False
     if required_names == frozenset({"served_rate", "CI_SCALE_SUSTAINED_FLOOR"}):
         ops, eq_ok = frozenset({ast.GtE}), False
@@ -3901,29 +3903,15 @@ def _gc3_probe_partition_failures(src: str) -> list[str]:
     return fails
 
 
-def _b1_target_region(launcher: str, target: str) -> str:
-    """The shell text of one target, delimited by top-level function headers.
-
-    Delimiting on headers rather than on a comment between the targets is the
-    point: a comment can be reworded without changing anything the launcher
-    does, and a check that splits on one silently widens its region when that
-    happens. Same splitter as tests/functional/test_manifests.py's.
-    """
-    lines = launcher.splitlines()
-    starts = [
-        (index, match.group(1))
-        for index, match in (
-            (i, re.match(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z", line))
-            for i, line in enumerate(lines)
-        )
-        if match
-    ]
-    for position, (index, name) in enumerate(starts):
-        if name != target:
-            continue
-        stop = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-        return "\n".join(lines[index + 1:stop])
-    return ""
+#: The shell text of one launcher target, delimited by top-level function
+#: headers. ONE definition, in tests/functional/test_manifests.py, reached
+#: through the `_manifests` seam this module already loads: three copies of
+#: this body existed and would have drifted (review-followups-batch-20260920
+#: W1). Delimiting on headers rather than on a comment between the targets is
+#: the point: a comment can be reworded without changing anything the launcher
+#: does, and a check that splits on one silently widens its region when that
+#: happens.
+_b1_target_region = _manifests._b1_target_region
 
 
 def _gc3_route_surface_failures() -> list[str]:
@@ -6132,23 +6120,10 @@ B1LB_ESCAPES = GC3_WEAKENINGS
 b1lb = _load(B1LB_LEDGER_MODULE, "b1lb_sizing_ledger_profile")
 
 
-def _b1lb_region(launcher: str, target: str) -> str:
-    """One shell target's body, delimited by top-level function headers."""
-    lines = launcher.splitlines()
-    starts = [
-        (index, match.group(1))
-        for index, match in (
-            (i, re.match(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z", line))
-            for i, line in enumerate(lines)
-        )
-        if match
-    ]
-    for position, (index, name) in enumerate(starts):
-        if name != target:
-            continue
-        stop = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-        return "\n".join(lines[index + 1:stop])
-    return ""
+#: One shell target's body, under the name this section's checks call it by.
+#: The same single definition as `_b1_target_region` above; it was a third
+#: verbatim copy of that body until review-followups-batch-20260920 W1.
+_b1lb_region = _manifests._b1_target_region
 
 
 def _b1lb_target_failures(launcher: str, workflow: dict) -> list[str]:
@@ -8968,6 +8943,10 @@ def _e2ebd_core(result) -> dict:
     absent: they are dispatcher peaks read off a real clock and a real task
     queue, so two honest runs of the same baseline differ every few dozen
     executions (CI 35568809898). `_e2ebd_peak_failures` checks those instead.
+    The latency SAMPLES are absent for the same reason, and the two guards
+    that stand in for them are `_e2ebd_boundary_1_handler_failures` (the
+    handler cannot reach them) and `_e2ebd_p99_consistency_failures` (the
+    summary a run reports is the percentile of that run's own samples).
     """
     return {
         "offered": result.offered,
@@ -8998,6 +8977,161 @@ def _e2ebd_peak_failures(result, *, offered: int, rate: float) -> "list[str]":
     return fails
 
 
+#: The three diagnostic keywords of the baseline's `PhaseResult(...)`. Every
+#: OTHER keyword of that call names a measured value, and the set of locals
+#: feeding them is read off the carrier itself rather than listed here, so a
+#: renamed local is carried INTO the protected set instead of out of it.
+E2EBD_LEG_KEYWORDS = ("pre_dispatch_slip_ms", "start_lag_ms", "attempt_duration_ms")
+#: The measured keywords the guard refuses to accept as unprotected: each must
+#: be present and built from at least one local, or the pin below is vacuous.
+E2EBD_ORACLE_KEYWORDS = ("offered", "served", "errors", "latencies_ms", "status_codes")
+
+
+def _e2ebd_bindings(node: ast.AST) -> "tuple[set[str], list[str]]":
+    """Every name a subtree binds: plain `Name` stores, and any other form."""
+    plain: set[str] = set()
+    other: list[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            plain.add(child.id)
+        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Del):
+            other.append(f"del {child.id}")
+        elif isinstance(child, (ast.Attribute, ast.Subscript)) and isinstance(
+            child.ctx, (ast.Store, ast.Del)
+        ):
+            other.append(ast.unparse(child))
+        elif isinstance(child, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
+            other.append(ast.unparse(child))
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            other.append(f"{type(child).__name__} {child.name}")
+    return plain, other
+
+
+def _e2ebd_boundary_1_handler_failures(src: str) -> "list[str]":
+    """Structure of boundary 1's fail-soft handler in the e2e carrier.
+
+    `_e2ebd_core` compares counts and codes, so a handler that RESCALED the
+    latency samples -- every count, code and peak identical, p99 x 1000 --
+    satisfied every check in this file (measured on this stub: a reported
+    1261 ms against a 1.11 ms control). Cross-run equality of the values
+    cannot close that: they are wall-clock and two honest runs differ, which
+    is the flake beeec34 removed. What is checkable without a clock is that
+    the handler cannot reach them at all -- it may rebind the three
+    diagnostic leg vectors and nothing else, and may not so much as NAME any
+    local the baseline's `return PhaseResult(...)` is built from.
+    """
+    fails: list[str] = []
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as exc:
+        return [f"the e2e profile carrier no longer parses: {exc}"]
+    generator = _e2ebd_function(tree, "run_open_loop_baseline")
+
+    returns = [
+        n for n in ast.walk(generator)
+        if isinstance(n, ast.Return)
+        and isinstance(n.value, ast.Call)
+        and ast.unparse(n.value.func) == "PhaseResult"
+    ]
+    if len(returns) != 1:
+        return [f"{len(returns)} `return PhaseResult(...)` in the baseline, want 1"]
+    built = returns[0].value
+    legs: set[str] = set()
+    protected: set[str] = _e2ebd_name_ids(built.func)
+    supplied = {k.arg for k in built.keywords}
+    for keyword in built.keywords:
+        if keyword.arg in E2EBD_LEG_KEYWORDS:
+            legs |= _e2ebd_name_ids(keyword.value)
+        else:
+            protected |= _e2ebd_name_ids(keyword.value)
+    protected -= legs
+    if legs != set(E2EBD_LEG_KEYWORDS):
+        fails.append(
+            f"the diagnostic vectors are fed by {sorted(legs)}, "
+            f"want {sorted(E2EBD_LEG_KEYWORDS)}"
+        )
+    for name in E2EBD_ORACLE_KEYWORDS:
+        if name not in supplied:
+            fails.append(f"the baseline no longer passes {name}= to PhaseResult")
+    for keyword in built.keywords:
+        if keyword.arg in E2EBD_ORACLE_KEYWORDS and not _e2ebd_name_ids(keyword.value):
+            fails.append(f"{keyword.arg}= is built from no local this guard can protect")
+
+    # The boundary-1 block is the try whose OWN body derives the leg vectors;
+    # the generator's outer try/finally (the client close) also contains that
+    # call, several levels down, and is not it.
+    guarded = [
+        n for n in ast.walk(generator)
+        if isinstance(n, ast.Try)
+        and any(
+            isinstance(stmt, ast.Assign) and "derive_leg_vectors" in ast.unparse(stmt.value)
+            for stmt in n.body
+        )
+    ]
+    if len(guarded) != 1:
+        fails.append(f"{len(guarded)} try blocks guard derive_leg_vectors directly, want 1")
+        return fails
+    block = guarded[0]
+    if len(block.body) != 1:
+        fails.append(
+            f"boundary 1 guards {len(block.body)} statements; only the derivation is fail-soft"
+        )
+    if block.orelse or block.finalbody:
+        fails.append("boundary 1 grew an else/finally clause")
+    if len(block.handlers) != 1:
+        fails.append(f"boundary 1 has {len(block.handlers)} handlers, want 1")
+        return fails
+
+    handler = block.handlers[0]
+    caught = ast.unparse(handler.type) if handler.type is not None else "everything"
+    if caught != "Exception":
+        fails.append(f"boundary 1 catches {caught}, want Exception")
+    if handler.name is not None:
+        fails.append(f"boundary 1 binds the exception as {handler.name!r}")
+    body = ast.Module(body=list(handler.body), type_ignores=[])
+    bound, exotic = _e2ebd_bindings(body)
+    stray = sorted(bound - legs)
+    if stray:
+        fails.append(
+            f"boundary 1's handler binds {stray}; only {sorted(legs)} are its to write"
+        )
+    for form in exotic:
+        fails.append(f"boundary 1's handler binds through {form!r}")
+    reachable = sorted(_e2ebd_name_ids(body) & protected)
+    if reachable:
+        fails.append(f"boundary 1's handler names the measured {reachable}")
+    calls = [ast.unparse(n.func) for n in ast.walk(body) if isinstance(n, ast.Call)]
+    if calls:
+        fails.append(
+            f"boundary 1's handler calls {calls}; it may only rebind the three vectors"
+        )
+    return fails
+
+
+def _e2ebd_p99_consistency_failures(result, *, label: str) -> "list[str]":
+    """Within ONE run: each reported summary is a statistic of its own samples.
+
+    Deterministic, and never a comparison between two runs: the samples are
+    wall-clock, but the relation between a run's samples and the numbers it
+    reports about them is arithmetic. Recomputed with the shipped reference
+    helper, which no copy of the carrier can reach.
+    """
+    fails: list[str] = []
+    samples = list(result.latencies_ms)
+    expected = ref.nearest_rank_p99(samples)
+    if result.p99 != expected:
+        fails.append(
+            f"{label}: p99={result.p99!r} is not the nearest-rank percentile "
+            f"{expected!r} of its own {len(samples)} samples"
+        )
+    if samples and result.max_lateness_ms != max(samples):
+        fails.append(
+            f"{label}: max_lateness_ms={result.max_lateness_ms!r} is not the "
+            f"largest of its own samples ({max(samples)!r})"
+        )
+    return fails
+
+
 def _e2ebd_assert_boundary_1_preserved(faulted, control, *, offered: int) -> None:
     """Everything a boundary-1 diagnostic fault must leave untouched.
 
@@ -9005,11 +9139,15 @@ def _e2ebd_assert_boundary_1_preserved(faulted, control, *, offered: int) -> Non
     owns. Both peaks are produced before the guarded derivation runs, so
     fail-soft can only be observed to have left them well-formed -- requiring
     the faulted run to REPRODUCE them asserted that the scheduler is
-    deterministic, which is the defect this split fixes.
+    deterministic, which is the defect this split fixes. The latency samples
+    are wall-clock too, so what is required of them is the same kind of
+    within-run statement: the summaries each run reports are that run's own.
     """
     assert _e2ebd_core(faulted) == _e2ebd_core(control)
     assert _e2ebd_peak_failures(faulted, offered=offered, rate=E2EBD_STUB_RATE) == []
     assert _e2ebd_peak_failures(control, offered=offered, rate=E2EBD_STUB_RATE) == []
+    assert _e2ebd_p99_consistency_failures(faulted, label="faulted") == []
+    assert _e2ebd_p99_consistency_failures(control, label="control") == []
 
 
 def test_e2e_b1_diagnostics_fail_soft_at_each_boundary():
@@ -9251,6 +9389,134 @@ def test_e2e_b1_diagnostics_boundary_1_check_survives_dispatcher_jitter():
             _e2ebd_assert_boundary_1_preserved(
                 _replace(control, **peaks), control, offered=measured
             )
+
+
+def test_e2e_b1_boundary_1_cannot_reach_the_measured_values():
+    """Regression for review-fix-e2ebd-flaky-test S1 (pre-existing at 8e5dbcf).
+
+    The boundary-1 case projects a faulted run onto counts and codes, so a
+    diagnostic fault that rescaled the latency samples, or rewrote the p99
+    the run reports, satisfied every assertion this file made. Neither hole
+    can be closed by comparing values across two runs -- they are wall-clock.
+    Two guards close them without a clock: the handler is structurally unable
+    to reach anything the result is built from, and within one run the
+    summaries reported are statistics of that run's own samples.
+
+    The two mutants below are complementary, which is why both guards are
+    needed: rescaling the samples keeps the p99 self-consistent (only the
+    structural pin sees it), and rewriting the p99 leaves the samples honest
+    (only the within-run check sees it).
+    """
+    measured = 24
+    prologue = 4
+    profile_src, _diag_src, _load_src = _e2ebd_sources()
+    assert _e2ebd_boundary_1_handler_failures(profile_src) == []
+
+    # The shipped handler's body, verbatim and unique: each mutant is that
+    # handler plus exactly one statement.
+    anchor = "            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = [], [], []\n"
+    assert profile_src.count(anchor) == 1
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("helper drift")
+
+    control, _t, _m = _e2ebd_run_baseline(e2e, measured=measured, prologue=prologue)
+    assert _e2ebd_p99_consistency_failures(control, label="control") == []
+
+    for label, statement, named, samples_rewritten in (
+        (
+            "rescaled_samples",
+            "            latencies = [value * 1000.0 for value in latencies]\n",
+            "latencies",
+            True,
+        ),
+        (
+            "rewritten_p99",
+            "            PhaseResult.p99 = property("
+            "lambda self: nearest_rank_p99(self.latencies_ms) * 1000.0)\n",
+            "PhaseResult",
+            False,
+        ),
+    ):
+        mutated = profile_src.replace(anchor, anchor + statement, 1)
+        assert mutated != profile_src, label
+        failures = _e2ebd_boundary_1_handler_failures(mutated)
+        assert failures != [], label
+        assert any(named in f for f in failures), (label, failures)
+
+        module = _e2ebd_exec_profile(mutated, f"b1_e2e_profile_{label}_mutant")
+        module.derive_leg_vectors = _raise
+        faulted, _t2, _m2 = _e2ebd_run_baseline(
+            module, measured=measured, prologue=prologue
+        )
+        assert faulted.pre_dispatch_slip_ms == [], label
+
+        # Not cosmetic, and stated entirely within the faulted run: it reports
+        # a p99 larger than the whole window it was measured in, which no
+        # latency of that window can be (every sample is a completion inside
+        # `due0 .. t_last_complete`). Nothing here asks the scheduler to
+        # reproduce anything, so it cannot flake on a busy machine.
+        span_ms = (faulted.t_last_complete - faulted.due0) * 1000.0
+        assert faulted.p99 > span_ms, (label, faulted.p99, span_ms)
+        assert (max(faulted.latencies_ms) > span_ms) is samples_rewritten, label
+
+        # ... and every check that existed before still accepts it.
+        assert _e2ebd_core(faulted) == _e2ebd_core(control), label
+        assert _e2ebd_peak_failures(
+            faulted, offered=measured, rate=E2EBD_STUB_RATE
+        ) == [], label
+        values = e2ediag.build_e2e_b1_diagnostic_values(
+            faulted,
+            e2ediag.unavailable_snapshot("open"),
+            e2ediag.unavailable_snapshot("close"),
+        )
+        assert values["p99_ms"] == faulted.p99, label
+        assert values["status_histogram"] == f"202:{measured}", label
+        assert values["p99_leg_split_ms"] == E2EBD_UNAVAILABLE, label
+        assert e2ediag.serialize_e2e_b1_diagnostics(values).startswith(E2EBD_PREFIX)
+
+        consistency = _e2ebd_p99_consistency_failures(faulted, label=label)
+        assert (consistency == []) is samples_rewritten, (label, consistency)
+        if samples_rewritten:
+            # Still accepted by everything that runs the two baselines: the
+            # rescale is self-consistent, so the structural pin is the only
+            # thing that sees it. That is the whole reason the pin exists.
+            _e2ebd_assert_boundary_1_preserved(faulted, control, offered=measured)
+        else:
+            with pytest.raises(AssertionError):
+                _e2ebd_assert_boundary_1_preserved(faulted, control, offered=measured)
+
+    # The pin is not satisfied by accident: a handler that binds one more
+    # name, catches more than `Exception`, keeps the exception alive, widens
+    # what it guards, or calls anything at all is red.
+    for widened in (
+        profile_src.replace(anchor, anchor + "            codes = codes\n", 1),
+        profile_src.replace(anchor, anchor + "            spare = 1\n", 1),
+        profile_src.replace(anchor, anchor + "            del rate\n", 1),
+        profile_src.replace(anchor, anchor + "            import math as _m\n", 1),
+        profile_src.replace(anchor, anchor + "            latencies.clear()\n", 1),
+        profile_src.replace(
+            "        except Exception:  # noqa: BLE001 -- diagnostic only, never the oracle\n",
+            "        except BaseException as exc:  # widened\n",
+            1,
+        ),
+        profile_src.replace(
+            "        try:\n"
+            "            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(",
+            "        try:\n"
+            "            served = sum(1 for o in outcomes if o == 'served')\n"
+            "            pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(",
+            1,
+        ),
+    ):
+        assert widened != profile_src
+        assert _e2ebd_boundary_1_handler_failures(widened) != []
+
+    # A carrier that stopped building the result from locals cannot make the
+    # protected set empty and pass vacuously.
+    hollowed = profile_src.replace("            latencies_ms=latencies,\n", "", 1)
+    assert hollowed != profile_src
+    assert _e2ebd_boundary_1_handler_failures(hollowed) != []
 
 
 def test_e2e_b1_diagnostic_module_has_no_popen_or_environment_read():
