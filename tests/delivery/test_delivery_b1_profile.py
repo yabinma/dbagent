@@ -7423,6 +7423,7 @@ def test_b1_host_noise_probe_observation_is_post_write_and_nongating():
 
 import io as _io
 import math as _math
+from dataclasses import replace as _replace
 from urllib.parse import quote as _quote
 
 E2EBD_DIAG_PATH = REPO_ROOT / "tests" / "e2e" / "b1_e2e_diagnostics.py"
@@ -7714,6 +7715,38 @@ class E2EBDStubTransport:
         return self.status, b'{"investigation_id":"x"}', None
 
 
+#: Dispatch rate and in-flight cap `_e2ebd_run_baseline` drives the open loop
+#: at. Declared here because the range checks below are expressed in slots.
+E2EBD_STUB_RATE = 2000.0
+E2EBD_STUB_MAX_IN_FLIGHT = 1000
+#: Wall-clock width of the forced stall, in dispatch slots. Ten slots is far
+#: outside the spread two unstalled runs show: over 440 measured runs an
+#: unstalled `max_backlog` was 1 or 2 and a stalled one 9 or 10, so the
+#: forcing can never be confused with ordinary jitter.
+E2EBD_STALL_SLOTS = 10
+
+
+class E2EBDStallingStubTransport(E2EBDStubTransport):
+    """A stub that blocks the event loop once, inside the measured window.
+
+    `time.sleep` rather than `asyncio.sleep` on purpose: the open-loop
+    dispatcher's schedule is wall-clock, so only a blocking stall makes it
+    fall a KNOWN number of slots behind and report a `max_backlog` that no
+    unstalled run produces. Every count, code and latency slot is unaffected.
+    """
+
+    def __init__(self, *, stall_at: int, stall_slots: int = E2EBD_STALL_SLOTS, **kwargs):
+        super().__init__(**kwargs)
+        self.stall_slots = stall_slots
+        self.stall_s = stall_slots / E2EBD_STUB_RATE
+        self.stall_at = stall_at
+
+    async def post(self, url, *, content, headers):
+        if len(self.payloads) == self.stall_at:
+            time.sleep(self.stall_s)
+        return await super().post(url, content=content, headers=headers)
+
+
 def _e2ebd_exec_profile(src: str, name: str):
     """Execute a (possibly mutated) copy of the e2e profile carrier."""
     # Compiled under a synthetic filename on purpose: a mutant must never be
@@ -7900,9 +7933,9 @@ def _e2ebd_instrumentation_failures(src: str) -> "list[str]":
     return fails
 
 
-def _e2ebd_run_baseline(module, *, measured: int, prologue: int = 30):
+def _e2ebd_run_baseline(module, *, measured: int, prologue: int = 30, transport=None):
     """1 warmup + `prologue` prologue + `measured` requests through a stub."""
-    transport = E2EBDStubTransport()
+    transport = E2EBDStubTransport() if transport is None else transport
     marks: dict[str, object] = {}
 
     def _at_prologue_complete() -> None:
@@ -7921,8 +7954,8 @@ def _e2ebd_run_baseline(module, *, measured: int, prologue: int = 30):
             endpoint="http://stub/events",
             requests=[(f'{{"m":{i}}}'.encode(), {}) for i in range(measured)],
             transport=transport,
-            rate=2000,
-            max_in_flight=1000,
+            rate=E2EBD_STUB_RATE,
+            max_in_flight=E2EBD_STUB_MAX_IN_FLIGHT,
             warmup=(b'{"w":1}', {}),
             prologue=[(f'{{"p":{i}}}'.encode(), {}) for i in range(prologue)],
             include_sync_warmup=True,
@@ -8775,14 +8808,54 @@ class E2EBDRaisingStream:
 
 
 def _e2ebd_core(result) -> dict:
+    """The part of a baseline result two separate executions must agree on.
+
+    Counts and codes only. `max_backlog` and `max_in_flight` are deliberately
+    absent: they are dispatcher peaks read off a real clock and a real task
+    queue, so two honest runs of the same baseline differ every few dozen
+    executions (CI 35568809898). `_e2ebd_peak_failures` checks those instead.
+    """
     return {
         "offered": result.offered,
         "served": result.served,
         "errors": result.errors,
         "status_codes": list(result.status_codes),
         "latency_count": len(result.latencies_ms),
-        "max_backlog": result.max_backlog,
     }
+
+
+def _e2ebd_peak_failures(result, *, offered: int, rate: float) -> "list[str]":
+    """Shape of the two dispatcher peaks, checked within ONE run.
+
+    `max_in_flight` counts measured dispatches that have not completed, so
+    `1 <= max_in_flight <= offered` holds by construction whatever the
+    scheduler does. `max_backlog` counts schedule slots the dispatcher is
+    behind; its only construction-guaranteed ceiling is the window it was
+    measured in (measured here: a 20 ms stall inside a 12 ms window drives it
+    to 39, well past `offered`, so `offered` is NOT a safe bound).
+    """
+    fails: list[str] = []
+    backlog, in_flight = result.max_backlog, result.max_in_flight
+    span_slots = _math.ceil(max(0.0, result.t_last_complete - result.due0) * rate)
+    if type(backlog) is not int or not 0 <= backlog <= span_slots:
+        fails.append(f"max_backlog={backlog!r} is not an int in 0..{span_slots}")
+    if type(in_flight) is not int or not 1 <= in_flight <= offered:
+        fails.append(f"max_in_flight={in_flight!r} is not an int in 1..{offered}")
+    return fails
+
+
+def _e2ebd_assert_boundary_1_preserved(faulted, control, *, offered: int) -> None:
+    """Everything a boundary-1 diagnostic fault must leave untouched.
+
+    Equality for what the fault cannot touch, shape for what the OS scheduler
+    owns. Both peaks are produced before the guarded derivation runs, so
+    fail-soft can only be observed to have left them well-formed -- requiring
+    the faulted run to REPRODUCE them asserted that the scheduler is
+    deterministic, which is the defect this split fixes.
+    """
+    assert _e2ebd_core(faulted) == _e2ebd_core(control)
+    assert _e2ebd_peak_failures(faulted, offered=offered, rate=E2EBD_STUB_RATE) == []
+    assert _e2ebd_peak_failures(control, offered=offered, rate=E2EBD_STUB_RATE) == []
 
 
 def test_e2e_b1_diagnostics_fail_soft_at_each_boundary():
@@ -8809,7 +8882,7 @@ def test_e2e_b1_diagnostics_fail_soft_at_each_boundary():
         degraded, _t2, _m2 = _e2ebd_run_baseline(e2e, measured=measured, prologue=4)
     finally:
         e2e.derive_leg_vectors = original
-    assert _e2ebd_core(degraded) == _e2ebd_core(control)
+    _e2ebd_assert_boundary_1_preserved(degraded, control, offered=measured)
     assert _math.isfinite(degraded.p99) and _math.isfinite(control.p99)
     assert degraded.pre_dispatch_slip_ms == []
     assert degraded.start_lag_ms == []
@@ -8922,6 +8995,108 @@ def test_e2e_b1_diagnostics_fail_soft_at_each_boundary():
     assert e2ediag.write_e2e_b1_diagnostic_artifact(
         writer_line, path=Path("/proc/definitely-not-writable/x.txt")
     ) is False
+
+
+def test_e2e_b1_diagnostics_boundary_1_check_survives_dispatcher_jitter():
+    """Regression for CI 35568809898.
+
+    The boundary-1 case above runs the same baseline twice and requires the
+    faulted run to reproduce the control's core result. `max_backlog` and
+    `max_in_flight` are dispatcher peaks read off a real clock and a real task
+    queue, so two honest runs differ every few dozen executions -- CI reported
+    ``{'max_backlog': 1} != {'max_backlog': 2}`` with the other five items
+    identical. Both peaks are computed BEFORE boundary 1's try/except can run,
+    so fail-soft cannot change them; what the check must prove about them is
+    their shape, and what it must prove by equality is the counts and codes.
+    """
+    measured = 24
+    prologue = 4
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("helper drift")
+
+    control, _t, _m = _e2ebd_run_baseline(e2e, measured=measured, prologue=prologue)
+
+    # (a) The exact CI divergence, injected: a run identical to the control
+    # except that the scheduler let each peak land one slot away. Both twins
+    # are clamped into the band a real run of this shape can produce, so the
+    # only thing under test is that a one-slot difference is not a fault.
+    span_slots = _math.ceil(
+        (control.t_last_complete - control.due0) * E2EBD_STUB_RATE
+    )
+    twins = [
+        _replace(
+            control,
+            max_backlog=min(span_slots, control.max_backlog + 1),
+            max_in_flight=min(measured, control.max_in_flight + 1),
+        ),
+        _replace(
+            control,
+            max_backlog=max(0, control.max_backlog - 1),
+            max_in_flight=max(1, control.max_in_flight - 1),
+        ),
+    ]
+    # Non-vacuous by construction: `max_in_flight` cannot be both 1 and
+    # `measured`, so the clamps can never collapse BOTH twins onto the control.
+    assert any(
+        (t.max_backlog, t.max_in_flight)
+        != (control.max_backlog, control.max_in_flight)
+        for t in twins
+    ), (control.max_backlog, control.max_in_flight, span_slots)
+    for twin in twins:
+        _e2ebd_assert_boundary_1_preserved(twin, control, offered=measured)
+
+    # (b) The same divergence produced by the real dispatcher rather than by
+    # construction: a blocking stall on the second measured request puts the
+    # faulted run ten slots behind its schedule. The fault at boundary 1 is
+    # the shipped one, so this is the boundary-1 case with the scheduling
+    # difference forced instead of waited for.
+    original = e2e.derive_leg_vectors
+    try:
+        e2e.derive_leg_vectors = _raise
+        stalled, _t2, _m2 = _e2ebd_run_baseline(
+            e2e,
+            measured=measured,
+            prologue=prologue,
+            # 1 warmup + `prologue` prologue requests precede the window.
+            transport=E2EBDStallingStubTransport(stall_at=1 + prologue + 1),
+        )
+    finally:
+        e2e.derive_leg_vectors = original
+    # The forcing is real, and bounded from BELOW only -- an upper bound, or a
+    # comparison against the control's own peak, would put this test back on
+    # the scheduler. `time.sleep` never returns early, so a longer stall can
+    # only raise this number (measured: 9 or 10 over 200 runs, against 1 or 2
+    # unstalled, so half the stall width is a bound with room to spare).
+    assert stalled.max_backlog >= E2EBD_STALL_SLOTS // 2, stalled.max_backlog
+    assert stalled.pre_dispatch_slip_ms == []
+    _e2ebd_assert_boundary_1_preserved(stalled, control, offered=measured)
+
+    # (c) It still discriminates. Every value boundary 1 must preserve is
+    # checked, and a faulted run that changed one is red.
+    for broken in (
+        _replace(control, offered=measured - 1),
+        _replace(control, served=control.served - 1),
+        _replace(control, errors=control.errors + 1),
+        _replace(control, status_codes=[503] + list(control.status_codes)[1:]),
+        _replace(control, latencies_ms=list(control.latencies_ms)[:-1]),
+    ):
+        with pytest.raises(AssertionError):
+            _e2ebd_assert_boundary_1_preserved(broken, control, offered=measured)
+
+    # ... and so is a run whose peaks are no longer well-formed counters.
+    for peaks in (
+        {"max_backlog": -1},
+        {"max_backlog": 2.0},
+        {"max_backlog": True},
+        {"max_in_flight": 0},
+        {"max_in_flight": measured + 1},
+        {"max_in_flight": None},
+    ):
+        with pytest.raises(AssertionError):
+            _e2ebd_assert_boundary_1_preserved(
+                _replace(control, **peaks), control, offered=measured
+            )
 
 
 def test_e2e_b1_diagnostic_module_has_no_popen_or_environment_read():
