@@ -6245,6 +6245,32 @@ def _b1lb_values_file(tmp_path, ig: dict, name: str = "values.yaml"):
     return path
 
 
+def test_b1_launcher_region_splitter_is_one_shared_definition():
+    """The two splitter names ARE the manifests function, not copies of it.
+
+    `_b1_target_region` and `_b1lb_region` are both aliases of
+    tests/functional/test_manifests.py::_b1_target_region. Three verbatim
+    copies of that body existed until review-followups-batch-20260920 W1, and
+    a copy drifts silently because each one is reached by a different set of
+    tests. Identity (`is`), never equality of behaviour: two independent
+    bodies that agree today are exactly the state this pin exists to reject.
+    The source leg catches the other shape of the same regression -- a copy
+    defined ABOVE the alias, which the alias then shadows, so the identity
+    leg alone would not see it.
+    """
+    assert _b1_target_region is _manifests._b1_target_region
+    assert _b1lb_region is _manifests._b1_target_region
+
+    own_src = Path(__file__).read_text(encoding="utf-8")
+    copied = sorted(
+        node.name
+        for node in ast.walk(ast.parse(own_src))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in ("_b1_target_region", "_b1lb_region")
+    )
+    assert copied == [], f"the splitter body was copied back into this file: {copied}"
+
+
 def test_b1_latency_basis_target_is_isolated_and_fail_closed(tmp_path):
     """FP-B1LB-6: one explicit target, isolated from the gate, failing closed.
 
@@ -7839,10 +7865,16 @@ class E2EBDStubTransport:
 #: at. Declared here because the range checks below are expressed in slots.
 E2EBD_STUB_RATE = 2000.0
 E2EBD_STUB_MAX_IN_FLIGHT = 1000
-#: Wall-clock width of the forced stall, in dispatch slots. Ten slots is far
-#: outside the spread two unstalled runs show: over 440 measured runs an
-#: unstalled `max_backlog` was 1 or 2 and a stalled one 9 or 10, so the
-#: forcing can never be confused with ordinary jitter.
+#: Wall-clock width of the forced stall, in dispatch slots. On an IDLE host
+#: 440 measured runs put an unstalled `max_backlog` at 1 or 2 and a stalled
+#: one at 9 or 10. That is an observation of this host at rest, not a bound:
+#: under CPU contention an unstalled peak climbs well past 2 (measured under
+#: 24 CPU burners: 30 unstalled runs spread over 2..9, 18 of them above 2 --
+#: review-fix-e2ebd-flaky-test S2 saw 5..12), so the two populations are NOT
+#: claimed to be separable in general. Nothing here needs them to be. The
+#: assertion below is a LOWER bound on the stalled run alone
+#: (`>= E2EBD_STALL_SLOTS // 2`), never an upper bound on an unstalled one,
+#: and `time.sleep` never returns early, so contention can only raise it.
 E2EBD_STALL_SLOTS = 10
 
 
@@ -7852,7 +7884,11 @@ class E2EBDStallingStubTransport(E2EBDStubTransport):
     `time.sleep` rather than `asyncio.sleep` on purpose: the open-loop
     dispatcher's schedule is wall-clock, so only a blocking stall makes it
     fall a KNOWN number of slots behind and report a `max_backlog` that no
-    unstalled run produces. Every count, code and latency slot is unaffected.
+    unstalled run produces. Every count and code is unaffected, and so is the
+    latency COUNT -- one sample per request either way. The stalled request's
+    own latency VALUE grows by the stall (measured: p99 ~1 ms -> ~20.7 ms),
+    which is why the cross-run projection compares `latency_count` and not
+    the samples.
     """
 
     def __init__(self, *, stall_at: int, stall_slots: int = E2EBD_STALL_SLOTS, **kwargs):
