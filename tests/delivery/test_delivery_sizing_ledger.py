@@ -29,19 +29,15 @@ enter values.yaml, the threshold notes or acceptance evidence. The
 ``H_c``-to-recording diff may touch only deploy/charts/dbagent/values.yaml
 and tests/benchmark/thresholds.yaml.
 
-This module is also the fixed, fail-closed entry point for the isolated
-``b1_latency_basis`` target (FP-B1LB-6). ``scripts/integration-test.sh``
-invokes it as a script:
-
-    <venv python> tests/delivery/test_delivery_sizing_ledger.py \
-        basis-oracle-preflight --values <values.yaml> --decision <carrier>
-    <venv python> tests/delivery/test_delivery_sizing_ledger.py \
-        basis-oracle-route --values <values.yaml> --decision <carrier> \
-        --route <route record>
-
-Both print exactly ``basis_oracle_unobserved:<reason>`` on stderr and exit 3
-when the oracle cannot be observed on this runner; ordinary CLI misuse keeps
-an ordinary nonzero status so the two can never be confused.
+bench-on-demand (FP-BOD-9) made this ledger HISTORY. The five stored rows are
+the recorded CI-scale observations that produced 1.585 ms/request and the
+chart's 317m/1585m; the CI-scale route that could produce another one, the
+per-model topology carrier that bound them to one CPU model, and the live
+CPU-basis oracle that re-measured the basis are all deleted. This module opens
+no carrier and imports no discovery helper, and it is no longer a script: the
+``basis-oracle-preflight`` / ``basis-oracle-route`` subcommands went with the
+``b1_latency_basis`` target that invoked them. What remains is a static gate
+that fails a silent edit of a cost, of the basis or of a chart figure.
 """
 from __future__ import annotations
 
@@ -66,9 +62,6 @@ from delivery_helpers import CHARTS, REPO_ROOT, helm_template, parse_manifests
 
 DBAGENT = CHARTS / "dbagent"
 VALUES_YAML = DBAGENT / "values.yaml"
-GC3_DECISION = REPO_ROOT / "tests" / "benchmark" / "b1_topology_decision.json"
-GC3_PROBE_HELPER = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe.py"
-
 #: The historical, VOID basis label. It is a string in values.yaml's prose and
 #: a mutation operand here; it is never a qualification.
 VOID_SIZING_BASIS = 2.427
@@ -85,24 +78,8 @@ def _load_module(path: Path, name: str):
     return module
 
 
-#: GC-3's own carrier reader/validator. Selection is never reimplemented here.
-gc3 = _load_module(GC3_PROBE_HELPER, "b1lb_topology_probe")
-
-
 class SizingLedgerError(AssertionError):
     """A named failure of the closed ledger contract (FP-IG-23 / FP-B1LB-1..5)."""
-
-
-class BasisOracleUnobserved(Exception):
-    """The latency-basis oracle cannot be observed here; never a pass."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
-class BasisOracleRouteError(Exception):
-    """An unusable route record: ordinary failure, never an unobserved route."""
 
 
 def _fail(message: str) -> "None":
@@ -170,11 +147,18 @@ OUTCOME_OBSERVATION = "observation"
 OUTCOME_DISCARDED = "discarded"
 OUTCOMES = (OUTCOME_OBSERVATION, OUTCOME_DISCARDED)
 
-STATE_SELECTED = gc3.ROUTE_STATE_SELECTED
-STATE_UNHOSTABLE = gc3.ROUTE_STATE_UNHOSTABLE
-STATE_ABSENT = gc3.ROUTE_STATE_ABSENT
-STATE_UNAVAILABLE = gc3.ROUTE_STATE_UNAVAILABLE
-STATE_INVALID = gc3.ROUTE_STATE_INVALID
+# FP-BOD-9: inlined from the deleted probe module's own values, unchanged. The
+# attempt log already stored in values.yaml speaks this vocabulary and is not
+# rewritten; this file no longer imports the module that used to define it.
+STATE_SELECTED = "selected"
+STATE_UNHOSTABLE = "unhostable"
+STATE_ABSENT = "absent"
+STATE_UNAVAILABLE = "unavailable"
+STATE_INVALID = "invalid"
+ROUTE_UNRATIFIED_REASON_PREFIX = "topology_unratified_sku:"
+ROUTE_MODEL_UNAVAILABLE_REASON = "topology_cpu_model_unavailable"
+DECISION_MISSING_REASON = "gc3_decision_missing"
+DECISION_INVALID_REASON = "gc3_decision_invalid"
 STATE_NOT_REACHED = "not_reached"
 DECISION_STATES = (
     STATE_SELECTED, STATE_UNHOSTABLE, STATE_ABSENT,
@@ -198,15 +182,6 @@ _RUN_ID_RE = re.compile(r"^[0-9]+/[0-9]+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _IMAGE_RE = re.compile(r"^(?:imagedata|os-release):[0-9a-f]{16}$")
 
-# ---------------------------------------------------------------------------
-# FP-B1LB-6 — the isolated oracle's fail-closed reasons
-# ---------------------------------------------------------------------------
-UNOBSERVED_PREFIX = "basis_oracle_unobserved:"
-UNOBSERVED_EXIT = 3
-LEDGER_UNRECORDED = "ledger_unrecorded"
-LEDGER_INVALID = "ledger_invalid"
-
-
 def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -224,59 +199,6 @@ def _finite_positive(value, where: str) -> float:
     if number <= 0:
         _fail(f"{where} is not positive: {value!r}")
     return number
-
-
-# ---------------------------------------------------------------------------
-# FP-B1LB-2 — the GC-3 binding
-# ---------------------------------------------------------------------------
-_DECISION_CACHE: "dict[tuple[str, int, float], dict]" = {}
-
-
-def load_gc3_decision(decision_path=GC3_DECISION) -> dict:
-    """The tracked carrier, validated by GC-3's own closed-schema helper."""
-    path = Path(decision_path)
-    if not path.is_file():
-        _fail(f"{gc3.DECISION_MISSING_REASON}: {path}")
-    stat = path.stat()
-    key = (str(path), stat.st_size, stat.st_mtime)
-    cached = _DECISION_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        validated = gc3.validate_decision(payload)
-    except (gc3.TopologyProbeError, ValueError, OSError) as exc:
-        raise SizingLedgerError(f"{gc3.DECISION_INVALID_REASON}: {exc}") from exc
-    _DECISION_CACHE[key] = validated
-    return validated
-
-
-def gc3_selected_identity(decision: dict) -> dict:
-    """The one current `selected` model's identity, or fail closed.
-
-    Zero selected models and two selected models are both failures: one chart
-    resource tuple cannot consume several model-specific costs, and this
-    contract deliberately does not choose by map order, score or vendor.
-    """
-    models = (decision or {}).get("models")
-    if not isinstance(models, dict) or not models:
-        _fail("the GC-3 carrier has no models map")
-    selected = {
-        model: entry for model, entry in models.items()
-        if isinstance(entry, dict) and entry.get("status") == "selected"
-    }
-    if len(selected) != 1:
-        _fail(
-            "one chart ledger binds exactly one current GC-3 selected model; the "
-            f"carrier currently selects {len(selected)}: {sorted(selected)}"
-        )
-    model, entry = next(iter(selected.items()))
-    return {
-        "cpuModel": model,
-        "referenceTopology": entry["selected"],
-        "placementSchema": entry["placementSchema"],
-        "topologyDecisionHeadSha": entry["evidenceHeadSha"],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +250,7 @@ def require_ledger_shape(ig: dict) -> dict:
     return sb
 
 
-def _validate_signature(sig: dict, ig: dict, decision: dict) -> None:
+def _validate_signature(sig: dict, ig: dict) -> None:
     if set(sig) != set(SIGNATURE_KEYS):
         _fail(f"closed signature keys {sorted(SIGNATURE_KEYS)}; got {sorted(sig)}")
     if not isinstance(sig["headSha"], str) or not _SHA_RE.match(sig["headSha"]):
@@ -342,13 +264,11 @@ def _validate_signature(sig: dict, ig: dict, decision: dict) -> None:
         )
     if not isinstance(sig["image"], str) or not _IMAGE_RE.match(sig["image"]):
         _fail(f"signature.image is not a canonical B1 image fingerprint: {sig['image']!r}")
-    identity = gc3_selected_identity(decision)
-    for field in ("cpuModel", "referenceTopology", "placementSchema", "topologyDecisionHeadSha"):
-        if sig[field] != identity[field]:
-            _fail(
-                f"signature.{field} {sig[field]!r} is not the current GC-3 selected "
-                f"decision's {identity[field]!r}"
-            )
+    # FP-BOD-9: the four identity fields stay CLOSED KEYS of the signature and
+    # are still copied onto every observation, but there is no live carrier to
+    # compare them with. The selected-model binding went with the carrier; what
+    # keeps this ledger honest now is that its stored literals cannot change --
+    # see test_sizing_chart_is_the_five_historical_rows.
 
 
 def _run_id_order(run_id: str) -> "tuple[int, int]":
@@ -418,19 +338,19 @@ def _validate_observation(index: int, entry, sig: dict) -> "tuple[str, float]":
 
 def _validate_discard_reason(where: str, state: str, model, reason) -> None:
     if state in (STATE_UNHOSTABLE, STATE_ABSENT):
-        expected = f"{gc3.ROUTE_UNRATIFIED_REASON_PREFIX}{model}"
+        expected = f"{ROUTE_UNRATIFIED_REASON_PREFIX}{model}"
         if reason != expected:
             _fail(f"{where}.reason {reason!r} is not the GC-3 route reason {expected!r}")
         return
     if state == STATE_UNAVAILABLE:
-        if reason != gc3.ROUTE_MODEL_UNAVAILABLE_REASON:
+        if reason != ROUTE_MODEL_UNAVAILABLE_REASON:
             _fail(
                 f"{where}.reason {reason!r} is not "
-                f"{gc3.ROUTE_MODEL_UNAVAILABLE_REASON!r}"
+                f"{ROUTE_MODEL_UNAVAILABLE_REASON!r}"
             )
         return
     if state == STATE_INVALID:
-        if reason not in (gc3.DECISION_MISSING_REASON, gc3.DECISION_INVALID_REASON):
+        if reason not in (DECISION_MISSING_REASON, DECISION_INVALID_REASON):
             _fail(f"{where}.reason {reason!r} is not a GC-3 carrier failure reason")
         return
     if state == STATE_NOT_REACHED:
@@ -527,9 +447,7 @@ def _validate_attempts(attempts: list, sig: dict, observation_ids: list) -> None
         )
 
 
-def validate_sizing_ledger(
-    ig: dict, *, check_rendered_cpu: bool = True, decision: "dict | None" = None
-) -> None:
+def validate_sizing_ledger(ig: dict, *, check_rendered_cpu: bool = True) -> None:
     """FP-IG-23 validity + FP-B1LB-2/3/4/5 identity, linkage and recompute.
 
     Factored so the mutation fixtures can drive the same checks against a
@@ -547,7 +465,7 @@ def validate_sizing_ledger(
         _fail(f"want exactly five observations, got {len(obs)}")
 
     sig = sb["signature"]
-    _validate_signature(sig, ig, load_gc3_decision() if decision is None else decision)
+    _validate_signature(sig, ig)
 
     run_ids: list = []
     cpu_vals: list = []
@@ -598,9 +516,7 @@ def rendered_ingest_gateway_cpu() -> "tuple[int, int]":
     return _millicores(resources["requests"]["cpu"]), _millicores(resources["limits"]["cpu"])
 
 
-def chart_resource_expectations(
-    ig: dict, *, decision: "dict | None" = None
-) -> "tuple[int, int] | None":
+def chart_resource_expectations(ig: dict) -> "tuple[int, int] | None":
     """The derived (request, limit) millicores, or None while collection pends.
 
     The Phase A pending branch condition is EXACTLY
@@ -612,7 +528,7 @@ def chart_resource_expectations(
     sb = require_ledger_shape(ig)
     if sb["observations"] == [] and sb["collection"]["attempts"] == []:
         return None
-    validate_sizing_ledger(ig, check_rendered_cpu=False, decision=decision)
+    validate_sizing_ledger(ig, check_rendered_cpu=False)
     return derive_chart_millicores(float(sb["cpuMsPerRequest"]))
 
 
@@ -648,21 +564,22 @@ FIXTURE_IMAGE = "os-release:0000000000000000"
 #: Exactly representable in binary, so ceil(basis x 200) has no float artefact.
 FIXTURE_COSTS = (1.0, 1.25, 1.5, 1.125, 1.375)
 FIXTURE_RUN_IDS = ("11/1", "22/1", "33/1", "44/1", "55/1")
+FIXTURE_MODEL = "Synthetic Fixture CPU @ 1.00GHz"
+FIXTURE_TOPOLOGY = "gateway-split"
 FIXTURE_OTHER_MODEL = "Synthetic Fixture CPU @ 0.00GHz"
 FIXTURE_OTHER_TOPOLOGY = "postgres-isolated"
 
 
 def _fixture_signature(**overrides) -> dict:
-    identity = gc3_selected_identity(load_gc3_decision())
     signature = {
         "headSha": FIXTURE_HEAD_SHA,
         "cpus": REFERENCE_CPUS,
-        "cpuModel": identity["cpuModel"],
+        "cpuModel": FIXTURE_MODEL,
         "image": FIXTURE_IMAGE,
         "workers": 4,
-        "referenceTopology": identity["referenceTopology"],
-        "placementSchema": identity["placementSchema"],
-        "topologyDecisionHeadSha": identity["topologyDecisionHeadSha"],
+        "referenceTopology": FIXTURE_TOPOLOGY,
+        "placementSchema": 3,
+        "topologyDecisionHeadSha": "1" * 40,
     }
     signature.update(overrides)
     return signature
@@ -781,67 +698,6 @@ def test_fp_b1lb_1_operating_point_rules():
     _expect_red("worker_count_drift", _row(0, workerPidsPre=[1, 2, 3], workerPidsPost=[1, 2, 3]))
 
 
-def test_fp_b1lb_2_gc3_identity_binding():
-    """FP-B1LB-2: one chart basis, one exact GC-3-selected identity.
-
-    The carrier is read through GC-3's own validator; selection is not
-    reimplemented. Zero and two current `selected` models both fail closed,
-    and every identity field is independently discriminating.
-    """
-    decision = load_gc3_decision()
-    identity = gc3_selected_identity(decision)
-    selected = {
-        model: entry for model, entry in decision["models"].items()
-        if entry.get("status") == "selected"
-    }
-    assert list(selected) == [identity["cpuModel"]]
-    entry = selected[identity["cpuModel"]]
-    assert identity["referenceTopology"] == entry["selected"]
-    assert identity["placementSchema"] == entry["placementSchema"]
-    assert identity["topologyDecisionHeadSha"] == entry["evidenceHeadSha"]
-
-    # Fail-closed cardinality: neither zero nor two selected models may route.
-    for count, models in (
-        (0, {"m": {"status": "unhostable"}}),
-        (2, {"a": dict(entry), "b": dict(entry)}),
-    ):
-        try:
-            gc3_selected_identity({"models": models})
-        except AssertionError as exc:
-            assert "exactly one current GC-3 selected model" in str(exc)
-        else:
-            raise AssertionError(f"{count} selected models stayed green")
-
-    validate_sizing_ledger(_filled_ledger(), check_rendered_cpu=False)
-    for field, replacement in (
-        ("cpuModel", FIXTURE_OTHER_MODEL),
-        ("referenceTopology", FIXTURE_OTHER_TOPOLOGY),
-        ("placementSchema", 2),
-        ("topologyDecisionHeadSha", "f" * 40),
-    ):
-        signature = _fixture_signature(**{field: replacement})
-        try:
-            validate_sizing_ledger(
-                _filled_ledger(signature=signature), check_rendered_cpu=False
-            )
-        except AssertionError as exc:
-            assert f"signature.{field}" in str(exc), str(exc)
-        else:
-            raise AssertionError(f"a {field} unlike the GC-3 decision stayed green")
-    _expect_red("malformed_collection_head", lambda ig: ig["sizingBasis"]["signature"].__setitem__("headSha", "nope"))
-    _expect_red("cpus_not_reference_4", lambda ig: (
-        ig["sizingBasis"]["signature"].__setitem__("cpus", 16),
-        [e.__setitem__("cpus", 16) for e in ig["sizingBasis"]["observations"]],
-    ))
-    _expect_red("workers_not_the_chart_count", lambda ig: ig.__setitem__("workers", 8))
-    _expect_red("image_is_not_a_fingerprint", lambda ig: (
-        ig["sizingBasis"]["signature"].__setitem__("image", "unknown"),
-        [e.__setitem__("image", "unknown") for e in ig["sizingBasis"]["observations"]],
-    ))
-    _expect_red("signature_key_added", lambda ig: ig["sizingBasis"]["signature"].__setitem__("cpuQuota", 2))
-    _expect_red("signature_key_removed", lambda ig: ig["sizingBasis"]["signature"].pop("image"))
-
-
 def test_fp_b1lb_3_five_distinct_rows():
     """FP-B1LB-3: exactly five distinct, same-identity, fully valid rows."""
     validate_sizing_ledger(_filled_ledger(), check_rendered_cpu=False)
@@ -904,10 +760,10 @@ def test_fp_b1lb_4_attempt_log_linkage_and_reason_form():
     """
     sig = _fixture_signature()
     discards = {
-        STATE_UNHOSTABLE: f"{gc3.ROUTE_UNRATIFIED_REASON_PREFIX}{FIXTURE_OTHER_MODEL}",
-        STATE_ABSENT: f"{gc3.ROUTE_UNRATIFIED_REASON_PREFIX}{FIXTURE_OTHER_MODEL}",
-        STATE_UNAVAILABLE: gc3.ROUTE_MODEL_UNAVAILABLE_REASON,
-        STATE_INVALID: gc3.DECISION_MISSING_REASON,
+        STATE_UNHOSTABLE: f"{ROUTE_UNRATIFIED_REASON_PREFIX}{FIXTURE_OTHER_MODEL}",
+        STATE_ABSENT: f"{ROUTE_UNRATIFIED_REASON_PREFIX}{FIXTURE_OTHER_MODEL}",
+        STATE_UNAVAILABLE: ROUTE_MODEL_UNAVAILABLE_REASON,
+        STATE_INVALID: DECISION_MISSING_REASON,
         STATE_NOT_REACHED: f"{BENCHMARK_INCOMPLETE_PREFIX}B1 -- resource-declared CI-scale ingest-gateway burst",
     }
 
@@ -983,7 +839,7 @@ def test_fp_b1lb_4_attempt_log_linkage_and_reason_form():
                 .__setitem__("outcome", "retained"))
     for name, attempt in (
         ("unratified_reason_names_another_model",
-         _discard("6/1", STATE_UNHOSTABLE, f"{gc3.ROUTE_UNRATIFIED_REASON_PREFIX}other")),
+         _discard("6/1", STATE_UNHOSTABLE, f"{ROUTE_UNRATIFIED_REASON_PREFIX}other")),
         ("unavailable_reason_drift", _discard("6/1", STATE_UNAVAILABLE, "no_model")),
         ("invalid_reason_drift", _discard("6/1", STATE_INVALID, "gc3_decision_probably_ok")),
         ("not_reached_without_a_step", _discard("6/1", STATE_NOT_REACHED,
@@ -1082,111 +938,65 @@ def test_derived_chart_resources_follow_the_ledger_formula():
 
 
 # ---------------------------------------------------------------------------
-# FP-B1LB-6 — the isolated latency-basis target's fixed entry points
+# bench-on-demand FP-BOD-9 — the chart figures are history, and stay history
 # ---------------------------------------------------------------------------
-def _load_ingest_gateway(values_path) -> dict:
-    values = yaml.safe_load(Path(values_path).read_text(encoding="utf-8"))
-    return values["ingestGateway"]
+
+#: The five recorded observation costs, the basis they derive, and the two
+#: chart figures rendered from it. Literals, deliberately: this test is the
+#: thing that goes red when one of them is silently edited, so it may not read
+#: them out of the same document it is judging.
+HISTORICAL_COSTS = (1.445, 1.488, 1.475, 1.414, 1.391)
+HISTORICAL_BASIS = 1.585
+HISTORICAL_REQUEST_MILLICORES = 317
+HISTORICAL_LIMIT_MILLICORES = 1585
 
 
-def validate_latency_basis_preflight(values_path, decision_path) -> dict:
-    """Before b1_prepare: a nonempty, fully qualified ledger, or exit 3.
+def test_sizing_chart_is_the_five_historical_rows():
+    """FP-BOD-9 [function test]: the figures stay; the carrier does not.
 
-    An unrecorded ledger and an invalid one are DIFFERENT reasons: the first
-    is the expected pre-collection state, the second is a broken carrier.
-    Neither ever starts a live workload, and neither is a pass.
+    Named for two failures.
+
+    The first is a deletion or an edit of the chart figures. The live CPU-basis
+    oracle that used to re-measure 1.585 against a fresh CI-scale run is gone
+    with the route that produced it, so this static comparison is the whole of
+    what still fails a silent change to 1.585, to any of the five costs, or to
+    317m/1585m. A test that only checked `317m` were present would stay green
+    if the five costs behind it were replaced.
+
+    The second is a ledger check that goes green by importing the deleted
+    probe. "Stops reading the carrier" is not enough while the import remains:
+    a module that still loaded the deleted discovery helper would fail at import
+    time, and a module that re-added it would be binding the
+    chart to a selected model again. So the source of THIS file is required to
+    mention neither the carrier nor the probe module, and `values.yaml` is
+    required to name the carrier nowhere either.
     """
-    try:
-        ig = _load_ingest_gateway(values_path)
-        sb = require_ledger_shape(ig)
-    except Exception as exc:  # noqa: BLE001 - every shape failure is fail-closed
-        raise BasisOracleUnobserved(LEDGER_INVALID) from exc
-    if sb["observations"] == [] and sb["collection"]["attempts"] == []:
-        raise BasisOracleUnobserved(LEDGER_UNRECORDED)
-    try:
-        validate_sizing_ledger(
-            ig, check_rendered_cpu=False, decision=load_gc3_decision(decision_path)
-        )
-    except Exception as exc:  # noqa: BLE001 - every validity failure is fail-closed
-        raise BasisOracleUnobserved(LEDGER_INVALID) from exc
-    return sb["signature"]
+    values = yaml.safe_load(VALUES_YAML.read_text(encoding="utf-8"))
+    ig = values["ingestGateway"]
+    sb = ig["sizingBasis"]
 
-
-#: The signature fields a ROUTE record plus the current GC-3 decision can
-#: disagree with. Sorted, comma separated, they are the
-#: `signature_mismatch:<fields>` reason §3.6 fixes.
-ROUTE_VISIBLE_SIGNATURE_FIELDS = (
-    "cpuModel", "referenceTopology", "placementSchema", "topologyDecisionHeadSha",
-)
-
-
-def route_signature_mismatch(signature: dict, route: dict, identity: dict) -> list[str]:
-    """Which route-visible identity fields differ from the recorded ledger.
-
-    Pure, so every field is independently testable: two of the four cannot be
-    produced by a VALID route record on the current carrier at all (the route
-    schema pins `placementSchema`, and the decision head is read from the same
-    carrier), and defence in depth is exactly what they are for.
-    """
-    observed = {
-        "cpuModel": route["cpuModel"],
-        "referenceTopology": route["topology"],
-        "placementSchema": route["placementSchema"],
-        "topologyDecisionHeadSha": identity["topologyDecisionHeadSha"],
-    }
-    assert set(observed) == set(ROUTE_VISIBLE_SIGNATURE_FIELDS)
-    return sorted(
-        field for field, value in observed.items() if value != signature.get(field)
+    # (1) The five recorded costs, in order, and nothing else.
+    costs = tuple(float(row["cpuMsPerRequest"]) for row in sb["observations"])
+    assert costs == HISTORICAL_COSTS, costs
+    # (2) The basis they derive, as stored and as recomputed.
+    assert float(sb["cpuMsPerRequest"]) == HISTORICAL_BASIS, sb["cpuMsPerRequest"]
+    assert derive_basis(costs) == HISTORICAL_BASIS, derive_basis(costs)
+    # (3) The two chart figures, as stored and as derived from that basis.
+    resources = ig["resources"]
+    assert _millicores(resources["requests"]["cpu"]) == HISTORICAL_REQUEST_MILLICORES
+    assert _millicores(resources["limits"]["cpu"]) == HISTORICAL_LIMIT_MILLICORES
+    assert derive_chart_millicores(HISTORICAL_BASIS) == (
+        HISTORICAL_REQUEST_MILLICORES,
+        HISTORICAL_LIMIT_MILLICORES,
     )
 
-
-def validate_latency_basis_route(values_path, decision_path, route_path) -> dict:
-    """After route/route-fields and before pair discovery: this exact identity.
-
-    A GC-3 recorded route reports ITS OWN canonical reason rather than being
-    counted as an oracle pass, and any route-visible signature mismatch is
-    named field by field.
-    """
-    signature = validate_latency_basis_preflight(values_path, decision_path)
-    try:
-        route = gc3.validate_route(
-            json.loads(Path(route_path).read_text(encoding="utf-8"))
-        )
-    except (gc3.TopologyProbeError, ValueError, OSError) as exc:
-        raise BasisOracleRouteError(f"unusable route record {route_path}: {exc}") from exc
-    if route["disposition"] != gc3.ROUTE_GATING:
-        raise BasisOracleUnobserved(route["reason"])
-    identity = gc3_selected_identity(load_gc3_decision(decision_path))
-    mismatched = route_signature_mismatch(signature, route, identity)
-    if mismatched:
-        raise BasisOracleUnobserved(f"{SIGNATURE_MISMATCH_PREFIX}{','.join(mismatched)}")
-    return signature
-
-
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="test_delivery_sizing_ledger.py",
-        description="Fail-closed preconditions for the isolated b1_latency_basis target.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-    preflight = sub.add_parser("basis-oracle-preflight")
-    preflight.add_argument("--values", required=True)
-    preflight.add_argument("--decision", required=True)
-    route = sub.add_parser("basis-oracle-route")
-    route.add_argument("--values", required=True)
-    route.add_argument("--decision", required=True)
-    route.add_argument("--route", required=True)
-    args = parser.parse_args(argv)
-    try:
-        if args.command == "basis-oracle-preflight":
-            validate_latency_basis_preflight(args.values, args.decision)
-        else:
-            validate_latency_basis_route(args.values, args.decision, args.route)
-    except BasisOracleUnobserved as exc:
-        print(f"{UNOBSERVED_PREFIX}{exc.reason}", file=sys.stderr)
-        return UNOBSERVED_EXIT
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    # (4) The carrier is not read here, not imported here, and not cited by the
+    # chart. Its file does not exist any more; a re-added import would raise at
+    # collection, and a re-added citation is caught below.
+    own_source = Path(__file__).read_text(encoding="utf-8")
+    carrier_name = "b1_topology_" + "decision.json"
+    probe_name = "b1_topology_" + "probe"
+    for token in (carrier_name, probe_name):
+        assert own_source.count(token) == 0, f"{token!r} is still named by this guard"
+    assert not (REPO_ROOT / "tests" / "benchmark" / carrier_name).exists()
+    assert carrier_name not in VALUES_YAML.read_text(encoding="utf-8")

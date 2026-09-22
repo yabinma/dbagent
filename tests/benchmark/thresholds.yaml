@@ -1,208 +1,98 @@
 schema_version: 1
 benchmarks:
 - id: B1
-  description: 'Ingest webhook under declared CPU affinities: CI-scale merge gate plus four-measured-role-exclusive-core
-    product record'
-  threshold: 'CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s offered for
-    30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; product recorded, non-gating:
-    served == offered, p99 < 150 ms, 0 errors at 1000 req/s offered for 30s with 4 gateway CPUs
-    exclusive from PG/driver'
+  description: 'Ingest webhook under declared CPU affinities: the four-measured-role-exclusive-core
+    product run, measured on demand'
+  threshold: 'product on-demand: served == offered and 0 errors at 1000 req/s offered for 30s on the
+    product-exclusive placement (gateway 4, PostgreSQL 3, driver 1), each role''s CPU set exclusive of
+    the others; p99 < 150 ms is printed as met or missed and is not the bar'
   owning_milestone: M3
   status: covered
+  tier: on-demand
   tests:
   - services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path
-  - services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile
   - services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile
   notes: |
-    Two tiers over one shipped ingest path and one classifier. CI-scale gates in both CI and local
-    `scripts/integration-test.sh b1` on the same numbers.
-    The product tier is recorded, non-gating; reason: host-dependent, not in CI.
+    One shipped ingest path and one classifier, measured on demand rather than on every push.
+    bench-on-demand (design/slices/bench-on-demand/design.md, recorded in
+    design/frozen-deviations.md) removed B1 from the CI benchmark job together with the CI-scale
+    route, its per-exact-cpuModel topology carrier, the recorded non-gating route and the manual
+    CPU-basis oracle. `tier: on-demand` is where it runs now: the product profile, on a developer
+    host, through local `scripts/integration-test.sh b1_product`, before every `v*` tag and after a
+    change to the ingest write path. No CI job runs the live node; the guards that keep it out of CI
+    and keep its bar honest run in the functional job. It is not deferred, not skipped and not xfailed
+    -- the departure from CI is the deleted steps.
     The allocation mechanism is scheduler affinity (sched_setaffinity/taskset), not a CFS bandwidth
     quota and not a Docker cpuset: each measured role gets an exact, pairwise-disjoint set of logical
     CPUs, read back from /proc/<pid>/status Cpus_allowed_list and os.sched_getaffinity at window open
     and again at window close. Effective cpu.max, cpu.stat throttling counters, gateway CPU use and
     host-busy values are recorded as reported diagnostics only and decide nothing; an unreadable
     source is serialized as `unavailable` rather than as a zero.
-    CI-scale allocation, decided per exact CPU model (design/slices/gc-3-reference-topology):
-    the reference set is the first two complete SMT sibling pairs available to the launcher on the
-    four-vCPU ubuntu-latest reference host, and the role mapping over those two pairs is the
-    topology one exact `cpuModel` earned from two complete same-head discovery artifacts through
-    the tracked carrier tests/benchmark/b1_topology_decision.json (schema 3, keyed by exact
-    cpuModel). Each entry in that carrier holds one CURRENT decision -- the only thing routing
-    reads -- plus `superseded`, an oldest-to-newest list of every decision it replaced, each
-    naming the head that replaced it. A current decision is replaced only by a complete
-    same-model pair from a strictly descendant product head, through
-    `b1_topology_probe.py decide --supersede <that current evidence head>`, which proves the
-    descent offline with `git merge-base --is-ancestor`; a superseded head below is provenance
-    and never describes the active route. Per-model decision table at this revision, every entry
-    decided from two complete 28-arm discovery artifacts of its own exact model, produced by the
-    manual sweep `scripts/integration-test.sh b1_topology_probe`:
-    `AMD EPYC 7763 64-Core Processor` -- status selected; current evidence head
-    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b; superseded, oldest to newest:
-    51e8a3175a4c247ab6afa47a5588bcbb96fafa99 (status unhostable, replaced at
-    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b) -- historical provenance, which does not describe
-    the active route; topology id gateway-split, with its topology-derived role cardinalities
-    gateway=2, postgres=1, driver=1 and placement schema 3; physical relationship over the two
-    reference sibling pairs: the gateway holds one SMT thread of each of the two physical cores,
-    PostgreSQL holds the sibling of the gateway's first thread, the driver holds the sibling of
-    the gateway's second thread, and no reference CPU is intentionally unassigned; its all-role
-    sibling witness, read before warmup and again after the measured window, covers exactly the
-    four reference CPUs as two symmetric two-member classes and is serialized as
-    gateway_thread_siblings_pct, postgres_thread_siblings_pct and driver_thread_siblings_pct;
-    six of the seven classes were ratifiable for this model in this pair (gateway-core,
-    gateway-isolated, gateway-split, postgres-core, postgres-isolated, postgres-split) and the
-    immutable ranking's first operand chose among them -- the carrier's recorded score operands
-    for the winning class are maximum due-time p99 84.04 ms, maximum max_in_flight 75 and
-    minimum served rate 499.56 req/s over its eight records, none of which is a bar, a threshold
-    or a sizing observation; discovery evidence
-    https://github.com/yabinma/dbagent/actions/runs/35271046137 and
-    https://github.com/yabinma/dbagent/actions/runs/35271058579; final gating run: none at this
-    carrier revision yet -- the ordinary benchmark B1 step observed on this exact model at this
-    revision is that record, and until it exists this row publishes only what the discovery pair
-    decided and no CI acceptance result.
-    `AMD EPYC 9V74 80-Core Processor` -- status unhostable; current evidence head
-    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b; superseded, oldest to newest:
-    51e8a3175a4c247ab6afa47a5588bcbb96fafa99 (status unhostable, replaced at
-    9ffaf346bfc02b973db8c475b57ffd2bf516cd2b) -- historical provenance, which does not describe
-    the active route; no topology, no role cardinality and no placement schema are claimed for
-    it; in this pair no topology class met every unchanged CI-scale comparison in all eight of
-    its records, so no class is ratifiable for it; it is recorded, non-gating, under reason
-    `topology_unratified_sku:AMD EPYC 9V74 80-Core Processor`, and starts no live CI-scale
-    workload; discovery evidence https://github.com/yabinma/dbagent/actions/runs/35271020778
-    and https://github.com/yabinma/dbagent/actions/runs/35271033101.
-    No row in this revision is decided from anything but two complete same-head 28-arm discovery
-    artifacts of its own exact model, and each row is evidence for its own current evidence head
-    alone. The 9V74 row is a per-model negative result against the unchanged bar below, which is
-    neither weakened nor re-derived by it, and neither row claims anything about any other exact
-    model. A `selected` row names its topology id, its topology-derived
-    gateway/PostgreSQL/driver cardinalities, its physical relationship over the two pairs, its
-    all-role sibling witness, placement schema 3, the two discovery evidence URLs and its final
-    gating run; an `unhostable` row names no topology and no cardinality and cites
-    `topology_unratified_sku:<model>`. Every row names its current evidence head as the full
-    40-character commit id and lists every superseded head oldest-to-newest, or `superseded: none`.
-    A valid exact model that is absent from the table follows
-    that same recorded, non-gating policy under the same reason; a model whose string cannot be
-    read or is outside the closed model-string rules records
-    `topology_cpu_model_unavailable`. A recorded route runs the unconditional container-free
-    coverage phase first, starts no live workload afterwards, and is not a pytest skip and not a
-    green benchmark. A missing or corrupt carrier is neither: it fails the target with
-    `gc3_decision_missing` or `gc3_decision_invalid`. CI-scale profile:
-    open-loop 500 req/s offered for 30 s = 15000 offered requests, due-time latency,
-    MAX_IN_FLIGHT=500, unmeasured prologue, no environment knob; it asserts placement_ok=1,
-    offered==15000, served+errors==offered, errors==0, served==offered, due-time p99<150ms,
-    committed==served, served_rate>=CI_SCALE_SUSTAINED_FLOOR=450 and platform ONLINE, through the
-    reference tier test
-    services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile.
-    Rate derivation, fixed at design time: 3.034 ms/served request on the contended reference host in
-    CI run 34965890902; 500 x 0.003034 = 1.517 CPU on two exclusive gateway CPUs is 75.85% utilization;
-    the 80% ceiling is 0.80 x 2.00 / 0.003034 = 527.36 req/s, rounded down to the next 100 for the
-    500 req/s offer, with one further fixed 50 req/s finite-window margin giving the 450 req/s
-    served-rate floor.
     Product allocation: the first eight CPUs available to the launcher, split 4/3/1, so the gateway
     holds four logical CPUs exclusive of the PostgreSQL and driver sets. Product profile: open-loop
     1000 req/s offered for 30 s = 30000 offered requests, MAX_IN_FLIGHT=1000, run only through local
     `scripts/integration-test.sh b1_product` on a host with at least eight available logical CPUs, via
-    services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile. Its
-    three product comparisons errors==0, p99<150ms and served==offered are serialized on the B1
-    fingerprint as met/missed and do not fail that target or the composite `all` route; its exact
-    pairwise-disjoint placement witness, accounting identities served+errors==offered and
+    services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile.
+    That node FAILS THE RUN on errors != 0 and on served != offered, and on its exact
+    pairwise-disjoint placement witness, the accounting identities served+errors==offered and
     committed==served, record integrity, the nonbinding MAX_IN_FLIGHT outer gate and
-    served_rate>=SUSTAINED_FLOOR=200 all stay failure-producing.
+    served_rate>=SUSTAINED_FLOOR=200. The three product comparisons errors==0, p99<150ms and
+    served==offered are still serialized on the B1 fingerprint as met/missed; the first and third are
+    met on any passing run because the two equalities above already decide it, and the p99 token is
+    RECORDED ONLY -- no node asserts that it is met, and `product_p99_lt_150_ms=missed` does not fail
+    the run and does not refuse a release.
     The product tier is absent from CI because a public-repository standard runner has
     four total vCPUs, and no larger, self-hosted or paid runner class is available on this account.
-    This entry is covered through its gating CI-scale tier; the product link is not reclassified as a
-    gating threshold by that status.
     In-process micro-benchmark of the HMAC verify + normalize + fingerprint hot path:
-    services/gateway/tests/test_hmac_auth.py.
-    The kind e2e link tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile is deliberately not
-    one of the three threshold-bearing links above; it stays a nested functional/deployment test
+    services/gateway/tests/test_hmac_auth.py. That link is a code-level unit benchmark and stays in
+    the unit-gateway job; `tier: on-demand` does not move it out of CI.
+    The kind e2e path tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile is deliberately not
+    one of the threshold-bearing links above; it stays a nested functional/deployment test
     under its current resource model, exercising the sustained profile (open-loop baseline at
     200 req/s) and a closed-loop saturation phase against the shipped image and chart with real
     kubelet probes, asserting completion/accounting and 0 restarts / no Unhealthy events; three
     bare-container affinities neither bound nor describe that topology, so it implements neither
     reference declaration and refutes neither, a green nested run is a sufficient demonstration and
-    a red one is not a refutation.
-    Nested kind latency policy, owner ruling 2026-09-21 through slice
-    design/slices/e2e-b1-kind-policy/design.md and logged at design/frozen-deviations.md: the kind
-    due-time p99 is still compared with 150 ms and the Boolean is recorded as pytest observation
-    metadata on every coherent completed baseline, and the measured value still reaches the legacy
-    print, the 33-field canonical diagnostics line, the fixed file and the uploaded artifact -- but
-    that comparison does not fail the kind job. Eleven kind comparisons still fail it: platform
-    ONLINE; baseline served+errors==6000, errors==0, served==6000 and committed==served; saturation
+    a red one is not a refutation. Eleven kind comparisons fail the e2e job: platform ONLINE;
+    baseline served+errors==6000, errors==0, served==6000 and committed==served; saturation
     sat_served+sat_errors==issued, sat_errors==0, gateway restart delta ==0, Unhealthy event count
-    ==0, sat_committed==sat_served, and the exact admissible audit-action tuple. Accepted cost,
-    stated rather than hidden: a regression visible only as nested kind latency no longer fails e2e.
-    The isolated CI-scale reference assertion keeps p99 < 150 ms at full strength, but it fails on
-    latency only on a runner CPU model with a ratified GC-3 placement, so on an unratified or
-    unhostable runner draw no CI job fails on ingest latency, and a kind/chart-only latency
-    regression is then visible only in the uploaded e2e diagnostics artifact. This policy changes no
-    kind deployment resource: the chart, the e2e values overlay and every pod request/limit are
-    untouched and undecided here.
+    ==0, sat_committed==sat_served, and the exact admissible audit-action tuple. The nested kind p99
+    is no longer measured, recorded or uploaded at all. This changes no kind deployment resource:
+    the chart, the e2e values overlay and every pod request/limit are untouched and undecided here.
     max_lateness_ms is a reported diagnostic rather than a bar, and beyond the floor a finite-window
     burst certifies no sustained served-rate figure near the offered rate. Serving shape is uvicorn
     workers=4 (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers); no shipped gateway configuration
-    value moves for either tier.
+    value moves.
     The ingestGateway sizing basis and the chart CPU request/limit derived from it are owned by
-    the B1-LATENCY-BASIS-1 slice, whose bounded collection is now RECORDED and QUALIFIED.
+    the B1-LATENCY-BASIS-1 slice, and that ledger is now HISTORY.
     ingestGateway.sizingBasis.cpuMsPerRequest is 1.585 ms per request: max + (max - min) over
     exactly the five recorded observation costs 1.445, 1.488, 1.475, 1.414 and 1.391, from which
     the chart renders requests.cpu = ceil(1.585 x 200) = 317m and limits.cpu = 5 x 317 = 1585m.
-    The warrant binds ONE collection head, 9239325e198fba129eb3b7c6cf328090e4da7c5f, to the ONE
-    GC-3-selected CPU model AMD EPYC 7763 64-Core Processor, reference topology gateway-split,
-    placement schema 3, image os-release:59a77b5f2666d9c8, workers=4, cpus=4 and GC-3 decision
-    head 9ffaf346bfc02b973db8c475b57ffd2bf516cd2b. ingestGateway.sizingBasis.observations now
-    carries five distinct qualifying CI-scale observations at that one collection head on that
-    one GC-3-selected CPU model: the accepted ordinary benchmark runs 35372436818/1,
-    35372461217/1, 35372474111/1, 35379959523/1 and 35386251868/1.
-    Each row repeats that signature identity -- collection head, cpus=4, exact cpuModel, exact B1
-    image fingerprint, worker count, reference topology, placement schema and the current GC-3
-    decision head -- and each meets the unchanged CI-scale bar stated above: 15000 offered, 15000
-    served and committed, 0 errors, served_rate>=CI_SCALE_SUSTAINED_FLOOR=450, due-time
-    p99<150ms, MAX_IN_FLIGHT=500 not reached, platform online, placement_ok=1 and a stable
-    four-worker identity. collection.attempts carries all eleven benchmark dispatches at that
-    head from the first through the fifth accepted one, each either linked one-to-one to its
-    observation or discarded with its exact recorded GC-3 route reason, failed B1 clause list,
-    signature mismatch or incomplete benchmark step: three AMD EPYC 9V74 80-Core Processor
-    dispatches and one AMD EPYC 9V45 96-Core Processor dispatch took recorded, non-serving GC-3
-    routes and started no workload, one benchmark job was never reached because an earlier
-    functional step failed, and one serving AMD EPYC 7763 64-Core Processor run was discarded
-    because its due-time p99 was 154.0 ms. Nothing here was invented, copied from an
-    investigation or written by a tool: every cost, service, worker, model, authority and
-    placement fact is copied verbatim from that run's own canonical `B1 env=` line, and every run
-    id and head from GitHub's workflow metadata.
+    ingestGateway.sizingBasis.observations carries those five recorded historical observations and
+    collection.attempts the eleven dispatches from the first through the fifth accepted one, each
+    either linked one-to-one to its observation or discarded with its exact recorded reason. Nothing
+    re-derives those figures: the live requalifying CPU-basis oracle is deleted with the CI-scale
+    operating point it was computed at, and a product-profile sample at 1000 req/s on eight CPUs is
+    a different claim, so it is evidence neither for nor against 1.585.
     tests/delivery/test_delivery_sizing_ledger.py::test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run
-    remains the single actual-state owner of that ledger and of the void it replaced. The
-    requalifying CPU-basis oracle
-    FP-IG-18 is isolated in `scripts/integration-test.sh b1_latency_basis`, absent from `all` and
-    from default CI and reachable in CI only through a default-false manual workflow_dispatch
-    input, so it can neither perturb nor decide the merge gate above. Restating the frozen
-    product-local qualifying-run literals onto this unchanged CI-scale operating point is a
-    deliberate deviation specified by design/slices/b1-latency-basis-1/design.md and recorded in
-    design/frozen-deviations.md; it neither weakens the CI-scale bar nor claims product-scale
-    capacity, and no run of either tier here is admitted as a sizing observation.
-    Both tiers and the derivation are specified by
-    design/slices/gc-1-reference-topology/design.md and recorded in design/frozen-deviations.md;
-    the per-exact-cpuModel CI-scale topology decision and its recorded routes are specified by
-    design/slices/gc-3-reference-topology/design.md.
-    GC-4 (gateway PostgreSQL plan reuse) appends six cost fields to both B1 fingerprint lines, after
+    remains the single actual-state owner of that ledger and of the void it replaced, it stays a CI
+    benchmark-job step, and it is what still fails a silent edit of 1.585 or of 317m/1585m.
+    Both the product profile and the derivation are specified by
+    design/slices/gc-1-reference-topology/design.md, the sizing warrant by
+    design/slices/b1-latency-basis-1/design.md, and every superseding decision above is recorded in
+    design/frozen-deviations.md.
+    GC-4 (gateway PostgreSQL plan reuse) appends six cost fields to the B1 fingerprint line, after
     the two lateness-leg fields and never before a gating one: postgres_cpu_us_per_req is
     measured-window PostgreSQL CPU microseconds per served request, and postgres_wait_scheduled,
     postgres_wait_completed, postgres_wait_failed, postgres_wait_observations and
     postgres_wait_events_pct describe a test-only 50 ms sampler of non-idle client backends over the
     same window. Each is a reported diagnostic in the same sense as max_lateness_ms: none is a bar,
-    a recorded verdict, a topology-selector input or a sizing observation, and a missing reading is
-    serialized as `unavailable` rather than as a zero. Each row of the per-exact-cpuModel decision
-    table above is evidence for its own current evidence head and for no other; GC-3 alone decides
-    hostability, and it does so from the carrier rather than from any head this slice names. GC-4
-    changed
+    a recorded verdict or a sizing observation, and a missing reading is serialized as `unavailable`
+    rather than as a zero. GC-4 changed
     the fused statement's plan+execute cost per merge
     and nothing else: not this profile, not any bar, not any capacity or durability setting, and not
-    any recorded entry. A model's current decision is replaced only when the GC-3 selector proves a
-    complete same-model pair at a strictly descendant head and appends the replaced decision to that
-    row's superseded list; manual editing is not an allowed shortcut. Until the selector publishes
-    such a decision the row above remains authoritative, GC-4 claims no SKU and no p99 result, and
-    the unchanged CI-scale bar stated above remains the only thing that can establish one.
-    GC-5 (durable commit shape) appends eight further reported fields to both B1 fingerprint lines,
+    any recorded entry.
+    GC-5 (durable commit shape) appends eight further reported fields to the B1 fingerprint line,
     immediately after those six and still never before a gating one: postgres_xact_commit_delta,
     postgres_xact_rollback_delta, postgres_xact_commits_per_served, postgres_wal_records_delta,
     postgres_wal_bytes_delta, postgres_wal_write_delta, postgres_wal_sync_delta and
@@ -210,21 +100,16 @@ benchmarks:
     pg_stat_wal through a connection to a separate maintenance database so the reader's own
     transactions cannot enter the counter it reports; an unusable observation serializes
     `unavailable` in all eight rather than a zero. GC-5's claim is transaction frequency and nothing
-    else: committed database transactions per served request on the recorded product-local route,
+    else: committed database transactions per served request on the product-local route,
     which its own node
     services/gateway/tests/test_b1_ingest_burst.py::test_gc5_commit_shape_reference_profile
     requires to be at most 0.60. That node consumes no other quantity; CPU per request, max in
     flight, p99, the three lateness legs, the wait histogram and the WAL deltas stay reported
-    diagnostics in the same sense as max_lateness_ms, and none of them becomes a bar, a recorded
-    verdict, a topology-selector input or a sizing observation. GC-5 changed
+    diagnostics in the same sense as max_lateness_ms. GC-5 changed
     how many ingested events share one durable commit
-    and nothing else: not this profile, not the CI-scale bar above, not MAX_IN_FLIGHT, workers,
-    limit_concurrency, the pools, the schema, the durability settings or the sizing basis. It
-    claims no SKU, no p99 result and no hosting outcome: each per-model row above remains evidence
-    for its own current evidence head, with every superseded head listed there as provenance, and
-    GC-3 alone may change it, through the same selector and the same strict-descendant supersession
-    proof over a complete same-model pair.
-    B1-HOST-NOISE (host noise) appends ten further reported fields to both B1 fingerprint lines,
+    and nothing else: not this profile, not the product bar above, not MAX_IN_FLIGHT, workers,
+    limit_concurrency, the pools, the schema, the durability settings or the sizing basis.
+    B1-HOST-NOISE (host noise) appends ten further reported fields to the B1 fingerprint line,
     immediately after those eight and still never before a gating one: host_steal_usec,
     assigned_cpu_steal_usec, host_psi_cpu_some_usec, host_psi_cpu_full_usec, host_psi_io_some_usec,
     host_psi_io_full_usec, host_psi_memory_some_usec, host_psi_memory_full_usec,
@@ -239,17 +124,18 @@ benchmarks:
     `id:value+id:value` sorted by numeric CPU id, so no value carries a raw comma. A missing,
     malformed, incomplete, reset or unreadable source serializes the whole affected field as
     `unavailable` -- never a zero and never a partial map -- and names the reason in a
-    `B1 diagnostic unavailable:` note; a runner without a cpufreq directory therefore reports both
+    `B1 diagnostic unavailable:` note; a host without a cpufreq directory therefore reports both
     frequency maps as `unavailable`, which is data rather than a failure. The block is append-only:
     every pre-slice fingerprint stays valid unedited and no exact field count is enforced anywhere.
-    All ten are reported diagnostics in the same sense as max_lateness_ms. None is a bar, a
-    recorded verdict, a topology-selector input, a qualifying-run predicate, a CPU-basis operand or
+    All ten are reported diagnostics in the same sense as max_lateness_ms. None is a bar,
+    a recorded verdict, a qualifying-run predicate, a CPU-basis operand or
     a sizing observation; no node compares one, no run is retried, skipped or exempted because of
-    one, and the CI-scale bar stated above still decides every run by itself. B1-HOST-NOISE changed
+    one, and the product bar stated above still decides every run by itself. No CI job requires a
+    live observation of them. B1-HOST-NOISE changed
     what the fingerprint reports about host conditions during the window
-    and nothing else: not this profile, not the CI-scale bar above, not MAX_IN_FLIGHT, workers,
+    and nothing else: not this profile, not the product bar above, not MAX_IN_FLIGHT, workers,
     limit_concurrency, the pools, the schema, the durability settings, the GC-5 commit shape or the
-    sizing basis. It explains no result, predicts no result, claims no SKU and no p99 outcome, and
+    sizing basis. It explains no result, predicts no result and claims no p99 outcome, and
     observes neither a governor trace, a thermal reading, noisy-neighbour identity nor
     guest-invisible SMT contention.
 - id: B2
@@ -393,98 +279,69 @@ benchmarks:
   status: covered
   tests:
   - tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput
-  notes: "M6 measured the scale-shaped \u22651000 inserts/s bar through the real write_audit + PGTraceStore.insert_llm_call\
-    \ against the shared seeded 12-partition fixture (tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput).\
-    \ Writer model: seven concurrent writer process instances (four services in the\
-    \ default single-replica deployment: ingest-gateway x4, dashboard-api, probe-gateway,\
-    \ temporal-worker), each with an independent unwidened engine at make_engine defaults,\
-    \ stock durability. The input to the topology derivation moved with FP-IG-20\
-    \ (ingest-gateway is four processes); writers is the derived sum, not a tuning knob.\
-    \ Combined means the two tables. M1 test_audit.py still covers unit-level write_audit\
-    \ correctness. The 1000/s figure is derived from B1 rather than from this entry: B1 requires\
-    \ the ingest front door to sustain a 5x burst of 200 req/s for 30 s with 0\
-    \ errors, and services/gateway/gateway/ingest.py writes exactly one audit_log row\
-    \ per ingested alert on four mutually exclusive branches (event_merged:252,\
-    \ event_received:287, event_rejected:320; one reference per action, the\
-    \ representative first occurrence). GC-2 leaves that one-row-per-alert\
-    \ accounting unchanged while moving the committed-existing-case merge into\
-    \ the fused statement merge_existing_event_with_audit, which writes its\
-    \ event_merged row itself; the under-lock merge, open and reject branches\
-    \ still call write_audit, and the representative above is the remaining\
-    \ real under-lock write_audit call. B11 measures the audit-table insert\
-    \ station, not the whole HTTP merge transaction: B1, not B11, gates the\
-    \ fused ingest shape. So the storage tier absorbs 1000 audit\
-    \ inserts/s at that burst. The recorded ~995/s was measured under the four-writer\
-    \ model and is not comparable with any seven-writer figure (section 14.4 rule 3).\
-    \ The first seven-writer reference measurement is read by the existing B11 branch\
-    \ pair; this pass does not re-measure or re-derive the threshold. Per the reference\
-    \ benchmark environment in design section 14.4, the measurement of\
-    \ record is the CI benchmark job on ubuntu-latest; an off-reference run is\
-    \ diagnostic and cannot re-derive a threshold in either direction. The benchmark\
-    \ prints a B11 env=cpus=...,serial_commit_ms=...,combined_over_single=...\
-    \ fingerprint alongside the writer count, the writer map and the single-writer\
-    \ rate, so a storage-class difference and a compute difference between two hosts\
-    \ are distinguishable from a log. The benchmark additionally prints one\
-    \ canonical B11 diagnostics= record on a pass and before a threshold\
-    \ failure: 21 comma-delimited fields in one fixed order -- the combined\
-    \ rate, the two existing commit/concurrency fingerprints, one\
-    \ elapsed-milliseconds and committed-row entry per declared writer\
-    \ instance (plus-joined, so no writer entry can forge a field boundary),\
-    \ aggregate host steal and the six cpu/io/memory PSI some+full totals\
-    \ over the same measured window, and the storage identity at\
-    \ PostgreSQL's own data_directory. The storage view is read\
-    \ unprivileged inside the running PostgreSQL container -- that\
-    \ container's own mount record plus the read-only block sysfs\
-    \ attributes it exposes -- and never from the pytest process's\
-    \ filesystem, a Docker volume class or a host backing path; it is\
-    \ resolved before engine and row warmup, so no diagnostic read touches\
-    \ the measured window. Free-form values are percent-encoded, each field\
-    \ falls back independently to the literal unavailable, and every one of\
-    \ them is reported-only: none conditions the threshold, the writer\
-    \ model, the pool, durability, a retry or a skip.\
-    \ B11 gate policy (design/slices/b11-gate-policy rev 0.3): the >= 1000 inserts/s bar\
-    \ is required-green and merge-blocking on every miss, with no retry, no rerun, no\
-    \ skip, no xfail, no continue-on-error and no exit-code masking. A completed\
-    \ below-threshold measurement whose unrounded host_psi_io_full_usec share of the\
-    \ same measured window is at least 0.20 gains exactly one suffix in its assertion\
-    \ message: failure_classification=io_full_stall_observed together with\
-    \ classification_scope=symptom_only_not_cause and gate_outcome=red. A share below\
-    \ 0.20, an unavailable counter, or a non-positive rate or row count leaves an\
-    \ ordinary unclassified red, which is the state a real product or harness regression\
-    \ on a quiet host must reach. The label claims no cause: PSI I/O full is partly\
-    \ produced by this workload's own fsync waits, so io_full_stall_observed\
-    \ distinguishes slow while waiting on I/O from other slow runs and does not\
-    \ distinguish host from product; a classified run remains a real required-green\
-    \ failure and only its message changes. The warrant is thin-provisional: five\
-    \ mixed-outcome samples in one storage class at evidence head\
-    \ b25349b2859647807237ca53fd7d02f93340e268, two passing and three failing, whose\
-    \ shares are table-rounded percentages (8 and 13 passing; 21, 22 and 26 failing)\
-    \ rather than exact raw extrema. The policy is re-reviewed after 20 additional\
-    \ completed measurements or immediately on the first numeric counterexample -- a\
-    \ pass at or above the 0.20 share, or a failure below it -- and the cutoff may move\
-    \ only through a new audited design revision that updates this object, the guard\
-    \ literals, the ledger and the frozen-deviation row together. Of the 21 canonical\
-    \ fields, 20 remain reported-only; host_psi_io_full_usec is classification-only in\
-    \ the message of an already-red result; all 21 remain outcome-inert."
-  gate_policy:
-    outcome: required-green
-    merge_blocking_on_miss: true
-    retries: 0
-    failure_classification:
-      name: io_full_stall_observed
-      host_psi_io_full_share_at_least: 0.20
-      evidence_head: b25349b2859647807237ca53fd7d02f93340e268
-      mixed_storage_class_samples: 5
-      passing_samples: 2
-      failing_samples: 3
-      observed_table_rounded_share_percent:
-        passing: [8, 13]
-        failing: [21, 22, 26]
-      evidence_precision: table-rounded-percent
-      evidence_strength: thin-provisional
-    review:
-      after_additional_completed_measurements: 20
-      on_first_counterexample: true
+  tier: on-demand
+  notes: |
+    M6 measured the scale-shaped >=1000 inserts/s bar through the real write_audit +
+    PGTraceStore.insert_llm_call against the shared seeded 12-partition fixture
+    (tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput).
+    Writer model: seven concurrent writer process instances (four services in the
+    default single-replica deployment: ingest-gateway x4, dashboard-api, probe-gateway,
+    temporal-worker), each with an independent unwidened engine at make_engine defaults,
+    stock durability. The input to the topology derivation moved with FP-IG-20
+    (ingest-gateway is four processes); writers is the derived sum, not a tuning knob.
+    Combined means the two tables. M1 test_audit.py still covers unit-level write_audit
+    correctness. The 1000/s figure is derived from B1 rather than from this entry: B1 requires
+    the ingest front door to sustain a 5x burst of 200 req/s for 30 s with 0
+    errors, and services/gateway/gateway/ingest.py writes exactly one audit_log row
+    per ingested alert on four mutually exclusive branches (event_merged:252,
+    event_received:287, event_rejected:320; one reference per action, the
+    representative first occurrence). GC-2 leaves that one-row-per-alert
+    accounting unchanged while moving the committed-existing-case merge into
+    the fused statement merge_existing_event_with_audit, which writes its
+    event_merged row itself; the under-lock merge, open and reject branches
+    still call write_audit, and the representative above is the remaining
+    real under-lock write_audit call. B11 measures the audit-table insert
+    station, not the whole HTTP merge transaction: B1, not B11, gates the
+    fused ingest shape. So the storage tier absorbs 1000 audit
+    inserts/s at that burst. The recorded ~995/s was measured under the four-writer
+    model and is not comparable with any seven-writer figure (section 14.4 rule 3).
+    The first seven-writer reference measurement is read by the existing B11 branch
+    pair; this pass does not re-measure or re-derive the threshold.
+    bench-on-demand (design/slices/bench-on-demand/design.md, recorded in
+    design/frozen-deviations.md) moved this benchmark out of the CI benchmark job.
+    `tier: on-demand` is where it runs: the same node id, with the same bar and the same
+    seven-writer model, on a developer host, before every `v*` tag and after a change to the
+    ingest write path. The bar itself is unchanged and unweakened -- a combined rate below
+    1000.0 is an assertion failure with its existing rate message and nothing after it. There
+    is no failure classification, no I/O-full stall suffix, no retry, no rerun, no skip, no
+    xfail, no continue-on-error and no exit-code masking. The entry is not deferred and the
+    node carries no skip decorator; the departure from CI is the deleted step. A recorded rate
+    below 1000.0, or a writer count other than 7, refuses a `v*` tag through
+    scripts/check_release_bench_record.py. The benchmark
+    prints a B11 env=cpus=...,serial_commit_ms=...,combined_over_single=...
+    fingerprint alongside the writer count, the writer map and the single-writer
+    rate, so a storage-class difference and a compute difference between two hosts
+    are distinguishable from a log. The benchmark additionally prints one
+    canonical B11 diagnostics= record on a pass and before a threshold
+    failure: 21 comma-delimited fields in one fixed order -- the combined
+    rate, the two existing commit/concurrency fingerprints, one
+    elapsed-milliseconds and committed-row entry per declared writer
+    instance (plus-joined, so no writer entry can forge a field boundary),
+    aggregate host steal and the six cpu/io/memory PSI some+full totals
+    over the same measured window, and the storage identity at
+    PostgreSQL's own data_directory. The storage view is read
+    unprivileged inside the running PostgreSQL container -- that
+    container's own mount record plus the read-only block sysfs
+    attributes it exposes -- and never from the pytest process's
+    filesystem, a Docker volume class or a host backing path; it is
+    resolved before engine and row warmup, so no diagnostic read touches
+    the measured window. Free-form values are percent-encoded, each field
+    falls back independently to the literal unavailable, and every one of
+    the 21 fields is reported-only: none conditions the threshold, the writer
+    model, the pool, durability, a retry or a skip, and none appears in the
+    assertion's condition or changes its message. The whole line is copied into the
+    release record so an on-demand run keeps its PSI numbers there; there is no second
+    ledger of them.
   concurrency_model:
     writers: 7
     pool: per-writer-independent

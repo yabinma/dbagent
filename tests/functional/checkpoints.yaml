@@ -215,6 +215,7 @@ checkpoints:
   - tests/e2e/test_e2e_smoke.py
   - tests/e2e/test_e2e_scenarios.py
   notes: "Automated: E0 install smoke, E1 worker OOM, E2 broken catalog (redaction), E3 queue saturation,\
-    \ E4 runaway kill_query, plus B1 burst. \xA713.2 coordinator full-GC hang and \xA713.4 single-worker\
+    \ E4 runaway kill_query, plus the B1 burst, which contributes its eleven correctness and\
+    \ availability clauses and no latency comparison. \xA713.2 coordinator full-GC hang and \xA713.4 single-worker\
     \ network isolation remain manual/real-cluster (kindnet does not enforce NetworkPolicy; real heap\
     \ pressure is not simulated)."

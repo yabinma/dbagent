@@ -35,11 +35,15 @@ from conftest import load_b11_writer_model
 # meanings; this one is appended, printed once per completed measurement,
 # before the unchanged threshold assertion.  Every one of the 21 fields is
 # outcome-inert: none can move the threshold, the outcome, the exit code, a
-# retry or a skip.  Twenty of them stay reported-only.  The single exception is
-# `host_psi_io_full_usec`, which may additionally feed the classification-only
-# message branch of an already-red B11 result (design/slices/b11-gate-policy
-# §3.2/§3.3); that branch is evaluated only after `rate >= 1000.0` has already
-# failed and changes no outcome, exit code or threshold.
+# retry or a skip.  bench-on-demand (FP-BOD-4) deleted the one exception there
+# used to be: `host_psi_io_full_usec` no longer feeds any branch at all.  The
+# stall classifier that appended a label to an already-red message existed to
+# tell one shared-runner red from another, and B11 left per-push CI, so ALL 21
+# fields are reported-only now and a miss is the `rate >= 1000.0` assertion
+# with its own rate message and nothing after it.  The label itself is pinned
+# absent from this file by
+# tests/functional/test_b11_writer_model.py::test_b11_rate_bar_has_no_stall_suffix,
+# so it is deliberately not spelled here.
 B11_DIAGNOSTIC_PREFIX = "B11 diagnostics="
 B11_DIAGNOSTIC_UNAVAILABLE = "unavailable"
 B11_DIAGNOSTIC_FIELDS = (
@@ -65,14 +69,6 @@ B11_DIAGNOSTIC_FIELDS = (
     "storage_scheduler",
     "storage_model",
 )
-
-# B11 gate-policy slice §3.2/§3.3: the provisional, message-only failure
-# classification.  The share is compared unrounded against the reconstructed
-# measured window -- never against a table-rounded percentage -- and the label
-# is appended only to an assertion message Python builds after the sole gate
-# `rate >= 1000.0` has already failed.
-B11_IO_FULL_STALL_SHARE = 0.20
-B11_IO_FULL_STALL_CLASSIFICATION = "io_full_stall_observed"
 
 # The two closed scripts B11 runs, unprivileged, as OS user `postgres`, inside
 # the exact PostgreSQL container the seeded fixture is already running.  Docker
@@ -701,39 +697,6 @@ def _read_b11_storage_identity(container, pgdata_path: str) -> dict[str, str]:
     return values
 
 
-def _b11_failure_classification(
-    combined_rate_per_sec: float,
-    committed_rows: int,
-    host_psi_io_full_usec: str,
-) -> str:
-    """Name the observed I/O-full symptom of an already-failed B11 measurement.
-
-    Pure, lazily reached and outcome-inert: Python evaluates an ``assert``
-    message only after its condition is already false, so this can never run on
-    a pass.  It returns the empty string for a passing or non-positive rate, a
-    non-positive row count and an unavailable counter, and otherwise
-    reconstructs the measured window algebraically from the asserted rate and
-    the fixed committed row count -- there is no second clock and no reread of
-    the timed window.  The label names a symptom, not a mechanism, and the gate
-    stays ``rate >= 1000.0``: a classified run is the same required-green
-    failure with a longer message (design/slices/b11-gate-policy §3.2/§3.3).
-    """
-    if combined_rate_per_sec >= 1000.0 or combined_rate_per_sec <= 0:
-        return ""
-    if committed_rows <= 0 or host_psi_io_full_usec == B11_DIAGNOSTIC_UNAVAILABLE:
-        return ""
-    measured_window_usec = committed_rows / combined_rate_per_sec * 1_000_000
-    io_full_share = int(host_psi_io_full_usec) / measured_window_usec
-    if io_full_share < B11_IO_FULL_STALL_SHARE:
-        return ""
-    return (
-        f"; B11 failure_classification={B11_IO_FULL_STALL_CLASSIFICATION}; "
-        "B11 classification_scope=symptom_only_not_cause; "
-        f"B11 host_psi_io_full_share={io_full_share:.3f}; "
-        "B11 gate_outcome=red"
-    )
-
-
 def test_b11_audit_llm_insert_throughput(scale_pg):
     """Combined audit + llm_calls insert rate under durable Postgres.
 
@@ -932,78 +895,14 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     print(f"B11 single_writer_rate={single_writer_rate:.1f}/s")
     print(env_line)
     print(_serialize_b11_diagnostics(diagnostic_values))
+    # FP-BOD-4: the bar, and nothing after it. A miss is this assertion
+    # failure with its existing rate message; there is no stall suffix, no
+    # classification and no gate-outcome label. None of the 21 diagnostic
+    # fields printed above enters this condition or this message.
     assert rate >= 1000.0, (
         f"B11 combined insert rate={rate:.1f}/s (threshold 1000); "
         f"B11 writers={len(instances)}; B11 writer_map={writer_map}; "
         f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"
-        + _b11_failure_classification(
-            rate,
-            len(instances) * n_iters,
-            host_values["host_psi_io_full_usec"],
-        )
-    )
-
-
-def test_b11_failure_classification_names_only_high_io_full_reds():
-    """FP-B11GP-2: only an unrounded same-window I/O-full share >= 20% is named.
-
-    The literals are exact rather than illustrative: 5600 rows (the seven
-    manifest-derived instances times the fixed 800 timed rows) at 700.0/s
-    reconstruct an 8 000 000 usec window, so 1 600 000 usec is exactly 20.000%
-    and 1 599 999 usec is 19.9999875%.  Both sit either side of the boundary in
-    binary64 without rounding, which is the point: the comparison happens on
-    raw counters and only the rendered share is rounded, to three decimals.
-
-    Nothing here can turn a red green.  The helper only ever returns text, and
-    the low-stall regression case -- a real product slowdown on a quiet host --
-    must stay unclassified so it is never explained away.
-    """
-    classified = _b11_failure_classification(700.0, 5600, "1600000")
-    assert classified == (
-        "; B11 failure_classification=io_full_stall_observed; "
-        "B11 classification_scope=symptom_only_not_cause; "
-        "B11 host_psi_io_full_share=0.200; "
-        "B11 gate_outcome=red"
-    ), classified
-    assert "classification_scope=symptom_only_not_cause" in classified, classified
-    assert "gate_outcome=red" in classified, classified
-
-    # One counter below the boundary: 19.9999875%, unrounded, is not named.
-    assert _b11_failure_classification(700.0, 5600, "1599999") == "", "boundary"
-
-    # Three decimals, rendered only after the unrounded comparison.
-    assert _b11_failure_classification(700.0, 5600, "2080000") == (
-        "; B11 failure_classification=io_full_stall_observed; "
-        "B11 classification_scope=symptom_only_not_cause; "
-        "B11 host_psi_io_full_share=0.260; "
-        "B11 gate_outcome=red"
-    ), "0.260"
-
-    # A real regression on a quiet host: zero stall stays an ordinary red.
-    assert _b11_failure_classification(700.0, 5600, "0") == "", "zero"
-
-    # `unavailable` never becomes zero and never becomes a classification.
-    assert _b11_failure_classification(700.0, 5600, "unavailable") == "", "unavailable"
-    assert (
-        _b11_failure_classification(700.0, 5600, B11_DIAGNOSTIC_UNAVAILABLE) == ""
-    ), "unavailable constant"
-
-    # No reconstructable window: no label, and the assertion still fails.
-    assert _b11_failure_classification(0.0, 5600, "1600000") == "", "zero rate"
-    assert _b11_failure_classification(-1.0, 5600, "1600000") == "", "negative rate"
-    assert _b11_failure_classification(700.0, 0, "1600000") == "", "zero rows"
-    assert _b11_failure_classification(700.0, -5600, "1600000") == "", "negative rows"
-
-    # A passing rate is never classified, however high the stall: the message
-    # is not even built, and the helper refuses anyway.
-    assert _b11_failure_classification(1000.0, 5600, "1600000") == "", "at threshold"
-    assert _b11_failure_classification(1735.0, 5600, "99999999") == "", "fast"
-
-    # The two pinned module constants are the only tunables, and neither is
-    # reachable from a runtime value.
-    assert B11_IO_FULL_STALL_SHARE == 0.20, B11_IO_FULL_STALL_SHARE
-    assert B11_IO_FULL_STALL_CLASSIFICATION == "io_full_stall_observed", (
-        B11_IO_FULL_STALL_CLASSIFICATION
     )
 
 

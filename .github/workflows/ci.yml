@@ -44,24 +44,12 @@ on:
     types: [opened, synchronize, reopened]
   schedule:
     - cron: '0 3 * * *'          # nightly e2e
-  # GC-3 FP-GC3-2: the manual discovery route. The boolean defaults to false,
-  # so an ordinary manual run of this workflow behaves exactly as before and
-  # the 28-arm sweep costs nothing until somebody asks for it by name.
+  # bench-on-demand FP-BOD-1: the manual event stays, with NO inputs. The two
+  # booleans that ran the GC-3 topology sweep and the CPU-basis oracle are
+  # deleted with the targets they selected. Deleting the event itself would
+  # remove a way to re-run the functional e2e job by hand, which this slice
+  # does not touch.
   workflow_dispatch:
-    inputs:
-      b1_topology_probe:
-        description: Run GC-3 B1 topology discovery
-        required: false
-        default: false
-        type: boolean
-      # B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated CPU-basis oracle. Default
-      # false, so push, pull-request, scheduled and ordinary manual runs
-      # behave exactly as before and the ordinary B1 gate is untouched.
-      b1_latency_basis:
-        description: Run the isolated B1 CPU-basis oracle (B1-LATENCY-BASIS-1)
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   lint:
@@ -376,6 +364,19 @@ jobs:
         # local dev server (temporalio.testing.WorkflowEnvironment) both
         # use it directly -- see tests/functional/conftest.py.
         # tests/delivery is the packaging/docs/CI assertion tier (FP-M6-*).
+        #
+        # bench-on-demand FP-BOD-1/5 (design.md §3.2): the B1 harness coverage
+        # gate moves here out of the deleted `b1_write_coverage_driver`
+        # container, and the tag-gate script's own branch-coverage run joins
+        # it. Both live in THIS step's body rather than in steps of their own,
+        # because FP-M6-31 A10(v) pins exactly one measured pytest invocation
+        # per guarded job, immediately after the hygiene gate above; a second
+        # step would move that invocation away from its gate. The default
+        # `bash -e` shell fails the step on the first non-zero command, so no
+        # failure here is swallowed. The coverage bar stays 81 on the three
+        # surviving files, its data file lives under RUNNER_TEMP rather than
+        # /run/dbagent-b1, and its --include paths are repository-relative
+        # rather than /workspace.
         run: |
           services/worker/.venv/bin/python -m pytest \
             services/worker/tests services/gateway/tests \
@@ -384,6 +385,18 @@ jobs:
             --ignore=tests/functional/m2_probe_link \
             --ignore=services/gateway/tests/test_b1_ingest_burst.py \
             --ignore=tests/delivery/test_delivery_sizing_ledger.py
+          services/worker/.venv/bin/python -m pytest \
+            tests/functional/test_release_bench_record.py -v \
+            --cov=check_release_bench_record --cov-branch --cov-fail-under=81
+          env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 \
+            services/worker/.venv/bin/python -B -m coverage run --branch \
+            --data-file="$RUNNER_TEMP/b1-harness.coverage" \
+            -m pytest services/gateway/tests/test_b1_ingest_burst.py -v \
+            -m "not b1_live and not b1_product"
+          services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/b1_reference_profile.py,services/gateway/tests/test_b1_ingest_burst.py,scripts/b1-affinity-helper.py
+          services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/b1_reference_profile.py
+          services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/test_b1_ingest_burst.py
+          services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=scripts/b1-affinity-helper.py
       - name: Run Go cross-service functional tests (F8/F9; real probe +
           probe-gateway binaries over real mTLS + ephemeral Postgres)
         run: go test ./tests/functional/... -v -timeout 300s
@@ -453,54 +466,81 @@ jobs:
           services/worker/.venv/bin/python -m pytest \
             services/worker/tests/test_context_assembly.py::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v
 
-      # FP-IG-7 / FP-IG-12: B1 reference burst before B2/B10/B11 so a red B11
-      # cannot skip the measurement of record (§11.3.3 S). Hygiene gate is
-      # byte-identical to the pinned A10(v) command.
-      - name: FP-M6-31 A10(v) environment hygiene before B1 reference burst
-        run: |
-          bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
-      - name: B1 -- resource-declared CI-scale ingest-gateway burst (FP-GC1-1)
-        run: bash scripts/integration-test.sh b1
-
-      # One step so the session-scoped scale_pg seed is shared by B2/B10/B11
-      # (§11.1.3 — seeding thrice would triple the cost). Test ids name each bar.
+      # bench-on-demand FP-BOD-1: the B1 step and the hygiene step that existed
+      # only immediately before it are deleted; B1 runs on demand on a developer
+      # host. Nothing here is skipped or conditioned -- the steps are gone.
+      #
+      # One step so the session-scoped scale_pg seed is shared by B2/B10
+      # (§11.1.3 — seeding twice would double the cost). Test ids name each bar.
       # No --timeout flag: pytest-timeout is not a declared dependency.
-      # -s: keep B11 fixed-prefix diagnostics on a green run (errata pass 9).
+      # -s: keep the fixed-prefix diagnostics on a green run (errata pass 9).
+      # The operands are the NODE IDS of every top-level test in that file
+      # except the live B11 audit/LLM insert-throughput node, which left CI
+      # with B1 and is now measured on demand.
+      # Collecting the whole file would run the live B11 throughput test again.
       # FP-M6-31 A10(v): runtime env hygiene immediately before the measured step.
-      - name: FP-M6-31 A10(v) environment hygiene before B2/B10/B11
+      - name: FP-M6-31 A10(v) environment hygiene before B2/B10
         run: |
           bad="$(awk 'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); if (p != "PYTHON" && p != "PYTEST") continue; print k } }')"; if [ -n "$bad" ]; then printf 'FP-M6-31 A10(v): forbidden PYTHON*/PYTEST* environment key present before the measured invocation:\n%s\n' "$bad" >&2; exit 1; fi
-      - name: B2/B10/B11 -- PG scale benchmarks (shared seeded fixture)
+      - name: B2/B10 -- PG scale benchmarks (shared seeded fixture)
         run: |
           services/worker/.venv/bin/python -m pytest \
-            tests/benchmark/test_pg_scale.py -v -s
-      # FP-IG-23 / FP-IG-26: ledger gate after B1 (step 17). A later step
-      # cannot prevent an earlier one from running, so this siting cannot
-      # deadlock the producer. No third A10(v) gate: every uses: step
-      # precedes index 7 and only parsed run: bodies sit between the
-      # pinned gate at 18 and this step.
+            tests/benchmark/test_pg_scale.py::test_b2_fingerprint_correlation_p99_under_20ms \
+            tests/benchmark/test_pg_scale.py::test_b10_partitioned_list_and_filter_p99 \
+            tests/benchmark/test_pg_scale.py::test_b11_host_parser_reuse_is_direct \
+            tests/benchmark/test_pg_scale.py::test_b11_host_diagnostics_read_declared_sources \
+            tests/benchmark/test_pg_scale.py::test_b11_host_reader_observes_real_proc_stat \
+            tests/benchmark/test_pg_scale.py::test_b11_storage_identity_reads_target_postgres_container \
+            tests/benchmark/test_pg_scale.py::test_b11_storage_identity_fails_soft_without_substituting_another_mount \
+            tests/benchmark/test_pg_scale.py::test_b11_diagnostics_schema_is_canonical_and_comma_safe \
+            tests/benchmark/test_pg_scale.py::test_b11_diagnostic_sampling_brackets_the_timed_window \
+            -v -s
+      # FP-IG-23 / FP-BOD-9: the sizing ledger is a STATIC provenance gate now.
+      # It reads the five recorded historical costs and the chart figures out of
+      # deploy/charts/dbagent/values.yaml and fails a silent edit of either. It
+      # has no live producer in this workflow any more and needs none: nothing
+      # re-derives 1.585. No third A10(v) gate: every uses: step precedes index
+      # 7 and only parsed run: bodies sit between the pinned gate and this step.
       - name: FP-IG-23 -- sizing-ledger provenance gate
         run: |
           services/worker/.venv/bin/python -m pytest \
             tests/delivery/test_delivery_sizing_ledger.py -v
-      # B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated CPU-basis oracle, appended
-      # AFTER the FP-IG-23 provenance gate at step 20 and never before it.
-      # The explicit condition inherits Actions' implicit success(), so this
-      # step cannot run while the provenance gate is red -- the basis it would
-      # compare against would be exactly the unqualified one. On an enabled
-      # manual dispatch this is a SECOND live B1 run in this job: the ordinary
-      # gate at step 17 has already produced its own, unperturbed result.
-      - name: B1-LATENCY-BASIS-1 -- isolated CPU-basis oracle (manual, opt-in)
-        if: github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true
-        run: bash scripts/integration-test.sh b1_latency_basis
       # v1.5 manifest honesty rule (design.md Section 14.4): a
       # thresholds.yaml entry cannot stay `deferred` once its hot-path code
       # ships. M3 flipped B1/B2/B6/B8/B11/B13/B14; M4 flipped B12.
 
+  # bench-on-demand FP-BOD-5: the `v*` tag gate. It reads the committed record
+  # of the two on-demand benchmark runs out of the TAGGED tree and refuses the
+  # tag unless that record is a measurement of this tree and its own tokens show
+  # both bars met. It runs neither benchmark: `b1_product` needs eight logical
+  # CPUs and every runner here is a four-vCPU ubuntu-latest.
+  release-bench-record:
+    name: release bench record (v* tags)
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      # fetch-depth: 0 plus an explicit fetch of the release branch: the script
+      # proves ancestry against origin/main and walks from the measured commit
+      # to the tag commit, and a shallow clone can see neither.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch the release branch
+        run: git fetch origin main:refs/remotes/origin/main
+      - name: Check the release bench record
+        run: python3 scripts/check_release_bench_record.py
+
   images:
     name: build product images (six)
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [lint, release-bench-record]
+    # `always()` is what lets this job run on a pull request, where
+    # `release-bench-record` is skipped. A FAILED record job is neither
+    # `success` nor `skipped`, so images does not build and does not push.
+    if: >
+      always() &&
+      needs.lint.result == 'success' &&
+      (needs.release-bench-record.result == 'success' || needs.release-bench-record.result == 'skipped')
     permissions:
       contents: read
       packages: write
@@ -589,13 +629,6 @@ jobs:
           chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin/kind
       - name: Run e2e (1500s product budget inside 30m job)
         run: bash tests/e2e/run.sh
-      - name: Upload B1 diagnostics on success
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-b1-diagnostics
-          path: /tmp/rca-e2e/b1-baseline-diagnostics.txt
-          if-no-files-found: ignore
       - name: Upload phase timing and pod logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -605,38 +638,3 @@ jobs:
             /tmp/rca-e2e/**
             tests/e2e/*.log
           if-no-files-found: ignore
-
-  # GC-3 FP-GC3-2: the B1 reference-topology discovery instrument.
-  #
-  # NO `needs:` -- deliberately. This job is not part of the merge gate, is in
-  # no ordinary job's needs closure, and must be able to run while the
-  # `functional` job is the known `gc3_decision_missing` red that the probe
-  # head carries by design. `benchmark` and `e2e` skip through their own needs
-  # chains on such a dispatch; this job still produces its measurement.
-  #
-  # It measures 28 closed placements of the UNCHANGED CI-scale burst and
-  # records one truthful met/missed value per unchanged comparison. A candidate
-  # that misses the bar is data and does not fail this job; a missing arm, a
-  # bad placement or topology, an accounting failure or an unwritable artifact
-  # does. `if: always()` on the upload exists so a broken sweep still surfaces
-  # its `invalid` artifact -- it never converts the failing command's exit
-  # status into success, because the upload is a separate, later step.
-  #
-  # 28 x (30 s window + warmup + sibling startup + teardown) plus one image
-  # build is about 30-45 minutes; 75 leaves room for setup variance without
-  # leaving an unbounded runner.
-  b1-topology-probe:
-    name: B1 topology discovery (GC-3, manual, recorded)
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    if: github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true
-    steps:
-      - uses: actions/checkout@v4
-      - name: B1 topology discovery -- the closed 28-arm candidate set (FP-GC3-2)
-        run: bash scripts/integration-test.sh b1_topology_probe
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: b1-topology-probe-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/b1-topology-probe-${{ github.run_id }}-${{ github.run_attempt }}.json
-          if-no-files-found: error

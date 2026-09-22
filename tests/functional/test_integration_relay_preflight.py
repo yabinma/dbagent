@@ -69,8 +69,10 @@ IMAGE_ABSENT_SECOND_LINE = (
     "this preflight does not pull it."
 )
 
-#: §3.3. Exact `case` membership, not a substring test.
-ADMITTED_TARGETS = ("preflight", "b1", "b1_product", "b1_latency_basis", "b1_topology_probe")
+#: §3.3, narrowed by bench-on-demand FP-BOD-2: the CI-scale target, the
+#: CPU-basis oracle and the topology sweep are deleted, so the relay admits
+#: the two targets that remain. Exact `case` membership, not a substring test.
+ADMITTED_TARGETS = ("preflight", "b1_product")
 #: §3.3, declared independently of the script's argument `case`; the FP-RELAY-5
 #: test parses that `case` and compares the two.
 NON_ADMITTED_TARGETS = (
@@ -161,7 +163,7 @@ def _argument_case_targets() -> tuple[str, ...]:
     match = re.search(r"^  ([A-Za-z0-9_|]+)\) ;;$", _launcher_text(), re.MULTILINE)
     assert match is not None, "the launcher no longer opens with an argument case"
     names = tuple(match.group(1).split("|"))
-    assert "preflight" in names and "b1" in names, names
+    assert "preflight" in names and "b1_product" in names, names
     return names
 
 
@@ -298,7 +300,7 @@ def test_relay_decision_table(tmp_path: Path):
 
     # Count 0, no request or a non-admitted target: today's refusal, no Docker.
     for target, request in (
-        ("preflight", ""), ("b1", ""), ("b1_latency_basis", ""),
+        ("preflight", ""), ("b1_product", ""), ("all", ""),
         ("py", "prove"), ("all", "prove"), ("d0_2a", "prove"),
         ("b1_extra", "prove"),
     ):
@@ -324,7 +326,7 @@ def test_relay_decision_table(tmp_path: Path):
         assert not quiet_log.exists(), quiet_log.read_text(encoding="utf-8")
 
     # Count 0, admitted, any other non-empty request: fail closed, no Docker.
-    invalid = _gate_counted("0", "b1", "1", env=quiet_env)
+    invalid = _gate_counted("0", "b1_product", "1", env=quiet_env)
     assert invalid.returncode == 3
     assert invalid.stderr == RELAY_REFUSAL.format(reason="relay_request_invalid") + "\n"
     assert not quiet_log.exists()
@@ -333,7 +335,7 @@ def test_relay_decision_table(tmp_path: Path):
     # existing `docker info` check decides.
     ok_dir = tmp_path / "docker-ok"
     ok_log = _shim(ok_dir, "docker", stdout="28.0.0")
-    for target, request in (("preflight", "prove"), ("b1", "garbage"), ("py", "")):
+    for target, request in (("preflight", "prove"), ("b1_product", "garbage"), ("py", "")):
         result = _gate_counted("2", target, request, env=_path_with(ok_dir))
         detail = f"{target}/{request!r}: {result.stdout}{result.stderr}"
         assert "rc=0" in result.stdout, detail
@@ -345,7 +347,7 @@ def test_relay_decision_table(tmp_path: Path):
 
     bad_dir = tmp_path / "docker-bad"
     _shim(bad_dir, "docker", status=1)
-    unreachable = _gate_counted("2", "b1", "prove", env=_path_with(bad_dir))
+    unreachable = _gate_counted("2", "b1_product", "prove", env=_path_with(bad_dir))
     assert unreachable.returncode == 3, unreachable.stdout
     assert "cannot reach the Docker daemon" in unreachable.stderr
     assert "relay override" not in unreachable.stderr
@@ -356,7 +358,7 @@ def test_relay_decision_table(tmp_path: Path):
     without_check = region.replace("    relay_legacy_docker_info\n", "", 1)
     assert without_check != region, "the count>0 row no longer calls relay_legacy_docker_info"
     admitted = _gate_counted(
-        "2", "b1", "prove", region=without_check, env=_path_with(bad_dir)
+        "2", "b1_product", "prove", region=without_check, env=_path_with(bad_dir)
     )
     assert "rc=0" in admitted.stdout, admitted.stdout + admitted.stderr
 
@@ -393,7 +395,7 @@ def test_relay_socket_and_request_tokens(tmp_path: Path):
     assert not quiet_log.exists()
 
     for request in ("Prove", "1", "PROVE", "prove "):
-        result = _gate_counted("0", "b1", request, env=_path_with(quiet))
+        result = _gate_counted("0", "b1_product", request, env=_path_with(quiet))
         detail = f"{request!r}: {result.stdout}{result.stderr}"
         assert result.returncode == 3, detail
         assert result.stderr == RELAY_REFUSAL.format(reason="relay_request_invalid") + "\n", detail
@@ -528,7 +530,7 @@ def test_relay_prove_request_is_not_accepted_without_host_network_reachability(
         assert other not in result.stderr, detail
 
     # And the request on its own still admits nothing, from the shipped script.
-    request_only = _gate_counted("0", "b1", "prove", env={"DOCKER_HOST": ABSENT_SOCKET})
+    request_only = _gate_counted("0", "b1_product", "prove", env={"DOCKER_HOST": ABSENT_SOCKET})
     assert request_only.returncode == 3
     assert request_only.stderr == RELAY_REFUSAL.format(reason="relay_socket_absent") + "\n"
 
@@ -646,7 +648,7 @@ def test_relay_non_admitted_targets_keep_the_legacy_refusal(tmp_path: Path):
     # Admission is what refuses them: widen it and `py` stops taking that path.
     region = _relay_region()
     widened = region.replace(
-        "    preflight|b1|b1_product|b1_latency_basis|b1_topology_probe) return 0 ;;",
+        "    preflight|b1_product) return 0 ;;",
         "    *) return 0 ;;", 1,
     )
     assert widened != region, "the admitted `case` is no longer spelled as declared"
@@ -691,7 +693,7 @@ def test_relay_successful_proof_reaches_preflight_ok_without_changing_b1(tmp_pat
     for line in (
         "integration-test.sh: preflight OK (relay override)",
         "  relay proof         : host-network reachability verified",
-        "  admitted targets    : preflight b1 b1_product b1_latency_basis b1_topology_probe",
+        "  admitted targets    : preflight b1_product",
     ):
         assert line in printed, f"{line!r} not in {printed}"
     assert "outside the sandbox" not in result.stdout, detail
@@ -705,7 +707,7 @@ def test_relay_successful_proof_reaches_preflight_ok_without_changing_b1(tmp_pat
     assert _shell_function(shipped, "relay_address_count") != (
         "relay_address_count() {\n  echo 0\n}\n"
     )
-    assert 'run_step "B1 CI-scale (resource-declared, gating)" b1' in launcher
+    assert 'run_step "B1 product promise (on-demand, gating)" b1_product' in launcher
     assert "    --network host \\\n" in launcher
     assert 'B1_RUN_DIR="$(mktemp -d -t dbagent-b1-XXXXXXXXXX)"' in launcher
 
@@ -714,7 +716,7 @@ def test_relay_invalid_request_value_exits_3(tmp_path: Path):
     """FP-RELAY-7: anything but the exact word, on a target that could have run."""
     quiet = tmp_path / "quiet"
     quiet_log = _shim(quiet, "docker")
-    for target, request in (("b1", "1"), ("preflight", "yes"), ("b1_latency_basis", "true")):
+    for target, request in (("b1_product", "1"), ("preflight", "yes")):
         result = _gate_counted("0", target, request, env=_path_with(quiet))
         detail = f"{target}/{request}: {result.stdout}{result.stderr}"
         assert result.returncode == 3, detail
@@ -723,7 +725,7 @@ def test_relay_invalid_request_value_exits_3(tmp_path: Path):
 
     ok_dir = tmp_path / "docker-ok"
     _shim(ok_dir, "docker", stdout="28.0.0")
-    legacy = _gate_counted("2", "b1", "not-prove", env=_path_with(ok_dir))
+    legacy = _gate_counted("2", "b1_product", "not-prove", env=_path_with(ok_dir))
     assert "rc=0" in legacy.stdout, legacy.stdout + legacy.stderr
     assert "PREFLIGHT_MODE=legacy" in legacy.stdout
     assert "relay_request_invalid" not in legacy.stderr

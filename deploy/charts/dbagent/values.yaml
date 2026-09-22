@@ -117,31 +117,35 @@ ingestGateway:
   # MAX_IN_FLIGHT, and carried cpus=16 rather than the reference 4. It
   # certified nothing and is not re-certified by the signature below.
   #
-  # B1-LATENCY-BASIS-1 owns the replacement warrant, and the coordinator
-  # recorded it below. A qualifying observation is an ordinary CI-scale
-  # `benchmark` run at ONE collection head on the ONE GC-3-selected CPU model
-  # (tests/benchmark/b1_topology_decision.json), meeting the unchanged
-  # CI-scale bar: 15000 offered, 15000 served and committed, zero errors,
-  # served rate >= 450/s, due-time p99 < 150 ms, max in flight < 500,
-  # platform online, a valid placement witness and a stable four-worker
-  # identity. `observations` holds exactly five such rows. Every MEASURED field
-  # of a row -- cost, profile, authority, cpus, cpu model, image, workers,
-  # reference topology, placement schema, served, committed, errors, p99,
-  # served rate, max in flight, platform-online, placement-ok and the two
-  # worker PID lists -- is copied verbatim from that run's canonical `B1 env=`
-  # line. Four fields are not keys on that line: `runId`, `headSha` and
-  # `topologyDecisionHeadSha` are the run's identity (workflow metadata and the
-  # GC-3 decision carrier), and `offered` is the CI-scale profile's fixed
-  # 15000-request offer -- the line reports what the run served, and it is
-  # `test_b1_ci_scale_reference_profile`, on the passing run itself, that
-  # proves exactly that many were offered. `collection.attempts`
-  # holds every dispatch from the first through the fifth accepted one, each
-  # either linked to its observation or discarded with its exact recorded
-  # route reason, failed B1 clause list or incomplete benchmark step.
+  # B1-LATENCY-BASIS-1 owned the replacement warrant, and the coordinator
+  # recorded it below. The five rows in `observations` are the RECORDED
+  # HISTORICAL observations that warrant produced: five ordinary CI-scale
+  # `benchmark` runs at ONE collection head on one exact CPU model, each
+  # meeting the CI-scale bar of the day -- 15000 offered, 15000 served and
+  # committed, zero errors, served rate >= 450/s, due-time p99 < 150 ms, max in
+  # flight < 500, platform online, a valid placement witness and a stable
+  # four-worker identity. Every MEASURED field of a row -- cost, profile,
+  # authority, cpus, cpu model, image, workers, reference topology, placement
+  # schema, served, committed, errors, p99, served rate, max in flight,
+  # platform-online, placement-ok and the two worker PID lists -- was copied
+  # verbatim from that run's canonical `B1 env=` line. Four fields are not keys
+  # on that line: `runId`, `headSha` and `topologyDecisionHeadSha` are the run's
+  # identity from workflow metadata, and `offered` is the CI-scale profile's
+  # fixed 15000-request offer. `collection.attempts` holds every dispatch from
+  # the first through the fifth accepted one, each either linked to its
+  # observation or discarded with its exact recorded route reason, failed B1
+  # clause list or incomplete benchmark step.
   # cpuMsPerRequest is max + (max - min) over exactly those five costs. No id,
   # cost or discard here is fabricated, copied from an investigation, or
   # written by a tool.
-  # tests/delivery/test_delivery_sizing_ledger.py is the gate.
+  #
+  # bench-on-demand (FP-BOD-9): this ledger is now HISTORY. The CI-scale route
+  # that produced these rows, and the live CPU-basis oracle that re-measured
+  # 1.585 against a fresh run, are both deleted. Nothing re-derives these
+  # figures and no row is added; a product-profile sample is a different offer
+  # rate and a different CPU layout, so it is evidence neither for nor against
+  # 1.585. tests/delivery/test_delivery_sizing_ledger.py is the gate, and it
+  # fails if a cost, the basis or the chart figures below change.
   sizingBasis:
     cpuMsPerRequest: 1.585
     signature:

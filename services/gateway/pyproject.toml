@@ -34,14 +34,12 @@ include = ["gateway*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# GC-1 FP-GC1-2: the closed routing-marker set. `b1_live` is every consumer of
-# a live B1 fixture (and the full-window instant-server self-witness);
-# `b1_product` narrows that to the product-promise nodes; `b1_latency_basis`
-# routes the unchanged CPU-basis oracle to the B1-LATENCY-BASIS-1 slice, which
-# neither GC-1 target selects.
+# GC-1 FP-GC1-2, narrowed by bench-on-demand FP-BOD-2: the closed routing-marker
+# set. `b1_live` is every consumer of a live B1 fixture (and the full-window
+# instant-server self-witness); `b1_product` narrows that to the product-promise
+# nodes, which are the whole live surface now that the CI-scale route, the
+# CPU-basis oracle and the GC-3 discovery sweep are deleted.
 markers = [
     "b1_live: consumes a live B1 fixture or the full-window driver self-witness; never traced",
     "b1_product: product-promise live node; selected only by scripts/integration-test.sh b1_product",
-    "b1_latency_basis: CPU-basis oracle owned by B1-LATENCY-BASIS-1; outside both GC-1 targets",
-    "b1_topology_probe: GC-3 discovery arm in b1_topology_probe_live.py; selected only by scripts/integration-test.sh b1_topology_probe",
 ]

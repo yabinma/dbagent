@@ -13,6 +13,7 @@ import copy
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -135,9 +136,9 @@ EXPECTED_CI_JOBS = {
     "benchmark",
     "images",
     "e2e",
-    # GC-3 FP-GC3-2: the manual discovery instrument. Conditional, independent
-    # (no needs:), and deliberately outside every gating chain.
-    "b1-topology-probe",
+    # bench-on-demand FP-BOD-5: the `v*` tag gate. Conditional, and upstream of
+    # `images` so a red record stops the push.
+    "release-bench-record",
 }
 GO_TEST_JOBS = {"unit-go", "functional", "benchmark", "manifest-guard"}
 GO_TOOLCHAIN_ENV_NAMES = {"CC", "CXX", "FC", "AR", "PKG_CONFIG"}
@@ -150,12 +151,15 @@ GUARDED_STEPS: dict[str, list[int]] = {
     "unit-gateway": [3],
     "unit-dashboard-api": [3],
     "unit-go": [7],
-    "functional": [9, 10],
-    # 17 and 21 are the two B1 wrappers (`... b1`, `... b1_latency_basis`):
-    # neither is a pytest nor a go test step, so both are checked by the bash
-    # operand grammar and EXPECTED_BASH_WRAPPER_COMMANDS instead of the
-    # guarded-step envelope.
-    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20],
+    # bench-on-demand FP-BOD-1: index 9 is the measured pytest step, which is
+    # now an unparsed reviewable literal (see EXPECTED_FUNCTIONAL_PYTEST_RUN),
+    # so the guarded-step envelope covers the Go step alone.
+    "functional": [10],
+    # bench-on-demand FP-BOD-1: the two B1 wrapper steps are deleted, so the
+    # benchmark job has no bash-wrapper step left at all and its indices close
+    # up. Steps 16 and 17 are the A10(v) hygiene gate and the B2/B10 node-id
+    # pytest; 18 is the sizing-ledger provenance gate.
+    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18],
     "manifest-guard": [5, 6],
 }
 
@@ -177,12 +181,15 @@ EXPECTED_NEEDS_GRAPH: dict[str, tuple[str, ...]] = {
         "unit-worker",
     ),
     "benchmark": ("functional",),
-    "images": ("lint",),
+    # bench-on-demand FP-BOD-5: `images` waits for the tag gate as well as
+    # lint, so a `v*` tag whose bench record is missing, stale or failing
+    # never reaches the GHCR push.
+    "images": ("lint", "release-bench-record"),
     "e2e": ("functional",),
-    # No edge at all, in either direction: the probe must start while the probe
-    # head's `functional` job is the known gc3_decision_missing red, and no
-    # ordinary job may wait on a 75-minute discovery sweep.
-    "b1-topology-probe": (),
+    # No edge at all: the record job reads a committed file and runs no
+    # benchmark, so nothing gates it and it gates only `images` through the
+    # `needs` above.
+    "release-bench-record": (),
 }
 assert set(EXPECTED_NEEDS_GRAPH) == EXPECTED_CI_JOBS
 
@@ -223,15 +230,6 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         ".venv/bin/python -m pytest tests/ --cov=dashboard_api "
         "--cov-report=term-missing --cov-fail-under=81",
     )],
-    "functional": [(
-        None,
-        "services/worker/.venv/bin/python -m pytest "
-        "services/worker/tests services/gateway/tests "
-        "services/dashboard-api/tests tests/functional tests/delivery "
-        "tests/mocks/llm -v --ignore=tests/functional/m2_probe_link "
-        "--ignore=services/gateway/tests/test_b1_ingest_burst.py "
-        "--ignore=tests/delivery/test_delivery_sizing_ledger.py",
-    )],
     "benchmark": [
         (None, "services/worker/.venv/bin/python -m pytest tests/functional/test_manifests.py -v"),
         (None, "services/worker/.venv/bin/python -m pytest "
@@ -244,7 +242,20 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         (None, "services/worker/.venv/bin/python -m pytest "
          "services/worker/tests/test_context_assembly.py"
          "::test_b14_prompt_build_under_200ms_and_no_latest_truncation -v"),
-        (None, "services/worker/.venv/bin/python -m pytest tests/benchmark/test_pg_scale.py -v -s"),
+        (None, "services/worker/.venv/bin/python -m pytest "
+         "tests/benchmark/test_pg_scale.py::test_b2_fingerprint_correlation_p99_under_20ms "
+         "tests/benchmark/test_pg_scale.py::test_b10_partitioned_list_and_filter_p99 "
+         "tests/benchmark/test_pg_scale.py::test_b11_host_parser_reuse_is_direct "
+         "tests/benchmark/test_pg_scale.py::test_b11_host_diagnostics_read_declared_sources "
+         "tests/benchmark/test_pg_scale.py::test_b11_host_reader_observes_real_proc_stat "
+         "tests/benchmark/test_pg_scale.py"
+         "::test_b11_storage_identity_reads_target_postgres_container "
+         "tests/benchmark/test_pg_scale.py"
+         "::test_b11_storage_identity_fails_soft_without_substituting_another_mount "
+         "tests/benchmark/test_pg_scale.py"
+         "::test_b11_diagnostics_schema_is_canonical_and_comma_safe "
+         "tests/benchmark/test_pg_scale.py"
+         "::test_b11_diagnostic_sampling_brackets_the_timed_window -v -s"),
         (None, "services/worker/.venv/bin/python -m pytest "
          "tests/delivery/test_delivery_sizing_ledger.py -v"),
     ],
@@ -254,21 +265,12 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
 }
 assert set(GUARDED_STEPS) == GO_TEST_JOBS | set(EXPECTED_PYTEST_COMMANDS)
 
-# GC-1 FP-GC1-2: the only bash-wrapper steps whose operands are pinned by
-# equality, kept as their own literal inventory rather than folded into the
-# pytest one -- _is_pytest_cmd correctly excludes them from that computation.
-# B1-LATENCY-BASIS-1 FP-B1LB-6 APPENDED index 21 without renumbering 0..20:
-# index 17 is the unchanged ordinary gate, index 21 the manual, opt-in,
-# conditional CPU-basis oracle that sits strictly after the FP-IG-23
-# provenance gate at index 20.
-EXPECTED_BASH_WRAPPER_COMMANDS: dict[str, list[tuple[int, str]]] = {
-    "benchmark": [
-        (17, "bash scripts/integration-test.sh b1"),
-        (21, "bash scripts/integration-test.sh b1_latency_basis"),
-    ],
-    # GC-3 FP-GC3-2: step 1, between the checkout and the always() upload.
-    "b1-topology-probe": [(1, "bash scripts/integration-test.sh b1_topology_probe")],
-}
+# bench-on-demand FP-BOD-1: EMPTY, and the emptiness is the pin. Every
+# `scripts/integration-test.sh` wrapper step is deleted -- the CI-scale gate,
+# the CPU-basis oracle and the topology sweep alike -- so no CI job delegates a
+# B1 run to the launcher at all. A re-added wrapper is extra, and
+# `test_ci_does_not_run_b1_or_b11` names it by target.
+EXPECTED_BASH_WRAPPER_COMMANDS: dict[str, list[tuple[int, str]]] = {}
 
 EXPECTED_E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short"
 EXPECTED_E2E_HYGIENE_COMMAND = (
@@ -287,6 +289,43 @@ EXPECTED_E2E_GITHUB_PATH_LINES = {
     'echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"',
 }
 
+# bench-on-demand FP-BOD-1/5 (design.md §3.2): the functional job's measured
+# step. It carries THREE pytest invocations in one body -- the broad functional
+# run, the tag-gate script's own branch-coverage run, and the B1 harness
+# coverage phase that moved here out of the deleted driver container -- because
+# FP-M6-31 A10(v) pins exactly one measured pytest STEP per guarded job,
+# immediately after the hygiene gate.
+#
+# It is pinned as an UNPARSED REVIEWABLE LITERAL, for the same reason the
+# images push body below is: the closed `run:` grammar refuses a quoted word
+# containing whitespace, and `-m "not b1_live and not b1_product"` is exactly
+# that. Byte equality is the stronger pin -- a pipe, a redirect, a command
+# substitution, a dropped `--ignore` or a widened marker expression all change
+# these bytes -- and `_b1_route_failures` plus
+# `test_on_demand_tier_is_covered_asserted_and_absent_from_ci` read the same
+# step for the B1 clauses specifically.
+EXPECTED_FUNCTIONAL_PYTEST_RUN = (
+    'services/worker/.venv/bin/python -m pytest \\\n'
+    '  services/worker/tests services/gateway/tests \\\n'
+    '  services/dashboard-api/tests \\\n'
+    '  tests/functional tests/delivery tests/mocks/llm -v \\\n'
+    '  --ignore=tests/functional/m2_probe_link \\\n'
+    '  --ignore=services/gateway/tests/test_b1_ingest_burst.py \\\n'
+    '  --ignore=tests/delivery/test_delivery_sizing_ledger.py\n'
+    'services/worker/.venv/bin/python -m pytest \\\n'
+    '  tests/functional/test_release_bench_record.py -v \\\n'
+    '  --cov=check_release_bench_record --cov-branch --cov-fail-under=81\n'
+    'env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 \\\n'
+    '  services/worker/.venv/bin/python -B -m coverage run --branch \\\n'
+    '  --data-file="$RUNNER_TEMP/b1-harness.coverage" \\\n'
+    '  -m pytest services/gateway/tests/test_b1_ingest_burst.py -v \\\n'
+    '  -m "not b1_live and not b1_product"\n'
+    'services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/b1_reference_profile.py,services/gateway/tests/test_b1_ingest_burst.py,scripts/b1-affinity-helper.py\n'
+    'services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/b1_reference_profile.py\n'
+    'services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/test_b1_ingest_burst.py\n'
+    'services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=scripts/b1-affinity-helper.py'
+)
+
 # (AG)(5): the images GHCR-push body is pinned as a reviewable literal — never
 # derived from the workflow file it is supposed to protect (review C2).
 EXPECTED_IMAGES_PUSH_RUN = (
@@ -300,11 +339,30 @@ EXPECTED_IMAGES_PUSH_RUN = (
     "done"
 )
 
+#: bench-on-demand FP-BOD-5: the tag gate's two bodies, byte-pinned. `git` and
+#: `python3` are outside the closed command-word grammar on purpose -- nothing
+#: else in this workflow runs either -- so the job's steps are pinned here
+#: instead of parsed.
+EXPECTED_RELEASE_RECORD_FETCH_RUN = "git fetch origin main:refs/remotes/origin/main"
+EXPECTED_RELEASE_RECORD_CHECK_RUN = "python3 scripts/check_release_bench_record.py"
+
+#: (AG)(5) exception list, bound beside the literals it names.
+PINNED_EXECUTABLE_RUNS = frozenset({
+    EXPECTED_FUNCTIONAL_PYTEST_RUN,
+    EXPECTED_RELEASE_RECORD_CHECK_RUN,
+})
+
 UNPARSED_RUN_STEPS: dict[str, list[str]] = {
-    "functional": [EXPECTED_CI_HYGIENE_RUN],
-    "benchmark": [EXPECTED_CI_HYGIENE_RUN, EXPECTED_CI_HYGIENE_RUN],
+    "functional": [EXPECTED_CI_HYGIENE_RUN, EXPECTED_FUNCTIONAL_PYTEST_RUN],
+    # bench-on-demand FP-BOD-1: one hygiene gate, not two -- the gate that
+    # existed only immediately before the deleted B1 step went with it.
+    "benchmark": [EXPECTED_CI_HYGIENE_RUN],
     "manifest-guard": [EXPECTED_CI_HYGIENE_RUN],
     "images": [EXPECTED_IMAGES_PUSH_RUN],
+    "release-bench-record": [
+        EXPECTED_RELEASE_RECORD_FETCH_RUN,
+        EXPECTED_RELEASE_RECORD_CHECK_RUN,
+    ],
 }
 
 
@@ -328,11 +386,17 @@ RUN_COMMAND_WORDS = frozenset({
     "services/worker/.venv/bin/python",
     "services/gateway/.venv/bin/pip",
     "services/dashboard-api/.venv/bin/pip",
+    # bench-on-demand FP-BOD-1 (design.md §3.2): the B1 harness coverage
+    # command runs under `env -u PYTHON_VERSION …`, exactly as the deleted
+    # driver container ran it. Admitting the word does not admit a shape: the
+    # guarded-step checks below still reject a pipe, a redirect, a command
+    # substitution and an inline assignment in the same step.
+    "env",
 })
-assert len(RUN_COMMAND_WORDS) == 19
+assert len(RUN_COMMAND_WORDS) == 20
 
 GUARDED_STEP_COMMAND_WORDS = frozenset({
-    "go", "bash", ".venv/bin/python", "services/worker/.venv/bin/python",
+    "go", "bash", ".venv/bin/python", "services/worker/.venv/bin/python", "env",
 })
 BASH_SCRIPTS = frozenset({
     # GC-1 FP-GC1-2: the B1 benchmark step is a wrapper around the tracked
@@ -390,11 +454,18 @@ _BRACED_PARAM_RE = re.compile(
 )
 
 CONDITIONAL_JOBS = {
-    # GC-3 FP-GC3-2: manual only, and only when asked for by name. `== true`
-    # rather than a truthiness test: a `workflow_dispatch` boolean arrives as a
-    # real boolean, and a string comparison would run the sweep on "false".
-    "b1-topology-probe": (
-        "github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true"
+    # bench-on-demand FP-BOD-5: the tag gate, and nothing else. The condition
+    # is on the ref alone -- it is not a condition on B1 or B11, which this
+    # job never runs.
+    "release-bench-record": "startsWith(github.ref, 'refs/tags/v')",
+    # bench-on-demand FP-BOD-5: `always()` is what lets `images` run on a pull
+    # request, where the record job is skipped. A FAILED record job is neither
+    # `success` nor `skipped`, so the images job does not build and does not
+    # push. This is the `v*` tag gate, pinned by equality.
+    "images": (
+        "always() && needs.lint.result == 'success' && "
+        "(needs.release-bench-record.result == 'success' || "
+        "needs.release-bench-record.result == 'skipped')"
     ),
     "e2e": (
         "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || "
@@ -404,25 +475,148 @@ CONDITIONAL_JOBS = {
 }
 CONDITIONAL_STEPS = {
     "images": [(7, "github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')")],
-    # FP-E2EB1D-9: the success-only B1 diagnostics upload at index 7, and the
-    # byte-identical failure upload shifted to 8. Two conditional steps, both
-    # LAST in the job and both after the pytest step, so neither can convert
-    # the e2e command's exit status into success.
-    "e2e": [(7, "success()"), (8, "failure()")],
-    # The upload is the ONLY conditional step of the probe job, and it is the
-    # last one: `always()` makes a broken sweep surface its invalid artifact
-    # without ever masking step 1's exit status.
-    "b1-topology-probe": [(2, "always()")],
-    # B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated CPU-basis oracle is the ONLY
-    # conditional step of the benchmark job and the last one. `== true` rather
-    # than a truthiness test: a workflow_dispatch boolean arrives as a real
-    # boolean and a string comparison would run the oracle on "false". The
-    # explicit condition inherits Actions' implicit success(), so step 21
-    # cannot run while the FP-IG-23 provenance gate at step 20 is red.
-    "benchmark": [
-        (21, "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true")
-    ],
+    # bench-on-demand FP-BOD-8: the success-only B1 diagnostics upload is
+    # deleted with the module that wrote its file, so the failure upload
+    # shifts back to index 7. It is LAST in the job and after the e2e command,
+    # so it cannot convert that command's exit status into success.
+    "e2e": [(7, "failure()")],
 }
+
+
+#: The command words a PINNED body may begin a line with. It is the ordinary
+#: closed set plus the two the tag gate needs: the record checker runs on the
+#: runner's own stdlib interpreter, and the release branch is fetched with
+#: git. Neither word is admitted anywhere the grammar parses, so neither can
+#: enter the workflow except through a byte-pinned literal above.
+#: The command words a PINNED line may BEGIN with. Deliberately far narrower
+#: than COMMAND_OPERANDS: the parsed grammar admits `curl`, `tar`, `sudo`,
+#: `source`, `helm`, `npm` and friends because setup steps legitimately need
+#: them, and a MEASURED step never does. Only these five can head a line in a
+#: body that skips the parser.
+PINNED_BODY_COMMAND_WORDS = frozenset({
+    "bash", "env", "git", "python3",
+    ".venv/bin/python", "services/worker/.venv/bin/python",
+})
+#: The only modules a pinned body may select with python's own `-m`.
+PINNED_BODY_PYTHON_MODULES = frozenset({"pytest", "coverage"})
+#: `git`'s only admitted subcommand here: the tag gate fetches the release
+#: branch so ancestry is answerable, and does nothing else.
+PINNED_BODY_GIT_SUBCOMMANDS = frozenset({"fetch"})
+#: Flags that turn any of the heads above into a general interpreter. `-c`
+#: is the whole point of the S1 gap: `bash -c '…'`, `python3 -c '…'` and
+#: `sh -c '…'` all run arbitrary text that no operand rule can read.
+PINNED_BODY_FORBIDDEN_FLAGS = frozenset({
+    "-c", "--command", "-exec", "--exec", "-e", "--eval", "-i", "--interactive",
+})
+
+
+def _pinned_body_is_python(word: str) -> bool:
+    base = word.rsplit("/", 1)[-1]
+    return base in {"python", "python3"} or base.startswith("python3.")
+
+
+def _pinned_body_operand_failures(tokens: "list[str]") -> list[str]:
+    """The operand grammar, restated for one line of a pinned body.
+
+    `_check_operands` decides this for every PARSED step; a pinned body never
+    reaches it, so the same questions are asked here. It is not a paraphrase
+    of that function -- it is stricter, because the shapes a measured step may
+    take are a small subset of the shapes a setup step may take.
+    """
+    fails: list[str] = []
+    head = tokens[0]
+    for flag in tokens:
+        if flag in PINNED_BODY_FORBIDDEN_FLAGS:
+            fails.append(f"carries the interpreter flag {flag!r}")
+    if head == "bash":
+        script = next((t for t in tokens[1:] if not t.startswith("-")), None)
+        if script not in BASH_SCRIPTS:
+            fails.append(f"bash runs {script!r}, which is not an admitted script")
+        # bench-on-demand FP-BOD-1: the parsed grammar admits the tracked
+        # launcher because a setup step legitimately may call it. A MEASURED
+        # step may not: no CI job delegates a B1 run any more.
+        if script == "scripts/integration-test.sh":
+            fails.append("a measured body delegates to the tracked launcher")
+        return fails
+    if head == "git":
+        subcommand = tokens[1] if len(tokens) > 1 else None
+        if subcommand not in PINNED_BODY_GIT_SUBCOMMANDS:
+            fails.append(f"git runs {subcommand!r}")
+        return fails
+    rest = tokens
+    if head == "env":
+        index = 1
+        while index < len(rest) and rest[index] == "-u":
+            index += 2  # `-u NAME`: an UNSET, never a binding
+        if index >= len(rest) or not _pinned_body_is_python(rest[index]):
+            fails.append("env does not wrap an admitted interpreter")
+            return fails
+        rest = rest[index:]
+    if not _pinned_body_is_python(rest[0]):
+        fails.append(f"line head {head!r} is not an admitted command word")
+        return fails
+    # A python-family command either selects an admitted module with `-m`, or
+    # runs exactly one tracked `.py` file and nothing else.
+    module_flags = [i for i, t in enumerate(rest) if t == "-m"]
+    if not module_flags:
+        positional = [t for t in rest[1:] if not t.startswith("-")]
+        if len(positional) != 1 or not positional[0].endswith(".py"):
+            fails.append(f"python runs {positional!r}, not one tracked script")
+        return fails
+    seen_pytest = False
+    for i in module_flags:
+        value = rest[i + 1] if i + 1 < len(rest) else None
+        if seen_pytest:
+            continue  # pytest's own `-m`: a marker expression, not a module
+        if value not in PINNED_BODY_PYTHON_MODULES:
+            fails.append(f"python -m selects {value!r}")
+        seen_pytest = seen_pytest or value == "pytest"
+        seen_pytest = seen_pytest or "pytest" in rest[: i + 1]
+    return fails
+
+
+def _pinned_body_escape_failures(body: str) -> list[str]:
+    """Every property the closed grammar would have decided, on raw bytes.
+
+    A pinned body skips `_shell_words`, so this restates the rules rather than
+    trusting the pin alone: the byte equality says the body did not change,
+    and this says the body that was pinned is admissible in the first place.
+    Shape first (no metacharacter can build a second command), then the
+    operand grammar line by line.
+    """
+    fails: list[str] = []
+    collapsed = _delete_continuations(body)
+    for token in ("|", ">", "<", "`", "$(", "&", ";", "(", ")", "{", "}"):
+        if token in collapsed:
+            fails.append(f"carries {token!r}")
+    for escape in ("--deselect", "continue-on-error", "|| true", "-p ", " -O", "--pdb",
+                   "--exitfirst", "-x ", "pytest.mark.skip", "pytest.mark.xfail"):
+        if escape in collapsed:
+            fails.append(f"carries the escape {escape!r}")
+    for line in collapsed.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        head = stripped.split(" ", 1)[0]
+        if head not in PINNED_BODY_COMMAND_WORDS:
+            fails.append(f"line head {head!r} is not an admitted command word")
+            continue
+        if "=" in head:
+            fails.append(f"inline assignment {head!r}")
+            continue
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            fails.append(f"line does not tokenise: {stripped[:60]!r}")
+            continue
+        fails.extend(_pinned_body_operand_failures(tokens))
+    # A PYTHON*/PYTEST* key may only be UNSET here, never bound.
+    for word in collapsed.split():
+        if "=" in word:
+            name = word.split("=", 1)[0].lstrip("-")
+            if _is_forbidden_py_env_key(name) or _is_forbidden_go_env_key(name):
+                fails.append(f"binds the forbidden env key {name!r}")
+    return fails
 
 
 def _load(path: Path) -> dict:
@@ -2374,12 +2568,7 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
     run_data = _collect_run_parse(workflow)
 
     # UNPARSED equality — pin is a hard-coded literal (AG)(5) / review C2
-    unparsed_expected: dict[str, list[str]] = {
-        "functional": [EXPECTED_CI_HYGIENE_RUN],
-        "benchmark": [EXPECTED_CI_HYGIENE_RUN, EXPECTED_CI_HYGIENE_RUN],
-        "manifest-guard": [EXPECTED_CI_HYGIENE_RUN],
-        "images": [EXPECTED_IMAGES_PUSH_RUN],
-    }
+    unparsed_expected: dict[str, list[str]] = dict(UNPARSED_RUN_STEPS)
 
     for jn, rows in run_data.items():
         refused = [run.strip() for i, run, parsed in rows if parsed is None]
@@ -2388,12 +2577,30 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
             add("run_not_recognized", f"{jn} unparsed mismatch")
 
     # (AG)(5) belt: no *pinned* unreadable string may contain lowercase
-    # go / python / pytest (case-sensitive). Hygiene legitimately holds
-    # PYTHON/PYTEST uppercase only.
+    # go / python / pytest (case-sensitive), because an unparsed body escapes
+    # the operand grammar. Hygiene legitimately holds PYTHON/PYTEST uppercase
+    # only.
+    #
+    # bench-on-demand (FP-BOD-1/5) introduces exactly two exceptions, both
+    # named constants and both byte-pinned above. They exist because the
+    # closed grammar refuses a quoted word containing whitespace, and the B1
+    # harness selection `-m "not b1_live and not b1_product"` is exactly that
+    # -- as is every pytest marker expression, since `not X` has a space in
+    # it. Rather than drop the belt, each exception is put through
+    # `_pinned_body_escape_failures`, which restates, on the same bytes, every
+    # property the grammar would have decided: no pipe, redirect, command
+    # substitution, backquote, `&&`, `;`, `||`, inline assignment, plugin
+    # injection, interpreter optimisation flag, deselection or masking, and
+    # nothing but admitted command words at the head of each line.
     for jn, pinned_list in unparsed_expected.items():
         for r in pinned_list:
-            if "go" in r or "python" in r or "pytest" in r:
+            if not ("go" in r or "python" in r or "pytest" in r):
+                continue
+            if r not in PINNED_EXECUTABLE_RUNS:
                 add("run_not_recognized", f"{jn} pinned contains go|python|pytest")
+                continue
+            for reason in _pinned_body_escape_failures(r):
+                add("run_not_recognized", f"{jn} pinned body {reason}")
 
     # lexical GITHUB_ENV ban and flag scans over words
     go_test_jobs_found: set[str] = set()
@@ -2695,22 +2902,24 @@ def _covered_py_links(root: Path = REPO_ROOT) -> list[str]:
     return links
 
 
-#: e2e-b1-kind-policy: the nested kind diagnostic test. It is deliberately NOT
-#: one of B1's threshold-bearing links -- its due-time p99 is observational --
-#: so nothing in `thresholds.yaml` would otherwise carry `tests/e2e/` into the
-#: collection-suppression guard below. This constant does, explicitly.
-B1_NESTED_DIAGNOSTIC_LINK = (
+#: bench-on-demand FP-BOD-8: the nested kind burst. It is deliberately NOT one
+#: of B1's threshold-bearing links -- it carries no latency comparison at all
+#: since the p99 tape was deleted -- so nothing in `thresholds.yaml` would
+#: otherwise carry `tests/e2e/` into the collection-suppression guard below.
+#: This constant does, explicitly: its eleven correctness clauses still fail
+#: the e2e job, and a suppressed collection would silence all eleven.
+B1_NESTED_CORRECTNESS_LINK = (
     "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
 )
 
 
 def _collection_guard_links(root: Path = REPO_ROOT) -> list[str]:
-    """Covered threshold links PLUS the nested diagnostic path.
+    """Covered threshold links PLUS the nested correctness path.
 
     Collection reachability and threshold-bearingness are different claims: a
     test that decides nothing numerically must still be collected and run.
     """
-    return [*_covered_py_links(root), B1_NESTED_DIAGNOSTIC_LINK]
+    return [*_covered_py_links(root), B1_NESTED_CORRECTNESS_LINK]
 
 
 def _chain_dirs(root: Path, links: list[str]) -> set[Path]:
@@ -3545,7 +3754,10 @@ def test_threshold_assertion_fixture_count():
     assert len(THRESHOLD_ASSERTION_FIXTURES) == 38
     assert len(THRESHOLD_ASSERTION_POSITIVE_CONTROLS) == 14
     assert len(LINK_LOOP_FIXTURES) == 9
-    assert len(CI_PIN_FIXTURES) == 110
+    # bench-on-demand FP-BOD-1 retired one row with the B1 wrapper step it
+    # mutated; the count is the remaining list, not a smaller integer over the
+    # same ids.
+    assert len(CI_PIN_FIXTURES) == 109
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -3830,43 +4042,48 @@ def _ci_pin_workflow_cases():
         lambda wf: _b9_step(wf).__setitem__("shell", "python"),
     )
 
+    # bench-on-demand FP-BOD-1: the functional job's measured step is pinned
+    # as a reviewable literal (the closed grammar refuses its quoted marker
+    # expression), so an edit to it is `run_not_recognized` rather than
+    # `pytest_command_drift` -- and it is BYTE equality, so an added `-o`
+    # override, a widened `--ignore` and a prepended `source` are all caught.
     def override_ini(wf):
         r = wf["jobs"]["functional"]["steps"][9]["run"]
         wf["jobs"]["functional"]["steps"][9]["run"] = (
             r.rstrip() + ' -o "python_functions=test_ci_*"\n'
         )
 
-    add("functional_pytest_gains_an_override_ini", "pytest_command_drift", override_ini)
+    add("functional_pytest_gains_an_override_ini", "run_not_recognized", override_ini)
 
-    # Step 17 is the B1 bash wrapper since GC-1; 19 is the surviving benchmark
-    # pytest step (B2/B10/B11), so the two pytest mutations move there.
+    # Step 17 is the surviving benchmark pytest step (B2/B10 node ids) since
+    # the two B1 wrapper steps were deleted.
     def config_flag(wf):
-        r = wf["jobs"]["benchmark"]["steps"][19]["run"]
-        wf["jobs"]["benchmark"]["steps"][19]["run"] = r.rstrip() + " -c /tmp/alt.ini\n"
+        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
+        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + " -c /tmp/alt.ini\n"
 
     add("benchmark_pytest_gains_a_config_flag", "pytest_command_drift", config_flag)
 
     def deselect(wf):
-        r = wf["jobs"]["benchmark"]["steps"][19]["run"]
-        wf["jobs"]["benchmark"]["steps"][19]["run"] = r.rstrip() + (
-            " --deselect tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput\n"
+        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
+        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + (
+            " --deselect tests/benchmark/test_pg_scale.py::test_b2_fingerprint_correlation_p99_under_20ms\n"
         )
 
     add("benchmark_pytest_gains_a_deselection", "pytest_command_drift", deselect)
 
-    # The wrapper is rejected by the bash operand grammar, not by the pytest
-    # inventory: an added option word is command_operand_drift.
-    def wrapper_option(wf):
-        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
-        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + " --unexpected-option\n"
-
-    add("benchmark_b1_wrapper_gains_an_option_word", "command_operand_drift", wrapper_option)
+    # bench-on-demand FP-BOD-1: the `benchmark_b1_wrapper_gains_an_option_word`
+    # case is RETIRED with the wrapper step it mutated -- no CI job delegates a
+    # B1 run to the launcher any more. Its replacement has the opposite
+    # polarity and a different owner: `_B1_ROUTE_MUTATIONS`'s
+    # `b1_wrapper_returned_to_ci` puts a wrapper step back and requires
+    # `wrapper_inventory_drift`, and `test_ci_does_not_run_b1_or_b11` names the
+    # target. There is nothing for a wrapper-shape fixture to mutate here.
 
     def ignore_wide(wf):
         r = wf["jobs"]["functional"]["steps"][9]["run"]
         wf["jobs"]["functional"]["steps"][9]["run"] = r.rstrip() + " --ignore=tests/functional\n"
 
-    add("functional_pytest_ignore_widened", "pytest_command_drift", ignore_wide)
+    add("functional_pytest_ignore_widened", "run_not_recognized", ignore_wide)
     add(
         "unit_gateway_pytest_working_directory_changed",
         "pytest_command_drift",
@@ -3953,7 +4170,7 @@ def _ci_pin_workflow_cases():
         r = wf["jobs"]["functional"]["steps"][9]["run"]
         wf["jobs"]["functional"]["steps"][9]["run"] = "source deploy/versions.env\n" + r
 
-    add("source_command_inside_a_guarded_step", "guarded_step_shape", source_guarded)
+    add("source_command_inside_a_guarded_step", "run_not_recognized", source_guarded)
 
     def redir(wf):
         r = wf["jobs"]["benchmark"]["steps"][14]["run"]
@@ -4144,20 +4361,32 @@ def _ci_pin_workflow_cases():
         lambda wf: wf["jobs"]["e2e"].__setitem__("needs", "benchmark"),
     )
     # FP-E2EB1D-9 negative fixtures for the new conditional-step data.
+    # bench-on-demand FP-BOD-8: the success-only B1 diagnostics upload is
+    # deleted, so the failure upload is index 7 again. Re-adding a
+    # success-conditioned upload, and widening the failure upload's condition,
+    # are both drift.
     add(
-        "e2e_b1_diagnostics_success_upload_condition_widened",
+        "e2e_b1_diagnostics_success_upload_returns",
         "step_envelope_drift",
-        lambda wf: wf["jobs"]["e2e"]["steps"][7].__setitem__("if", "always()"),
+        lambda wf: wf["jobs"]["e2e"]["steps"].insert(
+            7,
+            {
+                "name": "Upload B1 diagnostics on success",
+                "if": "success()",
+                "uses": "actions/upload-artifact@v4",
+                "with": {"name": "e2e-b1-diagnostics", "path": "/tmp/rca-e2e/x.txt"},
+            },
+        ),
     )
     add(
-        "e2e_b1_diagnostics_success_upload_removed",
+        "e2e_failure_upload_removed",
         "step_envelope_drift",
         lambda wf: wf["jobs"]["e2e"]["steps"].pop(7),
     )
     add(
         "e2e_failure_upload_condition_replaced_after_the_shift",
         "step_envelope_drift",
-        lambda wf: wf["jobs"]["e2e"]["steps"][8].__setitem__("if", "always()"),
+        lambda wf: wf["jobs"]["e2e"]["steps"][7].__setitem__("if", "always()"),
     )
     add(
         "e2e_if_drops_main_push_clause",
@@ -4433,7 +4662,7 @@ def test_ci_pins_the_checker_assumptions():
     run_sh = (REPO_ROOT / "tests/e2e/run.sh").read_text(encoding="utf-8")
     assert _e2e_runner_failures(run_sh) == []
     links = _collection_guard_links(REPO_ROOT)
-    assert B1_NESTED_DIAGNOSTIC_LINK in links
+    assert B1_NESTED_CORRECTNESS_LINK in links
     assert _pytest_collection_failures(REPO_ROOT, links) == []
     env_min = {"PATH": "/usr/bin:/bin", "HOME": "/tmp", "LC_ALL": "C"}
     r0 = subprocess.run(["/bin/bash", "-e", "-c", EXPECTED_E2E_HYGIENE_COMMAND], env=env_min)
@@ -4494,9 +4723,6 @@ def test_ci_pin_rejects_known_drift(case_id, kind, expected, mutator, tmp_path: 
 # ---------------------------------------------------------------------------
 
 B1_LAUNCHER = REPO_ROOT / "scripts" / "integration-test.sh"
-B1_CI_SCALE_LINK = (
-    "services/gateway/tests/test_b1_ingest_burst.py::test_b1_ci_scale_reference_profile"
-)
 B1_PRODUCT_LINK = (
     "services/gateway/tests/test_b1_ingest_burst.py::test_b1_product_exclusive_reference_profile"
 )
@@ -4525,29 +4751,16 @@ B1_ROUTE_CLAUSES: tuple[str, ...] = (
     # the launcher's own available CPUs, read before any role is narrowed
     'affinity="$(taskset -pc $$ 2>/dev/null | sed \'s/.*: *//\')"',
     "b1_expand_cpu_list \"$affinity\" | sort -n -u",
-    'if [ "${#cpus[@]}" -lt 4 ]; then',
     'if [ "${#cpus[@]}" -lt 8 ]; then',
     # the closed schema-2 product-local launch contract, affinity mechanism.
-    # GC-3 (FP-GC3-4): the ordinary CI-scale contract is no longer written by
-    # this shell at all -- `contract-selected` renders the ratified schema-3
-    # document -- so its literals are deliberately absent here.
+    # bench-on-demand (FP-BOD-2): it is the ONLY contract this shell writes.
+    # The schema-3 topology document, the carrier read, the route record and
+    # the `contract-selected` render are deleted with the CI-scale route, and
+    # their literals are pinned ABSENT in B1_RETIRED_ROUTE_CLAUSES below.
     '"schema": 2,',
     '"mechanism": "sched-affinity",',
     '"profile": "product-exclusive",',
     '"minimumHostLogicalCpus": 8,',
-    # the pre-placement route, its one closed read, and the ratified contract
-    'python3 "$B1_PROBE_PLANNER" route \\',
-    '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \\',
-    '--out "$B1_ROUTE_RECORD"',
-    "IFS=$'\\t' read -r route_disposition route_topology < <(",
-    'python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"',
-    'B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-'
-    '${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"',
-    'python3 "$B1_PROBE_PLANNER" contract-selected \\',
-    '--topology "$route_topology" \\',
-    '--pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \\',
-    '--run-id "$B1_RUN_ID" \\',
-    '--out "$B1_RUN_DIR/placement.json"',
     '"gateway": {"allowedCpus": "${gateway_cpus}"},',
     '"postgres": {"allowedCpus": "${postgres_cpus}"},',
     '"driver": {"allowedCpus": "${driver_cpus}"}',
@@ -4567,6 +4780,24 @@ B1_ROUTE_CLAUSES: tuple[str, ...] = (
     # the purge container is censused too: force-remove, then verify
     '    docker rm -f $ids >/dev/null 2>&1\n    ids="$(docker ps -aq --filter '
     '"label=${B1_RUN_LABEL_KEY}=${B1_RUN_ID}" 2>/dev/null)"',
+)
+
+#: bench-on-demand FP-BOD-2: every route the slice deleted, pinned ABSENT.
+#: A half-revert that puts one of these back is a named failure rather than a
+#: silently reinstated CI-scale gate.
+B1_RETIRED_ROUTE_CLAUSES: tuple[str, ...] = (
+    "b1_topology_probe",
+    "b1_latency_basis",
+    "B1_PROBE_PLANNER",
+    "B1_ROUTE_RECORD",
+    "contract-selected",
+    "route-fields",
+    "b1_topology_decision.json",
+    "b1_write_coverage_driver",
+    "driver-coverage.sh",
+    "driver-live.sh",
+    "basis-oracle-preflight",
+    "basis-oracle-route",
 )
 
 # The runner image declares VOLUME mountpoints under /workspace, and the
@@ -4623,7 +4854,7 @@ def _b1_mountpoint_failures(launcher: str) -> list[str]:
     prepare = [ln.strip() for ln in _b1_target_region(launcher, "b1_prepare").splitlines()]
     if mkdirs[0] not in prepare:
         add("volume_mountpoint_mkdir_outside_prepare", mkdirs[0])
-    for target in ("b1", "b1_product"):
+    for target in ("b1_product",):
         region = [ln.strip() for ln in _b1_target_region(launcher, target).splitlines()]
         prepared = next((i for i, ln in enumerate(region) if ln.startswith("b1_prepare")), None)
         started = next((i for i, ln in enumerate(region) if ln.startswith("b1_run_driver")), None)
@@ -4818,40 +5049,29 @@ def _b1_cleanup_failures(launcher: str) -> list[str]:
                 add("purge_mounts_more_than_the_run_dir", mount)
 
     # (5) every consumer gates on BOTH flags, on every path that can return
-    # success. GC-3 (FP-GC3-4) gave the ordinary target two such paths -- the
-    # recorded, no-live route and the gating route's live exit -- so the gate
-    # is counted, not merely looked for: one of two is a cleanup failure the
-    # recorded route would swallow.
-    for target, expected in (("b1", 2), ("b1_product", 1)):
+    # success. bench-on-demand (FP-BOD-2) left ONE such consumer and ONE such
+    # path: the product target's live exit. The recorded, no-live route that
+    # needed a second gate is deleted with the CI-scale target.
+    for target, expected in (("b1_product", 1),):
         observed = _uncommented(_b1_target_region(launcher, target)).count(B1_CLEANUP_GATE)
         if observed != expected:
             add("consumer_ignores_the_run_dir_failure", f"{target} {observed}/{expected}")
-
-    # ... and the arm loop names the one that actually happened.
-    arm = _uncommented(_b1_target_region(launcher, "b1_topology_probe_arm"))
-    if not arm:
-        add("arm_target_missing")
-        return fails
-    if "B1_RUN_DIR_FAILED=0" not in arm:
-        add("arm_does_not_reset_the_run_dir_flag")
-    if arm.count(B1_CONTAINER_VERDICT) != 1:
-        add("arm_container_verdict_inventory_drift", str(arm.count(B1_CONTAINER_VERDICT)))
-    if arm.count(B1_RUN_DIR_VERDICT) != 1:
-        add("arm_run_dir_verdict_inventory_drift", str(arm.count(B1_RUN_DIR_VERDICT)))
-    for flag, verdict in (
-        ("B1_CLEANUP_FAILED", B1_CONTAINER_VERDICT),
-        ("B1_RUN_DIR_FAILED", B1_RUN_DIR_VERDICT),
-    ):
-        gate = f'if [ "${flag}" -ne 0 ]; then'
-        if gate not in arm:
-            add("arm_gate_missing", flag)
-            continue
-        branch = arm.split(gate, 1)[1].split("\n  fi", 1)[0]
-        if verdict not in branch:
-            add("arm_gate_reports_the_other_failure", flag)
-        if "return 1" not in branch:
-            add("arm_gate_does_not_stop_the_sweep", flag)
     return fails
+
+
+def _b1_retired_arm_failures(launcher: str) -> list[str]:
+    """FP-BOD-2: the sweep's per-arm lifecycle is deleted, not weakened.
+
+    The 28-arm discovery sweep had its own cleanup contract -- reset the run
+    directory flag, one container verdict, one run-directory verdict, a
+    `return 1` on each -- because an arm that leaked a container contended
+    with the next measurement. There is no sweep any more, so there is nothing
+    to hold to that contract; what stays is that the target cannot come back
+    quietly, since a re-added arm would be running an unpinned lifecycle.
+    """
+    if _uncommented(_b1_target_region(launcher, "b1_topology_probe_arm")):
+        return ["retired_arm_target_survives"]
+    return []
 
 
 def _b1_target_region(launcher: str, target: str) -> str:
@@ -4915,61 +5135,20 @@ def _b1_affinity_failures(launcher: str) -> list[str]:
 
 
 def _b1_ordinary_route_order_failures(launcher: str) -> list[str]:
-    """GC-3 FP-GC3-4: the ordinary b1 region's order, read once, top to bottom.
+    """FP-BOD-2: the ordinary CI-scale route is deleted, and stays deleted.
 
-    Four facts, each positional, because each of them is exactly what a
-    plausible refactor would move: the allowed CPU set is read ONCE and the
-    one-CPU floor is evaluated on it before anything else; the container-free
-    coverage phase runs before routing; the four-CPU floor is evaluated on that
-    SAME retained array only inside the selected `gating` branch; and the
-    driver-side role mapping is rendered by `contract-selected`, never by a
-    `${cpus[N]}` literal in shell.
+    What this used to pin -- read the allowed CPU set once, run the traced
+    coverage phase, evaluate the four-CPU floor inside the `gating` branch,
+    render the role mapping through `contract-selected` -- described a target
+    that no longer exists. The positive half moved to the product route's own
+    checks in `_b1_affinity_failures`; what remains here is the absence.
     """
     fails: list[str] = []
-    region = _b1_target_region(launcher, "b1")
-    if not region:
-        return ["affinity_target_missing b1"]
-    lines = [ln.strip() for ln in region.splitlines()]
-
-    def first(predicate) -> "int | None":
-        return next((i for i, ln in enumerate(lines) if predicate(ln)), None)
-
-    for role in ("gateway", "postgres", "driver"):
-        if any(_B1_ROLE_SELECTION_RE.match(ln) and ln.startswith(role) for ln in lines):
-            fails.append(f"ordinary_b1_role_literal_survives {role}")
-    if _B1_CPU_INDEX_RE.search(region.replace('"${cpus[0]}"', "", 1)):
-        fails.append("ordinary_b1_indexes_the_cpu_array_more_than_once")
-    reads = [i for i, ln in enumerate(lines) if ln.startswith("mapfile -t cpus <")]
-    if len(reads) != 1:
-        fails.append(f"ordinary_b1_cpu_set_read_inventory_drift {len(reads)}")
-        return fails
-    one_cpu = first(lambda ln: ln == 'if [ "${#cpus[@]}" -lt 1 ]; then')
-    coverage = first(lambda ln: "driver-coverage.sh" in ln and ln.startswith("b1_run_driver"))
-    routed = first(
-        lambda ln: ln.startswith('python3 "$B1_PROBE_PLANNER" route') and ln.endswith("\\")
-    )
-    fields = first(lambda ln: 'route-fields --route "$B1_ROUTE_RECORD"' in ln)
-    four_cpu = first(lambda ln: ln == 'if [ "${#cpus[@]}" -lt 4 ]; then')
-    pairs = first(lambda ln: ln.startswith("mapfile -t sibling_pairs <"))
-    contract = first(lambda ln: "contract-selected" in ln)
-    live = first(lambda ln: "driver-live.sh" in ln and ln.startswith("b1_run_driver"))
-    order = {
-        "one_cpu_floor": one_cpu,
-        "coverage_phase": coverage,
-        "route": routed,
-        "route_fields": fields,
-        "four_cpu_floor": four_cpu,
-        "pair_discovery": pairs,
-        "contract_selected": contract,
-        "live_phase": live,
-    }
-    missing = sorted(name for name, index in order.items() if index is None)
-    if missing:
-        fails.append(f"ordinary_b1_route_step_missing {missing}")
-        return fails
-    positions = list(order.values())
-    if positions != sorted(positions) or reads[0] > one_cpu:
-        fails.append(f"ordinary_b1_route_order_drift {order}")
+    if _b1_target_region(launcher, "b1"):
+        fails.append("retired_ci_scale_target_survives")
+    for retired in ("b1_latency_basis", "b1_topology_probe", "b1_write_coverage_driver"):
+        if _b1_target_region(launcher, retired):
+            fails.append(f"retired_target_survives {retired}")
     return fails
 
 
@@ -4980,36 +5159,23 @@ B1_ENV_UNSET_PREFIX = (
 B1_PYCACHE_FLAG = "-X pycache_prefix=/run/dbagent-b1/pycache"
 # The three files this slice changes. Coverage is reported over exactly these,
 # once as an aggregate and once per file, all at --fail-under=81.
+# bench-on-demand FP-BOD-1 (design.md §3.2): the coverage phase moved out of
+# the deleted driver container into the functional job, so the paths are
+# REPOSITORY-RELATIVE now rather than rooted at the container's /workspace
+# mount, and the deleted probe module left the list. The bar is unchanged.
 B1_COVERED_FILES = (
-    "/workspace/services/gateway/tests/b1_reference_profile.py",
-    "/workspace/services/gateway/tests/test_b1_ingest_burst.py",
-    "/workspace/scripts/b1-affinity-helper.py",
-    # GC-3 FP-GC3-1/2/3: the stdlib-only enumerator/parser/collector/selector.
-    # It joins the aggregate AND the exact per-file report at the same bar --
-    # it is container-free helper code, so no substitute applies to it.
-    "/workspace/services/gateway/tests/b1_topology_probe.py",
+    "services/gateway/tests/b1_reference_profile.py",
+    "services/gateway/tests/test_b1_ingest_burst.py",
+    "scripts/b1-affinity-helper.py",
 )
 B1_COVERAGE_FAIL_UNDER = "--fail-under=81"
-# GC-3: every ordinary selection carries `not b1_topology_probe` explicitly.
-# The probe node lives in a separate, non-`test_`-prefixed module that no
-# directory collection discovers, so this is defence in depth rather than the
-# mechanism -- but a marker that selects nothing is exactly how a live node
-# would end up inside the traced container-free phase.
-B1_COVERAGE_SELECTION = (
-    "-m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'"
-)
-B1_CI_SCALE_LIVE_SELECTION = (
-    "-m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe'"
-)
+B1_COVERAGE_DATA_FILE = '--data-file="$RUNNER_TEMP/b1-harness.coverage"'
+#: FP-BOD-1: the container-free harness selection, on the functional job's
+#: step. Both exclusions are required: a marker that selects nothing is
+#: exactly how a live node would end up inside the traced phase.
+B1_COVERAGE_SELECTION = '-m "not b1_live and not b1_product"'
 B1_PRODUCT_SELECTION = "-m b1_product"
-B1_PROBE_SELECTION = "-m b1_topology_probe"
-# B1-LATENCY-BASIS-1 FP-B1LB-6: the isolated oracle's selection. It is the
-# ordinary CI-scale live selection WITHOUT `not b1_latency_basis`, so it adds
-# exactly the FP-IG-18 node and nothing else. Declared beside the other four
-# rather than derived from them: the whole point is that the ordinary
-# selection keeps excluding the marker byte for byte.
-B1_LATENCY_BASIS_SELECTION = "-m 'b1_live and not b1_product and not b1_topology_probe'"
-B1_ROUTING_MARKERS = ("b1_live", "b1_product", "b1_latency_basis", "b1_topology_probe")
+B1_ROUTING_MARKERS = ("b1_live", "b1_product")
 B1_REJECTED_ESCAPES = (
     "runs-on: ubuntu-24.04-8core",
     "self-hosted",
@@ -5026,80 +5192,6 @@ def _b1_launcher_source() -> str:
     return B1_LAUNCHER.read_text(encoding="utf-8")
 
 
-#: The two fail-closed CLI preconditions the isolated oracle runs, exactly as
-#: the launcher spells them (FP-B1LB-6). Declared here as literals so a
-#: silently weakened precondition is a manifest failure, not a green run.
-B1_LATENCY_BASIS_DRIVER = "b1_run_driver driver-latency-basis.sh"
-B1_ORDINARY_LIVE_DRIVER = "b1_run_driver driver-live.sh"
-B1_LATENCY_BASIS_WRAPPER = "bash scripts/integration-test.sh b1_latency_basis"
-B1_LATENCY_BASIS_CONDITION = (
-    "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis == true"
-)
-
-
-def _b1_latency_basis_failures(workflow: dict, launcher: str) -> list[str]:
-    """FP-B1LB-6: the isolated oracle exists, is isolated, and is opt-in.
-
-    The two live driver lines are counted independently -- one per target --
-    so neither target can quietly acquire the other's selection, and the
-    marker-leak direction has its own named cause rather than being folded
-    into the generic selection-count failures.
-    """
-    fails: list[str] = []
-
-    def add(reason: str, detail: str = "") -> None:
-        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
-
-    ordinary = _b1_target_region(launcher, "b1")
-    region = _b1_target_region(launcher, "b1_latency_basis")
-    if not region:
-        add("latency_basis_target_missing")
-        return fails
-    if region.count(B1_LATENCY_BASIS_DRIVER) != 1:
-        add("latency_basis_target_missing",
-            f"{region.count(B1_LATENCY_BASIS_DRIVER)} latency-basis driver lines")
-    if launcher.count(B1_LATENCY_BASIS_DRIVER) != 1:
-        add("latency_basis_target_missing",
-            f"{launcher.count(B1_LATENCY_BASIS_DRIVER)} latency-basis driver lines in the script")
-    if region.count(B1_LATENCY_BASIS_SELECTION) != 1:
-        add("latency_basis_selection_missing",
-            f"{region.count(B1_LATENCY_BASIS_SELECTION)} in the isolated target")
-    if launcher.count(B1_LATENCY_BASIS_SELECTION) != 1:
-        add("latency_basis_selection_missing",
-            f"{launcher.count(B1_LATENCY_BASIS_SELECTION)} in the whole script")
-
-    # Isolation, both directions: the explicit selection never appears in the
-    # ordinary route, and the ordinary route keeps excluding the marker.
-    if B1_LATENCY_BASIS_SELECTION in ordinary:
-        add("latency_basis_selection_leaked_to_ordinary_b1", "selection")
-    if B1_LATENCY_BASIS_DRIVER in ordinary:
-        add("latency_basis_selection_leaked_to_ordinary_b1", "driver line")
-    if ordinary.count(B1_ORDINARY_LIVE_DRIVER) != 1:
-        add("latency_basis_selection_leaked_to_ordinary_b1",
-            f"{ordinary.count(B1_ORDINARY_LIVE_DRIVER)} ordinary live driver lines")
-    if B1_CI_SCALE_LIVE_SELECTION not in ordinary:
-        add("latency_basis_selection_leaked_to_ordinary_b1", "ordinary live selection")
-    if "not b1_latency_basis" not in B1_COVERAGE_SELECTION:
-        add("latency_basis_selection_leaked_to_ordinary_b1", "coverage selection")
-
-    # Manual, opt-in, and downstream of the provenance gate.
-    steps = ((workflow.get("jobs") or {}).get("benchmark") or {}).get("steps") or []
-    hits = [i for i, step in enumerate(steps)
-            if (step.get("run") or "").strip() == B1_LATENCY_BASIS_WRAPPER]
-    if len(hits) != 1:
-        add("latency_basis_wrapper_missing", str(hits))
-        return fails
-    index = hits[0]
-    if _normalize_ws(steps[index].get("if") or "") != _normalize_ws(B1_LATENCY_BASIS_CONDITION):
-        add("latency_basis_condition_drift", repr(steps[index].get("if")))
-    gate = [i for i, step in enumerate(steps)
-            if "test_delivery_sizing_ledger.py" in (step.get("run") or "")]
-    if gate and not max(gate) < index:
-        add("latency_basis_condition_drift",
-            f"step {index} is not after the provenance gate at {gate}")
-    return fails
-
-
 def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
     """Every clause of the one-tracked-route contract, as named failures."""
     fails: list[str] = []
@@ -5108,27 +5200,12 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
         fails.append(f"{reason}{(' ' + detail) if detail else ''}")
 
     jobs = workflow.get("jobs") or {}
-    for job_name, expected in EXPECTED_BASH_WRAPPER_COMMANDS.items():
-        job = jobs.get(job_name)
-        if not isinstance(job, dict):
-            add("wrapper_job_missing", job_name)
-            continue
-        if job.get("runs-on") != "ubuntu-latest":
-            add("wrapper_runner_drift", f"{job_name} {job.get('runs-on')!r}")
-        steps = job.get("steps") or []
-        for index, body in expected:
-            if index >= len(steps):
-                add("wrapper_step_missing", f"{job_name}[{index}]")
-                continue
-            got = (steps[index].get("run") or "").strip()
-            if got != body:
-                add("wrapper_body_drift", f"{job_name}[{index}] {got!r}")
-        bodies = [(steps[i].get("run") or "").strip() for i in range(len(steps))]
-        wrapper_indices = [
-            i for i, b in enumerate(bodies) if "scripts/integration-test.sh" in b
-        ]
-        if wrapper_indices != [i for i, _ in expected]:
-            add("wrapper_inventory_drift", f"{job_name} {wrapper_indices}")
+    # bench-on-demand FP-BOD-1: NO job delegates a B1 run to the launcher any
+    # more, in any job, at any index. The inventory is the emptiness.
+    for job_name, job in jobs.items():
+        for index, step in enumerate(job.get("steps") or []):
+            if "scripts/integration-test.sh" in (step.get("run") or ""):
+                add("wrapper_inventory_drift", f"{job_name}[{index}]")
     if "scripts/integration-test.sh" not in BASH_SCRIPTS:
         add("wrapper_not_admitted")
     # The three routing markers are static pytest metadata, so the chain-config
@@ -5138,34 +5215,57 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
     if not PYTEST_OPTION_ALLOWLIST <= {"asyncio_mode", "markers"}:
         add("markers_allowlist_widened", str(sorted(PYTEST_OPTION_ALLOWLIST)))
 
-    # b1_product is local only: it must not appear anywhere in the workflow.
+    # FP-BOD-2: the `b1_product` TARGET is local only -- no workflow step may
+    # invoke it. The MARKER is a different string in a different position: the
+    # functional job's harness selection excludes it by name, which is how the
+    # live node stays out of the traced phase.
     for job_name, job in jobs.items():
         for i, step in enumerate(job.get("steps") or []):
-            if "b1_product" in (step.get("run") or ""):
+            body = step.get("run") or ""
+            if "integration-test.sh b1_product" in body:
                 add("product_target_in_ci", f"{job_name}[{i}]")
 
     for clause in B1_ROUTE_CLAUSES:
         if clause not in launcher:
             add("route_clause_missing", repr(clause))
+    for retired in B1_RETIRED_ROUTE_CLAUSES:
+        if retired in launcher:
+            add("retired_route_clause_survives", retired)
 
-    # Marker selections: exact literals, in the right phase.
-    coverage_lines = [
-        ln for ln in launcher.splitlines()
-        if "coverage run" in ln and "pytest" in ln and ln.strip().startswith(B1_ENV_UNSET_PREFIX)
+    # FP-BOD-1: the harness coverage phase is a functional-job step now. Its
+    # selection, its three includes and its bar are pinned on that step.
+    functional_steps = (jobs.get("functional") or {}).get("steps") or []
+    harness_bodies = [
+        (step.get("run") or "") for step in functional_steps
+        if "-m coverage run" in (step.get("run") or "")
     ]
-    if len(coverage_lines) != 1:
-        add("coverage_phase_drift", str(len(coverage_lines)))
-    elif B1_COVERAGE_SELECTION not in coverage_lines[0]:
-        add("coverage_selection_drift", coverage_lines[0])
-    live_lines = [
-        ln for ln in launcher.splitlines()
-        if "-m pytest" in ln and B1_CI_SCALE_LIVE_SELECTION in ln
-        and ln.strip().startswith(B1_ENV_UNSET_PREFIX)
-    ]
-    if len(live_lines) != 1:
-        add("live_selection_drift", str(len(live_lines)))
-    elif "coverage run" in live_lines[0]:
-        add("live_phase_traced", live_lines[0])
+    if len(harness_bodies) != 1:
+        add("coverage_phase_drift", str(len(harness_bodies)))
+    else:
+        body = harness_bodies[0]
+        if B1_COVERAGE_SELECTION not in body:
+            add("coverage_selection_drift", B1_COVERAGE_SELECTION)
+        if B1_COVERAGE_DATA_FILE not in body:
+            add("coverage_data_path_drift", B1_COVERAGE_DATA_FILE)
+        report_lines = [
+            ln.strip() for ln in body.splitlines() if "-m coverage report" in ln
+        ]
+        if len(report_lines) != 1 + len(B1_COVERED_FILES):
+            add("coverage_report_inventory_drift", str(len(report_lines)))
+        else:
+            aggregate, per_file = report_lines[0], report_lines[1:]
+            if f"--include={','.join(B1_COVERED_FILES)}" not in aggregate:
+                add("coverage_aggregate_scope_drift", aggregate)
+            for path, line in zip(B1_COVERED_FILES, per_file):
+                if f"--include={path}" not in line:
+                    add("coverage_per_file_scope_drift", line)
+        for line in report_lines:
+            if B1_COVERAGE_FAIL_UNDER not in line:
+                add("coverage_bar_drift", line)
+        for escape in B1_REJECTED_ESCAPES:
+            if escape in body:
+                add("rejected_escape_in_coverage_step", escape)
+
     product_lines = [
         ln for ln in launcher.splitlines()
         if "-m pytest" in ln and ln.strip().startswith(B1_ENV_UNSET_PREFIX)
@@ -5188,42 +5288,21 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
             add("env_unset_prefix_drift", stripped)
         if B1_PYCACHE_FLAG not in stripped:
             add("pycache_prefix_drift", stripped)
-    if launcher.count(B1_ENV_UNSET_PREFIX) < 6:
+    if launcher.count(B1_ENV_UNSET_PREFIX) < 1:
         add("env_unset_prefix_missing", str(launcher.count(B1_ENV_UNSET_PREFIX)))
 
-    # Coverage is reported at the fixed bar over exactly the changed files:
-    # one aggregate scoped to all three, plus one report per file.
-    report_lines = [
-        ln.strip() for ln in launcher.splitlines()
-        if ln.strip().startswith(B1_ENV_UNSET_PREFIX) and "-m coverage report" in ln
-    ]
-    if len(report_lines) != 1 + len(B1_COVERED_FILES):
-        add("coverage_report_inventory_drift", str(len(report_lines)))
-    else:
-        aggregate, per_file = report_lines[0], report_lines[1:]
-        if f"--include={','.join(B1_COVERED_FILES)}" not in aggregate:
-            add("coverage_aggregate_scope_drift", aggregate)
-        for path, line in zip(B1_COVERED_FILES, per_file):
-            if f"--include={path}" not in line:
-                add("coverage_per_file_scope_drift", line)
-    for line in report_lines:
-        if B1_COVERAGE_FAIL_UNDER not in line:
-            add("coverage_bar_drift", line)
-
-    # Writable coverage/cache paths, never the read-only source mount. Only
-    # driver-side commands are in scope: they are exactly the ones carrying the
-    # four-key prefix, and they are the ones that run against /workspace:ro.
+    # Writable cache paths, never the read-only source mount. Only driver-side
+    # commands are in scope: they are exactly the ones carrying the four-key
+    # prefix, and they are the ones that run against /workspace:ro.
     for line in launcher.splitlines():
         stripped = line.strip()
         if not stripped.startswith(B1_ENV_UNSET_PREFIX):
             continue
-        if "-m coverage" in stripped and "--data-file=/run/dbagent-b1/coverage/.coverage" not in stripped:
-            add("coverage_data_path_drift", stripped)
         if "-m pytest" in stripped and "-o cache_dir=/run/dbagent-b1/pytest-cache" not in stripped:
             add("pytest_cache_path_drift", stripped)
 
     # No pass-through, no caller-supplied profile value.
-    if '"$@"' in launcher.split("b1() {", 1)[-1].split("\nb1_product() {", 1)[0]:
+    if '"$@"' in launcher.split("b1_product() {", 1)[-1].split("\nb1_topology", 1)[0]:
         add("b1_accepts_pass_through")
 
     for escape in B1_REJECTED_ESCAPES:
@@ -5245,11 +5324,8 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
         # (FP-GC3-4) made the CI-scale half a CLOSED MAP KEYED BY EXACT
         # cpuModel -- checked entry by entry against the tracked carrier below
         # -- while the product-local scalar is unchanged.
-        "CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL",
-        "CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL",
         'PRODUCT_AFFINITY_CARDINALITY = {"gateway": 4, "postgres": 3, "driver": 1}',
         "PRODUCT_PLACEMENT_SCHEMA = 2",
-        "B1_TOPOLOGY_PLACEMENT_SCHEMA = probe.CONTRACT_SCHEMA",
         'B1_PLACEMENT_MECHANISM = "sched-affinity"',
         # The gateway command runs under its declared set.
         'f"taskset -c {b1.format_cpu_list(gateway_cpus)} "',
@@ -5319,34 +5395,8 @@ def _b1_route_failures(workflow: dict, launcher: str, *, markers_toml: str) -> l
     fails.extend(_b1_affinity_failures(launcher))
     fails.extend(_b1_mountpoint_failures(launcher))
     fails.extend(_b1_cleanup_failures(launcher))
-    fails.extend(_b1_model_keyed_declaration_failures(fixture_src))
-    fails.extend(_b1_latency_basis_failures(workflow, launcher))
+    fails.extend(_b1_retired_arm_failures(launcher))
     return fails
-
-
-# GC-3 (FP-GC3-3/4): the tracked model-keyed decision carrier. It is READ here,
-# never required: the two fail-closed carriers that demand its existence are
-# the delivery tests in tests/delivery/test_delivery_b1_profile.py. What this
-# guard enforces is AGREEMENT -- the Python declaration surface names exactly
-# the models the carrier selects, with exactly the topology-derived
-# cardinality and schema each of those entries carries. While the carrier is
-# absent, "exactly" means "no model", and a declaration map that named one
-# anyway would be a hand-written topology.
-GC3_DECISION_CARRIER = REPO_ROOT / "tests" / "benchmark" / "b1_topology_decision.json"
-GC3_SELECTED_PLACEMENT_SCHEMA = 3
-GC3_PRODUCT_PLACEMENT_SCHEMA = 2
-
-
-def _gc3_selected_entries() -> "dict[str, dict]":
-    """Every `selected` entry in the tracked carrier; empty while it is absent."""
-    if not GC3_DECISION_CARRIER.is_file():
-        return {}
-    decision = json.loads(GC3_DECISION_CARRIER.read_text(encoding="utf-8"))
-    models = (decision or {}).get("models") or {}
-    return {
-        model: entry for model, entry in models.items()
-        if isinstance(entry, dict) and entry.get("status") == "selected"
-    }
 
 
 def _source_assigns(src: str) -> "dict[str, ast.AST]":
@@ -5364,69 +5414,6 @@ def _source_assigns(src: str) -> "dict[str, ast.AST]":
     return out
 
 
-def _b1_model_keyed_declaration_failures(fixture_src: str) -> list[str]:
-    """The harness's per-model maps equal the carrier's selected entries."""
-    fails: list[str] = []
-    assigns = _source_assigns(fixture_src)
-    selected = _gc3_selected_entries()
-    for name in ("CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL",
-                 "CI_SCALE_PLACEMENT_SCHEMAS_BY_CPU_MODEL"):
-        node = assigns.get(name)
-        if node is None:
-            fails.append(f"model_keyed_declaration_missing {name}")
-            continue
-        try:
-            declared = ast.literal_eval(node)
-        except ValueError:
-            fails.append(f"model_keyed_declaration_not_literal {name}")
-            continue
-        if not isinstance(declared, dict):
-            fails.append(f"model_keyed_declaration_not_a_map {name}")
-            continue
-        if sorted(declared) != sorted(selected):
-            fails.append(
-                f"model_keyed_declaration_key_drift {name} "
-                f"{sorted(declared)} != {sorted(selected)}"
-            )
-            continue
-        for model, entry in selected.items():
-            expected = (
-                entry.get("cardinality")
-                if name == "CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL"
-                else GC3_SELECTED_PLACEMENT_SCHEMA
-            )
-            if declared[model] != expected:
-                fails.append(f"model_keyed_declaration_value_drift {name} {model!r}")
-    # A scalar CI-scale default is exactly what the per-model map replaces.
-    for retired in ("CI_SCALE_AFFINITY_CARDINALITY", "B1_PLACEMENT_SCHEMA"):
-        if retired in assigns:
-            fails.append(f"retired_scalar_declaration_survives {retired}")
-    # The two FIXED schemas either side of the per-model map.
-    product_schema = assigns.get("PRODUCT_PLACEMENT_SCHEMA")
-    if product_schema is None or ast.literal_eval(product_schema) != GC3_PRODUCT_PLACEMENT_SCHEMA:
-        fails.append("product_placement_schema_drift")
-    if "B1_TOPOLOGY_PLACEMENT_SCHEMA = probe.CONTRACT_SCHEMA" not in fixture_src:
-        fails.append("probe_placement_schema_drift")
-    return fails
-
-
-def test_ci_and_local_b1_route_are_identical():
-    """FP-GC1-2: one tracked launcher owns both B1 routes; CI invokes that target."""
-    wf = _load_wf()
-    assert B1_LAUNCHER.is_file(), "scripts/integration-test.sh must be tracked, not gitignored"
-    launcher = _b1_launcher_source()
-    markers_toml = B1_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
-    assert _b1_route_failures(wf, launcher, markers_toml=markers_toml) == []
-    # The composite local route includes both targets; CI includes only b1.
-    all_case = launcher.split("  all)", 1)[1].split(";;", 1)[0]
-    assert '" b1\n' in all_case or " b1\n" in all_case, all_case
-    assert "b1_product" in all_case, all_case
-    # The script's own anti-drift check names the wrapper literal, not an
-    # inner Docker or pytest command (those never appear in ci.yml).
-    assert "assert_matches_ci 'bash scripts/integration-test.sh b1'" in launcher
-    assert "assert_matches_ci 'docker run" not in launcher
-
-
 # ---------------------------------------------------------------------------
 # GC-3 — the manual topology-discovery route (FP-GC3-2 / 4 / 6).
 #
@@ -5435,818 +5422,6 @@ def test_ci_and_local_b1_route_are_identical():
 # dispatch-only" and "the ordinary merge gate is untouched": this slice adds a
 # measurement instrument, and the one thing it must never do is become one.
 # ---------------------------------------------------------------------------
-
-GC3_PROBE_JOB = "b1-topology-probe"
-GC3_PROBE_TARGET = "b1_topology_probe"
-GC3_PROBE_LIVE_MODULE = "services/gateway/tests/b1_topology_probe_live.py"
-GC3_PROBE_HELPER_MODULE = "services/gateway/tests/b1_topology_probe.py"
-GC3_PRODUCER_MODULE = "services/gateway/tests/test_b1_ingest_burst.py"
-GC3_PROBE_INPUT = {
-    "description": "Run GC-3 B1 topology discovery",
-    "required": False,
-    "default": False,
-    "type": "boolean",
-}
-# B1-LATENCY-BASIS-1 FP-B1LB-6 added the second manual input. The inventory
-# stays CLOSED -- an unpinned third input is still a named failure -- and each
-# entry is compared by whole-object equality, so a default flipped to true or a
-# boolean turned into a string is caught for either of them.
-GC3_MANUAL_DISPATCH_INPUTS = {
-    "b1_topology_probe": GC3_PROBE_INPUT,
-    "b1_latency_basis": {
-        "description": "Run the isolated B1 CPU-basis oracle (B1-LATENCY-BASIS-1)",
-        "required": False,
-        "default": False,
-        "type": "boolean",
-    },
-}
-GC3_PROBE_JOB_IF = (
-    "github.event_name == 'workflow_dispatch' && inputs.b1_topology_probe == true"
-)
-GC3_PROBE_TIMEOUT_MINUTES = 75
-GC3_PROBE_STEP_USES = {0: "actions/checkout@v4", 2: "actions/upload-artifact@v4"}
-GC3_PROBE_WRAPPER = (1, "bash scripts/integration-test.sh b1_topology_probe")
-GC3_PROBE_UPLOAD_WITH = {
-    "name": "b1-topology-probe-${{ github.run_id }}-${{ github.run_attempt }}",
-    "path": (
-        "${{ runner.temp }}/b1-topology-probe-"
-        "${{ github.run_id }}-${{ github.run_attempt }}.json"
-    ),
-    "if-no-files-found": "error",
-}
-GC3_PROBE_UPLOAD_IF = "always()"
-# The launcher clauses the discovery route is made of, as independent literals.
-GC3_PROBE_LAUNCHER_CLAUSES: tuple[str, ...] = (
-    # allowlisted target, guarded by the same anti-drift check as b1
-    "|b1|b1_product|b1_latency_basis|b1_topology_probe) ;;",
-    "assert_matches_ci 'bash scripts/integration-test.sh b1_topology_probe'",
-    # the outer accumulator and the final artifact live outside any B1_RUN_DIR
-    'B1_PROBE_ACCUMULATOR="$(mktemp -d -t dbagent-b1-probe-XXXXXXXXXX)"',
-    'B1_PROBE_PLAN="$B1_PROBE_ACCUMULATOR/plan.json"',
-    'mkdir -p "$B1_PROBE_ACCUMULATOR/records"',
-    'B1_PROBE_ARTIFACT="$(b1_topology_probe_artifact_path "$outer_run_id")"',
-    "printf '%s/b1-topology-probe-%s-%s.json' \"$temp\" \"$GITHUB_RUN_ID\" \"$GITHUB_RUN_ATTEMPT\"",
-    "printf '%s/b1-topology-probe-local-%s-1.json' \"$temp\" \"$1\"",
-    # one build, then one fresh driver/run-id/run-dir per arm
-    'if [ "$B1_IMAGE_BUILT" -eq 0 ]; then',
-    "b1_prepare || return 1",
-    'b1_run_driver driver-probe.sh "$driver_cpus"',
-    # the planner is the topology authority; the shell only copies its contract
-    '--plan "$B1_PROBE_PLAN" --arm "$index" --run-id "$B1_RUN_ID" \\',
-    '--out "$B1_RUN_DIR/placement.json" --context "$B1_RUN_DIR/probe-context.json"',
-    # the record leaves the run mount BEFORE the per-arm cleanup can delete it
-    'cp "$B1_RUN_DIR/arm-record.json" \\',
-    "b1_cleanup",
-    # EXIT-trap-safe collector, exactly once, and its status is the target's
-    "trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT",
-    "trap 'b1_topology_probe_finish' EXIT TERM INT",
-    # ... including across b1_prepare, whose first-arm image build is the long
-    # window: it ADDS its cleanup to the collector trap instead of replacing it,
-    # so a kill during the build still writes the closed `invalid` artifact.
-    'if [ "${B1_PROBE_FINISHED:-1}" -eq 0 ]; then',
-    '[ "$B1_PROBE_FINISHED" -eq 0 ] || return 0',
-    'python3 "$B1_PROBE_PLANNER" collect \\',
-    'if [ "$rc" -ne 0 ]; then return "$rc"; fi',
-)
-# The ordinary CI-scale route as GC-3 (FP-GC3-4) leaves it: an unconditional
-# container-free coverage phase, then a model-routed live phase. The three
-# literal `${cpus[0..3]}` role assignments are RETIRED -- `_b1_affinity_failures`
-# now proves their absence and the step order instead -- and what is pinned here
-# is the routing flow itself, clause by clause.
-GC3_ORDINARY_B1_CLAUSES: tuple[str, ...] = (
-    # one allowed-CPU read, one CPU required, coverage before anything else
-    "mapfile -t cpus < <(b1_available_cpus)",
-    'if [ "${#cpus[@]}" -lt 1 ]; then',
-    'cat > "$B1_RUN_DIR/driver-coverage.sh" <<\'B1_CI_SCALE_COVERAGE\'',
-    'b1_run_driver driver-coverage.sh "${cpus[0]}"',
-    # the pre-placement route, over the tracked carrier, into a closed record
-    'B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-'
-    '${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"',
-    'python3 "$B1_PROBE_PLANNER" route \\',
-    '--decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \\',
-    '--out "$B1_ROUTE_RECORD"',
-    # exactly one closed read of the two branch values
-    "IFS=$'\\t' read -r route_disposition route_topology < <(",
-    'python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"',
-    # a recorded route stops here: no pair discovery, no contract, no workload
-    'if [ "$route_disposition" = "recorded" ] && [ "$route_topology" = "none" ]; then',
-    # a gating route: four CPUs over the SAME array, then complete pairs
-    'if [ "${#cpus[@]}" -lt 4 ]; then',
-    'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")',
-    'if [ "${#sibling_pairs[@]}" -lt 2 ]; then',
-    # the planner renders the ratified class; the shell authors no mapping
-    'python3 "$B1_PROBE_PLANNER" contract-selected \\',
-    '--topology "$route_topology" \\',
-    '--pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \\',
-    '--out "$B1_RUN_DIR/placement.json"',
-    'b1_run_driver driver-live.sh "$driver_cpus"',
-)
-#: The recorded, non-gating dispositions this route may emit, and the distinct
-#: fail-closed reasons a missing or corrupt carrier emits. They are declared in
-#: the planner, so they are pinned there -- the launcher never spells one.
-#: The closed seven-class candidate set, declared here independently of the
-#: planner: a topology id appearing as a LITERAL in the launcher would mean the
-#: shell had become a second topology author.
-GC3_TOPOLOGY_IDS = (
-    "driver-isolated",
-    "gateway-core",
-    "gateway-isolated",
-    "gateway-split",
-    "postgres-core",
-    "postgres-isolated",
-    "postgres-split",
-)
-GC3_ROUTE_REASONS = {
-    "unratified": "topology_unratified_sku:",
-    "unavailable": "topology_cpu_model_unavailable",
-    "missing": "gc3_decision_missing",
-    "invalid": "gc3_decision_invalid",
-}
-
-
-#: GC-3 rev 0.8 (FP-GC3-7): the delivery tier proves every retained
-#: supersession edge offline with `git merge-base --is-ancestor`, so the job
-#: that runs it must check out the FULL history. A shallow clone cannot see a
-#: superseded head at all, and the proof would fail closed with
-#: `gc3_ancestry_unavailable`. The discovery job proves no ancestry and keeps
-#: its plain shallow checkout.
-GC3_ANCESTRY_JOB = "functional"
-GC3_FULL_HISTORY_WITH = {"fetch-depth": 0}
-#: The one lexical anchor the per-model manifest rows keep; the head
-#: assertions below are structural and are not satisfied by it.
-GC3_NO_HISTORY_TEXT = "superseded: none"
-
-
-def _gc3_notes_row(notes: str, model: str) -> "str | None":
-    """The manifest's per-model row, found by the EXACT model string."""
-    marker = f"`{model}` -- status "
-    if notes.count(marker) != 1:
-        return None
-    start = notes.index(marker)
-    rest = notes[start + len(marker):]
-    ends = [
-        rest.index(token) for token in ("\n`", "\nNo row in this revision") if token in rest
-    ]
-    return notes[start:start + len(marker) + (min(ends) if ends else len(rest))]
-
-
-def _gc3_provenance_failures(workflow: dict, notes: str) -> list[str]:
-    """FP-GC3-7: the ancestry checkout, and the published per-model heads.
-
-    Two independent claims: the job that repeats the Git ancestry proof has the
-    history to repeat it with, and the tracked manifest names -- for every
-    exact model -- the carrier's full 40-lowercase-hex current evidence head
-    plus every superseded head in carrier order. A seven-character prefix is
-    not provenance, and a superseded head is never described as the active
-    route.
-    """
-    fails: list[str] = []
-    jobs = workflow.get("jobs") or {}
-    steps = (jobs.get(GC3_ANCESTRY_JOB) or {}).get("steps") or []
-    checkout = next(
-        (
-            step for step in steps
-            if str((step or {}).get("uses", "")).startswith("actions/checkout")
-        ),
-        None,
-    )
-    if checkout is None:
-        fails.append(f"ancestry_job_has_no_checkout {GC3_ANCESTRY_JOB}")
-    elif (checkout.get("with") or {}) != GC3_FULL_HISTORY_WITH:
-        fails.append(
-            f"functional_checkout_not_full_history {(checkout.get('with') or {})}"
-        )
-    probe_steps = (jobs.get(GC3_PROBE_JOB) or {}).get("steps") or []
-    if probe_steps and (probe_steps[0].get("with") or {}):
-        fails.append("probe_checkout_gained_options")
-    if not GC3_DECISION_CARRIER.is_file():
-        return fails + ["decision_carrier_missing"]
-    decision = json.loads(GC3_DECISION_CARRIER.read_text(encoding="utf-8"))
-    models = (decision or {}).get("models") or {}
-    if not models:
-        return fails + ["decision_carrier_has_no_model"]
-    for model, entry in models.items():
-        row = _gc3_notes_row(notes, model)
-        if row is None:
-            fails.append(f"notes_row_missing {model!r}")
-            continue
-        if entry.get("evidenceHeadSha") not in row:
-            fails.append(f"notes_row_omits_current_head {model!r}")
-        heads = [
-            record["decision"]["evidenceHeadSha"]
-            for record in entry.get("superseded") or []
-        ]
-        offsets = []
-        for head in heads:
-            if head not in row:
-                fails.append(f"notes_row_omits_superseded_head {model!r} {head}")
-            else:
-                offsets.append(row.index(head))
-        if offsets != sorted(offsets):
-            fails.append(f"notes_row_superseded_out_of_carrier_order {model!r}")
-        if not heads and GC3_NO_HISTORY_TEXT not in row:
-            fails.append(f"notes_row_omits_superseded_none {model!r}")
-    return fails
-
-
-def _gc3_probe_failures(workflow: dict, launcher: str, *, markers_toml: str) -> list[str]:
-    """Every clause of the dispatch-only discovery contract, as named failures."""
-    fails: list[str] = []
-
-    def add(reason: str, detail: str = "") -> None:
-        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
-
-    # (1) the manual input contract
-    on = workflow.get(True) if True in workflow else workflow.get("on")
-    dispatch = (on or {}).get("workflow_dispatch")
-    if not isinstance(dispatch, dict) or "inputs" not in dispatch:
-        add("dispatch_input_missing", repr(dispatch))
-    else:
-        inputs = dispatch["inputs"]
-        if set(inputs) != set(GC3_MANUAL_DISPATCH_INPUTS):
-            add("dispatch_input_inventory_drift", str(sorted(inputs)))
-        else:
-            for name, expected in GC3_MANUAL_DISPATCH_INPUTS.items():
-                if inputs[name] != expected:
-                    add("dispatch_input_drift", f"{name} {inputs[name]}")
-
-    # (2) the job envelope
-    jobs = workflow.get("jobs") or {}
-    job = jobs.get(GC3_PROBE_JOB)
-    if not isinstance(job, dict):
-        add("probe_job_missing")
-        return fails
-    if job.get("runs-on") != "ubuntu-latest":
-        add("probe_runner_drift", repr(job.get("runs-on")))
-    if job.get("timeout-minutes") != GC3_PROBE_TIMEOUT_MINUTES:
-        add("probe_timeout_drift", repr(job.get("timeout-minutes")))
-    if "needs" in job:
-        add("probe_needs_edge", repr(job.get("needs")))
-    if _normalize_ws(job.get("if") or "") != _normalize_ws(GC3_PROBE_JOB_IF):
-        add("probe_condition_drift", repr(job.get("if")))
-    if "continue-on-error" in job:
-        add("probe_masks_status", "job continue-on-error")
-    steps = job.get("steps") or []
-    if len(steps) != 3:
-        add("probe_step_inventory_drift", str(len(steps)))
-        return fails
-    for index, uses in GC3_PROBE_STEP_USES.items():
-        if steps[index].get("uses") != uses:
-            add("probe_step_action_drift", f"[{index}] {steps[index].get('uses')!r}")
-    wrapper_index, wrapper_body = GC3_PROBE_WRAPPER
-    if (steps[wrapper_index].get("run") or "").strip() != wrapper_body:
-        add("probe_wrapper_drift", repr((steps[wrapper_index].get("run") or "").strip()))
-    for index, step in enumerate(steps):
-        if "continue-on-error" in step:
-            add("probe_masks_status", f"[{index}] continue-on-error")
-        body = step.get("run") or ""
-        if "|| true" in body or "; true" in body:
-            add("probe_masks_status", f"[{index}] exit-code masking")
-    upload = steps[2]
-    if _normalize_ws(upload.get("if") or "") != GC3_PROBE_UPLOAD_IF:
-        add("probe_upload_condition_drift", repr(upload.get("if")))
-    if (upload.get("with") or {}) != GC3_PROBE_UPLOAD_WITH:
-        add("probe_upload_contract_drift", str(upload.get("with")))
-    # The upload must be the LAST step: a later `run:` would execute after an
-    # always() step and could reintroduce status masking.
-    if 2 != len(steps) - 1:
-        add("probe_upload_not_last")
-
-    # (3) no ordinary job waits on it, and it waits on nothing
-    for name, other in jobs.items():
-        if name == GC3_PROBE_JOB:
-            continue
-        needs = other.get("needs")
-        listed = [needs] if isinstance(needs, str) else list(needs or [])
-        if GC3_PROBE_JOB in listed:
-            add("probe_in_gating_chain", name)
-        for step in other.get("steps") or []:
-            if GC3_PROBE_TARGET in (step.get("run") or ""):
-                add("probe_target_in_ordinary_job", name)
-
-    # (4) the launcher route
-    for clause in GC3_PROBE_LAUNCHER_CLAUSES:
-        if clause not in launcher:
-            add("probe_clause_missing", repr(clause))
-    # Scoped to the ORDINARY route -- its own target plus the shared
-    # container-free coverage writer it calls -- not to the whole script.
-    # B1-LATENCY-BASIS-1 added a second selected route that legitimately
-    # repeats several of these clauses (FP-B1LB-6), so a whole-file membership
-    # test would survive deleting the ordinary route's own copy.
-    ordinary_route = "\n".join(
-        (
-            _b1_target_region(launcher, "b1"),
-            _b1_target_region(launcher, "b1_write_coverage_driver"),
-        )
-    )
-    for clause in GC3_ORDINARY_B1_CLAUSES:
-        if clause not in ordinary_route:
-            add("ordinary_b1_clause_missing", repr(clause))
-    region = _b1_target_region(launcher, GC3_PROBE_TARGET)
-    if not region:
-        add("probe_target_missing")
-        return fails
-    if '"$@"' in region:
-        add("probe_accepts_pass_through")
-    for masking in ("|| true", "|| :", "; true", "set +e"):
-        if masking in region:
-            add("probe_masks_status", f"launcher {masking}")
-    arm_region = _b1_target_region(launcher, "b1_topology_probe_arm")
-    for masking in ("|| true", "|| :", "set +e"):
-        if masking in arm_region:
-            add("probe_masks_status", f"arm {masking}")
-    # Exactly one pytest command, lexically inside the target, whose only
-    # positional operand is the live-only module. test_delivery_ci.py resolves
-    # each target's collection from this region and does not follow helper
-    # calls, so the placement is the contract.
-    pytest_lines = [ln.strip() for ln in region.splitlines() if "-m pytest" in ln]
-    if len(pytest_lines) != 1:
-        add("probe_pytest_inventory_drift", str(len(pytest_lines)))
-    else:
-        line = pytest_lines[0]
-        operands = [
-            word for word in line.split()
-            if word.endswith(".py") and not word.startswith("-")
-        ]
-        if operands != [GC3_PROBE_LIVE_MODULE]:
-            add("probe_collection_drift", str(operands))
-        if GC3_PRODUCER_MODULE in line:
-            add("probe_collects_the_producer", line)
-        if B1_PROBE_SELECTION not in line:
-            add("probe_selection_drift", line)
-        if not line.startswith(B1_ENV_UNSET_PREFIX):
-            add("probe_env_unset_prefix_drift", line)
-        if B1_PYCACHE_FLAG not in line:
-            add("probe_pycache_prefix_drift", line)
-        if "-o cache_dir=/run/dbagent-b1/pytest-cache" not in line:
-            add("probe_cache_path_drift", line)
-        if "coverage run" in line:
-            add("probe_phase_traced", line)
-    # It never joins the local composite route.
-    all_case = launcher.split("  all)", 1)[1].split(";;", 1)[0]
-    if GC3_PROBE_TARGET in all_case:
-        add("probe_target_in_all", all_case)
-
-    # (5) the marker is registered, and the live module carries both markers on
-    # exactly one node that consumes the named probe fixture.
-    if f'"{GC3_PROBE_TARGET}:' not in markers_toml:
-        add("probe_marker_not_registered")
-    live_path = REPO_ROOT / GC3_PROBE_LIVE_MODULE
-    helper_path = REPO_ROOT / GC3_PROBE_HELPER_MODULE
-    if not live_path.is_file():
-        add("probe_live_module_missing")
-        return fails
-    if not helper_path.is_file():
-        add("probe_helper_module_missing")
-    if live_path.name.startswith("test_") or live_path.name.endswith("_test.py"):
-        add("probe_live_module_is_collectable", live_path.name)
-    live_src = live_path.read_text(encoding="utf-8")
-    live_tree = ast.parse(live_src)
-    nodes = [
-        node for node in ast.walk(live_tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test")
-    ]
-    if len(nodes) != 1:
-        add("probe_node_inventory_drift", str([n.name for n in nodes]))
-    else:
-        node = nodes[0]
-        markers = {
-            ast.unparse(d.func if isinstance(d, ast.Call) else d).split("pytest.mark.", 1)[-1]
-            for d in node.decorator_list
-            if ast.unparse(d.func if isinstance(d, ast.Call) else d).startswith("pytest.mark.")
-        }
-        for marker in ("b1_live", GC3_PROBE_TARGET):
-            if marker not in markers:
-                add("probe_node_marker_missing", marker)
-        if "b1_product" in markers:
-            add("probe_node_carries_product_marker")
-        if "b1_topology_probe_run" not in {a.arg for a in node.args.args}:
-            add("probe_node_fixture_drift", str([a.arg for a in node.args.args]))
-    for escape in ("pytest.mark.skip", "pytest.mark.xfail", "pytest.skip(", "--deselect"):
-        if escape in live_src:
-            add("probe_live_module_escape", escape)
-
-    # (6) GC-3 FP-GC3-4: the ordinary route's own contract.
-    fails.extend(_gc3_ordinary_route_failures(launcher, helper_path))
-    return fails
-
-
-def _gc3_ordinary_route_failures(launcher: str, helper_path: Path) -> list[str]:
-    """The recorded/gating split, as named failures, from the shell's own text."""
-    fails: list[str] = []
-
-    def add(reason: str, detail: str = "") -> None:
-        fails.append(f"{reason}{(' ' + detail) if detail else ''}")
-
-    region = _b1_target_region(launcher, "b1")
-    if not region:
-        add("ordinary_b1_target_missing")
-        return fails
-    # One allowed-CPU read, coverage before routing, the selected-only
-    # four-CPU floor, and no `${cpus[N]}` role literal: the same positional
-    # rules `_b1_affinity_failures` enforces, asserted here too because this
-    # is FP-GC3-4's own function test.
-    fails.extend(_b1_ordinary_route_order_failures(launcher))
-
-    # The four recorded/failure reasons are the PLANNER's vocabulary. The shell
-    # spells none of them: it branches on two closed words and nothing else.
-    helper_src = helper_path.read_text(encoding="utf-8") if helper_path.is_file() else ""
-    for label, reason in sorted(GC3_ROUTE_REASONS.items()):
-        if reason not in helper_src:
-            add("route_reason_not_declared", f"{label} {reason!r}")
-        if reason in launcher:
-            add("route_reason_spelled_in_shell", f"{label} {reason!r}")
-
-    # The shell reads the two branch values exactly once, and never parses the
-    # carrier, re-reads the host model, or reconstructs a topology itself.
-    if region.count("route-fields") != 1:
-        add("route_fields_read_inventory_drift", str(region.count("route-fields")))
-    route_calls = [
-        ln for ln in region.splitlines()
-        if ln.strip().startswith('python3 "$B1_PROBE_PLANNER" route')
-        and "route-fields" not in ln
-    ]
-    if len(route_calls) != 1:
-        add("route_call_inventory_drift", str(len(route_calls)))
-    for forbidden in ("jq ", "/proc/cpuinfo", "model name", "python3 -c"):
-        if forbidden in region:
-            add("route_parsed_in_shell", forbidden)
-    carrier_reads = [
-        ln.strip() for ln in region.splitlines() if "b1_topology_decision.json" in ln
-    ]
-    if len(carrier_reads) != 1 or not carrier_reads[0].startswith("--decision "):
-        add("carrier_read_outside_route", str(carrier_reads))
-    for topology in GC3_TOPOLOGY_IDS:
-        if topology in launcher:
-            add("topology_literal_in_launcher", topology)
-    if "$B1_ROUTE_RECORD" in region and 'cp "$B1_ROUTE_RECORD"' in region:
-        add("route_record_copied_into_the_run_dir")
-    if "B1_RUN_DIR/route" in region:
-        add("route_record_copied_into_the_run_dir")
-
-    # The recorded branch: cleanup, then `return 0`, with no live work of any
-    # kind between the branch and its return.
-    marker = 'if [ "$route_disposition" = "recorded" ] && [ "$route_topology" = "none" ]; then'
-    if marker not in region:
-        add("recorded_branch_missing")
-        return fails
-    branch = region.split(marker, 1)[1].split("\n  fi", 1)[0]
-    if "b1_cleanup" not in branch:
-        add("recorded_branch_does_not_clean_up")
-    if "return 0" not in branch:
-        add("recorded_branch_does_not_return_zero")
-    for live_work in ("b1_run_driver driver-live.sh", "contract-selected",
-                      "b1_complete_sibling_pairs", "placement.json", "-m pytest"):
-        if live_work in branch:
-            add("recorded_branch_starts_live_work", live_work)
-    # ...and every live step happens strictly after that branch closes.
-    tail = region.split(marker, 1)[1].split("\n  fi", 1)[1]
-    for live_work in ("b1_run_driver driver-live.sh", "contract-selected",
-                      "b1_complete_sibling_pairs"):
-        if live_work not in tail:
-            add("gating_step_missing", live_work)
-    return fails
-
-
-def test_gc3_probe_and_ratified_b1_routes_are_pinned():
-    """FP-GC3-2/4/6: the discovery route is manual, honest and not a gate.
-
-    What this pins TODAY is the probe head: the dispatch input, the independent
-    job, the single-operand collection, the three marker selections, and the
-    ordinary CI-scale route left exactly as GC-1 shipped it apart from the new
-    two-complete-SMT-pair prerequisite. The selected-topology mapping and the
-    replacement manifest wording belong to FP-GC3-4 and arrive only once the
-    decision carrier exists -- this guard deliberately asserts no selected
-    topology, because none has been measured.
-    """
-    wf = _load_wf()
-    launcher = _b1_launcher_source()
-    markers_toml = B1_GATEWAY_PYPROJECT.read_text(encoding="utf-8")
-    assert _gc3_probe_failures(wf, launcher, markers_toml=markers_toml) == []
-    # The merge gate still runs exactly one B1 target, and it is not this one.
-    ci_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    assert "bash scripts/integration-test.sh b1\n" in ci_text
-    assert ci_text.count("bash scripts/integration-test.sh b1_topology_probe") == 1
-    assert "bash scripts/integration-test.sh b1_product" not in ci_text
-    # No decision carrier is claimed at this head, and no topology literal has
-    # been applied to the ordinary route.
-    for topology in (
-        "gateway-core", "gateway-split", "postgres-core", "postgres-split",
-        "postgres-isolated", "driver-isolated", "gateway-isolated",
-    ):
-        assert f'"topology": "{topology}"' not in launcher, topology
-
-    # Negative controls: one mutation at a time, each named.
-    import copy as _copy
-
-    def _reasons(workflow=None, text=None, markers=None) -> set[str]:
-        return {
-            f.split(" ", 1)[0]
-            for f in _gc3_probe_failures(
-                workflow if workflow is not None else _load_wf(),
-                text if text is not None else launcher,
-                markers_toml=markers if markers is not None else markers_toml,
-            )
-        }
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"][GC3_PROBE_JOB]["needs"] = ["functional"]
-    assert "probe_needs_edge" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"]["benchmark"]["needs"] = [GC3_PROBE_JOB]
-    assert "probe_in_gating_chain" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"][GC3_PROBE_JOB]["timeout-minutes"] = 360
-    assert "probe_timeout_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"][GC3_PROBE_JOB]["steps"][2]["if"] = "success()"
-    assert "probe_upload_condition_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"][GC3_PROBE_JOB]["steps"][1], mutated["jobs"][GC3_PROBE_JOB]["steps"][2] = (
-        mutated["jobs"][GC3_PROBE_JOB]["steps"][2],
-        mutated["jobs"][GC3_PROBE_JOB]["steps"][1],
-    )
-    assert {"probe_wrapper_drift", "probe_step_action_drift"} & _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"][GC3_PROBE_JOB]["steps"][1]["continue-on-error"] = True
-    assert "probe_masks_status" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated["jobs"][GC3_PROBE_JOB]["steps"][2]["with"]["path"] = "/tmp/anything.json"
-    assert "probe_upload_contract_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    on_key = True if True in mutated else "on"
-    mutated[on_key]["workflow_dispatch"]["inputs"][GC3_PROBE_TARGET]["default"] = True
-    assert "dispatch_input_drift" in _reasons(workflow=mutated)
-
-    # B1-LATENCY-BASIS-1 FP-B1LB-6: the second manual input is pinned by the
-    # same whole-object equality, and the inventory is still closed.
-    mutated = _copy.deepcopy(wf)
-    mutated[on_key]["workflow_dispatch"]["inputs"]["b1_latency_basis"]["default"] = True
-    assert "dispatch_input_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated[on_key]["workflow_dispatch"]["inputs"]["b1_latency_basis"]["type"] = "string"
-    assert "dispatch_input_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated[on_key]["workflow_dispatch"]["inputs"].pop("b1_latency_basis")
-    assert "dispatch_input_inventory_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated[on_key]["workflow_dispatch"]["inputs"]["b1_anything_else"] = dict(GC3_PROBE_INPUT)
-    assert "dispatch_input_inventory_drift" in _reasons(workflow=mutated)
-
-    mutated = _copy.deepcopy(wf)
-    mutated[on_key]["workflow_dispatch"] = None
-    assert "dispatch_input_missing" in _reasons(workflow=mutated)
-
-    collects_producer = launcher.replace(
-        f"-m pytest {GC3_PROBE_LIVE_MODULE}",
-        f"-m pytest {GC3_PRODUCER_MODULE} {GC3_PROBE_LIVE_MODULE}", 1)
-    assert collects_producer != launcher
-    assert {"probe_collection_drift", "probe_collects_the_producer"} <= _reasons(
-        text=collects_producer
-    )
-
-    widened = launcher.replace(f" {B1_PROBE_SELECTION} ", " -m b1_live ", 1)
-    assert widened != launcher
-    assert "probe_selection_drift" in _reasons(text=widened)
-
-    traced = launcher.replace(
-        f"{B1_PYCACHE_FLAG} -m pytest {GC3_PROBE_LIVE_MODULE}",
-        f"{B1_PYCACHE_FLAG} -m coverage run -m pytest {GC3_PROBE_LIVE_MODULE}", 1)
-    assert traced != launcher
-    assert "probe_phase_traced" in _reasons(text=traced)
-
-    per_arm_build = launcher.replace('if [ "$B1_IMAGE_BUILT" -eq 0 ]; then', "if true; then", 1)
-    assert per_arm_build != launcher
-    assert "probe_clause_missing" in _reasons(text=per_arm_build)
-
-    prepare_overwrites_the_collector = launcher.replace(
-        '  if [ "${B1_PROBE_FINISHED:-1}" -eq 0 ]; then\n'
-        "    trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT\n"
-        "  else\n"
-        "    trap 'b1_cleanup' EXIT TERM INT\n"
-        "  fi\n",
-        "  trap 'b1_cleanup' EXIT TERM INT\n", 1)
-    assert prepare_overwrites_the_collector != launcher
-    assert "probe_clause_missing" in _reasons(text=prepare_overwrites_the_collector)
-
-    no_collector = launcher.replace("trap 'b1_topology_probe_finish' EXIT TERM INT", "true")
-    assert no_collector != launcher
-    assert "probe_clause_missing" in _reasons(text=no_collector)
-
-    lost_record = launcher.replace('cp "$B1_RUN_DIR/arm-record.json" \\', 'true \\', 1)
-    assert lost_record != launcher
-    assert "probe_clause_missing" in _reasons(text=lost_record)
-
-    inner_accumulator = launcher.replace(
-        'B1_PROBE_ACCUMULATOR="$(mktemp -d -t dbagent-b1-probe-XXXXXXXXXX)"',
-        'B1_PROBE_ACCUMULATOR="$B1_RUN_DIR/probe"', 1)
-    assert inner_accumulator != launcher
-    assert "probe_clause_missing" in _reasons(text=inner_accumulator)
-
-    masked = launcher.replace(
-        'if [ "$rc" -ne 0 ]; then return "$rc"; fi', "return 0", 1)
-    assert masked != launcher
-    assert "probe_clause_missing" in _reasons(text=masked)
-
-    joined_all = launcher.replace(
-        '             run_step "B1 product promise (recorded, non-gating)" b1_product ;;',
-        '             run_step "B1 product promise (recorded, non-gating)" b1_product\n'
-        '             run_step "probe" b1_topology_probe ;;', 1)
-    assert joined_all != launcher
-    assert "probe_target_in_all" in _reasons(text=joined_all)
-
-    no_prerequisite = launcher.replace(
-        'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")', "true", 1)
-    assert no_prerequisite != launcher
-    assert "ordinary_b1_clause_missing" in _reasons(text=no_prerequisite)
-
-    unregistered = "\n".join(
-        ln for ln in markers_toml.splitlines() if f'"{GC3_PROBE_TARGET}:' not in ln
-    )
-    assert unregistered != markers_toml
-    assert "probe_marker_not_registered" in _reasons(markers=unregistered)
-
-    # --- GC-3 FP-GC3-4: the ordinary route, one mutation at a time ----------
-    coverage_after_route = launcher.replace(
-        '  b1_run_driver driver-coverage.sh "${cpus[0]}"\n',
-        "", 1).replace(
-        '  b1_run_driver driver-live.sh "$driver_cpus"\n',
-        '  b1_run_driver driver-coverage.sh "${cpus[0]}"\n'
-        '  b1_run_driver driver-live.sh "$driver_cpus"\n', 1)
-    assert coverage_after_route != launcher
-    assert "ordinary_b1_route_order_drift" in _reasons(text=coverage_after_route)
-
-    coverage_made_conditional = launcher.replace(
-        '  b1_run_driver driver-coverage.sh "${cpus[0]}"',
-        '  [ "${SKIP_COVERAGE:-0}" = "1" ] || b1_run_driver driver-coverage.sh "${cpus[0]}"', 1)
-    assert coverage_made_conditional != launcher
-    assert "ordinary_b1_route_step_missing" in _reasons(text=coverage_made_conditional)
-
-    second_cpu_read = launcher.replace(
-        '  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}',
-        '  mapfile -t cpus < <(b1_available_cpus)\n'
-        '  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}', 1)
-    assert second_cpu_read != launcher
-    assert "ordinary_b1_cpu_set_read_inventory_drift" in _reasons(text=second_cpu_read)
-
-    guard_moved_before_coverage = launcher.replace(
-        '  if [ "${#cpus[@]}" -lt 4 ]; then\n', "", 1).replace(
-        '  if [ "${#cpus[@]}" -lt 1 ]; then\n',
-        '  if [ "${#cpus[@]}" -lt 4 ]; then\n'
-        '    echo "moved" >&2\n'
-        '    return 1\n'
-        '  fi\n'
-        '  if [ "${#cpus[@]}" -lt 1 ]; then\n', 1)
-    assert guard_moved_before_coverage != launcher
-    assert "ordinary_b1_route_order_drift" in _reasons(text=guard_moved_before_coverage)
-
-    live_on_a_recorded_route = launcher.replace(
-        '    echo "integration-test.sh: b1 recorded a non-gating route; no live workload ran.',
-        '    b1_run_driver driver-live.sh "${cpus[0]}"\n'
-        '    echo "integration-test.sh: b1 recorded a non-gating route; no live workload ran.', 1)
-    assert live_on_a_recorded_route != launcher
-    assert "recorded_branch_starts_live_work" in _reasons(text=live_on_a_recorded_route)
-
-    reason_decided_in_shell = launcher.replace(
-        '    b1_cleanup\n    trap - EXIT TERM INT\n'
-        '    if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi\n'
-        "    return 0\n",
-        '    echo "topology_cpu_model_unavailable"\n'
-        "    b1_cleanup\n    trap - EXIT TERM INT\n"
-        '    if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi\n'
-        "    return 0\n", 1)
-    assert reason_decided_in_shell != launcher
-    assert "route_reason_spelled_in_shell" in _reasons(text=reason_decided_in_shell)
-
-    topology_literal = launcher.replace(
-        '    --topology "$route_topology" \\',
-        '    --topology "postgres-core" \\', 1)
-    assert topology_literal != launcher
-    assert "topology_literal_in_launcher" in _reasons(text=topology_literal)
-
-    carrier_parsed_in_shell = launcher.replace(
-        '  b1_run_driver driver-coverage.sh "${cpus[0]}"',
-        '  jq -r .models "$REPO_ROOT/tests/benchmark/b1_topology_decision.json"\n'
-        '  b1_run_driver driver-coverage.sh "${cpus[0]}"', 1)
-    assert carrier_parsed_in_shell != launcher
-    assert {"route_parsed_in_shell", "carrier_read_outside_route"} & _reasons(
-        text=carrier_parsed_in_shell
-    )
-
-    second_route_read = launcher.replace(
-        '  if [ "${#cpus[@]}" -lt 4 ]; then',
-        '  python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"\n'
-        '  if [ "${#cpus[@]}" -lt 4 ]; then', 1)
-    assert second_route_read != launcher
-    assert "route_fields_read_inventory_drift" in _reasons(text=second_route_read)
-
-    route_copied_into_the_run_dir = launcher.replace(
-        '  if [ "${#cpus[@]}" -lt 4 ]; then',
-        '  cp "$B1_ROUTE_RECORD" "$B1_RUN_DIR/route.json"\n'
-        '  if [ "${#cpus[@]}" -lt 4 ]; then', 1)
-    assert route_copied_into_the_run_dir != launcher
-    assert "route_record_copied_into_the_run_dir" in _reasons(text=route_copied_into_the_run_dir)
-
-    # The per-model declaration surface may not name a model the carrier does
-    # not select -- that is a hand-written topology, whatever it claims.
-    fixture_src = (
-        REPO_ROOT / "services" / "gateway" / "tests" / "test_b1_ingest_burst.py"
-    ).read_text(encoding="utf-8")
-    assert _b1_model_keyed_declaration_failures(fixture_src) == []
-    # Anchored on the declaration's OPENING BRACE, so the mutation names a
-    # model the carrier does not select whether the map is empty or already
-    # carries one: an added entry is a hand-written topology, whatever it says.
-    invented_model = fixture_src.replace(
-        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {',
-        'CI_SCALE_AFFINITY_CARDINALITIES_BY_CPU_MODEL: "dict[str, dict[str, int]]" = {\n'
-        '    "Invented CPU": {"gateway": 2, "postgres": 1, "driver": 1},', 1)
-    assert invented_model != fixture_src
-    assert any(
-        f.startswith("model_keyed_declaration_key_drift")
-        for f in _b1_model_keyed_declaration_failures(invented_model)
-    )
-    scalar_restored = fixture_src.replace(
-        "PRODUCT_AFFINITY_CARDINALITY = {",
-        'CI_SCALE_AFFINITY_CARDINALITY = {"gateway": 2, "postgres": 1, "driver": 1}\n'
-        "PRODUCT_AFFINITY_CARDINALITY = {", 1)
-    assert scalar_restored != fixture_src
-    assert any(
-        f.startswith("retired_scalar_declaration_survives")
-        for f in _b1_model_keyed_declaration_failures(scalar_restored)
-    )
-    product_schema_moved = fixture_src.replace(
-        "PRODUCT_PLACEMENT_SCHEMA = 2", "PRODUCT_PLACEMENT_SCHEMA = 3", 1)
-    assert product_schema_moved != fixture_src
-    assert "product_placement_schema_drift" in _b1_model_keyed_declaration_failures(
-        product_schema_moved
-    )
-
-    # --- GC-3 rev 0.8 FP-GC3-7: the ancestry checkout and the published heads
-    thresholds = yaml.safe_load(
-        (REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text(encoding="utf-8")
-    )
-    notes = next(e for e in thresholds["benchmarks"] if e["id"] == "B1")["notes"]
-    assert _gc3_provenance_failures(wf, notes) == []
-
-    def _provenance_reasons(workflow=None, text=None) -> set:
-        return {
-            f.split(" ", 1)[0]
-            for f in _gc3_provenance_failures(
-                workflow if workflow is not None else _load_wf(),
-                text if text is not None else notes,
-            )
-        }
-
-    shallow = _copy.deepcopy(wf)
-    shallow["jobs"][GC3_ANCESTRY_JOB]["steps"][0].pop("with", None)
-    assert "functional_checkout_not_full_history" in _provenance_reasons(workflow=shallow)
-
-    truncated = _copy.deepcopy(wf)
-    truncated["jobs"][GC3_ANCESTRY_JOB]["steps"][0]["with"] = {"fetch-depth": 1}
-    assert "functional_checkout_not_full_history" in _provenance_reasons(workflow=truncated)
-
-    carrier = json.loads(GC3_DECISION_CARRIER.read_text(encoding="utf-8"))
-    for model, entry in carrier["models"].items():
-        head = entry["evidenceHeadSha"]
-        # A seven-character prefix is not provenance.
-        abbreviated = notes.replace(head, head[:7])
-        assert abbreviated != notes
-        assert "notes_row_omits_current_head" in _provenance_reasons(text=abbreviated)
-        row = _gc3_notes_row(notes, model)
-        assert row is not None and head in row, model
-        # Dropping this row's provenance is red in whichever shape the row
-        # has: a history-free row loses `superseded: none`, and a superseded
-        # row loses the full head it was replaced at. A seven-character prefix
-        # is not provenance there either.
-        superseded_heads = [
-            record["decision"]["evidenceHeadSha"] for record in entry["superseded"]
-        ]
-        if superseded_heads:
-            older = superseded_heads[0]
-            abridged = notes.replace(older, older[:7])
-            assert abridged != notes
-            assert "notes_row_omits_superseded_head" in _provenance_reasons(text=abridged)
-        else:
-            unrecorded = notes.replace(GC3_NO_HISTORY_TEXT, "history is not published")
-            assert unrecorded != notes
-            assert "notes_row_omits_superseded_none" in _provenance_reasons(text=unrecorded)
-        rekeyed = notes.replace(f"`{model}` -- status ", "`Some Other CPU` -- status ", 1)
-        assert rekeyed != notes
-        assert "notes_row_missing" in _provenance_reasons(text=rekeyed)
-        break
-
-
 
 # ---------------------------------------------------------------------------
 # GC-3 FP-GC3-4, review round 1 C1: the launcher's OWN pair string must be a
@@ -6262,145 +5437,12 @@ def test_gc3_probe_and_ratified_b1_routes_are_pinned():
 # broken, which is exactly what a space-separated "lo hi" pair did.
 # ---------------------------------------------------------------------------
 
-B1_SIBLING_HELPERS = (
-    "b1_expand_cpu_list",
-    "b1_canonical_cpu_list",
-    "b1_thread_siblings",
-    "b1_complete_sibling_pairs",
-)
-#: (fabricated sibling groups, allowed CPUs, expected pair renderings). The
-#: second case is the i7 replica's sparse shape: the same RELATIONSHIP over
-#: non-contiguous CPU ids, which a `lo-hi` range cannot express.
-B1_SIBLING_FIXTURES = (
-    ({0: "0-1", 1: "0-1", 2: "2-3", 3: "2-3"}, (0, 1, 2, 3), ["0-1", "2-3"]),
-    ({0: "0,8", 8: "0,8", 1: "1,9", 9: "1,9"}, (0, 1, 8, 9), ["0,8", "1,9"]),
-)
-
-
-def _b1_function_source(launcher: str, name: str) -> str:
-    """One shell function, header through its own closing brace."""
-    lines = launcher.splitlines()
-    start = next(
-        (i for i, ln in enumerate(lines) if ln == f"{name}() {{"), None
-    )
-    assert start is not None, f"{name} is not defined in the launcher"
-    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
-    return "\n".join(lines[start:end + 1])
-
-
-def _b1_emitted_sibling_pairs(tmp_path, groups: dict, allowed, *, launcher=None) -> list[str]:
-    """Run the launcher's real helpers over a fabricated sysfs tree."""
-    root = tmp_path / "sys-cpu"
-    for cpu, rendered in groups.items():
-        target = root / f"cpu{cpu}" / "topology"
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "thread_siblings_list").write_text(rendered + "\n", encoding="utf-8")
-    launcher = _b1_launcher_source() if launcher is None else launcher
-    program = "\n".join(
-        [
-            "set -uo pipefail",
-            f'B1_CPU_TOPOLOGY_ROOT="{root}"',
-            *[_b1_function_source(launcher, name) for name in B1_SIBLING_HELPERS],
-            "declare -a sibling_pairs=()",
-            'mapfile -t sibling_pairs < <(b1_complete_sibling_pairs '
-            + " ".join(str(cpu) for cpu in allowed)
-            + ")",
-            'printf "%s\\n" "${sibling_pairs[@]}"',
-        ]
-    )
-    proc = subprocess.run(
-        ["bash", "-c", program], capture_output=True, text=True, timeout=60
-    )
-    assert proc.returncode == 0, proc.stderr
-    return [ln for ln in proc.stdout.splitlines() if ln]
-
-
-def test_gc3_launcher_sibling_pairs_are_accepted_by_contract_selected(tmp_path):
-    """FP-GC3-4: what the shell emits is what `contract-selected` consumes.
-
-    Red-before evidence (review round 1, C1): with
-    ``printf '%s %s\\n' "$lo" "$hi"`` the helper emitted ``0 1``, and this test
-    failed with ``b1_topology_probe: non-decimal CPU id in '0 1' ('0 1')`` --
-    while every hand-written-``0-1`` unit test stayed green.
-    """
-    helper = REPO_ROOT / "services" / "gateway" / "tests" / "b1_topology_probe.py"
-    run_id = "0123456789abcdef0123456789abcdef"
-    for index, (groups, allowed, expected) in enumerate(B1_SIBLING_FIXTURES):
-        emitted = _b1_emitted_sibling_pairs(tmp_path / f"case{index}", groups, allowed)
-        # The CLI call comes FIRST, deliberately: the defect this test exists
-        # for is not "the rendering changed", it is "the gating command cannot
-        # consume its own argument", and that is what the failure should say.
-        out = tmp_path / f"placement-{index}.json"
-        proc = subprocess.run(
-            [
-                sys.executable, str(helper), "contract-selected",
-                "--topology", "gateway-core",
-                "--pairs", emitted[0], emitted[1],
-                "--run-id", run_id, "--out", str(out),
-            ],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
-        )
-        assert proc.returncode == 0, (
-            f"the launcher emits {emitted!r}, which contract-selected refuses: "
-            f"{proc.stderr.strip()}"
-        )
-        assert emitted == expected, (groups, emitted)
-        # No whitespace anywhere: `--pairs` takes two words, and a pair that
-        # carried a space would either split into two arguments or arrive as a
-        # CPU list the parser cannot read.
-        for pair in emitted:
-            assert pair == pair.strip() and not any(c.isspace() for c in pair), pair
-        contract = json.loads(out.read_text(encoding="utf-8"))
-        assert contract["schema"] == 3 and contract["profile"] == "ci-scale"
-        assert contract["topology"] == "gateway-core"
-        # gateway-core over the two observed pairs: the gateway owns the whole
-        # first physical core, PostgreSQL and the driver share the second.
-        first, second = sorted(expected), sorted(expected)
-        low = sorted(int(c) for c in re.findall(r"\d+", emitted[0]))
-        high = sorted(int(c) for c in re.findall(r"\d+", emitted[1]))
-        assert contract["roles"]["gateway"]["allowedCpus"] == emitted[0]
-        assert contract["roles"]["postgres"]["allowedCpus"] == str(high[0])
-        assert contract["roles"]["driver"]["allowedCpus"] == str(high[1])
-        # ...and the CLI's stdout is the driver CPU list the shell runs on.
-        assert proc.stdout.strip() == str(high[1])
-        assert low == sorted(int(c) for c in re.findall(r"\d+", emitted[0]))
-    # The retired encoding, asserted absent at its source: a space-separated
-    # pair is not a CPU list and must never come back.
-    helper_src = _b1_function_source(_b1_launcher_source(), "b1_complete_sibling_pairs")
-    assert "'%s %s\\n'" not in helper_src, helper_src
-    assert "b1_canonical_cpu_list" in helper_src, helper_src
-
-    # Negative control, run every time: restore the retired `printf '%s %s'`
-    # in a COPY of the launcher, emit from it, and require the CLI to refuse
-    # what it produced. Without this the assertion above is a spelling check;
-    # with it, the pin is named for the composition it actually protects.
-    groups, allowed, _expected = B1_SIBLING_FIXTURES[0]
-    reverted = _b1_launcher_source().replace(
-        'printf \'%s\\n\' "$(b1_canonical_cpu_list "$lo" "$hi")"',
-        'printf \'%s %s\\n\' "$lo" "$hi"', 1)
-    assert reverted != _b1_launcher_source()
-    emitted = _b1_emitted_sibling_pairs(
-        tmp_path / "reverted", groups, allowed, launcher=reverted
-    )
-    assert emitted == ["0 1", "2 3"], emitted
-    refused = subprocess.run(
-        [
-            sys.executable, str(helper), "contract-selected",
-            "--topology", "gateway-core", "--pairs", emitted[0], emitted[1],
-            "--run-id", run_id, "--out", str(tmp_path / "never-written.json"),
-        ],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
-    )
-    assert refused.returncode == 1, refused.stdout
-    assert "non-decimal CPU id" in refused.stderr, refused.stderr
-    assert not (tmp_path / "never-written.json").exists()
-
-
 _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     # (id, kind, expected reason) -- the mutator is resolved below by id.
-    ("wrapper_body_gains_a_word", "workflow", "wrapper_body_drift"),
-    ("wrapper_step_moved", "workflow", "wrapper_body_drift"),
-    ("benchmark_runner_upgraded", "workflow", "wrapper_runner_drift"),
+    # bench-on-demand FP-BOD-1: the wrapper cases become ONE case with the
+    # opposite polarity -- a re-added `integration-test.sh` step in any job is
+    # the drift now, because no CI job may delegate a B1 run at all.
+    ("b1_wrapper_returned_to_ci", "workflow", "wrapper_inventory_drift"),
     ("product_target_sent_to_ci", "workflow", "product_target_in_ci"),
     ("launcher_drops_the_image_build", "launcher", "route_clause_missing"),
     ("driver_loses_the_host_pid_namespace", "launcher", "route_clause_missing"),
@@ -6421,7 +5463,7 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("launcher_stops_reading_its_own_affinity", "launcher", "route_clause_missing"),
     ("schema_reverted_to_1", "launcher", "route_clause_missing"),
     ("mechanism_reverted_to_quota", "launcher", "route_clause_missing"),
-    ("ordinary_b1_role_literal_reintroduced", "launcher", "ordinary_b1_role_literal_survives"),
+    ("ci_scale_target_returned", "launcher", "retired_ci_scale_target_survives"),
     ("product_affinity_cardinality_changed", "launcher", "affinity_cardinality_drift"),
     ("gateway_postgres_affinity_overlap", "launcher", "affinity_overlap"),
     ("gateway_driver_affinity_overlap", "launcher", "affinity_overlap"),
@@ -6443,20 +5485,19 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("opening_affinity_gate_removed", "fixture", "fixture_clause_missing"),
     ("closing_affinity_gate_removed", "fixture", "fixture_clause_missing"),
     # --- selections, environment, coverage, cleanup ---
-    ("coverage_selection_widened", "launcher", "coverage_selection_drift"),
-    ("live_selection_traced", "launcher", "live_phase_traced"),
+    ("coverage_selection_widened", "workflow", "coverage_selection_drift"),
     ("product_selection_widened", "launcher", "product_selection_drift"),
     ("env_unset_key_dropped", "launcher", "env_unset_prefix_drift"),
     ("bytecode_cache_left_on_the_source_mount", "launcher", "pycache_prefix_drift"),
-    ("coverage_bar_lowered", "launcher", "coverage_bar_drift"),
-    ("coverage_aggregate_include_widened", "launcher", "coverage_aggregate_scope_drift"),
-    ("coverage_per_file_report_dropped", "launcher", "coverage_report_inventory_drift"),
-    ("coverage_data_file_moved_to_the_source_mount", "launcher", "coverage_data_path_drift"),
+    ("coverage_bar_lowered", "workflow", "coverage_bar_drift"),
+    ("coverage_aggregate_include_widened", "workflow", "coverage_aggregate_scope_drift"),
+    ("coverage_per_file_report_dropped", "workflow", "coverage_report_inventory_drift"),
+    ("coverage_data_file_moved_to_the_source_mount", "workflow", "coverage_data_path_drift"),
     ("pytest_cache_moved_to_the_source_mount", "launcher", "pytest_cache_path_drift"),
     # GC-3 (FP-GC3-4): the single driver script became two, so masking is two
     # independent mutations -- one per phase -- and each must go red on its own.
-    ("coverage_phase_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
-    ("live_phase_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
+    ("coverage_phase_masks_a_failure", "workflow", "rejected_escape_in_coverage_step"),
+    ("product_phase_masks_a_failure", "launcher", "rejected_escape_in_launcher"),
     ("launcher_continues_on_error", "launcher", "rejected_escape_in_launcher"),
     ("marker_registration_removed", "markers", "marker_not_registered"),
     ("pytest_markers_allowlist_removed", "admission", "markers_not_admitted"),
@@ -6471,8 +5512,6 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     # --- the run directory the rootful daemon writes as uid 0 (fix.md D1) ---
     ("cleanup_blames_containers_for_the_run_dir", "launcher",
      "cleanup_run_dir_sets_the_container_flag"),
-    ("arm_blames_containers_for_the_run_dir", "launcher",
-     "arm_container_verdict_inventory_drift"),
     ("cleanup_drops_the_root_capable_purge", "launcher", "cleanup_purge_missing"),
     ("cleanup_stops_checking_that_the_run_dir_is_gone", "launcher",
      "cleanup_removal_unchecked"),
@@ -6480,24 +5519,13 @@ _B1_ROUTE_MUTATIONS: list[tuple[str, str, str]] = [
     ("purge_loses_its_run_label", "launcher", "purge_clause_missing"),
     ("purge_gains_the_source_mount", "launcher", "purge_mounts_more_than_the_run_dir"),
     ("b1_ignores_the_run_dir_failure", "launcher", "consumer_ignores_the_run_dir_failure"),
-    ("arm_does_not_reset_the_run_dir_flag", "launcher", "arm_does_not_reset_the_run_dir_flag"),
+    ("probe_arm_target_returned", "launcher", "retired_arm_target_survives"),
     ("cleanup_drops_the_post_purge_census", "launcher", "cleanup_post_purge_census_missing"),
     ("post_purge_census_is_not_fatal", "launcher", "cleanup_post_purge_flag_missing"),
-    # --- B1-LATENCY-BASIS-1 FP-B1LB-6/7: the isolated oracle route ---
-    # Each of the five named causes is produced by its own mutation; none of
-    # them is reachable through the generic wrapper_body/inventory failures.
-    ("latency_basis_target_removed", "launcher", "latency_basis_target_missing"),
-    ("latency_basis_selection_removed", "launcher", "latency_basis_selection_missing"),
-    ("latency_basis_marker_leaks_into_ordinary_b1", "launcher",
-     "latency_basis_selection_leaked_to_ordinary_b1"),
-    ("ordinary_b1_stops_excluding_the_latency_marker", "launcher",
-     "latency_basis_selection_leaked_to_ordinary_b1"),
-    ("latency_basis_wrapper_removed", "workflow", "latency_basis_wrapper_missing"),
-    ("latency_basis_tail_made_unconditional", "workflow", "latency_basis_condition_drift"),
-    ("latency_basis_tail_condition_made_truthy", "workflow", "latency_basis_condition_drift"),
-    ("latency_basis_tail_moved_before_the_provenance_gate", "workflow",
-     "latency_basis_condition_drift"),
-    ("latency_basis_wrapper_body_gains_a_word", "workflow", "wrapper_body_drift"),
+    # --- bench-on-demand FP-BOD-2: each retired route, put back by name ---
+    ("latency_basis_target_returned", "launcher", "retired_target_survives"),
+    ("topology_carrier_read_returned", "launcher", "retired_route_clause_survives"),
+    ("coverage_driver_function_returned", "launcher", "retired_target_survives"),
 ]
 
 
@@ -6520,12 +5548,13 @@ _B1_POST_PURGE_CENSUS = """  ids="$(docker ps -aq --filter "label=${B1_RUN_LABEL
 def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str,
                              fixture: str) -> tuple[dict, str, str, str]:
     steps = wf["jobs"]["benchmark"]["steps"]
-    if case_id == "wrapper_body_gains_a_word":
-        steps[17]["run"] = steps[17]["run"].strip() + " --unexpected-option"
-    elif case_id == "wrapper_step_moved":
-        steps[17], steps[19] = steps[19], steps[17]
-    elif case_id == "benchmark_runner_upgraded":
-        wf["jobs"]["benchmark"]["runs-on"] = "ubuntu-latest-8-cores"
+    functional_steps = wf["jobs"]["functional"]["steps"]
+    harness_index = next(
+        i for i, step in enumerate(functional_steps)
+        if "-m coverage run" in (step.get("run") or "")
+    )
+    if case_id == "b1_wrapper_returned_to_ci":
+        steps.append({"run": "bash scripts/integration-test.sh b1"})
     elif case_id == "product_target_sent_to_ci":
         steps.append({"run": "bash scripts/integration-test.sh b1_product"})
     elif case_id == "launcher_drops_the_image_build":
@@ -6578,13 +5607,8 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
         launcher = launcher.replace('"schema": 2,', '"schema": 1,')
     elif case_id == "mechanism_reverted_to_quota":
         launcher = launcher.replace('"mechanism": "sched-affinity",', '"mechanism": "cfs-quota",')
-    elif case_id == "ordinary_b1_role_literal_reintroduced":
-        # GC-3: the ordinary target allocates nothing. A literal role
-        # assignment reappearing in it is a second topology author.
-        launcher = launcher.replace(
-            '  b1_run_driver driver-live.sh "$driver_cpus"',
-            '  gateway_cpus="$(b1_canonical_cpu_list "${cpus[0]}" "${cpus[1]}")"\n'
-            '  b1_run_driver driver-live.sh "$driver_cpus"', 1)
+    elif case_id == "ci_scale_target_returned":
+        launcher = launcher + "\nb1() {\n  return 0\n}\n"
     elif case_id == "product_affinity_cardinality_changed":
         launcher = launcher.replace(
             'postgres_cpus="$(b1_canonical_cpu_list "${cpus[4]}" "${cpus[5]}" "${cpus[6]}")"',
@@ -6651,17 +5675,9 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
             'witness.failures(roles_close, gateway_worker_pids=workers_post, when="close")',
             "[]", 1)
     elif case_id == "coverage_selection_widened":
-        launcher = launcher.replace(B1_COVERAGE_SELECTION, "-m 'not b1_product'", 1)
-    elif case_id == "live_selection_traced":
-        launcher = launcher.replace(
-            f"python3 -B {B1_PYCACHE_FLAG} -m pytest "
-            "services/gateway/tests/test_b1_ingest_burst.py -v -s "
-            + B1_CI_SCALE_LIVE_SELECTION,
-            f"python3 -B {B1_PYCACHE_FLAG} -m coverage run "
-            "--data-file=/run/dbagent-b1/coverage/.coverage "
-            "-m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s "
-            + B1_CI_SCALE_LIVE_SELECTION,
-            1)
+        functional_steps[harness_index]["run"] = functional_steps[harness_index][
+            "run"
+        ].replace(B1_COVERAGE_SELECTION, '-m "not b1_product"', 1)
     elif case_id == "product_selection_widened":
         launcher = launcher.replace("-m b1_product -o cache_dir", "-m b1_live -o cache_dir", 1)
     elif case_id == "env_unset_key_dropped":
@@ -6673,26 +5689,32 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
     elif case_id == "bytecode_cache_left_on_the_source_mount":
         launcher = launcher.replace(" -X pycache_prefix=/run/dbagent-b1/pycache", "", 1)
     elif case_id == "coverage_bar_lowered":
-        launcher = launcher.replace("--fail-under=81", "--fail-under=1")
+        functional_steps[harness_index]["run"] = functional_steps[harness_index][
+            "run"
+        ].replace("--fail-under=81", "--fail-under=1")
     elif case_id == "coverage_aggregate_include_widened":
-        launcher = launcher.replace(f"--include={','.join(B1_COVERED_FILES)}", "", 1)
+        functional_steps[harness_index]["run"] = functional_steps[harness_index][
+            "run"
+        ].replace(f"--include={','.join(B1_COVERED_FILES)}", "", 1)
     elif case_id == "coverage_per_file_report_dropped":
-        launcher = "\n".join(
-            ln for ln in launcher.splitlines()
+        functional_steps[harness_index]["run"] = "\n".join(
+            ln for ln in functional_steps[harness_index]["run"].splitlines()
             if f"--include={B1_COVERED_FILES[2]}" not in ln
         )
     elif case_id == "coverage_data_file_moved_to_the_source_mount":
-        launcher = launcher.replace("--data-file=/run/dbagent-b1/coverage/.coverage",
-                                    "--data-file=/workspace/.coverage")
+        functional_steps[harness_index]["run"] = functional_steps[harness_index][
+            "run"
+        ].replace(B1_COVERAGE_DATA_FILE, '--data-file=.coverage')
     elif case_id == "pytest_cache_moved_to_the_source_mount":
         launcher = launcher.replace("-o cache_dir=/run/dbagent-b1/pytest-cache",
                                     "-o cache_dir=/workspace/.pytest_cache")
     elif case_id == "coverage_phase_masks_a_failure":
-        launcher = launcher.replace('  b1_run_driver driver-coverage.sh "${cpus[0]}"',
-                                    '  b1_run_driver driver-coverage.sh "${cpus[0]}" || true', 1)
-    elif case_id == "live_phase_masks_a_failure":
-        launcher = launcher.replace('  b1_run_driver driver-live.sh "$driver_cpus"',
-                                    '  b1_run_driver driver-live.sh "$driver_cpus" || true', 1)
+        functional_steps[harness_index]["run"] = (
+            functional_steps[harness_index]["run"] + " || true"
+        )
+    elif case_id == "product_phase_masks_a_failure":
+        launcher = launcher.replace('  b1_run_driver driver-product.sh "$driver_cpus"',
+                                    '  b1_run_driver driver-product.sh "$driver_cpus" || true', 1)
     elif case_id == "launcher_continues_on_error":
         launcher = launcher + "\ncontinue-on-error\n"
     elif case_id == "marker_registration_removed":
@@ -6718,30 +5740,16 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
         fixture = fixture.replace("if len(matches) != 1:", "if len(matches) < 1:", 1)
     elif case_id == "cleanup_drops_the_post_purge_census":
         launcher = launcher.replace(_B1_POST_PURGE_CENSUS, "  return 0\n}", 1)
-    elif case_id == "latency_basis_target_removed":
+    elif case_id == "latency_basis_target_returned":
+        launcher = launcher + "\nb1_latency_basis() {\n  return 0\n}\n"
+    elif case_id == "topology_carrier_read_returned":
         launcher = launcher.replace(
-            '  b1_run_driver driver-latency-basis.sh "$driver_cpus"\n', "", 1)
-    elif case_id == "latency_basis_selection_removed":
-        launcher = launcher.replace(B1_LATENCY_BASIS_SELECTION, "-m b1_live", 1)
-    elif case_id == "latency_basis_marker_leaks_into_ordinary_b1":
-        launcher = launcher.replace(
-            B1_CI_SCALE_LIVE_SELECTION, B1_LATENCY_BASIS_SELECTION, 1)
-    elif case_id == "ordinary_b1_stops_excluding_the_latency_marker":
-        launcher = launcher.replace(
-            B1_CI_SCALE_LIVE_SELECTION,
-            "-m 'b1_live and not b1_product and not b1_topology_probe and not nothing'", 1)
-    elif case_id == "latency_basis_wrapper_removed":
-        steps.pop(21)
-    elif case_id == "latency_basis_tail_made_unconditional":
-        steps[21].pop("if", None)
-    elif case_id == "latency_basis_tail_condition_made_truthy":
-        steps[21]["if"] = (
-            "github.event_name == 'workflow_dispatch' && inputs.b1_latency_basis"
-        )
-    elif case_id == "latency_basis_tail_moved_before_the_provenance_gate":
-        steps[20], steps[21] = steps[21], steps[20]
-    elif case_id == "latency_basis_wrapper_body_gains_a_word":
-        steps[21]["run"] = steps[21]["run"].strip() + " --unexpected-option"
+            "b1_product() {",
+            'b1_product() {\n'
+            '  python3 "$B1_PROBE_PLANNER" route --decision '
+            '"$REPO_ROOT/tests/benchmark/b1_topology_decision.json"', 1)
+    elif case_id == "coverage_driver_function_returned":
+        launcher = launcher + "\nb1_write_coverage_driver() {\n  return 0\n}\n"
     elif case_id == "post_purge_census_is_not_fatal":
         launcher = launcher.replace(
             _B1_POST_PURGE_CENSUS,
@@ -6749,10 +5757,8 @@ def _apply_b1_route_mutation(case_id: str, wf: dict, launcher: str, markers: str
     elif case_id == "cleanup_blames_containers_for_the_run_dir":
         # The defect fix.md D1 describes: one flag for two unrelated facts.
         launcher = launcher.replace("      B1_RUN_DIR_FAILED=1", "      B1_CLEANUP_FAILED=1", 1)
-    elif case_id == "arm_blames_containers_for_the_run_dir":
-        launcher = launcher.replace(
-            "arm $index could not remove its run directory; the sweep stops here",
-            "arm $index left containers behind; the sweep stops here", 1)
+    elif case_id == "probe_arm_target_returned":
+        launcher = launcher + "\nb1_topology_probe_arm() {\n  return 0\n}\n"
     elif case_id == "cleanup_drops_the_root_capable_purge":
         launcher = launcher.replace("      b1_purge_run_dir\n", "", 1)
     elif case_id == "cleanup_stops_checking_that_the_run_dir_is_gone":
@@ -6851,100 +5857,80 @@ def _redirecting_read_text(target: Path, replacement: Path):
 
 
 def test_b1_entry_matches_its_declared_contract():
-    """FP-GC1-5 (was FP-IG-10): whole-object equality for B1 against literals of its own."""
+    """FP-GC1-5 (was FP-IG-10) / FP-BOD-7: whole-object equality for B1.
+
+    The expected object is the PRODUCT contract now: one measured profile, one
+    `tier: on-demand` key, two links and a `notes` body that describes a
+    benchmark measured on a developer host. Every clause the CI-scale route,
+    the topology carrier, the CPU-basis oracle and the kind p99 tape used to
+    publish is pinned ABSENT below, so a half-revert that leaves one of them
+    in the manifest is red here rather than merely stale.
+    """
     data = yaml.safe_load((REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text())
     b1 = next(e for e in data["benchmarks"] if e["id"] == "B1")
     assert b1["id"] == "B1"
     assert b1["description"] == (
-        "Ingest webhook under declared CPU affinities: CI-scale merge gate plus "
-        "four-measured-role-exclusive-core product record"
+        "Ingest webhook under declared CPU affinities: the "
+        "four-measured-role-exclusive-core product run, measured on demand"
     )
     assert b1["threshold"] == (
-        "CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s "
-        "offered for 30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; "
-        "product recorded, non-gating: served == offered, p99 < 150 ms, 0 errors at "
-        "1000 req/s offered for 30s with 4 gateway CPUs exclusive from PG/driver"
+        "product on-demand: served == offered and 0 errors at 1000 req/s offered "
+        "for 30s on the product-exclusive placement (gateway 4, PostgreSQL 3, "
+        "driver 1), each role's CPU set exclusive of the others; p99 < 150 ms is "
+        "printed as met or missed and is not the bar"
     )
     assert b1["owning_milestone"] == "M3"
-    # `covered` is earned by the gating CI-scale tier. It does not reclassify
-    # the product link as a gating threshold.
+    # `covered` is earned by the product run's own threshold comparison; the
+    # on-demand tier is a key beside it, not a status and not a skip.
     assert b1["status"] == "covered"
-    # e2e-b1-kind-policy: exactly three genuine threshold links. The nested
-    # kind path left this list when its p99 became observational; it is pinned
-    # in `notes` and by the collection guard instead.
+    assert b1["tier"] == "on-demand"
+    # FP-BOD-7: two links. The hmac micro-benchmark stays in the unit-gateway
+    # job -- `tier: on-demand` does not pull it out of CI -- and the product
+    # run is the on-demand benchmark itself.
     assert b1["tests"] == [
         "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
-        B1_CI_SCALE_LINK,
         B1_PRODUCT_LINK,
     ]
-    assert B1_NESTED_DIAGNOSTIC_LINK not in b1["tests"]
+    assert B1_NESTED_CORRECTNESS_LINK not in b1["tests"]
     assert "concurrency_model" not in b1
     notes = b1["notes"]
-    # CI-scale tier: the two allocations and the gating numbers.
     for clause in (
-        "CI-scale gates in both CI and local",
-        "`scripts/integration-test.sh b1`",
+        # the on-demand disposition and its two triggers
+        "tier: on-demand",
+        "design/slices/bench-on-demand/design.md",
+        "before every `v*` tag",
+        "No CI job runs the live node",
+        "not deferred, not skipped and not xfailed",
+        # the allocation mechanism, unchanged
         "scheduler affinity (sched_setaffinity/taskset), not a CFS bandwidth",
         "exact, pairwise-disjoint set of logical",
         "reported diagnostics only and decide nothing",
         "`unavailable`",
-        # GC-3 (FP-GC3-4): the CI-scale allocation is decided per exact CPU
-        # model over the two complete SMT sibling pairs, not taken from the
-        # first four CPU ids. The replacement phrase and the recorded-route
-        # policy are pinned; the retired phrase is pinned ABSENT below.
-        "first two complete SMT sibling pairs available to the launcher",
-        "tests/benchmark/b1_topology_decision.json",
-        "topology_unratified_sku:<model>",
-        "topology_cpu_model_unavailable",
-        "gc3_decision_missing",
-        "gc3_decision_invalid",
-        "500 req/s offered for 30 s = 15000",
-        "MAX_IN_FLIGHT=500",
-        "served_rate>=CI_SCALE_SUSTAINED_FLOOR=450",
-        "due-time p99<150ms",
-        "placement_ok=1",
-        "3.034 ms/served request",
-        "527.36 req/s",
-        # product tier, with the exact recorded-not-gating reason
-        "recorded, non-gating; reason: host-dependent, not in CI",
+        # the product bar, with the two failure-producing equalities named
         "the first eight CPUs available to the launcher, split 4/3/1",
         "holds four logical CPUs exclusive of the PostgreSQL and driver sets",
         "1000 req/s offered for 30 s = 30000",
         "MAX_IN_FLIGHT=1000",
         "`scripts/integration-test.sh b1_product`",
         "at least eight available logical CPUs",
-        "met/missed",
-        "do not fail that target",
+        "FAILS THE RUN on errors != 0 and on served != offered",
         "served_rate>=SUSTAINED_FLOOR=200",
+        "met/missed",
+        "RECORDED ONLY",
+        "does not refuse a release",
         "four total vCPUs",
         "no larger, self-hosted or paid runner class is available on this account",
-        # e2e disposition and the routed CPU basis
+        # the e2e disposition, without a latency claim
         "kind",
         "nested",
         "refutes neither",
-        # e2e-b1-kind-policy: the observational-latency policy and its cost
-        B1_NESTED_DIAGNOSTIC_LINK,
-        "one of the three threshold-bearing links above",
-        "design/slices/e2e-b1-kind-policy/design.md",
-        "recorded as pytest observation",
-        "does not fail the kind job",
-        "Eleven kind comparisons still fail it",
-        "sat_committed==sat_served, and the exact admissible audit-action tuple",
-        "no longer fails e2e",
-        "keeps p99 < 150 ms at full strength",
-        "ratified GC-3 placement",
-        "no CI job fails on ingest latency",
-        "visible only in the uploaded e2e diagnostics artifact",
-        "kind deployment resource",
+        "Eleven kind comparisons fail the e2e job",
+        "no longer measured, recorded or uploaded at all",
+        "changes no kind deployment resource",
+        # the sizing ledger, kept as history (FP-BOD-9 / DW9)
         "B1-LATENCY-BASIS-1",
-        # B1-LATENCY-BASIS-1 FP-B1LB-7: the resolved handoff wording replaces
-        # the stale `cpuMsPerRequest=2.427` / "five consecutive" expectation.
-        # The notes describe the schema and the pending coordinator operation
-        # and state NO basis number before collection.
         "ingestGateway.sizingBasis.observations",
         "collection.attempts",
-        "five distinct qualifying CI-scale observations",
-        "`scripts/integration-test.sh b1_latency_basis`",
         "design/slices/b1-latency-basis-1/design.md",
         "design/slices/gc-1-reference-topology/design.md",
         "design/frozen-deviations.md",
@@ -6954,22 +5940,38 @@ def test_b1_entry_matches_its_declared_contract():
         "workers=4",
     ):
         assert clause in notes, f"B1 notes missing {clause!r}"
-    # The notes must not call the product comparisons gating, nor promise to
-    # move either link to a later milestone.
+    # The notes must not call the recorded p99 gating, promise to move a link
+    # to a later milestone, or republish anything the slice deleted.
     for forbidden in (
         "product tier gates",
         "product comparisons gate",
         "will be gating",
         "will move to",
-        # rev 0.4's falsified allocation primitive must not survive in the
-        # published contract
+        # rev 0.4's falsified allocation primitive
         "CPU=2.00/1.00/0.50",
         "cpu.max pair",
         "cgroup v2 CPU quota",
-        # GC-3 (FP-GC3-4): the retired first-four/2-1-1 CI-scale claim. The
-        # launcher no longer allocates that way for ANY model, so leaving the
-        # phrase would publish a topology nothing measured.
+        # the retired first-four/2-1-1 CI-scale claim
         "the first four CPUs available to the launcher, split 2/1/1",
+        # bench-on-demand FP-BOD-1/2/8/9: every deleted route, by name
+        "CI-scale gates in both CI and local",
+        "`scripts/integration-test.sh b1`",
+        "`scripts/integration-test.sh b1_latency_basis`",
+        "tests/benchmark/b1_topology_decision.json",
+        "topology_unratified_sku",
+        "topology_cpu_model_unavailable",
+        "gc3_decision_missing",
+        "gc3_decision_invalid",
+        "500 req/s offered for 30 s = 15000",
+        "MAX_IN_FLIGHT=500",
+        "CI_SCALE_SUSTAINED_FLOOR=450",
+        "recorded, non-gating; reason: host-dependent, not in CI",
+        "recorded as pytest observation",
+        "does not fail the kind job",
+        "keeps p99 < 150 ms at full strength",
+        "ratified GC-3 placement",
+        "visible only in the uploaded e2e diagnostics artifact",
+        "e2e-b1-diagnostics",
     ):
         assert forbidden not in notes, f"B1 notes must not say {forbidden!r}"
 
@@ -7008,76 +6010,360 @@ B1_KIND_POLICY_NOTES_CLAUSES: tuple[str, ...] = (
 )
 
 
-def test_e2e_kind_policy_is_explicit_in_manifest():
-    """FP-E2EB1K-4: B1 lists only threshold gates and states the kind policy in notes."""
-    text = (REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text(encoding="utf-8")
-    data = yaml.safe_load(text)
-    b1 = next(e for e in data["benchmarks"] if e["id"] == "B1")
 
-    # (1) exactly the three genuine threshold links, in their existing order.
-    assert b1["tests"] == [
-        "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
-        B1_CI_SCALE_LINK,
-        B1_PRODUCT_LINK,
-    ]
-    assert B1_NESTED_DIAGNOSTIC_LINK not in b1["tests"]
-    # and the nested path is not smuggled back in through another entry.
-    for entry in data["benchmarks"]:
-        assert B1_NESTED_DIAGNOSTIC_LINK not in (entry.get("tests") or []), entry["id"]
+# ---------------------------------------------------------------------------
+# bench-on-demand -- B1 and B11 leave per-push CI (FP-BOD-1, FP-BOD-5,
+# FP-BOD-7).
+#
+# Every literal below is declared here, independently of the files it pins.
+# ---------------------------------------------------------------------------
 
-    # (2) the threshold string and status do not move with the policy.
-    assert b1["status"] == "covered"
-    assert b1["threshold"] == (
-        "CI-scale gating: >= 450 req/s served, p99 < 150 ms, 0 errors at 500 req/s "
-        "offered for 30s with exclusive gateway/PG/driver affinity cardinalities=2/1/1; "
-        "product recorded, non-gating: served == offered, p99 < 150 ms, 0 errors at "
-        "1000 req/s offered for 30s with 4 gateway CPUs exclusive from PG/driver"
+#: The two on-demand benchmarks, and the one file the B1 live node lives in.
+BOD_ON_DEMAND_IDS = frozenset({"B1", "B11"})
+BOD_BURST_FILE = "services/gateway/tests/test_b1_ingest_burst.py"
+BOD_PG_SCALE_FILE = "tests/benchmark/test_pg_scale.py"
+BOD_LIVE_NODE_IDS = (
+    "test_b1_product_exclusive_reference_profile",
+    "test_b1_ci_scale_reference_profile",
+    "test_b11_audit_llm_insert_throughput",
+)
+#: Whole-token launcher targets no `run:` body may carry. `b1_product` is NOT
+#: among them: it is a strict extension of `b1` and would make a substring
+#: search pass or fail for the wrong reason, so the check is on tokens.
+BOD_RETIRED_TARGETS = ("b1", "b1_latency_basis", "b1_topology_probe")
+BOD_LAUNCHER_TOKEN = "integration-test.sh"
+#: The two node ids CI must still run from the B2/B10 benchmark step.
+BOD_REQUIRED_BENCHMARK_NODES = (
+    "test_b2_fingerprint_correlation_p99_under_20ms",
+    "test_b10_partitioned_list_and_filter_p99",
+)
+#: FP-BOD-7: both marker exclusions, required together on any command whose
+#: positional root IS the burst file.
+BOD_MARKER_EXCLUSIONS = ("not b1_live", "not b1_product")
+#: FP-BOD-5: the tag gate's wiring, restated here rather than read from the
+#: workflow it protects.
+BOD_RECORD_JOB = "release-bench-record"
+BOD_RECORD_STEP_RUN = "python3 scripts/check_release_bench_record.py"
+BOD_IMAGES_NEEDS = ["lint", "release-bench-record"]
+BOD_IMAGES_IF = (
+    "always() && needs.lint.result == 'success' && "
+    "(needs.release-bench-record.result == 'success' || "
+    "needs.release-bench-record.result == 'skipped')"
+)
+
+#: pytest options that consume the FOLLOWING token, so its value is never
+#: mistaken for a positional collection root.
+_BOD_VALUE_OPTIONS = frozenset({"-m", "-k", "-o", "-c", "-p", "-W", "--deselect", "--ignore"})
+
+
+def _bod_pytest_commands(run: str) -> "list[list[str]]":
+    """Every pytest invocation in one `run:` body, as token lists.
+
+    `shlex` rather than the module's closed grammar on purpose: this reads a
+    body the grammar deliberately refuses (a quoted marker expression carries
+    whitespace), and the question here is which files a command COLLECTS, not
+    whether the body is admissible -- `_ci_pin_failures` owns that.
+    """
+    out: "list[list[str]]" = []
+    collapsed = _delete_continuations(run or "")
+    for chunk in re.split(r"[\n;]|&&", collapsed):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            tokens = shlex.split(chunk)
+        except ValueError:
+            continue
+        if "pytest" not in tokens:
+            continue
+        out.append(tokens)
+    return out
+
+
+def _bod_pytest_operands(tokens: "list[str]") -> "tuple[list[str], list[str], str]":
+    """(positional roots, `--ignore` operands, the joined `-m` expression)."""
+    roots: "list[str]" = []
+    ignores: "list[str]" = []
+    marker = ""
+    index = tokens.index("pytest") + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _BOD_VALUE_OPTIONS:
+            if index + 1 < len(tokens):
+                if token == "-m":
+                    marker += " " + tokens[index + 1]
+                elif token == "--ignore":
+                    ignores.append(tokens[index + 1])
+            index += 2
+            continue
+        if token.startswith("--ignore="):
+            ignores.append(token.split("=", 1)[1])
+            index += 1
+            continue
+        if token.startswith("-m") and len(token) > 2 and not token.startswith("--"):
+            marker += " " + token[2:]
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        roots.append(token)
+        index += 1
+    return roots, ignores, marker
+
+
+def _bod_resolved(base: str, operand: str) -> Path:
+    """One collection operand, resolved against its step's working directory."""
+    return (REPO_ROOT / base / operand.split("::", 1)[0]).resolve()
+
+
+def _bod_step_base(job: dict, step: dict) -> str:
+    return str(
+        step.get("working-directory")
+        or (job.get("defaults") or {}).get("run", {}).get("working-directory")
+        or job.get("working-directory")
+        or ""
     )
-    assert b1["owning_milestone"] == "M3"
 
-    # (3) every policy fact is stated in notes, including the accepted cost.
-    notes = b1["notes"]
-    for clause in B1_KIND_POLICY_NOTES_CLAUSES:
-        assert clause in notes, f"B1 notes missing {clause!r}"
-    # The nested link is named exactly once, and only in notes.
-    assert notes.count(B1_NESTED_DIAGNOSTIC_LINK) == 1
-    assert text.count(B1_NESTED_DIAGNOSTIC_LINK) == 1
 
-    # (4) the kind-policy paragraph states a policy change, not a weakened bar
-    #     and not a promise that the job turns green. Scoped to that paragraph
-    #     on purpose: the surrounding GC-3 prose legitimately says "pytest
-    #     skip" about a different route.
-    start = "Nested kind latency policy, owner ruling"
-    end = "untouched and undecided here."
-    assert notes.count(start) == 1 and notes.count(end) == 1
-    policy = notes[notes.index(start):notes.index(end) + len(end)]
-    for forbidden in (
-        "skip", "xfail", "quarantine", "retry", "continue-on-error", "mask",
-        "lower", "relax", "weaken", "floor", "expected to pass", "should now pass",
-        "will be gating", "will move to", "turns green",
-    ):
-        assert forbidden not in policy, f"the kind policy paragraph must not say {forbidden!r}"
+def test_ci_does_not_run_b1_or_b11():
+    """FP-BOD-1 [function test]: no CI job executes either on-demand benchmark.
 
-    # (5) this test never reads a gitignored design file. `design/` is absent
-    #     in CI, so the deviation is pinned as a STRING in the committed
-    #     manifest; the only project file this test opens is thresholds.yaml.
-    src = Path(__file__).read_text(encoding="utf-8")
-    fn = next(
-        n for n in ast.parse(src).body
-        if isinstance(n, ast.FunctionDef)
-        and n.name == "test_e2e_kind_policy_is_explicit_in_manifest"
-    )
-    opened = [
-        ast.unparse(node) for node in ast.walk(fn)
-        if isinstance(node, ast.Call)
-        and ast.unparse(node.func).endswith(("read_text", "read_bytes", "open"))
+    Named for a workflow that still runs the ingest burst or the audit
+    throughput test -- INCLUDING by collecting the whole of
+    `tests/benchmark/test_pg_scale.py`, which is how B11 would come back
+    without any step naming it.
+
+    The launcher targets are matched as WHOLE TOKENS after
+    `integration-test.sh`. A substring search for `b1` would fail on the live
+    `b1_product` target, which is exactly the one this repository still has and
+    still must never run in CI; a substring search for `b1_product` would pass
+    a re-added `b1`.
+    """
+    workflow = _load_wf()
+    jobs = workflow.get("jobs") or {}
+    offences: "list[str]" = []
+    benchmark_nodes: "set[str]" = set()
+
+    for job_name, job in jobs.items():
+        for index, step in enumerate(_job_steps(job)):
+            run = _step_run(step) or ""
+            where = f"{job_name}[{index}]"
+            for retired in BOD_RETIRED_TARGETS:
+                if re.search(
+                    rf"{re.escape(BOD_LAUNCHER_TOKEN)}\s+{re.escape(retired)}(?![\w-])", run
+                ):
+                    offences.append(f"{where} runs the retired target {retired!r}")
+            for node_id in BOD_LIVE_NODE_IDS:
+                if node_id in run:
+                    offences.append(f"{where} names the live node {node_id!r}")
+            for tokens in _bod_pytest_commands(run):
+                roots, _ignores, _marker = _bod_pytest_operands(tokens)
+                base = _bod_step_base(job, step)
+                for root in roots:
+                    resolved = _bod_resolved(base, root)
+                    if resolved == (REPO_ROOT / BOD_PG_SCALE_FILE).resolve() and (
+                        "::" not in root
+                    ):
+                        offences.append(
+                            f"{where} collects the whole of {BOD_PG_SCALE_FILE}"
+                        )
+                    if "::" in root and root.split("::", 1)[0].endswith(
+                        "test_pg_scale.py"
+                    ):
+                        benchmark_nodes.add(root.split("::", 1)[1])
+
+    assert offences == [], offences
+    # ...and the two code-level PG benchmarks CI still owns are still named.
+    for node in BOD_REQUIRED_BENCHMARK_NODES:
+        assert node in benchmark_nodes, f"the benchmark job no longer runs {node}"
+
+
+def test_on_demand_tier_is_covered_asserted_and_absent_from_ci():
+    """FP-BOD-7 [function test]: covered, asserted, and out of CI -- all three.
+
+    Named for three separate regressions, and it takes all three checks to
+    catch them.
+
+    `tier: on-demand` while the linked test has no threshold comparison would
+    make the manifest's honesty rule vacuous for the two benchmarks that left
+    CI -- so the linked functions go through the same parser
+    `test_covered_benchmarks_link_to_threshold_asserting_tests` uses, and
+    neither may carry a skip decorator.
+
+    A workflow that merely omits the live node id, and then collects the burst
+    file WITHOUT the marker exclusions or without the working-directory
+    relative `--ignore`, runs the live node anyway. Node-id absence alone is
+    not this test: the resolution below is working-directory aware, because
+    the unit-gateway job ignores `tests/test_b1_ingest_burst.py` from inside
+    `services/gateway` and the repository-relative string does not name the
+    file from there.
+    """
+    data = _load(REPO_ROOT / "tests/benchmark/thresholds.yaml")
+    tiered = {
+        entry["id"]: entry for entry in data["benchmarks"] if "tier" in entry
+    }
+    assert set(tiered) == BOD_ON_DEMAND_IDS, sorted(tiered)
+    for entry in tiered.values():
+        assert entry["tier"] == "on-demand", entry["id"]
+        assert entry["status"] == "covered", entry["id"]
+        # The benchmark-named links carry a real threshold comparison, and the
+        # linked function is not skipped.
+        named = [
+            link for link in entry["tests"]
+            if _link_names_benchmark(link, entry["id"]) and link.endswith(
+                tuple(f"::{n}" for n in (_link_test_name(link),))
+            )
+        ]
+        assert named, entry["id"]
+        for link in named:
+            assert _link_asserts_threshold(link, REPO_ROOT), link
+            path = _resolve_test_file(link, REPO_ROOT)
+            assert path is not None and path.is_file(), link
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            func = next(
+                (
+                    node for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == _link_test_name(link)
+                ),
+                None,
+            )
+            assert func is not None, link
+            assert not any(_is_skip_decorator(d) for d in func.decorator_list), link
+
+    workflow = _load_wf()
+    burst = (REPO_ROOT / BOD_BURST_FILE).resolve()
+    offences: "list[str]" = []
+    for job_name, job in (workflow.get("jobs") or {}).items():
+        for index, step in enumerate(_job_steps(job)):
+            run = _step_run(step) or ""
+            where = f"{job_name}[{index}]"
+            for node_id in BOD_LIVE_NODE_IDS:
+                if node_id in run:
+                    offences.append(f"{where} names {node_id!r}")
+            base = _bod_step_base(job, step)
+            for tokens in _bod_pytest_commands(run):
+                roots, ignores, marker = _bod_pytest_operands(tokens)
+                resolved_ignores = {_bod_resolved(base, i) for i in ignores}
+                for root in roots:
+                    target = _bod_resolved(base, root)
+                    if target == burst:
+                        # The harness command: held to the marker pair, never
+                        # to an `--ignore` of its own operand.
+                        for exclusion in BOD_MARKER_EXCLUSIONS:
+                            if exclusion not in marker:
+                                offences.append(
+                                    f"{where} collects the burst file without "
+                                    f"{exclusion!r} (marker={marker.strip()!r})"
+                                )
+                        continue
+                    if not target.is_dir():
+                        continue
+                    if burst.is_relative_to(target) and burst not in resolved_ignores:
+                        offences.append(
+                            f"{where} collects {root!r} without an --ignore that "
+                            f"resolves to {BOD_BURST_FILE} (base={base!r}, "
+                            f"ignores={sorted(str(i) for i in resolved_ignores)})"
+                        )
+    assert offences == [], offences
+
+
+#: Review S1: the shapes a pinned body must refuse. Each is a real way to run
+#: something the operand grammar would never have admitted in a parsed step.
+BOD_PINNED_BODY_ESCAPES = (
+    "bash -c 'echo pwned'",
+    "sh -c 'echo pwned'",
+    "curl https://example.invalid/x",
+    "python3 -c 'import os'",
+    "services/worker/.venv/bin/python -c 'import os'",
+    "sudo chmod 777 /",
+    "source deploy/versions.env",
+    "export PYTHONPATH=/tmp/hook",
+    "python3 -m http.server",
+    "services/worker/.venv/bin/python -m pip install x",
+    "git push origin main",
+    "env -u X curl http://x",
+    "python3 evil.sh",
+    "bash scripts/integration-test.sh b1",
+    "services/worker/.venv/bin/python -m pytest a -p rca_bench",
+    "services/worker/.venv/bin/python -m pytest a --deselect b",
+    "npm install evil",
+    "tar -xzf /tmp/x.tgz",
+)
+
+
+def test_pinned_run_bodies_are_held_to_the_operand_grammar():
+    """The (AG)(5) exception is compensated, not a hole (review S1).
+
+    Two `run:` bodies skip `_shell_words` because the closed grammar refuses a
+    quoted word containing whitespace and every pytest marker expression is
+    one. Byte equality alone would only catch a workflow-side edit: someone
+    who edited `EXPECTED_FUNCTIONAL_PYTEST_RUN` to match would face no operand
+    check at all. `_pinned_body_escape_failures` is that check, and this test
+    is what says it still is one.
+
+    Named for the failure it has to catch: a pinned body that runs something
+    the parser would never have admitted -- a general interpreter (`-c`), an
+    un-admitted command word, a second module, a plugin injection, or a
+    delegation to the tracked launcher.
+    """
+    # The two shipped bodies are admissible, and are the only exceptions.
+    assert PINNED_EXECUTABLE_RUNS == {
+        EXPECTED_FUNCTIONAL_PYTEST_RUN,
+        EXPECTED_RELEASE_RECORD_CHECK_RUN,
+    }
+    for body in PINNED_EXECUTABLE_RUNS:
+        assert _pinned_body_escape_failures(body) == [], body[:80]
+    assert _pinned_body_escape_failures(EXPECTED_RELEASE_RECORD_FETCH_RUN) == []
+
+    # ...and every escape is refused, appended to a real pinned body so the
+    # check is on the shape rather than on a synthetic one-liner.
+    for escape in BOD_PINNED_BODY_ESCAPES:
+        mutated = EXPECTED_FUNCTIONAL_PYTEST_RUN + "\n" + escape
+        assert _pinned_body_escape_failures(mutated) != [], escape
+
+    # The head allowlist is narrower than the parsed grammar's on purpose: a
+    # measured step never needs a setup command word.
+    assert PINNED_BODY_COMMAND_WORDS < COMMAND_OPERANDS | {"python3", "git"}
+    for setup_word in ("curl", "tar", "sudo", "source", "export", "npm", "helm", "chmod"):
+        assert setup_word not in PINNED_BODY_COMMAND_WORDS, setup_word
+
+
+def test_release_record_gates_image_push():
+    """FP-BOD-5 [CI pin]: a red record job cannot publish images.
+
+    Named for a tag that publishes images while the record job failed. An
+    `if: always()` with no result check would let exactly that happen, so the
+    success-or-skipped clause is required by equality -- `always()` alone is
+    what keeps `images` running on a pull request, where the record job is
+    skipped, and it is also what would let a FAILED record job through if the
+    two result clauses were dropped.
+    """
+    workflow = _load_wf()
+    jobs = workflow.get("jobs") or {}
+    record = jobs.get(BOD_RECORD_JOB)
+    assert record is not None, f"the {BOD_RECORD_JOB} job is missing"
+    assert record.get("if") == "startsWith(github.ref, 'refs/tags/v')", record.get("if")
+    assert record.get("runs-on") == "ubuntu-latest", record.get("runs-on")
+    steps = _job_steps(record)
+    checkout = steps[0]
+    assert checkout.get("uses", "").startswith("actions/checkout"), checkout
+    assert (checkout.get("with") or {}).get("fetch-depth") == 0, checkout
+    test_steps = [
+        (_step_run(step) or "").strip() for step in steps
+        if "check_release_bench_record" in (_step_run(step) or "")
     ]
-    assert len(opened) == 2, opened
-    assert sum("thresholds.yaml" in call for call in opened) == 1, opened
-    assert all("design" not in call for call in opened), opened
-    assert "design/frozen-deviations.md" in B1_KIND_POLICY_NOTES_CLAUSES
+    assert test_steps == [BOD_RECORD_STEP_RUN], test_steps
+    for step in steps:
+        assert "continue-on-error" not in step, step
+    # It runs neither benchmark, and delegates to no launcher target.
+    for step in steps:
+        run = _step_run(step) or ""
+        for node_id in BOD_LIVE_NODE_IDS:
+            assert node_id not in run, run
+        assert BOD_LAUNCHER_TOKEN not in run, run
 
-    # (6) the collection guard -- not the threshold list -- is what keeps the
-    #     nested test reachable, and it names the same constant.
-    assert B1_NESTED_DIAGNOSTIC_LINK in _collection_guard_links(REPO_ROOT)
-    assert B1_NESTED_DIAGNOSTIC_LINK not in _covered_py_links(REPO_ROOT)
+    images = jobs["images"]
+    assert images.get("needs") == BOD_IMAGES_NEEDS, images.get("needs")
+    assert _normalize_ws(images.get("if", "")) == _normalize_ws(BOD_IMAGES_IF)

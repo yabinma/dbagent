@@ -1,10 +1,13 @@
 """FP-IG-9: B1 e2e link — nested-tier profile against shipped image and chart.
 
 Baseline: open-loop at BASE_RATE for BASE_SECONDS, failing on completion,
-errors and exact audit accounting; the p99 is evaluated against P99_MS and
-recorded as an observation, not failure-producing (55ddeff). No rate
-comparison. Saturation: closed-loop of SATURATION_CLIENTS for BURST_SECONDS
-(0 errors, 0 restarts, no Unhealthy, exact audit accounting).
+errors and exact audit accounting. No rate comparison and NO LATENCY
+COMPARISON: bench-on-demand (FP-BOD-8) deleted the nested p99 observation, its
+diagnostic module and its success artifact once B1 stopped being a CI latency
+gate, so there is nothing left for the kind tape to stand in for. Saturation:
+closed-loop of SATURATION_CLIENTS for BURST_SECONDS (0 errors, 0 restarts, no
+Unhealthy, exact audit accounting). Eleven correctness clauses still fail the
+job.
 """
 from __future__ import annotations
 
@@ -25,7 +28,6 @@ import importlib.util
 import sys
 
 from tests.e2e.conftest import lookup_platform
-from tests.e2e.b1_e2e_diagnostics import B1E2EDiagnosticSession
 
 _PROFILE_PATH = Path(__file__).resolve().parent / "b1_e2e_profile.py"
 _spec = importlib.util.spec_from_file_location("b1_e2e_profile", _PROFILE_PATH)
@@ -272,125 +274,9 @@ def _unhealthy_events_since(
     return hits
 
 
-def _cgroup_cpu_stat() -> dict[str, int | None]:
-    """Read gateway cgroup cpu.stat fields (usage_usec, throttled_usec, nr_throttled).
-
-    Returns a dict with int values or None when unreadable. Diagnostics only —
-    unavailable is reported in the fingerprint, never asserted (design.md K).
-    """
-    empty = {"usage_usec": None, "throttled_usec": None, "nr_throttled": None}
-    try:
-        pod = _gateway_pod_name()
-        out = subprocess.run(
-            [
-                "kubectl",
-                "-n",
-                NAMESPACE,
-                "exec",
-                pod,
-                "--",
-                "cat",
-                "/sys/fs/cgroup/cpu.stat",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if out.returncode != 0:
-            # cgroup v1 fallback for usage only
-            out_v1 = subprocess.run(
-                [
-                    "kubectl",
-                    "-n",
-                    NAMESPACE,
-                    "exec",
-                    pod,
-                    "--",
-                    "cat",
-                    "/sys/fs/cgroup/cpuacct/cpuacct.usage",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if out_v1.returncode != 0:
-                return empty
-            # nanoseconds → microseconds
-            try:
-                return {
-                    "usage_usec": int(out_v1.stdout.strip()) // 1000,
-                    "throttled_usec": None,
-                    "nr_throttled": None,
-                }
-            except ValueError:
-                return empty
-        parsed: dict[str, int | None] = {
-            "usage_usec": None,
-            "throttled_usec": None,
-            "nr_throttled": None,
-        }
-        for line in out.stdout.splitlines():
-            parts = line.split()
-            if len(parts) != 2:
-                continue
-            key, val = parts[0], parts[1]
-            if key in parsed:
-                try:
-                    parsed[key] = int(val)
-                except ValueError:
-                    parsed[key] = None
-        return parsed
-    except Exception:  # noqa: BLE001
-        return empty
-
-
-def _fmt_diag(value: float | int | None) -> str:
-    """Fingerprint field: number or the literal ``unavailable`` (design.md K)."""
-    if value is None:
-        return "unavailable"
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    return str(value)
-
-
-def _host_fingerprint() -> dict[str, str | int]:
-    # File reads only — no os.environ (FP-IG-13). cpu_count via /proc.
-    cpus = 0
-    try:
-        cpus = sum(1 for _ in Path("/sys/devices/system/cpu").glob("cpu[0-9]*"))
-    except OSError:
-        cpus = 0
-    if cpus == 0:
-        try:
-            text = Path("/proc/cpuinfo").read_text(encoding="utf-8")
-            cpus = sum(1 for line in text.splitlines() if line.startswith("processor"))
-        except OSError:
-            cpus = 0
-
-    model = "unknown"
-    try:
-        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
-            if line.lower().startswith("model name"):
-                model = " ".join(line.split(":", 1)[1].split())
-                break
-    except OSError:
-        pass
-    image = "unknown"
-    for path, prefix in (
-        (Path("/imagegeneration/imagedata.json"), "imagedata"),
-        (Path("/etc/os-release"), "os-release"),
-    ):
-        if path.is_file():
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-            image = f"{prefix}:{digest}"
-            break
-    return {"cpus": cpus, "cpu_model": model, "image": image}
-
-
 @pytest.mark.e2e
-def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):
+def test_b1_ingest_burst_profile(ingest_url, dashboard_url):
     token = _admin_token(dashboard_url)
-    host = _host_fingerprint()
     # (1) platform ONLINE before any load
     platform_online = _platform_online(dashboard_url, token)
     assert platform_online == True, (  # noqa: E712 — named Eq for FP-IG-19
@@ -411,10 +297,7 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):
         marks["audit_before"] = _count_ingest_audit_rows(
             dashboard_url, token, datetime.now(timezone.utc) - timedelta(hours=1), cap=10**7
         )
-        marks["cgroup_before"] = _cgroup_cpu_stat()
         marks["restarts_before"] = _gateway_restart_count()
-
-    diagnostics = B1E2EDiagnosticSession()
 
     # --- Baseline phase ---
     baseline = asyncio.run(
@@ -427,53 +310,16 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):
             prologue=prologue,
             include_sync_warmup=True,
             on_prologue_complete=_after_prologue,
-            on_window_open=diagnostics.open,
-            on_window_complete=diagnostics.close,
         )
     )
     audit_after_base = _count_ingest_audit_rows(
         dashboard_url, token, datetime.now(timezone.utc) - timedelta(hours=1), cap=10**7
     )
     committed = audit_after_base - int(marks.get("audit_before", 0))
-    cgroup_after = _cgroup_cpu_stat()
-    cgroup_before = marks.get("cgroup_before") or {}
-    gw_cpu_seconds: float | None = None
-    gw_throttled_usec: int | None = None
-    gw_nr_throttled: int | None = None
-    if cgroup_before.get("usage_usec") is not None and cgroup_after.get("usage_usec") is not None:
-        gw_cpu_seconds = (cgroup_after["usage_usec"] - cgroup_before["usage_usec"]) / 1e6
-    if (
-        cgroup_before.get("throttled_usec") is not None
-        and cgroup_after.get("throttled_usec") is not None
-    ):
-        gw_throttled_usec = int(cgroup_after["throttled_usec"] - cgroup_before["throttled_usec"])
-    if (
-        cgroup_before.get("nr_throttled") is not None
-        and cgroup_after.get("nr_throttled") is not None
-    ):
-        gw_nr_throttled = int(cgroup_after["nr_throttled"] - cgroup_before["nr_throttled"])
-    restarts_after_base = _gateway_restart_count()
-    base_restart_delta = restarts_after_base - int(marks.get("restarts_before", restarts_after_base))
-
-    # Fixed-shape per-phase fingerprint (design.md §11.3.3 K / review C7).
-    print(
-        f"B1 env=cpus={host['cpus']},cpu_model={host['cpu_model']},image={host['image']},"
-        f"tier=e2e,phase=baseline,max_lateness_ms={baseline.max_lateness_ms:.1f},"
-        f"p99_ms={baseline.p99:.1f},rate={baseline.served_rate:.1f},"
-        f"lateness_drift_ms={baseline.lateness_drift_ms:.1f},"
-        f"gw_cpu_seconds={_fmt_diag(gw_cpu_seconds)},"
-        f"gw_throttled_usec={_fmt_diag(gw_throttled_usec)},"
-        f"gw_nr_throttled={_fmt_diag(gw_nr_throttled)},"
-        f"gw_restarts={base_restart_delta},"
-        f"in_flight={baseline.max_in_flight}",
-        flush=True,
-    )
-    diagnostics.emit(baseline)
-    # (2)(3)(4)(6) fail the job; (5) p99 is observed only — locals either way
+    # (2)(3)(4)(6) fail the job. FP-BOD-8: no latency comparison, no recorded
+    # observation and no diagnostic emission happen here any more.
     served = baseline.served
     errors = baseline.errors
-    p99 = baseline.p99
-    record_property("b1_kind_p99_lt_150_ms", p99 < P99_MS)
     assert served + errors == 6000
     assert errors == 0
     assert served == 6000
@@ -487,7 +333,6 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):
     sat_audit_before = _count_ingest_audit_rows(
         dashboard_url, token, datetime.now(timezone.utc) - timedelta(hours=1), cap=10**7
     )
-    sat_cgroup_before = _cgroup_cpu_stat()
     counter = {"i": 0}
 
     def factory() -> tuple[bytes, dict[str, str]]:
@@ -519,45 +364,7 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):
         dashboard_url, token, datetime.now(timezone.utc) - timedelta(hours=1), cap=10**7
     )
     sat_committed = sat_audit_after - sat_audit_before
-    sat_cgroup_after = _cgroup_cpu_stat()
-    sat_gw_cpu: float | None = None
-    sat_gw_throttled: int | None = None
-    sat_gw_nr: int | None = None
-    if (
-        sat_cgroup_before.get("usage_usec") is not None
-        and sat_cgroup_after.get("usage_usec") is not None
-    ):
-        sat_gw_cpu = (
-            sat_cgroup_after["usage_usec"] - sat_cgroup_before["usage_usec"]
-        ) / 1e6
-    if (
-        sat_cgroup_before.get("throttled_usec") is not None
-        and sat_cgroup_after.get("throttled_usec") is not None
-    ):
-        sat_gw_throttled = int(
-            sat_cgroup_after["throttled_usec"] - sat_cgroup_before["throttled_usec"]
-        )
-    if (
-        sat_cgroup_before.get("nr_throttled") is not None
-        and sat_cgroup_after.get("nr_throttled") is not None
-    ):
-        sat_gw_nr = int(
-            sat_cgroup_after["nr_throttled"] - sat_cgroup_before["nr_throttled"]
-        )
-
     restart_delta = restarts_after - restarts_before
-    print(
-        f"B1 env=cpus={host['cpus']},cpu_model={host['cpu_model']},image={host['image']},"
-        f"tier=e2e,phase=saturation,max_lateness_ms={sat.max_lateness_ms:.1f},"
-        f"p99_ms={sat.p99:.1f},rate={sat.served_rate:.1f},"
-        f"lateness_drift_ms={sat.lateness_drift_ms:.1f},"
-        f"gw_cpu_seconds={_fmt_diag(sat_gw_cpu)},"
-        f"gw_throttled_usec={_fmt_diag(sat_gw_throttled)},"
-        f"gw_nr_throttled={_fmt_diag(sat_gw_nr)},"
-        f"gw_restarts={restart_delta},"
-        f"in_flight={sat.max_in_flight}",
-        flush=True,
-    )
     # (7)(8)
     issued = sat.offered
     sat_served = sat.served

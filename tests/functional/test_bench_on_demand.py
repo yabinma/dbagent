@@ -1,0 +1,146 @@
+"""bench-on-demand: the launcher's retired targets, and the runbook (FP-BOD-2/6).
+
+Two function tests and the unit coverage of the launcher exits behind them.
+Every literal is declared here, independently of the files it pins: a check
+derived from its own subject detects nothing.
+"""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LAUNCHER = REPO_ROOT / "scripts" / "integration-test.sh"
+RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "bench-on-demand.md"
+
+#: The three targets this slice deletes. Each must be refused with the
+#: launcher's ordinary unknown-target status, BEFORE the relay gate: a target
+#: that merely fails later is still a target.
+RETIRED_TARGETS = ("b1", "b1_latency_basis", "b1_topology_probe")
+#: The target that stays, and the one the usage text must still offer.
+PRODUCT_TARGET = "b1_product"
+UNKNOWN_TARGET_EXIT = 2
+HELP_EXIT = 0
+
+#: The release trigger's two commands and the record path, as the runbook must
+#: spell them.
+RUNBOOK_B1_COMMAND = "/opt/gitspace/dbagent/scripts/integration-test.sh b1_product"
+RUNBOOK_B11_COMMAND = (
+    "tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput"
+)
+RUNBOOK_RESULTS_PATH = "docs/runbooks/bench-on-demand-results.txt"
+#: The performance-investigation trigger's two named product paths.
+RUNBOOK_INVESTIGATION_PATHS = (
+    "services/gateway/gateway/ingest.py",
+    "services/gateway/gateway/merge_commit.py",
+)
+#: The release procedure, clause by clause.
+RUNBOOK_RELEASE_CLAUSES = (
+    "git status --porcelain",
+    "git rev-parse HEAD",
+    "measured_sha",
+    "only when both commands exited 0",
+    "Commit only that file",
+    "Push the commit to `main`",
+    "Tag that commit",
+)
+
+
+def _run_launcher(target: str) -> subprocess.CompletedProcess:
+    """Invoke the tracked launcher with one argument, in a clean environment.
+
+    The relay gate is deliberately NOT satisfied here: the point of the test
+    is that an unknown target is refused by the argument `case` before the
+    gate runs at all, so a sandboxed environment reaches the same verdict a
+    developer host does.
+    """
+    return subprocess.run(
+        ["bash", str(LAUNCHER), target],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_integration_test_sh_rejects_retired_b1_targets():
+    """FP-BOD-2 [function test]: the launcher still accepts `b1` or the probe.
+
+    Named for a launcher that kept a CI-scale or recorded route. Each retired
+    name is INVOKED and must exit 2 -- the ordinary unknown-target status --
+    and the usage text must not list it.
+
+    Grepping for the absence of the letters `topology` would be red on a
+    comment that describes the deletion, and green on a target that still
+    exists under another spelling. The exit status is the target's own answer
+    to "do you exist", so that is what is read.
+    """
+    assert LAUNCHER.is_file()
+
+    for target in RETIRED_TARGETS:
+        result = _run_launcher(target)
+        assert result.returncode == UNKNOWN_TARGET_EXIT, (
+            f"{target!r} exited {result.returncode}: "
+            f"{result.stdout[-400:]!r} {result.stderr[-400:]!r}"
+        )
+        assert f"unknown target '{target}'" in result.stderr, result.stderr
+
+    # ...and the help path, which runs before the relay gate too, no longer
+    # offers them.
+    help_result = _run_launcher("--help")
+    assert help_result.returncode == HELP_EXIT, help_result.stderr
+    usage = help_result.stdout
+    assert PRODUCT_TARGET in usage, usage
+    for target in RETIRED_TARGETS:
+        assert f"|{target}|" not in usage, f"usage still offers {target!r}"
+        assert f"| {target} |" not in usage, f"usage still offers {target!r}"
+        assert f"\n  {target} " not in usage, f"usage still describes {target!r}"
+
+    # The surviving target is still a `case` arm, not just usage prose.
+    source = LAUNCHER.read_text(encoding="utf-8")
+    assert f"  {PRODUCT_TARGET}) run_step " in source, source[:0] or "case arm missing"
+    for target in RETIRED_TARGETS:
+        assert f"  {target}) run_step " not in source, f"{target} still dispatches"
+    # The relay override admits exactly the two targets that remain.
+    assert "    preflight|b1_product) return 0 ;;" in source
+    assert 'echo "  admitted targets    : preflight b1_product"' in source
+
+
+def test_bench_on_demand_runbook_names_triggers_and_commands():
+    """FP-BOD-6 [function test]: the runbook says WHEN, WHAT and WHERE.
+
+    Named for a runbook that exists and does not say when a run is required or
+    which command to use. A file that merely mentions B1 would pass a
+    existence check and leave an operator with no procedure, so every clause
+    of the release procedure, both investigation paths, both commands and the
+    results path are required by name.
+    """
+    assert RUNBOOK.is_file(), f"{RUNBOOK} is missing"
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    # (1) The two triggers.
+    assert "Release" in text and "v*" in text
+    assert "Performance investigation" in text
+    for path in RUNBOOK_INVESTIGATION_PATHS:
+        assert path in text, f"the investigation trigger does not name {path}"
+
+    # (2) The two commands and the results path.
+    assert RUNBOOK_B1_COMMAND in text, "the B1 command is missing"
+    assert RUNBOOK_B11_COMMAND in text, "the B11 node id is missing"
+    assert RUNBOOK_RESULTS_PATH in text, "the results path is missing"
+
+    # (3) The release procedure, clause by clause, in order.
+    positions = []
+    for clause in RUNBOOK_RELEASE_CLAUSES:
+        assert clause in text, f"the release procedure omits {clause!r}"
+        positions.append(text.index(clause))
+    # "copy only after both commands exited 0" must precede the commit and the
+    # tag: a runbook that commits first documents the wrong procedure.
+    copy_at = text.index("only when both commands exited 0")
+    assert copy_at < text.index("Commit only that file")
+    assert text.index("Commit only that file") < text.index("Tag that commit")
+
+    # (4) It adds no third benchmark, no skip flag and no way to tag without
+    # the record.
+    for forbidden in ("--skip", "SKIP_BENCH", "without the record", "b1_latency_basis"):
+        assert forbidden not in text, f"the runbook offers {forbidden!r}"

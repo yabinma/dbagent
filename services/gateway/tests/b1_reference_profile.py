@@ -31,19 +31,8 @@ INGEST_GATEWAY_WORKERS = 4
 TRACKER_CMDLINE_MARK = "multiprocessing.resource_tracker"
 WORKER_CMDLINE_MARK = "multiprocessing.spawn"
 
-# GC-1 FP-GC1-1 — the CI-scale resource-declared profile. Distinct names, each
-# bound exactly once at module scope; the product constants above do not move.
-# Derivation (design-time, never recomputed here): 3.034 ms/served request on
-# the contended EPYC reference host, an 80% ceiling on the 2.00-CPU gateway
-# quota gives 527.36 req/s, rounded down to the next 100 → 500 offered/s; one
-# further fixed 50 req/s finite-window margin → a 450 req/s served floor.
-CI_SCALE_BURST_RATE = 500
-CI_SCALE_BURST_SECONDS = 30
-CI_SCALE_TOTAL_REQUESTS = 15_000
-CI_SCALE_P99_MS = 150.0
-CI_SCALE_SUSTAINED_FLOOR = 450
-CI_SCALE_MAX_IN_FLIGHT = 500
-CI_SCALE_PROLOGUE_REQUESTS = 75  # int(500 * 150 / 1000)
+# bench-on-demand FP-BOD-2: the CI-scale constants are deleted with the route
+# that measured them. The product constants above are the only profile left.
 
 # Post-window shed probe slack (FP-IG-36 / §11.3.3 AK). Absorbs connect losses;
 # never load-bearing — the pigeonhole minimum alone forces a shed.

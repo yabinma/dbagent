@@ -49,10 +49,11 @@
 #   CI needs none of this for the go and py tiers: GitHub-hosted runners have normal
 #   networking, so `ci.yml` runs those tests directly.
 #
-#   The b1 tier is the exception, and it is deliberate: ci.yml's `benchmark` job step 17
-#   runs `bash scripts/integration-test.sh b1` -- THIS script -- so the gating CI-scale
-#   route and the local one are one launcher rather than two that can drift. That wrapper
-#   step is pinned by equality in tests/functional/test_manifests.py.
+#   The B1 tier is the exception, and it is deliberate: `b1_product` needs a Docker
+#   daemon, the host PID namespace and scheduler affinity over at least eight logical
+#   CPUs. Since bench-on-demand (FP-BOD-1/2) no CI job runs it at all: it is measured on
+#   a developer host before a release and after a change to the ingest write path. See
+#   docs/runbooks/bench-on-demand.md.
 #
 # WHAT IT RUNS
 #
@@ -63,14 +64,14 @@
 # TRACKED, NOT LOCAL-ONLY (GC-1 FP-GC1-2)
 #
 #   This file used to be gitignored and local-only. It is now version-controlled and is
-#   the SINGLE carrier of the B1 reference deployment: `.github/workflows/ci.yml` invokes
-#   `bash scripts/integration-test.sh b1` for the merge-gating CI-scale benchmark, and a
-#   developer runs the identical target locally. That is the whole point -- CI and local
-#   cannot drift apart, because there is only one topology and one set of assertions.
+#   the SINGLE carrier of the B1 reference deployment: one target, `b1_product`, one
+#   placement contract and one set of assertions, so there is nothing for a second copy
+#   to drift from.
 #
-#   `tests/functional/test_manifests.py` pins the workflow step body, this script's
-#   container flags, the placement contract, the marker selections and the cleanup scope
-#   by equality, so a silent edit to either side is a named test failure.
+#   `tests/functional/test_manifests.py` pins this script's container flags, the
+#   placement contract, the marker selections and the cleanup scope by equality, and
+#   `tests/functional/test_bench_on_demand.py` pins that the retired CI-scale, oracle and
+#   topology-probe targets are refused, so a silent edit is a named test failure.
 #
 # THE REST OF THE SUITE STILL RUNS SANDBOXED
 #
@@ -91,45 +92,26 @@ cd "$REPO_ROOT" || exit 1
 WHAT="${1:-all}"
 
 case "$WHAT" in
-  all|go|py|python|preflight|smoke|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run|b1|b1_product|b1_latency_basis|b1_topology_probe) ;;
+  all|go|py|python|preflight|smoke|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run|b1_product) ;;
   -h|--help|help)
     # QUOTED heredoc: this block contains backticks and angle brackets that must print
     # literally. Unquoted, bash treats `go test -exec <anything>` as a command
     # substitution and the line renders empty with a syntax error on stderr. (The
     # refusal message below is deliberately UNquoted -- it interpolates $REPO_ROOT.)
     cat <<'EOF'
-usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_latency_basis|b1_topology_probe|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run]
+usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1_product|d0_2a|d0_2c|d0_2d|d0_3a|d0_3b|d0_3c|d0_4|d0_4_workers|sp_1|sp_1_run|sp_1_sg4|rm_1|rm_1_run|lv_1|lv_1_run]
 
-  all  (default)  go + py + b1 + b1_product -- the local acceptance route
-  b1              the resource-declared CI-scale B1 benchmark (gating; the
-                  same target ci.yml runs). It ALWAYS runs its container-free
-                  coverage phase first, on one allowed CPU. It then reads this
-                  host's exact CPU model and routes on the tracked decision
-                  carrier tests/benchmark/b1_topology_decision.json: a model
-                  with a ratified topology runs the live gate under exactly
-                  that topology, over the first two complete SMT sibling pairs;
-                  any other model records a named non-gating reason and starts
-                  no workload. There is no fixed 2/1/1 layout any more, and no
-                  first-four-CPUs fallback. A missing or corrupt carrier fails
-                  the target rather than reading as an unratified model.
-  b1_product      the recorded, non-gating 1000 req/s product-promise run on
-                  measured-role-exclusive cores; needs >= 8 logical CPUs
-  b1_latency_basis
-                  the isolated CPU-basis oracle (B1-LATENCY-BASIS-1). The same
-                  selected CI-scale route, plus the FP-IG-18 node that compares
-                  measured gateway CPU per request against the recorded chart
-                  basis. Explicit only: never part of `all`, never part of the
-                  ordinary `b1` result, and in CI only behind a manual
-                  workflow_dispatch input. It exits 3 with
-                  basis_oracle_unobserved:<reason> and starts no workload when
-                  the ledger is unrecorded/invalid or this runner is not the
-                  recorded signature identity.
-  b1_topology_probe
-                  GC-3 topology discovery: the 28 closed placements of the
-                  CI-scale burst, measured once each and recorded. Manual only
-                  (workflow_dispatch), never part of `all` or ordinary CI. A
-                  candidate that misses the bar is DATA, not a failure; the
-                  target fails only on a broken measurement.
+  all  (default)  go + py + b1_product -- the local acceptance route
+  b1_product      the on-demand 1000 req/s product-promise B1 run on
+                  measured-role-exclusive cores (gateway 4 / PostgreSQL 3 /
+                  driver 1); needs >= 8 logical CPUs. It FAILS the run when the
+                  offer is not fully served, when any request errors, or when
+                  the placement, accounting or record-integrity checks fail; the
+                  due-time p99 is printed as met or missed and is not the bar.
+                  Run it before every v* tag and after a change to the ingest
+                  write path -- see docs/runbooks/bench-on-demand.md. A host that
+                  cannot host it gets this target's non-zero refusal; there is no
+                  recorded route that exits 0 without measuring anything.
   go              go test ./... -race -timeout 300s -p 1
   py              the functional/service pytest tiers that use testcontainers
   preflight       run only the checks, no tests -- confirms in ~1s that the
@@ -138,11 +120,11 @@ usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_l
                   -- proves end to end that a container's published port is
                   actually reachable from both
 
-RELAY OVERRIDE: when this shell has no global-scope address, the five admitted
-targets -- preflight, b1, b1_product, b1_latency_basis, b1_topology_probe -- can
-still run, but only after this script has proved host-network reachability through
-your own Docker socket. Ask for the proof, and point TMPDIR at a directory the host
-daemon can bind-mount (the script sets neither for you):
+RELAY OVERRIDE: when this shell has no global-scope address, the two admitted
+targets -- preflight and b1_product -- can still run, but only after this script
+has proved host-network reachability through your own Docker socket. Ask for the
+proof, and point TMPDIR at a directory the host daemon can bind-mount (the script
+sets neither for you):
 
     DBAGENT_DOCKER_RELAY=prove TMPDIR=<directory-the-host-daemon-can-bind-mount> \
       /opt/gitspace/dbagent/scripts/integration-test.sh preflight
@@ -157,7 +139,7 @@ Must run OUTSIDE the Claude Code sandbox -- see the header of this file.
 EOF
     exit 0 ;;
   *)
-    echo "integration-test.sh: unknown target '$WHAT' (want: all | go | py | preflight | smoke | b1 | b1_product | b1_latency_basis | b1_topology_probe | d0_2a | d0_2c | d0_2d | d0_3a | d0_3b | d0_3c | d0_4 | d0_4_workers | sp_1 | sp_1_run | sp_1_sg4 | rm_1 | rm_1_run | lv_1 | lv_1_run)" >&2
+    echo "integration-test.sh: unknown target '$WHAT' (want: all | go | py | preflight | smoke | b1_product | d0_2a | d0_2c | d0_2d | d0_3a | d0_3b | d0_3c | d0_4 | d0_4_workers | sp_1 | sp_1_run | sp_1_sg4 | rm_1 | rm_1_run | lv_1 | lv_1_run)" >&2
     exit 2 ;;
 esac
 
@@ -175,8 +157,8 @@ esac
 # /usr/bin/ip and from nowhere else, so whatever a caller's PATH calls `ip` is never
 # consulted. A count greater than zero is the ordinary host and CI; it takes the
 # existing `docker info` check, unchanged. A count of zero refuses exactly as it
-# always has, with one exception -- one of the five admitted targets (preflight, b1,
-# b1_product, b1_latency_basis, b1_topology_probe) whose caller asked for it with
+# always has, with one exception -- one of the two admitted targets (preflight,
+# b1_product) whose caller asked for it with
 # DBAGENT_DOCKER_RELAY=prove AND for which this script has then proved host-network
 # reachability itself: a local unix socket, a mktemp directory the daemon can see
 # through a bind mount, and a `--network host` client that completed a TCP handshake
@@ -215,7 +197,7 @@ relay_address_count() {
 
 relay_target_admitted() {
   case "$1" in
-    preflight|b1|b1_product|b1_latency_basis|b1_topology_probe) return 0 ;;
+    preflight|b1_product) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -445,7 +427,7 @@ relay_print_preflight() {
     echo "integration-test.sh: preflight OK (relay override)"
     echo "  relay proof         : host-network reachability verified"
     echo "  docker              : $(/usr/bin/docker version --format '{{.Server.Version}}' 2>/dev/null) via ${DOCKER_HOST:-default socket}"
-    echo "  admitted targets    : preflight b1 b1_product b1_latency_basis b1_topology_probe"
+    echo "  admitted targets    : preflight b1_product"
   else
     echo "integration-test.sh: preflight OK"
     echo "  outside the sandbox : $(/usr/bin/ip -o addr show scope global | awk '{print $2}' | sort -u | tr '\n' ' ')"
@@ -729,16 +711,18 @@ lv_1_run() {
 # ---------------------------------------------------------------------------
 # B1 -- the resource-declared reference deployment (GC-1, FP-GC1-1..4).
 #
-# Both B1 routes run here and nowhere else: ci.yml's benchmark job invokes
-# `bash scripts/integration-test.sh b1`, and a developer runs the same target
-# locally, so the CI-scale gate is one deployment with one set of assertions.
+# One B1 route runs here and nowhere else: `b1_product`, the on-demand product
+# profile. The CI-scale route, its per-model topology carrier, the recorded
+# non-gating route and the CPU-basis oracle were deleted by bench-on-demand
+# (FP-BOD-2); a host that cannot host this target gets a non-zero refusal, not
+# an exit 0 with no workload.
 #
 # The allocation is SCHEDULER AFFINITY, not CFS bandwidth. Revision 0.4 of this
 # slice declared per-role CPU quotas and measured what that costs: a bursty
 # role spends its fractional 100 ms allowance early and is then suspended for
 # the rest of the period, so the gateway was throttled in 43 of 307 periods
 # while averaging only 1.15 of its 2.00 declared cores, PostgreSQL in 65 of
-# 308, and CI-scale p99 came out at 614-794 ms against a 150 ms bar. Exact,
+# 308, and the measured p99 came out at 614-794 ms against a 150 ms bar. Exact,
 # pairwise-disjoint CPU sets give a role its full declared cores at any instant
 # and never suspend it for accounting reasons. NOTHING here applies --cpus,
 # --cpu-period, --cpu-quota or --cpuset-cpus to a measured role; cgroup
@@ -749,7 +733,7 @@ lv_1_run() {
 # would share one container and one accounting boundary with no independent
 # witness. Affinity is then applied per role -- `taskset` on the driver and
 # gateway container commands, and the closed CAP_SYS_NICE helper on the
-# Docker-owned PostgreSQL tree, in BOTH profiles.
+# Docker-owned PostgreSQL tree.
 #
 # Nothing here accepts a profile value from the caller: the target takes no
 # arguments, the rates and cardinalities are literals in this file and in
@@ -766,16 +750,8 @@ B1_RUN_ID=""
 B1_RUN_DIR=""
 B1_CLEANUP_FAILED=0
 B1_RUN_DIR_FAILED=0
-# GC-3: the review-runner image is built once per invocation and reused by
-# every arm of the 28-arm discovery sweep. Rebuilding per arm would put a
-# multi-minute, uncontrolled compile on the measured host between measurements.
+# The review-runner image is built once per invocation and reused.
 B1_IMAGE_BUILT=0
-# GC-3 (FP-GC3-4): the ordinary route's own record. The launcher writes it,
-# prints its percent-encoded canonical form once, and never copies it into
-# B1_RUN_DIR -- the live witness joins decision to fingerprint through the
-# tracked carrier on the read-only source mount instead.
-B1_ROUTE_RECORD=""
-
 # The daemon endpoint is a host fact, not a profile input: CI's rootful daemon
 # listens on /var/run/docker.sock, a rootless developer daemon does not. The
 # container destination is always /var/run/docker.sock so the driver and the
@@ -826,59 +802,13 @@ b1_canonical_cpu_list() {
 # process was allowed. That is what makes a local run reproduce the four-core
 # shape instead of expanding with the host.
 #
-# GC-3 (FP-GC3-4): ordinary b1 reads this array EXACTLY ONCE and keeps it. Its
-# roles are no longer the first four entries -- they are the selected
-# topology's mapping over the first two COMPLETE SMT SIBLING PAIRS inside this
-# set, rendered by `contract-selected`. The product route still takes the
-# first eight entries as 4/3/1 and is unchanged.
+# bench-on-demand (FP-BOD-2): the product route is the only route, and it
+# takes the first eight entries of this array as 4/3/1.
 b1_available_cpus() {
   local affinity
   affinity="$(taskset -pc $$ 2>/dev/null | sed 's/.*: *//')"
   [ -n "$affinity" ] || return 1
   b1_expand_cpu_list "$affinity" | sort -n -u
-}
-
-B1_CPU_TOPOLOGY_ROOT="/sys/devices/system/cpu"
-
-# One CPU's canonical kernel thread-sibling list, or nothing.
-b1_thread_siblings() {
-  local path="$B1_CPU_TOPOLOGY_ROOT/cpu$1/topology/thread_siblings_list"
-  [ -r "$path" ] || return 1
-  tr -d ' \n' < "$path"
-}
-
-# The complete two-thread sibling pairs inside the allowed set, ONE CANONICAL
-# LINUX CPU LIST PER LINE ("0-1", or "0,8" on a host whose siblings are not
-# adjacent ids), ordered by minimum CPU id. A pair is admitted only when the
-# kernel list holds exactly two CPUs, both are allowed, each member names the
-# identical two-member set, and the set was not already taken. Everything else
-# is simply not a pair -- there is no repair and no partial admission, because
-# a wrong answer here would silently move the measured topology.
-#
-# The RENDERING is a contract, not a display choice. Each line is passed
-# unchanged as one `--pairs` word to `b1_topology_probe.py contract-selected`,
-# whose parser accepts canonical Linux CPU-list syntax and nothing else; the
-# space-separated "lo hi" this used to print was not a CPU list at all, so the
-# gating branch could not render its own ratified topology (review round 1 C1).
-# `b1_canonical_cpu_list` is the one renderer in this file, and the product
-# route and the probe planner already speak it.
-b1_complete_sibling_pairs() {
-  local -a allowed=("$@")
-  local cpu raw lo hi taken=" " allowed_list=" ${allowed[*]} "
-  local -a members=()
-  for cpu in "${allowed[@]}"; do
-    raw="$(b1_thread_siblings "$cpu")" || continue
-    mapfile -t members < <(b1_expand_cpu_list "$raw" | sort -n -u)
-    [ "${#members[@]}" -eq 2 ] || continue
-    lo="${members[0]}"; hi="${members[1]}"
-    case "$allowed_list" in *" $lo "*) ;; *) continue ;; esac
-    case "$allowed_list" in *" $hi "*) ;; *) continue ;; esac
-    [ "$(b1_expand_cpu_list "$(b1_thread_siblings "$lo")" | sort -n -u | tr '\n' ',')" = "$lo,$hi," ] || continue
-    [ "$(b1_expand_cpu_list "$(b1_thread_siblings "$hi")" | sort -n -u | tr '\n' ',')" = "$lo,$hi," ] || continue
-    case "$taken" in *" $lo-$hi "*) continue ;; esac
-    taken="$taken$lo-$hi "
-    printf '%s\n' "$(b1_canonical_cpu_list "$lo" "$hi")"
-  done
 }
 
 # Empty this run's directory through the same root-capable path that filled it.
@@ -1005,16 +935,7 @@ b1_prepare() {
   # driver never starts. Creating them here gives CI the shape a developer
   # host already has. They stay empty: the anonymous volume mounts over them.
   mkdir -p "$REPO_ROOT/libs/py/rca_common/.venv" "$REPO_ROOT/services/worker/.venv" || return 1
-  # The probe sweep is already under way when this runs for arms 1..N, and the
-  # window it covers -- the first arm's multi-minute image build -- is the one
-  # most likely to be killed. Replacing the collector with a bare cleanup for
-  # the duration would lose the `invalid` artifact GC-3 §3.3 promises on a kill
-  # (review.md 2026-09-16 W1), so ADD to the trap instead of overwriting it.
-  if [ "${B1_PROBE_FINISHED:-1}" -eq 0 ]; then
-    trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT
-  else
-    trap 'b1_cleanup' EXIT TERM INT
-  fi
+  trap 'b1_cleanup' EXIT TERM INT
   if [ "$B1_IMAGE_BUILT" -eq 0 ]; then
     docker build -t dbagent-review-runner:b1 -f deploy/review-runner/Dockerfile . || return 1
     B1_IMAGE_BUILT=1
@@ -1053,298 +974,20 @@ b1_run_driver() {
     taskset -c "$cpuset" bash "$B1_RUN_MOUNT/$script"
 }
 
-# The container-free coverage phase, written ONCE and used by BOTH selected
-# routes: the ordinary gating `b1` and the explicit `b1_latency_basis`
-# oracle run the same traced selection, over the same files, at the same
-# bar. It is factored here rather than duplicated so the two can never
-# become two different coverage contracts -- the delivery pin counts
-# exactly one traced pytest command and exactly one report per covered
-# file in this whole script.
-b1_write_coverage_driver() {
-  # Container-free coverage phase. No live fixture and no full-window
-  # self-witness ever runs under the tracer: its unmeasured overhead would
-  # consume the driver's single declared CPU.
-  #
-  # Coverage is reported over the four files this slice changes -- first as
-  # one aggregate, then file by file, all at --fail-under=81. The aggregate is
-  # scoped to the same four files on purpose: an unscoped report also counts
-  # gateway/ingest.py, rca_common and the e2e profile copy, which this
-  # harness-unit selection imports but is not the instrument for (the
-  # unit-gateway job owns those, at its own --cov-fail-under=81). Counting them
-  # here would make the number a statement about product code that no test in
-  # this phase exercises.
-  cat > "$B1_RUN_DIR/driver-coverage.sh" <<'B1_CI_SCALE_COVERAGE'
-set -uo pipefail
-cd /workspace
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage run --branch --data-file=/run/dbagent-b1/coverage/.coverage -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'not b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_reference_profile.py,/workspace/services/gateway/tests/test_b1_ingest_burst.py,/workspace/scripts/b1-affinity-helper.py,/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_reference_profile.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/test_b1_ingest_burst.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/scripts/b1-affinity-helper.py || exit $?
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m coverage report --data-file=/run/dbagent-b1/coverage/.coverage --fail-under=81 --include=/workspace/services/gateway/tests/b1_topology_probe.py || exit $?
-B1_CI_SCALE_COVERAGE
-}
-
-# The ordinary CI-scale route: an UNCONDITIONAL container-free coverage phase,
-# then a model-routed live phase.
-#
-# GC-3 (FP-GC3-4) split the old single driver script in two, and the order is
-# the contract. Coverage runs first, on one allowed CPU, with no placement
-# contract, no gateway or PostgreSQL sibling and no host-model or carrier read
-# at all -- so the same aggregate and four per-file --fail-under=81 reports are
-# observed locally, on every randomly assigned CI runner model, and even before
-# a missing carrier makes the target fail. Its driver container is test
-# infrastructure, not the CI-scale workload.
-#
-# Only afterwards is the exact host CPU model read -- once, by the shared
-# reader in the planner, before pair discovery, before a placement contract and
-# before any live process -- and looked up in the tracked decision carrier. A
-# `selected` model runs the unchanged failure-producing gate under its own
-# ratified topology; every other model records an explicit non-gating reason
-# and starts no workload. No topology literal, role mapping, carrier parse,
-# second model read or second allowed-CPU read exists in this shell.
-b1() {
-  assert_matches_ci 'bash scripts/integration-test.sh b1' || return 1
-  local -a cpus=()
-  mapfile -t cpus < <(b1_available_cpus)
-  if [ "${#cpus[@]}" -lt 1 ]; then
-    echo "integration-test.sh: b1 needs a usable scheduler-affinity operation (taskset)" >&2
-    return 1
-  fi
-  b1_prepare || return 1
-  b1_write_coverage_driver
-  b1_run_driver driver-coverage.sh "${cpus[0]}"
-  local rc=$?
-  if [ "$rc" -ne 0 ]; then
-    b1_cleanup
-    trap - EXIT TERM INT
-    return "$rc"
-  fi
-
-  # Pre-placement routing. `route` reads and canonicalises the host model once
-  # through the same reader the discovery artifact records its identity with,
-  # validates the whole schema-2 carrier, performs one exact key lookup and
-  # writes the closed record. It exits 0 for a gating or a recorded route and
-  # nonzero only for a missing or corrupt carrier -- infrastructure corruption
-  # is not an unratified SKU.
-  local route_disposition route_topology
-  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
-  python3 "$B1_PROBE_PLANNER" route \
-    --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \
-    --out "$B1_ROUTE_RECORD"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    b1_cleanup
-    trap - EXIT TERM INT
-    return "$rc"
-  fi
-  # The shell's ONLY branch values, from one closed read. It never parses JSON,
-  # rereads the carrier, chooses a model or reconstructs a topology.
-  IFS=$'\t' read -r route_disposition route_topology < <(
-    python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"
-  )
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$route_disposition" ]; then
-    echo "integration-test.sh: b1 could not read the route record $B1_ROUTE_RECORD" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  if [ "$route_disposition" = "recorded" ] && [ "$route_topology" = "none" ]; then
-    echo "integration-test.sh: b1 recorded a non-gating route; no live workload ran. See $B1_ROUTE_RECORD"
-    b1_cleanup
-    trap - EXIT TERM INT
-    if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
-    return 0
-  fi
-  if [ "$route_disposition" != "gating" ] || [ -z "$route_topology" ] || [ "$route_topology" = "none" ]; then
-    echo "integration-test.sh: b1 read an unusable route ($route_disposition/$route_topology)" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-
-  # A ratified model. Only now does the target need four allowed CPUs, and
-  # only over the SAME array coverage's one-CPU floor was evaluated on.
-  if [ "${#cpus[@]}" -lt 4 ]; then
-    echo "integration-test.sh: b1 needs at least 4 available logical CPUs, this host offers ${#cpus[@]}" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  # GC-3 (FP-GC3-1): the CI-scale reference deployment is defined over two
-  # complete two-thread SMT sibling pairs, because a CPU id proves nothing
-  # about a physical core -- `0-1` is one core on a hosted four-vCPU guest
-  # and two different cores on the i7 replica. A host without two complete pairs
-  # cannot host this measurement; it gets a named prerequisite failure and
-  # never four unrelated CPUs. This is NOT a skip: the target returns nonzero.
-  local -a sibling_pairs=()
-  mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")
-  if [ "${#sibling_pairs[@]}" -lt 2 ]; then
-    echo "integration-test.sh: b1 needs two complete two-thread SMT sibling pairs inside its allowed CPU set ($(b1_canonical_cpu_list "${cpus[@]}")); this host offers ${#sibling_pairs[@]}" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  # The planner is the single topology authority here too: the shell supplies
-  # the observed pairs and the route-selected class, and gets back the written
-  # schema-3 contract's driver CPU list. No role mapping, cardinality, profile
-  # or model value crosses this boundary.
-  local driver_cpus
-  driver_cpus="$(python3 "$B1_PROBE_PLANNER" contract-selected \
-    --topology "$route_topology" \
-    --pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \
-    --run-id "$B1_RUN_ID" \
-    --out "$B1_RUN_DIR/placement.json")"
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$driver_cpus" ]; then
-    echo "integration-test.sh: b1 could not render the selected topology $route_topology" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  cat > "$B1_RUN_DIR/driver-live.sh" <<'B1_CI_SCALE_LIVE'
-set -uo pipefail
-cd /workspace
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'b1_live and not b1_product and not b1_latency_basis and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
-B1_CI_SCALE_LIVE
-  b1_run_driver driver-live.sh "$driver_cpus"
-  rc=$?
-  b1_cleanup
-  trap - EXIT TERM INT
-  if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
-  return "$rc"
-}
-
-# B1-LATENCY-BASIS-1 (FP-B1LB-6) -- the ISOLATED CPU-basis oracle.
-#
-# Same GC-3 route file, same selected topology contract, same container
-# ownership, same verified cleanup and the same container-free coverage phase
-# as `b1`. The ONE difference is the live marker expression: it adds the
-# `b1_latency_basis` node (FP-IG-18) to the ordinary CI-scale selection. That
-# node compares a measured gateway CPU cost against the RECORDED chart basis,
-# which is a requalification question, not the merge gate -- coupling it to
-# `b1` would recreate exactly the perturbation GC-1 isolated it from.
-#
-# It is absent from `all` and from default CI; ci.yml reaches it only through
-# a `workflow_dispatch` whose `b1_latency_basis` input is explicitly true.
-#
-# It FAILS CLOSED twice, and neither failure is a skip:
-#   * before any container exists, when the sizing ledger is unrecorded or
-#     invalid -- there is no right-hand side to compare against; and
-#   * immediately after routing, when this runner is not the exact recorded
-#     signature identity -- a measurement of another CPU model, topology or
-#     image is not a measurement of the recorded basis's population.
-# Both print `basis_oracle_unobserved:<reason>` and exit 3, so a rotated
-# runner is reported as unobserved rather than counted as an oracle pass.
-b1_latency_basis() {
-  assert_matches_ci 'bash scripts/integration-test.sh b1_latency_basis' || return 1
-  local -a cpus=()
-  mapfile -t cpus < <(b1_available_cpus)
-  if [ "${#cpus[@]}" -lt 1 ]; then
-    echo "integration-test.sh: b1_latency_basis needs a usable scheduler-affinity operation (taskset)" >&2
-    return 1
-  fi
-  # Precondition 1: a recorded, fully qualified ledger, BEFORE b1_prepare.
-  "$REPO_ROOT/services/worker/.venv/bin/python" "$REPO_ROOT/tests/delivery/test_delivery_sizing_ledger.py" basis-oracle-preflight --values "$REPO_ROOT/deploy/charts/dbagent/values.yaml" --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json"
-  local rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "integration-test.sh: b1_latency_basis did not observe the CPU-basis oracle; no workload ran" >&2
-    return "$rc"
-  fi
-  b1_prepare || return 1
-  b1_write_coverage_driver
-  b1_run_driver driver-coverage.sh "${cpus[0]}"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    b1_cleanup
-    trap - EXIT TERM INT
-    return "$rc"
-  fi
-
-  local route_disposition route_topology
-  B1_ROUTE_RECORD="${RUNNER_TEMP:-/tmp}/b1-topology-route-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
-  python3 "$B1_PROBE_PLANNER" route \
-    --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" \
-    --out "$B1_ROUTE_RECORD"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    b1_cleanup
-    trap - EXIT TERM INT
-    return "$rc"
-  fi
-  IFS=$'\t' read -r route_disposition route_topology < <(
-    python3 "$B1_PROBE_PLANNER" route-fields --route "$B1_ROUTE_RECORD"
-  )
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$route_disposition" ]; then
-    echo "integration-test.sh: b1_latency_basis could not read the route record $B1_ROUTE_RECORD" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  # Precondition 2: this runner IS the recorded signature identity. A recorded
-  # GC-3 route reports its own canonical reason here, before pair discovery and
-  # before any live fixture.
-  "$REPO_ROOT/services/worker/.venv/bin/python" "$REPO_ROOT/tests/delivery/test_delivery_sizing_ledger.py" basis-oracle-route --values "$REPO_ROOT/deploy/charts/dbagent/values.yaml" --decision "$REPO_ROOT/tests/benchmark/b1_topology_decision.json" --route "$B1_ROUTE_RECORD"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "integration-test.sh: b1_latency_basis did not observe the CPU-basis oracle; no workload ran" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return "$rc"
-  fi
-  if [ "$route_disposition" != "gating" ] || [ -z "$route_topology" ] || [ "$route_topology" = "none" ]; then
-    echo "integration-test.sh: b1_latency_basis read an unusable route ($route_disposition/$route_topology)" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  if [ "${#cpus[@]}" -lt 4 ]; then
-    echo "integration-test.sh: b1_latency_basis needs at least 4 available logical CPUs, this host offers ${#cpus[@]}" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  local -a sibling_pairs=()
-  mapfile -t sibling_pairs < <(b1_complete_sibling_pairs "${cpus[@]}")
-  if [ "${#sibling_pairs[@]}" -lt 2 ]; then
-    echo "integration-test.sh: b1_latency_basis needs two complete two-thread SMT sibling pairs inside its allowed CPU set ($(b1_canonical_cpu_list "${cpus[@]}")); this host offers ${#sibling_pairs[@]}" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  local driver_cpus
-  driver_cpus="$(python3 "$B1_PROBE_PLANNER" contract-selected \
-    --topology "$route_topology" \
-    --pairs "${sibling_pairs[0]}" "${sibling_pairs[1]}" \
-    --run-id "$B1_RUN_ID" \
-    --out "$B1_RUN_DIR/placement.json")"
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$driver_cpus" ]; then
-    echo "integration-test.sh: b1_latency_basis could not render the selected topology $route_topology" >&2
-    b1_cleanup
-    trap - EXIT TERM INT
-    return 1
-  fi
-  cat > "$B1_RUN_DIR/driver-latency-basis.sh" <<'B1_LATENCY_BASIS_LIVE'
-set -uo pipefail
-cd /workspace
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s -m 'b1_live and not b1_product and not b1_topology_probe' -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
-B1_LATENCY_BASIS_LIVE
-  b1_run_driver driver-latency-basis.sh "$driver_cpus"
-  rc=$?
-  b1_cleanup
-  trap - EXIT TERM INT
-  if [ "$B1_CLEANUP_FAILED" -ne 0 ] || [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then return 1; fi
-  return "$rc"
-}
-
 # The product promise: 1000 req/s for 30 s with four gateway CPUs exclusive of
 # the PostgreSQL and driver sets. Local only, and deliberately absent from CI --
 # a public standard runner has four total vCPUs and there is no larger-runner
-# budget. Its three product comparisons are recorded as met/missed on the
-# fingerprint; placement, accounting and record integrity still gate.
+# budget.
+#
+# bench-on-demand (FP-BOD-3): this is a GATE, not a recording. Two of the three
+# product comparisons are failure-producing asserts in
+# test_b1_product_exclusive_reference_profile -- `errors == 0` and
+# `served == offered` -- so a run that errored or did not serve its whole offer
+# FAILS this target, and the placement, accounting and record-integrity checks
+# still fail it as before. Only the due-time p99 stays recorded: it is
+# serialized as met/missed on the fingerprint, no node asserts it, and
+# `product_p99_lt_150_ms=missed` neither fails this target nor refuses a
+# release. See docs/runbooks/bench-on-demand.md.
 b1_product() {
   local -a cpus=()
   mapfile -t cpus < <(b1_available_cpus)
@@ -1389,177 +1032,6 @@ B1_PRODUCT_DRIVER
   return "$rc"
 }
 
-# ---------------------------------------------------------------------------
-# GC-3 -- the B1 reference-topology discovery route (FP-GC3-1/2).
-#
-# A MANUAL measurement instrument, not a gate. `ci.yml` starts it only from a
-# `workflow_dispatch` with `b1_topology_probe=true`; it is in no job's `needs:`
-# and in no local composite target. It measures the closed 28-arm candidate set
-# -- seven topology classes x two orientations x two round-robin rounds -- each
-# under the UNCHANGED CI-scale workload, and records one truthful met/missed
-# value per unchanged comparison.
-#
-# The separation this rests on: a candidate that misses the bar is DATA. This
-# target fails only when the measurement itself is broken -- a missing or
-# duplicated arm, a placement or topology that was not observed, an accounting
-# or lifecycle failure, or an artifact that cannot be written. Asserting the
-# bar per arm would stop the sweep at the first expected miss and destroy the
-# evidence the decision needs.
-#
-# Nothing here authors a topology. The stdlib-only planner in
-# services/gateway/tests/b1_topology_probe.py enumerates the closed set on the
-# host, and the Python parser inside the driver independently reconstructs and
-# compares every mapping before a single request is offered.
-# ---------------------------------------------------------------------------
-
-B1_PROBE_PLANNER="services/gateway/tests/b1_topology_probe.py"
-B1_PROBE_ACCUMULATOR=""
-B1_PROBE_PLAN=""
-B1_PROBE_ARTIFACT=""
-B1_PROBE_FINISHED=1
-B1_PROBE_FAILED_ARM=""
-B1_PROBE_FAILED_EXIT=0
-
-# In CI the name resolves byte-for-byte to ci.yml's upload `path:`. A local run
-# keeps its own retained, run-scoped name so two local sweeps cannot overwrite
-# each other's evidence.
-b1_topology_probe_artifact_path() {
-  local temp="${RUNNER_TEMP:-/tmp}"
-  if [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ]; then
-    printf '%s/b1-topology-probe-%s-%s.json' "$temp" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-  else
-    printf '%s/b1-topology-probe-local-%s-1.json' "$temp" "$1"
-  fi
-}
-
-# EXIT-trap safe, and idempotent. However the sweep ends -- all arms done, an
-# arm failed, the runner was killed -- the collector runs exactly once over the
-# immutable plan and whatever records exist, and writes `complete` or a closed
-# `invalid` naming the missing arms. A best-effort invalid artifact never
-# converts a broken sweep into success: this returns the collector's status.
-b1_topology_probe_finish() {
-  [ "$B1_PROBE_FINISHED" -eq 0 ] || return 0
-  B1_PROBE_FINISHED=1
-  local -a failure=()
-  if [ -n "$B1_PROBE_FAILED_ARM" ]; then
-    failure=(--failed-arm "$B1_PROBE_FAILED_ARM" --exit-code "$B1_PROBE_FAILED_EXIT")
-  fi
-  python3 "$B1_PROBE_PLANNER" collect \
-    --plan "$B1_PROBE_PLAN" \
-    --records "$B1_PROBE_ACCUMULATOR/records" \
-    --out "$B1_PROBE_ARTIFACT" ${failure[@]+"${failure[@]}"}
-  local rc=$?
-  echo "integration-test.sh: b1_topology_probe artifact retained at $B1_PROBE_ARTIFACT"
-  return "$rc"
-}
-
-# One arm: a fresh run id, a fresh run directory, a fresh driver container, a
-# fresh database, a fresh warmup and a fresh measured window. Nothing crosses
-# arms, and the validated record is copied OUT of the run mount before the
-# per-arm cleanup can remove it.
-b1_topology_probe_arm() {
-  local index="$1" rc=0 driver_cpus
-  B1_RUN_ID=""
-  B1_RUN_DIR=""
-  B1_CLEANUP_FAILED=0
-  B1_RUN_DIR_FAILED=0
-  b1_prepare || return 1
-  trap 'b1_cleanup; b1_topology_probe_finish' EXIT TERM INT
-  driver_cpus="$(python3 "$B1_PROBE_PLANNER" contract \
-    --plan "$B1_PROBE_PLAN" --arm "$index" --run-id "$B1_RUN_ID" \
-    --out "$B1_RUN_DIR/placement.json" --context "$B1_RUN_DIR/probe-context.json")"
-  rc=$?
-  if [ "$rc" -eq 0 ]; then
-    cp "$B1_PROBE_ACCUMULATOR/driver-probe.sh" "$B1_RUN_DIR/driver-probe.sh" || rc=1
-  fi
-  if [ "$rc" -eq 0 ]; then
-    b1_run_driver driver-probe.sh "$driver_cpus"
-    rc=$?
-  fi
-  if [ "$rc" -eq 0 ]; then
-    if [ -f "$B1_RUN_DIR/arm-record.json" ]; then
-      cp "$B1_RUN_DIR/arm-record.json" \
-        "$(printf '%s/records/record-%02d.json' "$B1_PROBE_ACCUMULATOR" "$index")" || rc=1
-    else
-      echo "integration-test.sh: arm $index (run ${B1_RUN_ID}, dir ${B1_RUN_DIR}) wrote no record" >&2
-      rc=1
-    fi
-  fi
-  b1_cleanup
-  trap 'b1_topology_probe_finish' EXIT TERM INT
-  if [ "$B1_CLEANUP_FAILED" -ne 0 ]; then
-    echo "integration-test.sh: arm $index left containers behind; the sweep stops here" >&2
-    return 1
-  fi
-  if [ "$B1_RUN_DIR_FAILED" -ne 0 ]; then
-    echo "integration-test.sh: arm $index could not remove its run directory; the sweep stops here" >&2
-    return 1
-  fi
-  return "$rc"
-}
-
-b1_topology_probe() {
-  assert_matches_ci 'bash scripts/integration-test.sh b1_topology_probe' || return 1
-  local outer_run_id planned index rc=0 collect_rc=0
-  outer_run_id="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
-  if [ "${#outer_run_id}" -ne 32 ]; then
-    echo "integration-test.sh: could not generate a 32-hex probe run id" >&2
-    return 1
-  fi
-  # The accumulator and the final artifact live OUTSIDE every per-arm
-  # B1_RUN_DIR on purpose: the ordinary b1_cleanup removes a run directory
-  # after each arm, and a record stored there would be deleted with it.
-  B1_PROBE_ACCUMULATOR="$(mktemp -d -t dbagent-b1-probe-XXXXXXXXXX)" || return 1
-  B1_PROBE_PLAN="$B1_PROBE_ACCUMULATOR/plan.json"
-  mkdir -p "$B1_PROBE_ACCUMULATOR/records" || return 1
-  B1_PROBE_ARTIFACT="$(b1_topology_probe_artifact_path "$outer_run_id")"
-  B1_PROBE_FAILED_ARM=""
-  B1_PROBE_FAILED_EXIT=0
-  B1_PROBE_FINISHED=0
-  trap 'b1_topology_probe_finish' EXIT TERM INT
-
-  # The planner is the single topology authority. If this host has no two
-  # complete SMT sibling pairs it writes one `invalid` artifact with
-  # failureCode `unsupported_topology` and runs no candidate at all, so a
-  # rerun on a suitable host costs nothing and no measurement is invented.
-  planned="$(python3 "$B1_PROBE_PLANNER" plan --out "$B1_PROBE_PLAN" --artifact "$B1_PROBE_ARTIFACT")"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    B1_PROBE_FINISHED=1
-    trap - EXIT TERM INT
-    echo "integration-test.sh: b1_topology_probe wrote an invalid artifact at $B1_PROBE_ARTIFACT" >&2
-    return "$rc"
-  fi
-
-  # The container-free coverage phase runs with `b1`; this target is the
-  # untraced live sweep only. The probe marker selects the single dual-
-  # marked node in the live-only module, whose file is the command's ONLY
-  # positional operand -- that is what keeps the frozen sizing-ledger producer
-  # test_b1_ingest_burst.py collected by exactly one CI job (FP-IG-26).
-  cat > "$B1_PROBE_ACCUMULATOR/driver-probe.sh" <<'B1_TOPOLOGY_PROBE_DRIVER'
-set -uo pipefail
-cd /workspace
-env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 python3 -B -X pycache_prefix=/run/dbagent-b1/pycache -m pytest services/gateway/tests/b1_topology_probe_live.py -v -s -m b1_topology_probe -o cache_dir=/run/dbagent-b1/pytest-cache || exit $?
-B1_TOPOLOGY_PROBE_DRIVER
-
-  for ((index = 0; index < planned; index++)); do
-    echo "--- b1_topology_probe arm $((index + 1)) of $planned"
-    b1_topology_probe_arm "$index"
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-      B1_PROBE_FAILED_ARM="$index"
-      B1_PROBE_FAILED_EXIT="$rc"
-      echo "integration-test.sh: arm $index failed ($rc); stopping the sweep after cleanup" >&2
-      break
-    fi
-  done
-  b1_topology_probe_finish
-  collect_rc=$?
-  trap - EXIT TERM INT
-  if [ "$rc" -ne 0 ]; then return "$rc"; fi
-  return "$collect_rc"
-}
-
 # One real testcontainers test per runtime, hardcoded -- no caller-supplied filter, for
 # the same reason there is no argument pass-through. Both legs start a Postgres, migrate
 # it with alembic and connect, so a pass proves the whole chain the sandbox breaks:
@@ -1581,8 +1053,7 @@ case "$WHAT" in
   smoke)     run_step "Smoke (one testcontainers test per runtime: Go + Python)" smoke_test ;;
   all)       run_step "Go (go test ./... -race -p 1)" go_tests
              run_step "Python (functional + service tiers)" py_tests
-             run_step "B1 CI-scale (resource-declared, gating)" b1
-             run_step "B1 product promise (recorded, non-gating)" b1_product ;;
+             run_step "B1 product promise (on-demand, gating)" b1_product ;;
   go)        run_step "Go (go test ./... -race -p 1)" go_tests ;;
   py|python) run_step "Python (functional + service tiers)" py_tests ;;
   d0_2a)     run_step "D0.2-a direct _ingest_txn replay (diagnostic)" d0_2a ;;
@@ -1600,10 +1071,7 @@ case "$WHAT" in
   rm_1_run)  run_step "RM-1 driver ceiling: the real session, needs Docker (diagnostic)" rm_1_run ;;
   lv_1)      run_step "LV-1 leg witness: self-test + dry-run (diagnostic)" lv_1 ;;
   lv_1_run)  run_step "LV-1 leg witness: the real session (diagnostic)" lv_1_run ;;
-  b1)        run_step "B1 CI-scale (resource-declared, gating)" b1 ;;
-  b1_product) run_step "B1 product promise (recorded, non-gating)" b1_product ;;
-  b1_latency_basis) run_step "B1 CPU-basis oracle (isolated, explicit)" b1_latency_basis ;;
-  b1_topology_probe) run_step "B1 topology discovery (28 arms, recorded, manual)" b1_topology_probe ;;
+  b1_product) run_step "B1 product promise (on-demand, gating)" b1_product ;;
 esac
 
 echo

@@ -15,8 +15,6 @@ checker function each:
     C1-C7   the call-site checks
     B11D1-B11D5   the host/storage diagnostics that decide no outcome
                   (design/slices/b11-host-diagnostics, FP-B11HD-1..5)
-    B11GP1-B11GP2   the required-green gate policy and its message-only
-                  classification (design/slices/b11-gate-policy, FP-B11GP-1..5)
 
 The ID is matched as an **exact token**, never as a prefix: the fourth test
 compares ``message.split(":", 1)[0]`` to the expected ID, so a fixture that
@@ -63,8 +61,6 @@ BENCH_NAME = "test_pg_scale.py"
 # generated evidence, not a B11 tier source: it is never imported, never
 # executed, and configures no database. A1 names it explicitly so the tier
 # inventory stays a closed set that still rejects every OTHER new file.
-GC3_DECISION_NAME = "b1_topology_decision.json"
-GC3_DECISION = BENCH_DIR / GC3_DECISION_NAME
 LOADER_NAME = "load_b11_writer_model"
 B11_TEST_NAME = "test_b11_audit_llm_insert_throughput"
 # The one function the executor may drive, and the two production writers its
@@ -323,18 +319,6 @@ EXPECTED_MODULE_BINDINGS: dict[str, Counter] = {
             ("B11_DIAGNOSTIC_FIELDS", "assign"): 1,
             ("B11_CONTAINER_MOUNT_SCRIPT", "assign"): 1,
             ("B11_CONTAINER_BLOCK_SCRIPT", "assign"): 1,
-            # B11 gate-policy slice §3.6: exactly four new declared bindings --
-            # two constants, the pure classifier and its boundary unit test.
-            # They are legal only through this inventory; none is duplicated
-            # into ALLOWED_FREE_NAMES and none adds an import, builtin,
-            # attribute, exception or filesystem capability.
-            ("B11_IO_FULL_STALL_SHARE", "assign"): 1,
-            ("B11_IO_FULL_STALL_CLASSIFICATION", "assign"): 1,
-            ("_b11_failure_classification", "def"): 1,
-            (
-                "test_b11_failure_classification_names_only_high_io_full_reds",
-                "def",
-            ): 1,
             ("_encode_b11_value", "def"): 1,
             ("_writer_instance_label", "def"): 1,
             ("_serialize_writer_elapsed_rows", "def"): 1,
@@ -490,9 +474,26 @@ EXPECTED_PACKAGING_FILES = {
 }
 BENCHMARK_WORKFLOWS = (".github/workflows/ci.yml",)
 GUARDED_JOBS = ("benchmark", "functional")
+# bench-on-demand FP-BOD-1: the benchmark job names every top-level test in
+# tests/benchmark/test_pg_scale.py EXCEPT the live audit/LLM throughput node,
+# which left CI with B1 and is measured on demand. A whole-file `pytest
+# tests/benchmark/test_pg_scale.py` would run it again, so this pin is an
+# equality on the node-id list rather than on the file.
+_B11_CI_NODE_IDS = (
+    "test_b2_fingerprint_correlation_p99_under_20ms",
+    "test_b10_partitioned_list_and_filter_p99",
+    "test_b11_host_parser_reuse_is_direct",
+    "test_b11_host_diagnostics_read_declared_sources",
+    "test_b11_host_reader_observes_real_proc_stat",
+    "test_b11_storage_identity_reads_target_postgres_container",
+    "test_b11_storage_identity_fails_soft_without_substituting_another_mount",
+    "test_b11_diagnostics_schema_is_canonical_and_comma_safe",
+    "test_b11_diagnostic_sampling_brackets_the_timed_window",
+)
 EXPECTED_B11_COMMAND = (
     "services/worker/.venv/bin/python -m pytest "
-    "tests/benchmark/test_pg_scale.py -v -s"
+    + " ".join(f"tests/benchmark/test_pg_scale.py::{name}" for name in _B11_CI_NODE_IDS)
+    + " -v -s"
 )
 # One physical line inside a `run:` block scalar, so normalization is the
 # identity and the guard can both compare it and execute it.
@@ -751,11 +752,15 @@ from conftest import load_b11_writer_model
 # meanings; this one is appended, printed once per completed measurement,
 # before the unchanged threshold assertion.  Every one of the 21 fields is
 # outcome-inert: none can move the threshold, the outcome, the exit code, a
-# retry or a skip.  Twenty of them stay reported-only.  The single exception is
-# `host_psi_io_full_usec`, which may additionally feed the classification-only
-# message branch of an already-red B11 result (design/slices/b11-gate-policy
-# §3.2/§3.3); that branch is evaluated only after `rate >= 1000.0` has already
-# failed and changes no outcome, exit code or threshold.
+# retry or a skip.  bench-on-demand (FP-BOD-4) deleted the one exception there
+# used to be: `host_psi_io_full_usec` no longer feeds any branch at all.  The
+# stall classifier that appended a label to an already-red message existed to
+# tell one shared-runner red from another, and B11 left per-push CI, so ALL 21
+# fields are reported-only now and a miss is the `rate >= 1000.0` assertion
+# with its own rate message and nothing after it.  The label itself is pinned
+# absent from this file by
+# tests/functional/test_b11_writer_model.py::test_b11_rate_bar_has_no_stall_suffix,
+# so it is deliberately not spelled here.
 B11_DIAGNOSTIC_PREFIX = "B11 diagnostics="
 B11_DIAGNOSTIC_UNAVAILABLE = "unavailable"
 B11_DIAGNOSTIC_FIELDS = (
@@ -781,14 +786,6 @@ B11_DIAGNOSTIC_FIELDS = (
     "storage_scheduler",
     "storage_model",
 )
-
-# B11 gate-policy slice §3.2/§3.3: the provisional, message-only failure
-# classification.  The share is compared unrounded against the reconstructed
-# measured window -- never against a table-rounded percentage -- and the label
-# is appended only to an assertion message Python builds after the sole gate
-# `rate >= 1000.0` has already failed.
-B11_IO_FULL_STALL_SHARE = 0.20
-B11_IO_FULL_STALL_CLASSIFICATION = "io_full_stall_observed"
 
 # The two closed scripts B11 runs, unprivileged, as OS user `postgres`, inside
 # the exact PostgreSQL container the seeded fixture is already running.  Docker
@@ -1417,39 +1414,6 @@ def _read_b11_storage_identity(container, pgdata_path: str) -> dict[str, str]:
     return values
 
 
-def _b11_failure_classification(
-    combined_rate_per_sec: float,
-    committed_rows: int,
-    host_psi_io_full_usec: str,
-) -> str:
-    \"\"\"Name the observed I/O-full symptom of an already-failed B11 measurement.
-
-    Pure, lazily reached and outcome-inert: Python evaluates an ``assert``
-    message only after its condition is already false, so this can never run on
-    a pass.  It returns the empty string for a passing or non-positive rate, a
-    non-positive row count and an unavailable counter, and otherwise
-    reconstructs the measured window algebraically from the asserted rate and
-    the fixed committed row count -- there is no second clock and no reread of
-    the timed window.  The label names a symptom, not a mechanism, and the gate
-    stays ``rate >= 1000.0``: a classified run is the same required-green
-    failure with a longer message (design/slices/b11-gate-policy §3.2/§3.3).
-    \"\"\"
-    if combined_rate_per_sec >= 1000.0 or combined_rate_per_sec <= 0:
-        return ""
-    if committed_rows <= 0 or host_psi_io_full_usec == B11_DIAGNOSTIC_UNAVAILABLE:
-        return ""
-    measured_window_usec = committed_rows / combined_rate_per_sec * 1_000_000
-    io_full_share = int(host_psi_io_full_usec) / measured_window_usec
-    if io_full_share < B11_IO_FULL_STALL_SHARE:
-        return ""
-    return (
-        f"; B11 failure_classification={B11_IO_FULL_STALL_CLASSIFICATION}; "
-        "B11 classification_scope=symptom_only_not_cause; "
-        f"B11 host_psi_io_full_share={io_full_share:.3f}; "
-        "B11 gate_outcome=red"
-    )
-
-
 def test_b11_audit_llm_insert_throughput(scale_pg):
     \"\"\"Combined audit + llm_calls insert rate under durable Postgres.
 
@@ -1648,78 +1612,14 @@ def test_b11_audit_llm_insert_throughput(scale_pg):
     print(f"B11 single_writer_rate={single_writer_rate:.1f}/s")
     print(env_line)
     print(_serialize_b11_diagnostics(diagnostic_values))
+    # FP-BOD-4: the bar, and nothing after it. A miss is this assertion
+    # failure with its existing rate message; there is no stall suffix, no
+    # classification and no gate-outcome label. None of the 21 diagnostic
+    # fields printed above enters this condition or this message.
     assert rate >= 1000.0, (
         f"B11 combined insert rate={rate:.1f}/s (threshold 1000); "
         f"B11 writers={len(instances)}; B11 writer_map={writer_map}; "
         f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"
-        + _b11_failure_classification(
-            rate,
-            len(instances) * n_iters,
-            host_values["host_psi_io_full_usec"],
-        )
-    )
-
-
-def test_b11_failure_classification_names_only_high_io_full_reds():
-    \"\"\"FP-B11GP-2: only an unrounded same-window I/O-full share >= 20% is named.
-
-    The literals are exact rather than illustrative: 5600 rows (the seven
-    manifest-derived instances times the fixed 800 timed rows) at 700.0/s
-    reconstruct an 8 000 000 usec window, so 1 600 000 usec is exactly 20.000%
-    and 1 599 999 usec is 19.9999875%.  Both sit either side of the boundary in
-    binary64 without rounding, which is the point: the comparison happens on
-    raw counters and only the rendered share is rounded, to three decimals.
-
-    Nothing here can turn a red green.  The helper only ever returns text, and
-    the low-stall regression case -- a real product slowdown on a quiet host --
-    must stay unclassified so it is never explained away.
-    \"\"\"
-    classified = _b11_failure_classification(700.0, 5600, "1600000")
-    assert classified == (
-        "; B11 failure_classification=io_full_stall_observed; "
-        "B11 classification_scope=symptom_only_not_cause; "
-        "B11 host_psi_io_full_share=0.200; "
-        "B11 gate_outcome=red"
-    ), classified
-    assert "classification_scope=symptom_only_not_cause" in classified, classified
-    assert "gate_outcome=red" in classified, classified
-
-    # One counter below the boundary: 19.9999875%, unrounded, is not named.
-    assert _b11_failure_classification(700.0, 5600, "1599999") == "", "boundary"
-
-    # Three decimals, rendered only after the unrounded comparison.
-    assert _b11_failure_classification(700.0, 5600, "2080000") == (
-        "; B11 failure_classification=io_full_stall_observed; "
-        "B11 classification_scope=symptom_only_not_cause; "
-        "B11 host_psi_io_full_share=0.260; "
-        "B11 gate_outcome=red"
-    ), "0.260"
-
-    # A real regression on a quiet host: zero stall stays an ordinary red.
-    assert _b11_failure_classification(700.0, 5600, "0") == "", "zero"
-
-    # `unavailable` never becomes zero and never becomes a classification.
-    assert _b11_failure_classification(700.0, 5600, "unavailable") == "", "unavailable"
-    assert (
-        _b11_failure_classification(700.0, 5600, B11_DIAGNOSTIC_UNAVAILABLE) == ""
-    ), "unavailable constant"
-
-    # No reconstructable window: no label, and the assertion still fails.
-    assert _b11_failure_classification(0.0, 5600, "1600000") == "", "zero rate"
-    assert _b11_failure_classification(-1.0, 5600, "1600000") == "", "negative rate"
-    assert _b11_failure_classification(700.0, 0, "1600000") == "", "zero rows"
-    assert _b11_failure_classification(700.0, -5600, "1600000") == "", "negative rows"
-
-    # A passing rate is never classified, however high the stall: the message
-    # is not even built, and the helper refuses anyway.
-    assert _b11_failure_classification(1000.0, 5600, "1600000") == "", "at threshold"
-    assert _b11_failure_classification(1735.0, 5600, "99999999") == "", "fast"
-
-    # The two pinned module constants are the only tunables, and neither is
-    # reachable from a runtime value.
-    assert B11_IO_FULL_STALL_SHARE == 0.20, B11_IO_FULL_STALL_SHARE
-    assert B11_IO_FULL_STALL_CLASSIFICATION == "io_full_stall_observed", (
-        B11_IO_FULL_STALL_CLASSIFICATION
     )
 
 
@@ -2779,12 +2679,12 @@ def _callee_name(call: ast.Call) -> str | None:
 # plugin, any of which could patch `yaml.safe_load` for the guard's own reads.
 # --------------------------------------------------------------------------
 
-# FP-IG-11 + B11 gate-policy slice §3.6: closed allowlist of exactly three keys.
+# FP-IG-11: closed allowlist of exactly two keys. bench-on-demand FP-BOD-4
+# deleted the `gate_policy` object with the stall label it described.
 MANIFEST_ALLOWED_KEYS = frozenset(
     {
         "benchmarks[id=B11].concurrency_model",
         "benchmarks[id=B11].notes",
-        "benchmarks[id=B11].gate_policy",
     }
 )
 
@@ -2798,7 +2698,6 @@ path, key_path = sys.argv[1], sys.argv[2]
 allowed = {
     "benchmarks[id=B11].concurrency_model",
     "benchmarks[id=B11].notes",
-    "benchmarks[id=B11].gate_policy",
 }
 if key_path not in allowed:
     raise SystemExit("unsupported key path: %r" % (key_path,))
@@ -2806,8 +2705,6 @@ data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 by_id = {entry["id"]: entry for entry in data["benchmarks"]}
 if key_path.endswith(".notes"):
     print(json.dumps(by_id["B11"]["notes"]))
-elif key_path.endswith(".gate_policy"):
-    print(json.dumps(by_id["B11"]["gate_policy"]))
 else:
     print(json.dumps(by_id["B11"]["concurrency_model"]))
 '''
@@ -4454,10 +4351,6 @@ B11_DIAGNOSTIC_FUNCTIONS = (
     "_serialize_b11_diagnostics",
     "_read_b11_host_snapshot",
     "_b11_host_delta_values",
-    # B11 gate-policy slice §3.6: the message-only classifier joins this
-    # inventory for one reason -- B11D4 must forbid it inside either timed
-    # loop.  Its permitted call site is owned by B11GP1, not by B11D4/B11D5.
-    "_b11_failure_classification",
 ) + B11_STORAGE_FUNCTIONS
 # Calls that must never appear inside a timed loop (B11's own row loop or the
 # single-writer diagnostic loop).
@@ -5487,9 +5380,8 @@ def check_B11D5(src: str, notes: str) -> None:
     Structural only.  It owns the absence of a diagnostic-conditioned *outcome*
     branch -- no diagnostic name may reach the bar, an `if`/`while`/ternary
     test, a skip or a retry -- and the fixed 800/50/100 row counts.  It does not
-    own or deny the module-level, message-only branch on
-    `host_psi_io_full_usec`; that branch belongs to `check_B11GP1`
-    (design/slices/b11-gate-policy §3.6).
+    own or deny anything about the deleted stall classification: FP-BOD-4
+    removed it, and no module-level branch on a diagnostic value remains.
     """
     tree = ast.parse(src)
     b11 = _b11_function_in(tree)
@@ -5591,6 +5483,23 @@ def check_B11D5(src: str, notes: str) -> None:
                     f"line {node.lineno}; `unavailable` is a reportable value, not "
                     "a skip, a retry or a threshold exemption",
                 )
+    # bench-on-demand FP-BOD-4: and no diagnostic value reaches the bar's
+    # MESSAGE either. The stall classification read `host_psi_io_full_usec`
+    # here to append a label to an already-red result; that suffix is deleted,
+    # and a miss is now the rate assertion with its own message and nothing
+    # after it.
+    for node in ast.walk(b11):
+        if not isinstance(node, ast.Assert) or node.msg is None:
+            continue
+        for inner in ast.walk(node.msg):
+            if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
+                _require(
+                    inner.id not in diagnostic_names,
+                    "B11D5",
+                    f"a diagnostic value {inner.id!r} reaches the bar's failure "
+                    f"message at line {inner.lineno}; a miss is the rate "
+                    "assertion and nothing appended to it",
+                )
 
     for phrase in (
         "B11 diagnostics=",
@@ -5607,811 +5516,12 @@ def check_B11D5(src: str, notes: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# B11GP1-B11GP2 — the required-green gate policy and its message-only failure
-# classification (design/slices/b11-gate-policy, FP-B11GP-1..5).  Two more
-# module-level rule IDs, independent of the benchmark tier's own tests.
-# --------------------------------------------------------------------------
-
-B11_CLASSIFIER_NAME = "_b11_failure_classification"
-B11_CLASSIFIER_TEST_NAME = (
-    "test_b11_failure_classification_names_only_high_io_full_reds"
-)
-B11_SHARE_CONSTANT_NAME = "B11_IO_FULL_STALL_SHARE"
-B11_SHARE_CONSTANT_VALUE = 0.20
-B11_LABEL_CONSTANT_NAME = "B11_IO_FULL_STALL_CLASSIFICATION"
-B11_LABEL_CONSTANT_VALUE = "io_full_stall_observed"
-B11_CLASSIFIER_PARAMS = (
-    "combined_rate_per_sec",
-    "committed_rows",
-    "host_psi_io_full_usec",
-)
-B11_STALL_FIELD = "host_psi_io_full_usec"
-B11_ITERS_NAME = "n_iters"
-B11_HOST_DELTA_NAME = "_b11_host_delta_values"
-B11_ROW_COUNT_VALUE = 800
-
-# The whole suffix, rendered back out of the AST: every Constant piece verbatim
-# and every FormattedValue as `{<expr>:<spec>}`.  Dropping
-# `classification_scope=symptom_only_not_cause`, dropping `gate_outcome=red`,
-# renaming the label or rounding before the comparison all change this string.
-B11_CLASSIFICATION_SUFFIX_TEMPLATE = (
-    "; B11 failure_classification={B11_IO_FULL_STALL_CLASSIFICATION}; "
-    "B11 classification_scope=symptom_only_not_cause; "
-    "B11 host_psi_io_full_share={io_full_share:.3f}; "
-    "B11 gate_outcome=red"
-)
-
-# The exact helper body of design §3.3, minus its docstring.  Compared after
-# `ast.unparse` normalization on both sides, so it pins the arithmetic, the two
-# empty-string guards, the comparison directions and the boundary literal
-# without pinning whitespace or comments.
-B11_CLASSIFIER_BODY_SOURCE = '''\
-if combined_rate_per_sec >= 1000.0 or combined_rate_per_sec <= 0:
-    return ""
-if committed_rows <= 0 or host_psi_io_full_usec == B11_DIAGNOSTIC_UNAVAILABLE:
-    return ""
-measured_window_usec = committed_rows / combined_rate_per_sec * 1_000_000
-io_full_share = int(host_psi_io_full_usec) / measured_window_usec
-if io_full_share < B11_IO_FULL_STALL_SHARE:
-    return ""
-return (
-    f"; B11 failure_classification={B11_IO_FULL_STALL_CLASSIFICATION}; "
-    "B11 classification_scope=symptom_only_not_cause; "
-    f"B11 host_psi_io_full_share={io_full_share:.3f}; "
-    "B11 gate_outcome=red"
-)
-'''
-
-# Names the classifier body may load.  Anything else -- a storage field, a CPU
-# reading, a B1 route, a second diagnostic -- is a false carrier.
-B11_CLASSIFIER_ALLOWED_LOADS = frozenset(
-    set(B11_CLASSIFIER_PARAMS)
-    | {
-        "B11_DIAGNOSTIC_UNAVAILABLE",
-        B11_SHARE_CONSTANT_NAME,
-        B11_LABEL_CONSTANT_NAME,
-        "measured_window_usec",
-        "io_full_share",
-        "int",
-    }
-)
-
-# Route tokens that may not appear in the classifier body or its call site.
-B11_FORBIDDEN_ROUTE_TOKENS = (
-    "storage_",
-    "rotational",
-    "block_device",
-    "cpu_count",
-    "sysconf",
-    "serial_commit",
-    "combined_over_single",
-    "steal",
-    "host_psi_cpu",
-    "host_psi_memory",
-    "host_psi_io_some",
-    "writer_elapsed_rows",
-    "integration-test.sh",
-    "b1_",
-)
-B11_STANDALONE_B1 = re.compile(r"(?<![A-Za-z0-9_-])B1(?![A-Za-z0-9_-])")
-B11_STATUS_REFERENCE = re.compile(r"steps\.[A-Za-z0-9_-]+\.(outcome|conclusion)")
-
-B11_GATE_POLICY_KEY = "benchmarks[id=B11].gate_policy"
-
-EXPECTED_B11_GATE_POLICY = {
-    "outcome": "required-green",
-    "merge_blocking_on_miss": True,
-    "retries": 0,
-    "failure_classification": {
-        "name": "io_full_stall_observed",
-        "host_psi_io_full_share_at_least": 0.20,
-        "evidence_head": "b25349b2859647807237ca53fd7d02f93340e268",
-        "mixed_storage_class_samples": 5,
-        "passing_samples": 2,
-        "failing_samples": 3,
-        "observed_table_rounded_share_percent": {
-            "passing": [8, 13],
-            "failing": [21, 22, 26],
-        },
-        "evidence_precision": "table-rounded-percent",
-        "evidence_strength": "thin-provisional",
-    },
-    "review": {
-        "after_additional_completed_measurements": 20,
-        "on_first_counterexample": True,
-    },
-}
-
-# The policy the notes must carry in prose, without euphemism.
-B11_GATE_POLICY_NOTES_PHRASES = (
-    "required-green",
-    "ordinary unclassified red",
-    "thin-provisional",
-    "table-rounded",
-    "20 additional",
-    "counterexample",
-    "no retry",
-    "fsync",
-    "io_full_stall_observed",
-    "classification_scope=symptom_only_not_cause",
-    "gate_outcome=red",
-    "does not distinguish host from product",
-    "remains a real required-green failure and only its message changes",
-    "classification-only in the message of an already-red result",
-    "outcome-inert",
-)
-# Diagnostics provenance the policy prose may not displace (B11D5 owns four of
-# these independently; naming them here makes "without removing existing text"
-# a check rather than an intention).
-B11_EXISTING_NOTES_PHRASES = (
-    "B11 diagnostics=",
-    "inside the running PostgreSQL container",
-    "unavailable",
-    "reported-only",
-    "21 comma-delimited fields in one fixed order",
-)
-
-CI_B1_STEP_NAME = "B1 -- resource-declared CI-scale ingest-gateway burst (FP-GC1-1)"
-CI_MEASURED_STEP_NAME = "B2/B10/B11 -- PG scale benchmarks (shared seeded fixture)"
-CI_BENCHMARK_JOB = "benchmark"
-
-# The guard module must not import yaml in-process: an ancestor conftest or an
-# installed plugin could patch `yaml.safe_load` for the guard's own reads.  The
-# workflow is parsed by this dedicated isolated child, exactly as A10 and the
-# manifest reader do, and only its JSON result reaches the parent.
-CI_BENCHMARK_ROUTE_SCRIPT = r"""
-import json, sys
-
-import yaml
-
-text, job_name, b1_name, measured_name = sys.argv[1:5]
-data = yaml.safe_load(text)
-job = data["jobs"][job_name]
-steps = job["steps"]
-b1 = [s for s in steps if s.get("name") == b1_name]
-measured = [s for s in steps if s.get("name") == measured_name]
-if len(b1) != 1:
-    raise SystemExit("expected exactly one %r step, found %d" % (b1_name, len(b1)))
-if len(measured) != 1:
-    raise SystemExit(
-        "expected exactly one %r step, found %d" % (measured_name, len(measured))
-    )
-print(json.dumps({"job": job, "b1_step": b1[0], "measured_step": measured[0]}))
-"""
-
-
-def read_ci_benchmark_route_isolated(ci_text: str) -> dict:
-    """The guard's only route to the workflow: parsed in a child, not here."""
-    proc = _run_isolated(
-        CI_BENCHMARK_ROUTE_SCRIPT,
-        ci_text,
-        CI_BENCHMARK_JOB,
-        CI_B1_STEP_NAME,
-        CI_MEASURED_STEP_NAME,
-    )
-    _require(
-        proc.returncode == 0 and proc.stdout.strip(),
-        "B11GP2",
-        f"isolated CI workflow read failed: rc={proc.returncode} "
-        f"stderr={proc.stderr.strip()}",
-    )
-    return json.loads(proc.stdout)
-
-
-def _b11gp_render_template(node: ast.AST) -> str:
-    """An f-string's literal shape: text verbatim, holes as `{expr:spec}`."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    _require(
-        isinstance(node, ast.JoinedStr),
-        "B11GP1",
-        "the classification suffix must be one (implicitly concatenated) "
-        f"string expression; found {type(node).__name__}",
-    )
-    assert isinstance(node, ast.JoinedStr)
-    out: list[str] = []
-    for piece in node.values:
-        if isinstance(piece, ast.Constant):
-            out.append(str(piece.value))
-            continue
-        assert isinstance(piece, ast.FormattedValue)
-        spec = ""
-        if piece.format_spec is not None:
-            spec = ":" + _b11gp_render_template(piece.format_spec)
-        out.append("{" + ast.unparse(piece.value) + spec + "}")
-    return "".join(out)
-
-
-def _b11gp_unparse_body(body: list[ast.stmt]) -> str:
-    return "\n".join(ast.unparse(node) for node in body)
-
-
-def _b11gp_sole_listcomp_expansion(b11: ast.FunctionDef) -> str:
-    """The manifest-derived instance list W2 pins, by its own structure."""
-    names = []
-    for node in ast.walk(b11):
-        if not (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.ListComp)
-            and len(node.value.generators) == 2
-        ):
-            continue
-        inner = node.value.generators[1].iter
-        if (
-            isinstance(inner, ast.Call)
-            and isinstance(inner.func, ast.Name)
-            and inner.func.id == "range"
-            and len(inner.args) == 1
-            and isinstance(inner.args[0], ast.Subscript)
-            and isinstance(inner.args[0].slice, ast.Constant)
-            and inner.args[0].slice.value == "processes"
-        ):
-            names.append(node.targets[0].id)
-    _require(
-        len(names) == 1,
-        "B11GP1",
-        "the classifier's row count must be derived from the one "
-        "manifest-driven instance expansion; found "
-        f"{len(names)} candidate expansions",
-    )
-    return names[0]
-
-
-def _b11gp_sole_assign_from_call(
-    b11: ast.FunctionDef, callee: str, rule: str, what: str
-) -> str:
-    names = [
-        node.targets[0].id
-        for node in ast.walk(b11)
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-        and isinstance(node.value, ast.Call)
-        and (_callee_name(node.value) or "") == callee
-    ]
-    _require(len(names) == 1, rule, f"{what}: expected exactly one `{callee}()` result")
-    return names[0]
-
-
-def check_B11GP1(src: str) -> None:
-    """FP-B11GP-1/2: the gate stays `rate >= 1000.0`; only the message may grow.
-
-    This checker, and not B11D5, owns the sole permitted module-level branch on
-    a diagnostic value: the pure `_b11_failure_classification` helper and the
-    single call to it inside the benchmark's assertion *message*.  It pins the
-    two constants, the exact helper body and suffix, the one legal call site
-    and its exact arguments, and the absence of any waiver, retry, decorator or
-    second reading of the measurement chain.
-    """
-    tree = ast.parse(src)
-    parents = _parent_map(tree)
-
-    # (1) the two pinned constants.
-    share = _module_constant(tree, B11_SHARE_CONSTANT_NAME, "B11GP1")
-    _require(
-        isinstance(share, ast.Constant)
-        and isinstance(share.value, float)
-        and share.value == B11_SHARE_CONSTANT_VALUE,
-        "B11GP1",
-        f"{B11_SHARE_CONSTANT_NAME} must be exactly "
-        f"{B11_SHARE_CONSTANT_VALUE!r}; the provisional boundary moves only "
-        "through an audited design revision",
-    )
-    label = _module_constant(tree, B11_LABEL_CONSTANT_NAME, "B11GP1")
-    _require(
-        isinstance(label, ast.Constant) and label.value == B11_LABEL_CONSTANT_VALUE,
-        "B11GP1",
-        f"{B11_LABEL_CONSTANT_NAME} must be exactly {B11_LABEL_CONSTANT_VALUE!r}",
-    )
-
-    # (2) the helper's signature and exact body.
-    helper = _module_function(tree, B11_CLASSIFIER_NAME, "B11GP1")
-    _require(
-        not helper.decorator_list,
-        "B11GP1",
-        "the classifier carries no decorator",
-    )
-    args = helper.args
-    _require(
-        [a.arg for a in args.args] == list(B11_CLASSIFIER_PARAMS)
-        and not args.posonlyargs
-        and not args.kwonlyargs
-        and args.vararg is None
-        and args.kwarg is None
-        and not args.defaults
-        and not args.kw_defaults,
-        "B11GP1",
-        f"{B11_CLASSIFIER_NAME} must take exactly "
-        f"{list(B11_CLASSIFIER_PARAMS)} positionally and nothing else; found "
-        f"{[a.arg for a in args.args]}",
-    )
-    _require(
-        [
-            ast.unparse(a.annotation) if a.annotation is not None else None
-            for a in args.args
-        ]
-        == ["float", "int", "str"],
-        "B11GP1",
-        f"{B11_CLASSIFIER_NAME} must annotate its three parameters "
-        "`float`, `int`, `str`",
-    )
-    _require(
-        isinstance(helper.returns, ast.Name) and helper.returns.id == "str",
-        "B11GP1",
-        f"{B11_CLASSIFIER_NAME} must be annotated `-> str`: it returns text, "
-        "never a verdict",
-    )
-    body = _strip_docstring(helper.body)
-    returns = [n for n in ast.walk(helper) if isinstance(n, ast.Return)]
-    _require(
-        len(returns) == 4,
-        "B11GP1",
-        f"the classifier must have exactly four returns, found {len(returns)}",
-    )
-    empties = [
-        n
-        for n in returns
-        if isinstance(n.value, ast.Constant) and n.value.value == ""
-    ]
-    _require(
-        len(empties) == 3,
-        "B11GP1",
-        "three of the classifier's returns must be the empty string: a "
-        "passing or non-positive rate, a non-positive row count or an "
-        "unavailable counter is never classified",
-    )
-    final = body[-1] if body else None
-    _require(
-        isinstance(final, ast.Return),
-        "B11GP1",
-        "the classifier's last statement must be the labelled return",
-    )
-    assert isinstance(final, ast.Return)
-    suffix = final.value
-    _require(
-        suffix is not None
-        and _b11gp_render_template(suffix) == B11_CLASSIFICATION_SUFFIX_TEMPLATE,
-        "B11GP1",
-        "the classification suffix must be exactly "
-        f"{B11_CLASSIFICATION_SUFFIX_TEMPLATE!r}; the fixed "
-        "`classification_scope=symptom_only_not_cause` and `gate_outcome=red` "
-        "fragments keep the failure line from reading as a waiver",
-    )
-    _require(
-        _b11gp_unparse_body(body)
-        == _b11gp_unparse_body(ast.parse(B11_CLASSIFIER_BODY_SOURCE).body),
-        "B11GP1",
-        "the classifier body is not the pinned §3.3 shape: the two "
-        "empty-string guards, the algebraic window reconstruction, the "
-        "unrounded `< B11_IO_FULL_STALL_SHARE` comparison and the exact "
-        "suffix are all fixed",
-    )
-    loads = {
-        n.id
-        for stmt in helper.body
-        for n in ast.walk(stmt)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
-    }
-    _require(
-        loads <= B11_CLASSIFIER_ALLOWED_LOADS,
-        "B11GP1",
-        f"the classifier loads {sorted(loads - B11_CLASSIFIER_ALLOWED_LOADS)}: "
-        "it may observe exactly its three parameters and the pinned constants",
-    )
-
-    # (3) the benchmark: one unchanged gate, no waiver, no retry, no decorator.
-    b11 = _b11_function_in(tree)
-    _require(
-        not b11.decorator_list,
-        "B11GP1",
-        "the benchmark carries no decorator: no rerun, retry, flaky or "
-        "conditional marker may sit above the gate",
-    )
-    asserts = [n for n in ast.walk(b11) if isinstance(n, ast.Assert)]
-    _require(
-        len(asserts) == 1,
-        "B11GP1",
-        f"the benchmark must make exactly one assertion, found {len(asserts)}",
-    )
-    gate = asserts[0]
-    test = gate.test
-    _require(
-        isinstance(test, ast.Compare)
-        and len(test.ops) == 1
-        and isinstance(test.ops[0], ast.GtE)
-        and isinstance(test.left, ast.Name)
-        and len(test.comparators) == 1
-        and isinstance(test.comparators[0], ast.Constant)
-        and test.comparators[0].value == 1000.0,
-        "B11GP1",
-        "the sole gate must remain `<rate> >= 1000.0`",
-    )
-    assert isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
-    rate_name = test.left.id
-    _require(
-        not [
-            n
-            for n in _own_scope_nodes(b11)
-            if isinstance(n, ast.BoolOp) and isinstance(n.op, ast.Or)
-        ],
-        "B11GP1",
-        "no boolean `or` may appear in the benchmark's own scope: "
-        "`assert rate >= 1000.0 or <anything>` is a waiver, whatever the "
-        "right operand returns",
-    )
-    _require(
-        not [
-            n
-            for n in _own_scope_nodes(b11)
-            if isinstance(n, (ast.Return, ast.Raise))
-        ],
-        "B11GP1",
-        "the benchmark's own scope may not return or raise before its gate",
-    )
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == "pytestmark":
-            _fail(
-                "B11GP1",
-                f"a module-level `pytestmark` at line {node.lineno} could skip "
-                "or rerun the measurement of record",
-            )
-        if isinstance(node, ast.Attribute) and node.attr in (
-            "mark",
-            "flaky",
-            "rerun",
-            "reruns",
-            "retry",
-            "repeat",
-        ):
-            _fail(
-                "B11GP1",
-                f"retry/rerun construct {node.attr!r} at line {node.lineno}",
-            )
-
-    # (4) the call sites: one in the benchmark's assertion message, the rest in
-    #     the boundary unit test, and nowhere else in the module.
-    calls = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and _callee_name(n) == B11_CLASSIFIER_NAME
-    ]
-    _require(calls, "B11GP1", "the classifier is never called")
-    homes = [(_enclosing_module_function(n, parents), n) for n in calls]
-    in_bench = [n for home, n in homes if home == B11_TEST_NAME]
-    in_unit = [n for home, n in homes if home == B11_CLASSIFIER_TEST_NAME]
-    strays = [
-        (home, n)
-        for home, n in homes
-        if home not in (B11_TEST_NAME, B11_CLASSIFIER_TEST_NAME)
-    ]
-    _require(
-        not strays,
-        "B11GP1",
-        "the classifier may be called only from "
-        f"{B11_TEST_NAME} and {B11_CLASSIFIER_TEST_NAME}; found "
-        + ", ".join(f"{home!r} at line {node.lineno}" for home, node in strays),
-    )
-    _require(
-        len(in_bench) == 1,
-        "B11GP1",
-        f"exactly one classifier call belongs in {B11_TEST_NAME}; found "
-        f"{len(in_bench)} -- a second call is a second reading of the run",
-    )
-    _require(
-        in_unit,
-        "B11GP1",
-        f"{B11_CLASSIFIER_TEST_NAME} must exercise the classifier directly",
-    )
-    call = in_bench[0]
-
-    for printed in _calls_named(b11, "print"):
-        _require(
-            id(call) not in {id(n) for n in ast.walk(printed)},
-            "B11GP1",
-            "the classifier may not be printed: the label exists only in an "
-            "already-failing assertion message, never on a passing run",
-        )
-    branch_test_nodes: set[int] = set()
-    for node in ast.walk(b11):
-        if isinstance(node, (ast.If, ast.While, ast.IfExp)):
-            for inner in ast.walk(node.test):
-                branch_test_nodes.add(id(inner))
-    _require(
-        id(call) not in branch_test_nodes,
-        "B11GP1",
-        "the classifier may not decide an `if`, `while` or ternary test",
-    )
-    ancestors: list[ast.AST] = []
-    cursor: ast.AST | None = parents.get(call)
-    while cursor is not None:
-        ancestors.append(cursor)
-        cursor = parents.get(cursor)
-    for node in ancestors:
-        _require(
-            not isinstance(node, (ast.Try, ast.ExceptHandler)),
-            "B11GP1",
-            "the classifier may not run inside an exception handler or a "
-            "`try` body: a swallowed failure is a masked gate",
-        )
-        _require(
-            not isinstance(node, (ast.IfExp, ast.BoolOp)),
-            "B11GP1",
-            "the classifier may not sit inside a ternary or a boolean "
-            "operand, even within the already-lazy assertion message: such a "
-            "wrapper lets an unpinned condition decide whether the label is "
-            "produced, which is the `ternary` placement the policy forbids",
-        )
-        _require(
-            not isinstance(
-                node,
-                (
-                    ast.For,
-                    ast.AsyncFor,
-                    ast.While,
-                    ast.ListComp,
-                    ast.SetComp,
-                    ast.DictComp,
-                    ast.GeneratorExp,
-                ),
-            ),
-            "B11GP1",
-            "the classifier may not run inside any loop or comprehension, "
-            "and least of all inside either timed loop",
-        )
-        _require(
-            not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-            or node is b11,
-            "B11GP1",
-            "the classifier call belongs to the benchmark's own scope",
-        )
-    msg_nodes = {id(n) for n in ast.walk(gate.msg)} if gate.msg is not None else set()
-    test_nodes = {id(n) for n in ast.walk(gate.test)}
-    _require(
-        id(call) in msg_nodes,
-        "B11GP1",
-        "the classifier call must sit inside the assertion *message*, which "
-        "Python evaluates only after the gate has already failed",
-    )
-    _require(
-        id(call) not in test_nodes,
-        "B11GP1",
-        "the classifier call may never reach the assertion condition",
-    )
-
-    # (5) the exact arguments: the asserted rate, the manifest-derived row
-    #     count, and the one permitted diagnostic field.
-    _require(
-        len(call.args) == 3 and not call.keywords,
-        "B11GP1",
-        "the classifier call takes exactly three positional arguments",
-    )
-    first, second, third = call.args
-    _require(
-        isinstance(first, ast.Name) and first.id == rate_name,
-        "B11GP1",
-        f"the classifier's first argument must be the asserted rate "
-        f"{rate_name!r}",
-    )
-    instances = _b11gp_sole_listcomp_expansion(b11)
-    _require(
-        isinstance(second, ast.BinOp)
-        and isinstance(second.op, ast.Mult)
-        and isinstance(second.left, ast.Call)
-        and isinstance(second.left.func, ast.Name)
-        and second.left.func.id == "len"
-        and len(second.left.args) == 1
-        and not second.left.keywords
-        and isinstance(second.left.args[0], ast.Name)
-        and second.left.args[0].id == instances
-        and isinstance(second.right, ast.Name)
-        and second.right.id == B11_ITERS_NAME,
-        "B11GP1",
-        "the classifier's row count must be exactly "
-        f"`len({instances}) * {B11_ITERS_NAME}`: the manifest-derived instance "
-        "count times the fixed timed row count, never a reread of the "
-        "measurement chain",
-    )
-    iters = [
-        n
-        for n in ast.walk(b11)
-        if isinstance(n, ast.Assign)
-        and len(n.targets) == 1
-        and isinstance(n.targets[0], ast.Name)
-        and n.targets[0].id == B11_ITERS_NAME
-    ]
-    _require(
-        len(iters) == 1
-        and isinstance(iters[0].value, ast.Constant)
-        and iters[0].value.value == B11_ROW_COUNT_VALUE,
-        "B11GP1",
-        f"{B11_ITERS_NAME} must stay the single fixed {B11_ROW_COUNT_VALUE}",
-    )
-    host_values = _b11gp_sole_assign_from_call(
-        b11, B11_HOST_DELTA_NAME, "B11GP1", "the host delta mapping"
-    )
-    _require(
-        isinstance(third, ast.Subscript)
-        and isinstance(third.value, ast.Name)
-        and third.value.id == host_values
-        and isinstance(third.slice, ast.Constant)
-        and third.slice.value == B11_STALL_FIELD,
-        "B11GP1",
-        "the classifier's only diagnostic input is "
-        f"{host_values}[{B11_STALL_FIELD!r}]",
-    )
-
-    # (6) the measurement chain is not read a second time.
-    rate_assigns = [
-        n
-        for n in ast.walk(b11)
-        if isinstance(n, ast.Assign)
-        and len(n.targets) == 1
-        and isinstance(n.targets[0], ast.Name)
-        and n.targets[0].id == rate_name
-    ]
-    _require(len(rate_assigns) == 1, "B11GP1", f"{rate_name!r} is assigned once")
-    b11_parents = _parent_map(b11)
-    expected_reads = {"elapsed": 2, "total_rows": 1, "committed": 1}
-    chain_lines = {
-        "elapsed": rate_assigns[0].lineno,
-        "total_rows": rate_assigns[0].lineno,
-    }
-    rows_assigns = [
-        n
-        for n in ast.walk(b11)
-        if isinstance(n, ast.Assign)
-        and len(n.targets) == 1
-        and isinstance(n.targets[0], ast.Name)
-        and n.targets[0].id == "total_rows"
-    ]
-    _require(len(rows_assigns) == 1, "B11GP1", "`total_rows` is assigned once")
-    chain_lines["committed"] = rows_assigns[0].lineno
-    for name, count in expected_reads.items():
-        reads = [
-            n
-            for n in ast.walk(b11)
-            if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
-        ]
-        _require(
-            len(reads) == count,
-            "B11GP1",
-            f"{name!r} is read {len(reads)} time(s) in the benchmark; W2's "
-            f"measurement chain reads it exactly {count}",
-        )
-        for node in reads:
-            stmt = _enclosing_statement(node, b11_parents)
-            _require(
-                stmt.lineno == chain_lines[name],
-                "B11GP1",
-                f"{name!r} is read outside W2's measurement chain at line "
-                f"{node.lineno}; the classifier reconstructs the window "
-                "algebraically instead",
-            )
-
-
-def check_B11GP2(src: str, gate_policy: dict, notes: str, ci_text: str) -> None:
-    """FP-B11GP-3/4: the policy carrier is exact and B11's red is independent.
-
-    It owns two things and says so: the whole structured `gate_policy` object
-    with both bounded review triggers and the honest policy prose beside it,
-    and B11's freedom from any B1 status, step- or job-level workflow
-    disposition.  A10 continues to own the exact pytest command and the shell's
-    failure propagation; this checker never restates them.
-    """
-    # (1) the structured carrier, whole-object.
-    _require(
-        gate_policy == EXPECTED_B11_GATE_POLICY,
-        "B11GP2",
-        "B11.gate_policy differs from EXPECTED_B11_GATE_POLICY: outcome, "
-        "retry count, cutoff, the five table-rounded observations, their "
-        "precision and strength markers and both review triggers are pinned "
-        f"together; got {gate_policy!r}",
-    )
-
-    # (2) no false carrier in the classifier or its call site.
-    tree = ast.parse(src)
-    helper = _module_function(tree, B11_CLASSIFIER_NAME, "B11GP2")
-    b11 = _b11_function_in(tree)
-    calls = _calls_named(b11, B11_CLASSIFIER_NAME)
-    _require(len(calls) == 1, "B11GP2", "exactly one classifier call in the benchmark")
-    region = _b11gp_unparse_body(_strip_docstring(helper.body))
-    region = region + "\n" + ast.unparse(calls[0])
-    for token in B11_FORBIDDEN_ROUTE_TOKENS:
-        _require(
-            token not in region,
-            "B11GP2",
-            f"forbidden route token {token!r} reaches the classification: CPU "
-            "SKU, storage model or class, B1 route, serial commit cost, steal "
-            "and every other diagnostic are non-inputs",
-        )
-    _require(
-        not B11_STANDALONE_B1.search(region),
-        "B11GP2",
-        "a B1 reference reaches the classification; B11's own miss is "
-        "authoritative whether B1 was live, recorded or unavailable",
-    )
-    subscripts = [n for n in ast.walk(calls[0]) if isinstance(n, ast.Subscript)]
-    _require(
-        len(subscripts) == 1
-        and isinstance(subscripts[0].slice, ast.Constant)
-        and subscripts[0].slice.value == B11_STALL_FIELD,
-        "B11GP2",
-        "the call site may read exactly one diagnostic field, "
-        f"{B11_STALL_FIELD!r}; a second input would make the label a "
-        "composite nothing measured",
-    )
-
-    # (3) the prose beside the object, without euphemism and without
-    #     displacing the shipped diagnostics provenance.
-    for phrase in B11_GATE_POLICY_NOTES_PHRASES:
-        _require(
-            phrase in notes,
-            "B11GP2",
-            f"the B11 manifest notes must state {phrase!r}: the policy, its "
-            "thin provisional warrant, both review triggers and the fsync/PSI "
-            "limitation are part of the entry, not of a comment",
-        )
-    for phrase in B11_EXISTING_NOTES_PHRASES:
-        _require(
-            phrase in notes,
-            "B11GP2",
-            f"the B11 manifest notes dropped shipped provenance {phrase!r}",
-        )
-
-    # (4) the CI route: unconditional job, unconditional measured step, and no
-    #     dependence on any B1 status.
-    route = read_ci_benchmark_route_isolated(ci_text)
-    job, b1_step, measured = route["job"], route["b1_step"], route["measured_step"]
-    for holder, what in ((job, "the `benchmark` job"), (measured, "the B2/B10/B11 step")):
-        _require(
-            "if" not in holder,
-            "B11GP2",
-            f"{what} carries an `if:`; B11 runs and blocks unconditionally",
-        )
-        _require(
-            "continue-on-error" not in holder,
-            "B11GP2",
-            f"{what} carries `continue-on-error`; a red B11 must fail the job",
-        )
-    _require(
-        "id" not in b1_step,
-        "B11GP2",
-        "the B1 step must carry no `id`: an id is the handle a later step "
-        "would use to condition B11 on B1's outcome",
-    )
-    serialized = json.dumps(measured, sort_keys=True)
-    _require(
-        CI_B1_STEP_NAME not in serialized,
-        "B11GP2",
-        "the B2/B10/B11 step names the B1 step",
-    )
-    _require(
-        "scripts/integration-test.sh b1" not in serialized,
-        "B11GP2",
-        "the B2/B10/B11 step invokes the B1 route",
-    )
-    _require(
-        not B11_STANDALONE_B1.search(serialized),
-        "B11GP2",
-        "the B2/B10/B11 step references B1",
-    )
-    _require(
-        not B11_STATUS_REFERENCE.search(serialized),
-        "B11GP2",
-        "the B2/B10/B11 step references a `steps.<id>.outcome` or "
-        "`steps.<id>.conclusion` status; B11's disposition is its own",
-    )
-
-
-# --------------------------------------------------------------------------
 # A1-A10 — the benchmark tier's configuration surface.
 # --------------------------------------------------------------------------
 
 
 def check_A1(bench_dir: Path) -> None:
-    expected = {CONFTEST_NAME, BENCH_NAME, "thresholds.yaml", GC3_DECISION_NAME}
+    expected = {CONFTEST_NAME, BENCH_NAME, "thresholds.yaml"}
     names = {
         p.name
         for p in bench_dir.iterdir()
@@ -7128,17 +6238,6 @@ def _run_all_checkers(repo_root: Path) -> None:
             bench_dir / "thresholds.yaml", key_path="benchmarks[id=B11].notes"
         ),
     )
-    check_B11GP1(sources[BENCH_NAME])
-    check_B11GP2(
-        sources[BENCH_NAME],
-        read_manifest_isolated(
-            bench_dir / "thresholds.yaml", key_path=B11_GATE_POLICY_KEY
-        ),
-        read_manifest_isolated(
-            bench_dir / "thresholds.yaml", key_path="benchmarks[id=B11].notes"
-        ),
-        (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
-    )
 
 
 # --------------------------------------------------------------------------
@@ -7226,11 +6325,9 @@ def test_b11_diagnostics_are_reported_only_and_fixed():
     pool, durability and fixture values, and the absence of any
     diagnostic-conditioned outcome branch, skip, retry or timed-loop read.
 
-    It no longer claims that no diagnostic-conditioned branch exists anywhere:
-    `check_B11GP1` owns the sole module-level branch on a diagnostic value, the
-    classification-only suffix `_b11_failure_classification` may append to an
-    assertion message Python builds only after the bar has already failed
-    (design/slices/b11-gate-policy §3.6).
+    bench-on-demand FP-BOD-4 deleted the stall classifier, so the claim is
+    unqualified again: no diagnostic-conditioned branch exists anywhere in the
+    benchmark, and nothing follows the bar's own rate message.
     """
     sources = tier_sources()
     src = sources[BENCH_NAME]
@@ -7319,9 +6416,6 @@ def _seed_repo(root: Path) -> None:
     # The miniature repository carries the same tier inventory as the real one,
     # so the A1 "extra_tier_file" control still fires for the file it adds and
     # never for a file this seed forgot to write.
-    (bench / GC3_DECISION_NAME).write_text(
-        GC3_DECISION.read_text(encoding="utf-8"), encoding="utf-8"
-    )
     for rel in sorted(EXPECTED_PACKAGING_FILES) + list(BENCHMARK_WORKFLOWS) + [
         GO_GUARD
     ] + CALL_SITE_FILES:
@@ -8409,8 +7503,8 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
             lambda root: _replace(
                 root,
                 ".github/workflows/ci.yml",
-                "tests/benchmark/test_pg_scale.py -v -s",
-                "tests/benchmark/test_pg_scale.py -v -s -p rca_bench",
+                "            -v -s",
+                "            -v -s -p rca_bench",
             ),
             a10,
         ),
@@ -8443,10 +7537,10 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         _replace(
             root,
             ".github/workflows/ci.yml",
-            "      - name: FP-M6-31 A10(v) environment hygiene before B2/B10/B11",
+            "      - name: FP-M6-31 A10(v) environment hygiene before B2/B10",
             "      - name: seed the hook\n"
             '        run: echo "PYTHONPATH=/tmp/b11-hook" >> "$GITHUB_ENV"\n'
-            "      - name: FP-M6-31 A10(v) environment hygiene before B2/B10/B11",
+            "      - name: FP-M6-31 A10(v) environment hygiene before B2/B10",
         )
 
     add("ci_persists_pythonpath_via_github_env", "A10", _seeded(github_env, a10))
@@ -8683,18 +7777,8 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
             root,
             TIER_BENCH,
             '        f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"\n'
-            "        + _b11_failure_classification(\n"
-            "            rate,\n"
-            "            len(instances) * n_iters,\n"
-            '            host_values["host_psi_io_full_usec"],\n'
-            "        )\n"
             "    )\n",
             '        f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"\n'
-            "        + _b11_failure_classification(\n"
-            "            rate,\n"
-            "            len(instances) * n_iters,\n"
-            '            host_values["host_psi_io_full_usec"],\n'
-            "        )\n"
             "    )\n"
             "    print(_serialize_b11_diagnostics(diagnostic_values))\n",
         )
@@ -8711,7 +7795,7 @@ def _fixtures() -> list[tuple[str, str, Callable[[], None]]]:
         "B11D2",
         diag_case(
             "from services.gateway.tests.b1_reference_profile import (",
-            "from services.gateway.tests.b1_topology_probe import (",
+            "from services.gateway.tests.b1_e2e_profile_substitute import (",
             b11d2,
         ),
     )
@@ -9497,649 +8581,132 @@ def test_b11_guard_positive_control_live_under_boolop_ifexp(case_id, mutate):
 def test_b11_guard_positive_control_real_repository():
     """Every checker, against the real tree."""
     _run_all_checkers(REPO_ROOT)
+
+
+def test_b11_guard_baselines_are_the_shipped_tier_verbatim():
+    """The clean baselines are copies, and a copy that drifts is a lie.
+
+    `CLEAN_BENCH` and `CLEAN_CONFTEST` are verbatim copies of the two files
+    they seed a temporary repository from, and every bypass fixture mutates
+    one of those copies rather than the tree. That only means anything while
+    the copy IS the tree: a baseline that drifts leaves each of those
+    fixtures proving a rule about text this repository no longer ships, and
+    the drift itself is invisible -- seeding and re-running the checkers
+    passes either way, because a stale comment breaks no rule.
+
+    Named for exactly that: an edit to `tests/benchmark/test_pg_scale.py`
+    (bench-on-demand FP-BOD-4 was one) that is not carried into the baseline
+    beside it. Byte equality, because anything weaker would admit the
+    difference that matters least and hide the one that matters most.
+    """
+    for name, live_path in (
+        ("CLEAN_BENCH", BENCH),
+        ("CLEAN_CONFTEST", CONFTEST),
+    ):
+        baseline = globals()[name]
+        live = live_path.read_text(encoding="utf-8")
+        assert baseline == live, (
+            f"{name} has drifted from {live_path.name}: regenerate it from the "
+            f"shipped file (lengths {len(baseline)} vs {len(live)})"
+        )
+
+
+
 # --------------------------------------------------------------------------
-# B11 gate policy (design/slices/b11-gate-policy, FP-B11GP-1..5): four function
-# tests, each with its own named red mutations.  Every mutation is applied to a
-# copy of the real shipped text and handed to the real checker; none of them
-# reimplements a rule or raises its own expected error.
+# bench-on-demand FP-BOD-4 — the bar, and nothing after it.
 # --------------------------------------------------------------------------
 
 
-def _gate_policy_sources() -> tuple[str, dict, str, str]:
-    return (
-        BENCH.read_text(encoding="utf-8"),
-        read_manifest_isolated(key_path=B11_GATE_POLICY_KEY),
-        read_manifest_isolated(key_path="benchmarks[id=B11].notes"),
-        CI_YML.read_text(encoding="utf-8"),
-    )
+def test_b11_rate_bar_has_no_stall_suffix():
+    """FP-BOD-4 [function test]: `rate >= 1000.0` survives; the label does not.
 
+    Named for two failures, and it takes both to go green.
 
-def _mutated(src: str, old: str, new: str) -> str:
-    assert old in src, f"fixture precondition: {old!r} is no longer present"
-    return src.replace(old, new, 1)
+    The first is a bar that moved off 1000.0 -- deleted, relaxed, turned into
+    a `>` on a different quantity, or pointed at something other than the
+    combined rate. That is read out of the AST of the live function, not out
+    of the file's text: a comment or a docstring mentioning `1000.0` proves
+    nothing.
 
+    The second is the stall suffix surviving the slice. B11 left per-push CI,
+    so `io_full_stall_observed` has nothing left to classify -- it existed to
+    tell one shared-runner red from another -- and an on-demand miss has to
+    stay a plain failure. Both the classifier and the label are required
+    absent from the benchmark file, and the label from the manifest too, so a
+    half-deletion that leaves either behind is red.
 
-def _rule_of(excinfo) -> str:
-    return str(excinfo.value).split(":", 1)[0]
-
-
-CALL_ARGUMENTS = (
-    "\n            rate,"
-    "\n            len(instances) * n_iters,"
-    '\n            host_values["host_psi_io_full_usec"],\n        '
-)
-CALL_EXPRESSION = f"_b11_failure_classification({CALL_ARGUMENTS})"
-ASSERT_MESSAGE_TAIL = (
-    '        f"B11 single_writer_rate={single_writer_rate:.1f}/s; {env_line}"\n'
-    f"        + {CALL_EXPRESSION}\n"
-)
-# The call site's own diagnostic argument.  The same key also appears in the
-# canonical 21-field mapping, so every input mutation anchors on this exact
-# indented line and cannot silently edit the diagnostics line instead.
-CALL_DIAGNOSTIC_ARG = '\n            host_values["host_psi_io_full_usec"],\n'
-
-
-def test_b11_gate_policy_is_message_only_and_required_green():
-    """FP-B11GP-1: the sole gate is untouched; only its message may grow.
-
-    The positive half runs `check_B11GP1` over the shipped benchmark.  The
-    negative half is the waiver matrix: every way an already-red measurement
-    could be turned into something other than a red is applied to a copy of
-    that same text, and the real checker must reject it at `B11GP1`.
+    Checking only `writers == 7` would stay green after the rate assert was
+    removed, which is exactly why that is not this test.
     """
     src = BENCH.read_text(encoding="utf-8")
-    check_B11GP1(src)
-
-    # The gate itself is still the only failure-producing expression, and the
-    # helper is genuinely lazy: it lives in `assert.msg`, never in `assert.test`.
     tree = ast.parse(src)
     b11 = _b11_function_in(tree)
+
+    # (1) The bar: one assert, `>=`, against the float 1000.0, on the name the
+    # combined rate is bound to.
     asserts = [n for n in ast.walk(b11) if isinstance(n, ast.Assert)]
-    assert len(asserts) == 1, len(asserts)
-    assert not _calls_named(asserts[0].test, B11_CLASSIFIER_NAME), "gate is pure"
-    assert len(_calls_named(asserts[0].msg, B11_CLASSIFIER_NAME)) == 1, "one call"
+    assert len(asserts) == 1, [ast.unparse(a.test) for a in asserts]
+    gate = asserts[0].test
+    assert isinstance(gate, ast.Compare), ast.unparse(gate)
+    assert len(gate.ops) == 1 and isinstance(gate.ops[0], ast.GtE), ast.unparse(gate)
+    assert isinstance(gate.left, ast.Name), ast.unparse(gate)
+    right = gate.comparators[0]
+    assert isinstance(right, ast.Constant), ast.unparse(gate)
+    assert right.value == 1000.0 and isinstance(right.value, float), right.value
 
-    cases: list[tuple[str, str]] = [
-        # (i) `assert rate >= 1000.0 or <helper>` — the classic soft pass.
-        (
-            "assertion_waiver_boolop",
-            _mutated(
-                src,
-                "    assert rate >= 1000.0, (",
-                f"    assert rate >= 1000.0 or {CALL_EXPRESSION}, (",
-            ),
-        ),
-        # (ii) a second reading of the same run.
-        (
-            "second_helper_call",
-            _mutated(
-                src,
-                ASSERT_MESSAGE_TAIL,
-                ASSERT_MESSAGE_TAIL + f"        + {CALL_EXPRESSION}\n",
-            ),
-        ),
-        # (iii) the label on a passing run: printed instead of asserted.
-        (
-            "classification_printed_on_every_run",
-            _mutated(
-                _mutated(src, f"        + {CALL_EXPRESSION}\n", ""),
-                "    print(env_line)\n",
-                f"    print(env_line + {CALL_EXPRESSION})\n",
-            ),
-        ),
-        # (iv) the label deciding a branch rather than describing a failure.
-        (
-            "classification_decides_a_branch",
-            _mutated(
-                _mutated(src, f"        + {CALL_EXPRESSION}\n", ""),
-                "    print(env_line)\n",
-                f"    if {CALL_EXPRESSION}:\n        print(env_line)\n"
-                "    else:\n        print(env_line)\n",
-            ),
-        ),
-        # (iv-a) the same branch spelled as a ternary that *wraps* the call
-        #        while leaving it inside the already-lazy message.  It cannot
-        #        create a pass -- Python still builds the message only after
-        #        `rate >= 1000.0` is false -- but it lets an unpinned condition
-        #        decide whether the label is produced at all, which is the
-        #        `ternary` placement the policy names as red.
-        (
-            "classification_wrapped_in_a_ternary",
-            _mutated(
-                src,
-                f"        + {CALL_EXPRESSION}\n",
-                f'        + ({CALL_EXPRESSION} if True else "")\n',
-            ),
-        ),
-        # (iv-b) the same conditional, spelled as a boolean `and`.  Rejecting
-        #        only the ternary would leave this one-token rewrite of it
-        #        open; the shipped `or` ban does not reach `and`.
-        (
-            "classification_wrapped_in_a_boolean_and",
-            _mutated(
-                src,
-                f"        + {CALL_EXPRESSION}\n",
-                f"        + (True and {CALL_EXPRESSION})\n",
-            ),
-        ),
-        # (iv-c) a generator: a loop form the `for`/`while` ancestor ban does
-        #        not name, so the call could be evaluated zero times.
-        (
-            "classification_inside_a_generator",
-            _mutated(
-                src,
-                f"        + {CALL_EXPRESSION}\n",
-                f'        + "".join({CALL_EXPRESSION} for _ in range(1))\n',
-            ),
-        ),
-        # (iv-d) the same, spelled as a list comprehension.  `SetComp` and
-        #        `DictComp` are rejected on the same terms.
-        (
-            "classification_inside_a_comprehension",
-            _mutated(
-                src,
-                f"        + {CALL_EXPRESSION}\n",
-                f'        + "".join([{CALL_EXPRESSION} for _ in range(1)])\n',
-            ),
-        ),
-        # (iv-e) the classifier deciding a comprehension's `if` filter: the
-        #        `if`/`while`/ternary test scan reads statement and ternary
-        #        tests, never a comprehension condition.
-        (
-            "classification_decides_a_comprehension_filter",
-            _mutated(
-                src,
-                f"        + {CALL_EXPRESSION}\n",
-                f'        + "".join("" for _ in range(1) if {CALL_EXPRESSION})\n',
-            ),
-        ),
-        # (v) the boundary moved by a constant edit.
-        (
-            "boundary_drift_constant",
-            _mutated(
-                src,
-                "B11_IO_FULL_STALL_SHARE = 0.20",
-                "B11_IO_FULL_STALL_SHARE = 0.13",
-            ),
-        ),
-        # (vi) `>=` at the boundary turned into `>`.
-        (
-            "boundary_drift_operator",
-            _mutated(
-                src,
-                "    if io_full_share < B11_IO_FULL_STALL_SHARE:",
-                "    if io_full_share <= B11_IO_FULL_STALL_SHARE:",
-            ),
-        ),
-        # (vii) the fixed scope fragment dropped from the suffix.
-        (
-            "classification_scope_fragment_dropped",
-            _mutated(
-                src,
-                '        "B11 classification_scope=symptom_only_not_cause; "\n',
-                "",
-            ),
-        ),
-        # (viii) `gate_outcome=red` dropped: the line would read as a waiver.
-        (
-            "gate_outcome_fragment_dropped",
-            _mutated(
-                src,
-                '        "B11 gate_outcome=red"\n',
-                '        "B11 observed"\n',
-            ),
-        ),
-        # (ix) `unavailable` coerced to zero rather than to no classification.
-        (
-            "unavailable_coerced_to_zero",
-            _mutated(
-                src,
-                "    if committed_rows <= 0 or host_psi_io_full_usec == "
-                "B11_DIAGNOSTIC_UNAVAILABLE:\n        return \"\"\n",
-                "    if committed_rows <= 0:\n        return \"\"\n"
-                "    if host_psi_io_full_usec == B11_DIAGNOSTIC_UNAVAILABLE:\n"
-                "        host_psi_io_full_usec = \"0\"\n",
-            ),
-        ),
-        # (x) the share taken from io `some` instead of io `full`.
-        (
-            "share_read_from_io_some",
-            _mutated(
-                src,
-                CALL_DIAGNOSTIC_ARG,
-                '\n            host_values["host_psi_io_some_usec"],\n',
-            ),
-        ),
-        # (xi) a per-writer window substituted for the global one.
-        (
-            "share_over_a_per_writer_window",
-            _mutated(src, "len(instances) * n_iters,", "n_iters,"),
-        ),
-        # (xii) the timed window read a second time.
-        (
-            "elapsed_read_again_for_the_classification",
-            _mutated(
-                src,
-                "len(instances) * n_iters,",
-                "int(elapsed * 1_000_000),",
-            ),
-        ),
-        # (xiii) a rerun marker above the measurement of record.
-        (
-            "rerun_decorator",
-            _mutated(
-                src,
-                "def test_b11_audit_llm_insert_throughput(scale_pg):",
-                "@pytest.mark.flaky(reruns=2)\n"
-                "def test_b11_audit_llm_insert_throughput(scale_pg):",
-            ),
-        ),
-        # (xiv) a module-level skip/rerun construct.
-        (
-            "module_pytestmark",
-            _mutated(
-                src,
-                "B11_IO_FULL_STALL_SHARE = 0.20",
-                "pytestmark = 1\nB11_IO_FULL_STALL_SHARE = 0.20",
-            ),
-        ),
-        # (xv) the classifier reachable from a third function.
-        (
-            "third_call_site",
-            _mutated(
-                src,
-                "def test_b11_host_parser_reuse_is_direct():",
-                "def test_b11_extra():\n"
-                '    return _b11_failure_classification(1.0, 1, "1")\n\n\n'
-                "def test_b11_host_parser_reuse_is_direct():",
-            ),
-        ),
-    ]
-    for case_id, mutant in cases:
-        with pytest.raises(AssertionError) as excinfo:
-            check_B11GP1(mutant)
-        assert _rule_of(excinfo) == "B11GP1", f"{case_id}: {excinfo.value}"
-
-    # W2 owns the measurement chain independently: the waiver and the second
-    # read of `elapsed` are red there too, without B11GP1 in the room.
-    for case_id in ("assertion_waiver_boolop", "elapsed_read_again_for_the_classification"):
-        mutant = dict(cases)[case_id]
-        with pytest.raises(AssertionError) as excinfo:
-            check_W2(mutant)
-        assert _rule_of(excinfo) == "W2", f"{case_id}: {excinfo.value}"
-
-    # And the shipped shape is W2-green: the algebraic row count reads nothing
-    # the measurement chain owns.
-    check_W2(src)
-
-
-def test_b11_gate_policy_manifest_is_exact_and_reviewable():
-    """FP-B11GP-3: the provisional policy and both review triggers are pinned.
-
-    This test decides the manifest carrier only.  Acting on a review trigger is
-    a coordinator document procedure recorded in the slice's
-    `policy-evidence.md`; no automated test here claims to prove a future edit.
-    """
-    gate_policy = read_manifest_isolated(key_path=B11_GATE_POLICY_KEY)
-    assert gate_policy == EXPECTED_B11_GATE_POLICY, gate_policy
-
-    # The named pieces, spelled out, so a silent narrowing of any one of them
-    # is visible in the failure rather than only in a whole-object diff.
-    assert gate_policy["outcome"] == "required-green", gate_policy
-    assert gate_policy["merge_blocking_on_miss"] is True, gate_policy
-    assert gate_policy["retries"] == 0, gate_policy
-    classification = gate_policy["failure_classification"]
-    assert classification["name"] == "io_full_stall_observed", classification
-    assert classification["host_psi_io_full_share_at_least"] == 0.20, classification
-    assert classification["evidence_head"] == (
-        "b25349b2859647807237ca53fd7d02f93340e268"
-    ), classification
-    assert classification["mixed_storage_class_samples"] == 5, classification
-    assert classification["passing_samples"] == 2, classification
-    assert classification["failing_samples"] == 3, classification
-    observed = classification["observed_table_rounded_share_percent"]
-    assert observed == {"passing": [8, 13], "failing": [21, 22, 26]}, observed
-    assert len(observed["passing"]) + len(observed["failing"]) == 5, observed
-    assert classification["evidence_precision"] == "table-rounded-percent", (
-        "the five percentages are rounded descriptions of a published table, "
-        "not exact raw extrema"
-    )
-    assert classification["evidence_strength"] == "thin-provisional", classification
-    review = gate_policy["review"]
-    assert review["after_additional_completed_measurements"] == 20, review
-    assert review["on_first_counterexample"] is True, review
-
-    # The boundary in the manifest is the boundary in the code.
-    bench = BENCH.read_text(encoding="utf-8")
-    tree = ast.parse(bench)
-    share = _module_constant(tree, B11_SHARE_CONSTANT_NAME, "B11GP1")
-    assert isinstance(share, ast.Constant), share
-    assert share.value == classification["host_psi_io_full_share_at_least"], share.value
-    label = _module_constant(tree, B11_LABEL_CONSTANT_NAME, "B11GP1")
-    assert isinstance(label, ast.Constant), label
-    assert label.value == classification["name"], label.value
-
-    # Exactly three isolated key paths, and nothing else is readable.
-    assert MANIFEST_ALLOWED_KEYS == frozenset(
-        {
-            "benchmarks[id=B11].concurrency_model",
-            "benchmarks[id=B11].notes",
-            B11_GATE_POLICY_KEY,
-        }
-    ), sorted(MANIFEST_ALLOWED_KEYS)
-    denied = _run_isolated(
-        MANIFEST_READ_SCRIPT, str(THRESHOLDS), "benchmarks[id=B11].threshold"
-    )
-    assert denied.returncode != 0, denied.stdout
-    assert "unsupported key path" in denied.stderr, denied.stderr
-
-    # The prose beside the object says the same things, without euphemism.
-    notes = read_manifest_isolated(key_path="benchmarks[id=B11].notes")
-    for phrase in B11_GATE_POLICY_NOTES_PHRASES + B11_EXISTING_NOTES_PHRASES:
-        assert phrase in notes, phrase
-
-    # A narrowed carrier is red at B11GP2, whole-object.
-    for case_id, mutate in (
-        ("cutoff_moved", {"host_psi_io_full_share_at_least": 0.13}),
-        ("retry_admitted", None),
-        ("precision_marker_dropped", {"evidence_precision": "exact"}),
-        ("thin_marker_dropped", {"evidence_strength": "established"}),
-        ("sample_count_inflated", {"mixed_storage_class_samples": 40}),
-    ):
-        mutant = json.loads(json.dumps(gate_policy))
-        if mutate is None:
-            mutant["retries"] = 1
-        else:
-            mutant["failure_classification"].update(mutate)
-        with pytest.raises(AssertionError) as excinfo:
-            check_B11GP2(bench, mutant, notes, CI_YML.read_text(encoding="utf-8"))
-        assert _rule_of(excinfo) == "B11GP2", f"{case_id}: {excinfo.value}"
-    for trigger in ("after_additional_completed_measurements", "on_first_counterexample"):
-        mutant = json.loads(json.dumps(gate_policy))
-        del mutant["review"][trigger]
-        with pytest.raises(AssertionError) as excinfo:
-            check_B11GP2(bench, mutant, notes, CI_YML.read_text(encoding="utf-8"))
-        assert _rule_of(excinfo) == "B11GP2", f"{trigger}: {excinfo.value}"
-
-    # The sibling ledger and its procedure resolve from the design's FP route.
-    ledger = (
-        REPO_ROOT
-        / "design"
-        / "slices"
-        / "b11-gate-policy"
-        / "policy-evidence.md"
-    )
-    if ledger.is_file():
-        ledger_text = ledger.read_text(encoding="utf-8")
-        assert "Policy evidence and review trigger" in ledger_text, "ledger heading"
-        assert classification["evidence_head"] in ledger_text, "ledger warrant head"
-
-
-def test_b11_gate_policy_has_no_b1_or_storage_route():
-    """FP-B11GP-4: B11's red is its own, whatever B1 did and whatever the disk is.
-
-    The frozen-deviation row for §14.4 rule 2 and §11.1.3's B11-red/B1-burst
-    branch pair is a separate reviewer-inspected document action in
-    `design/frozen-deviations.md`; this test decides only the mechanical part.
-    """
-    src, gate_policy, notes, ci_text = _gate_policy_sources()
-    check_B11GP2(src, gate_policy, notes, ci_text)
-
-    # (a) false carriers in the classifier or its call site.
-    source_cases: list[tuple[str, str]] = [
-        (
-            "storage_model_input",
-            _mutated(
-                src,
-                CALL_DIAGNOSTIC_ARG,
-                '\n            host_values["host_psi_io_full_usec"]\n'
-                '            + storage_values["storage_model"],\n',
-            ),
-        ),
-        (
-            "second_diagnostic_input",
-            _mutated(
-                src,
-                CALL_DIAGNOSTIC_ARG,
-                '\n            host_values["host_psi_io_full_usec"]\n'
-                '            + host_values["host_psi_cpu_full_usec"],\n',
-            ),
-        ),
-        (
-            "serial_commit_input",
-            _mutated(
-                src,
-                "    if io_full_share < B11_IO_FULL_STALL_SHARE:",
-                "    if io_full_share < B11_IO_FULL_STALL_SHARE * serial_commit_ms:",
-            ),
-        ),
-    ]
-    for case_id, mutant in source_cases:
-        with pytest.raises(AssertionError) as excinfo:
-            check_B11GP2(mutant, gate_policy, notes, ci_text)
-        assert _rule_of(excinfo) == "B11GP2", f"{case_id}: {excinfo.value}"
-
-    # (b) the prose that keeps the label from reading as an exoneration.
-    for phrase in (
-        "ordinary unclassified red",
-        "thin-provisional",
-        "20 additional",
-        "counterexample",
-        "fsync",
-        "remains a real required-green failure and only its message changes",
-    ):
-        with pytest.raises(AssertionError) as excinfo:
-            check_B11GP2(src, gate_policy, notes.replace(phrase, ""), ci_text)
-        assert _rule_of(excinfo) == "B11GP2", f"{phrase}: {excinfo.value}"
-
-    # (c) the workflow: no step- or job-level masking, no B1 dependence.
-    job_anchor = "  benchmark:\n    name: benchmark ("
-    step_anchor = (
-        "      - name: B2/B10/B11 -- PG scale benchmarks (shared seeded fixture)\n"
-    )
-    ci_cases: list[tuple[str, str]] = [
-        (
-            "job_level_if",
-            _mutated(ci_text, job_anchor, "  benchmark:\n    if: always()\n    name: benchmark ("),
-        ),
-        (
-            "job_level_continue_on_error",
-            _mutated(
-                ci_text,
-                job_anchor,
-                "  benchmark:\n    continue-on-error: true\n    name: benchmark (",
-            ),
-        ),
-        (
-            "step_level_if",
-            _mutated(ci_text, step_anchor, step_anchor + "        if: success()\n"),
-        ),
-        (
-            "step_level_continue_on_error",
-            _mutated(
-                ci_text, step_anchor, step_anchor + "        continue-on-error: true\n"
-            ),
-        ),
-        (
-            "step_references_b1_outcome",
-            _mutated(
-                ci_text,
-                step_anchor,
-                step_anchor
-                + '        env:\n          B1_STATUS: "${{ steps.b1burst.outcome }}"\n',
-            ),
-        ),
-        (
-            "step_references_b1_conclusion",
-            _mutated(
-                ci_text,
-                step_anchor,
-                step_anchor
-                + '        env:\n          B1_STATUS: "${{ steps.b1burst.conclusion }}"\n',
-            ),
-        ),
-        (
-            "step_names_the_b1_step",
-            _mutated(
-                ci_text,
-                step_anchor,
-                step_anchor
-                + '        env:\n          NOTE: "B1 -- resource-declared CI-scale'
-                ' ingest-gateway burst (FP-GC1-1)"\n',
-            ),
-        ),
-        (
-            "step_replays_the_b1_route",
-            _mutated(
-                ci_text,
-                step_anchor,
-                step_anchor + '        env:\n          REPLAY: "scripts/integration-test.sh b1"\n',
-            ),
-        ),
-        (
-            "b1_step_gains_an_id",
-            _mutated(
-                ci_text,
-                f"      - name: {CI_B1_STEP_NAME}\n",
-                f"      - name: {CI_B1_STEP_NAME}\n        id: b1burst\n",
-            ),
-        ),
-    ]
-    for case_id, mutant in ci_cases:
-        with pytest.raises(AssertionError) as excinfo:
-            check_B11GP2(src, gate_policy, notes, mutant)
-        assert _rule_of(excinfo) == "B11GP2", f"{case_id}: {excinfo.value}"
-
-    # (d) A10 keeps the command and the shell's failure propagation, so a
-    #     `|| true` is red there and this checker does not restate it.
-    masked = _mutated(
-        ci_text,
-        "            tests/benchmark/test_pg_scale.py -v -s\n",
-        "            tests/benchmark/test_pg_scale.py -v -s || true\n",
-    )
-    check_B11GP2(src, gate_policy, notes, masked)
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        _seed_repo(root)
-        (root / ".github" / "workflows" / "ci.yml").write_text(masked, encoding="utf-8")
-        with pytest.raises(AssertionError) as excinfo:
-            check_A10(root)
-        assert _rule_of(excinfo) == "A10", str(excinfo.value)
-
-
-def test_b11_gate_policy_preserves_fixed_contract_and_existing_guards():
-    """FP-B11GP-5: every shipped guard and every fixed value still stands."""
-    sources = tier_sources()
-    src = sources[BENCH_NAME]
-    notes = read_manifest_isolated(key_path="benchmarks[id=B11].notes")
-    gate_policy = read_manifest_isolated(key_path=B11_GATE_POLICY_KEY)
-    ci_text = CI_YML.read_text(encoding="utf-8")
-
-    check_W2(src)
-    check_W3(src)
-    check_W4(src)
-    check_B11D1(src)
-    check_B11D2(src)
-    check_B11D3(src)
-    check_B11D4(src)
-    check_B11D5(src, notes)
-    check_A6(sources)
-    check_A7a(sources)
-    check_A7b(sources)
-    check_A7c(sources)
-    check_A8(sources)
-    check_A10(REPO_ROOT)
-    check_B11GP1(src)
-    check_B11GP2(src, gate_policy, notes, ci_text)
-
-    # The workload's fixed values, read back from the shipped source.
-    tree = ast.parse(src)
-    b11 = _b11_function_in(tree)
-    asserts = [n for n in ast.walk(b11) if isinstance(n, ast.Assert)]
-    assert len(asserts) == 1 and asserts[0].test.comparators[0].value == 1000.0
-    constants = sorted(
-        n.args[0].value
-        for n in _calls_named(b11, "range")
-        if len(n.args) == 1 and isinstance(n.args[0], ast.Constant)
-    )
-    assert constants == [50, 100], constants
-    iters = [
+    # ...and the left operand really is the combined insert rate: it is bound
+    # once, from the two tables' committed rows over the measured window.
+    rate_name = gate.left.id
+    bindings = [
         n
         for n in ast.walk(b11)
         if isinstance(n, ast.Assign)
         and len(n.targets) == 1
         and isinstance(n.targets[0], ast.Name)
-        and n.targets[0].id == "n_iters"
+        and n.targets[0].id == rate_name
     ]
-    assert len(iters) == 1 and iters[0].value.value == 800, iters
+    assert len(bindings) == 1, [ast.unparse(n) for n in bindings]
+    bound = bindings[0].value
+    # `<rows> / <elapsed> if <elapsed> > 0 else 0.0`: a division of committed
+    # rows by the measured window, with the zero-window guard the shipped code
+    # already carries. A bar pointed at a constant, a single writer's rate or
+    # anything that is not that quotient fails here.
+    assert isinstance(bound, ast.IfExp), ast.unparse(bindings[0])
+    quotient = bound.body
+    assert isinstance(quotient, ast.BinOp) and isinstance(quotient.op, ast.Div), (
+        ast.unparse(bindings[0])
+    )
+    rows_name = quotient.left
+    assert isinstance(rows_name, ast.Name), ast.unparse(bindings[0])
+    rows_bindings = [
+        n
+        for n in ast.walk(b11)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == rows_name.id
+    ]
+    assert len(rows_bindings) == 1, [ast.unparse(n) for n in rows_bindings]
+    assert ast.unparse(rows_bindings[0].value) == "sum(committed)", (
+        ast.unparse(rows_bindings[0])
+    )
 
-    # The 21-field line and the five fixed prefixes are byte-unchanged.
-    fields = _module_constant(tree, "B11_DIAGNOSTIC_FIELDS", "B11D1")
-    assert tuple(e.value for e in fields.elts) == B11_CANONICAL_FIELDS
-    assert len(B11_CANONICAL_FIELDS) == 21, len(B11_CANONICAL_FIELDS)
-    for prefix in DIAGNOSTIC_PREFIXES:
-        assert prefix in src, prefix
-
-    # The classification is not a 22nd field: the canonical line is untouched.
-    serializer = _module_function(tree, "_serialize_b11_diagnostics", "B11D1")
-    assert B11_LABEL_CONSTANT_VALUE not in ast.unparse(serializer), serializer.name
-
-    # Seven writer instances, unchanged, from the manifest.
-    model = read_manifest_isolated()
-    assert model["writers"] == 7, model["writers"]
-    assert model == EXPECTED_CONCURRENCY_MODEL, "concurrency_model moved"
-
-    # The tier added no import, builtin, attribute, exception or capability.
-    assert {(m, n) for m, n, _a, _node in import_pairs(src)} <= (
-        ALLOWED_BENCHMARK_IMPORTS
-    ), "a new import entered the benchmark tier"
-
-    # Exactly four new declared bindings, and B11D4 forbids the new one in
-    # either timed loop.
-    expected = EXPECTED_MODULE_BINDINGS[BENCH_NAME]
-    for key in (
-        (B11_SHARE_CONSTANT_NAME, "assign"),
-        (B11_LABEL_CONSTANT_NAME, "assign"),
-        (B11_CLASSIFIER_NAME, "def"),
-        (B11_CLASSIFIER_TEST_NAME, "def"),
+    # (2) The stall classification is gone from the benchmark, name and label.
+    for token in (
+        "_b11_failure_classification",
+        "io_full_stall_observed",
+        "symptom_only_not_cause",
+        "gate_outcome=red",
+        "B11_IO_FULL_STALL_SHARE",
     ):
-        assert expected.get(key) == 1, key
-    assert collect_module_bindings(src) == expected, "benchmark binding inventory"
-    assert B11_CLASSIFIER_NAME in B11_DIAGNOSTIC_FUNCTIONS, B11_DIAGNOSTIC_FUNCTIONS
-    assert B11_CLASSIFIER_NAME in B11_TIMED_LOOP_FORBIDDEN_CALLS
+        assert token not in src, f"{token!r} survives in {BENCH_NAME}"
 
-    # Break the thing B11D4 is named for: the classifier inside the timed loop.
-    in_loop = _mutated(
-        src,
-        "                rows += 1\n",
-        "                rows += 1\n"
-        '                _b11_failure_classification(1.0, 1, "1")\n',
-    )
-    with pytest.raises(AssertionError) as excinfo:
-        check_B11D4(in_loop)
-    assert _rule_of(excinfo) == "B11D4", str(excinfo.value)
+    # ...and from the manifest, where the `gate_policy` object carried it.
+    manifest = THRESHOLDS.read_text(encoding="utf-8")
+    for token in ("io_full_stall_observed", "gate_policy", "symptom_only_not_cause"):
+        assert token not in manifest, f"{token!r} survives in thresholds.yaml"
 
-    # And the four now-narrowly-false descriptions were actually narrowed.
-    # Each is read from the exact declaration that carries it, so none of these
-    # assertions can be satisfied by its own text.
-    assert "Every one of the 21 fields is" in src, "module comment not narrowed"
-    assert "outcome-inert" in src, "module comment not narrowed"
-    assert "changes no knob, no\n    threshold and no outcome" in src, (
-        "the B11 benchmark docstring still says the line changes no branch"
-    )
-    b11_doc = ast.get_docstring(b11) or ""
-    assert "reported-only" not in b11_doc, b11_doc
-    assert "message-only use is `host_psi_io_full_usec`" in b11_doc, b11_doc
-    guard_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    b11d5_src = ast.unparse(_module_function(guard_tree, "check_B11D5", "B11D5"))
-    assert "the diagnostics decide no threshold outcome" in b11d5_src, (
-        "check_B11D5's docstring still claims the readings are reported-only"
-    )
-    assert "replace the threshold " in b11d5_src, "B11D5 skip/xfail wording"
-    assert "outcome the diagnostics chose" not in b11d5_src, "stale B11D5 wording"
-    positive_doc = test_b11_diagnostics_are_reported_only_and_fixed.__doc__ or ""
-    assert "diagnostic-conditioned outcome branch" in positive_doc, positive_doc
-    assert "owns the sole module-level branch" in positive_doc, positive_doc
-    assert "owns the sole permitted module-level branch" in (
-        check_B11GP1.__doc__ or ""
-    ), "B11GP1 must say that it, not B11D5, owns the branch"
+    # (3) The seven-writer model and the entry's on-demand tier are unchanged
+    # by the deletion: the bar is not the only thing a half-revert could take.
+    model = read_manifest_isolated(key_path=MANIFEST_KEY_PATH)
+    assert model["writers"] == 7, model["writers"]
