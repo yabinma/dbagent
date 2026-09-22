@@ -7868,11 +7868,11 @@ E2EBD_STUB_MAX_IN_FLIGHT = 1000
 #: Wall-clock width of the forced stall, in dispatch slots. On an IDLE host
 #: 440 measured runs put an unstalled `max_backlog` at 1 or 2 and a stalled
 #: one at 9 or 10. That is an observation of this host at rest, not a bound:
-#: under CPU contention an unstalled peak climbs well past 2 (measured under
-#: 24 CPU burners: 30 unstalled runs spread over 2..9, 18 of them above 2 --
-#: review-fix-e2ebd-flaky-test S2 saw 5..12), so the two populations are NOT
-#: claimed to be separable in general. Nothing here needs them to be. The
-#: assertion below is a LOWER bound on the stalled run alone
+#: under CPU contention an unstalled peak climbs well past 2: the archived
+#: review-fix-e2ebd-flaky-test S2 records unstalled peaks of 5, 6, 7, 8 and
+#: 12 under 24 CPU burners. So the two populations are NOT claimed to be
+#: separable in general. Nothing here needs them to be. The assertion below
+#: is a LOWER bound on the stalled run alone
 #: (`>= E2EBD_STALL_SLOTS // 2`), never an upper bound on an unstalled one,
 #: and `time.sleep` never returns early, so contention can only raise it.
 E2EBD_STALL_SLOTS = 10
@@ -7883,8 +7883,11 @@ class E2EBDStallingStubTransport(E2EBDStubTransport):
 
     `time.sleep` rather than `asyncio.sleep` on purpose: the open-loop
     dispatcher's schedule is wall-clock, so only a blocking stall makes it
-    fall a KNOWN number of slots behind and report a `max_backlog` that no
-    unstalled run produces. Every count and code is unaffected, and so is the
+    fall a KNOWN number of slots behind. What the test asserts is only that
+    the stall forces `max_backlog` to at least half the stall width; an
+    unstalled run on an IDLE host measured 1 or 2, and under load it can be
+    higher (see `E2EBD_STALL_SLOTS`), so the stalled peak is not claimed to
+    be unique to a stall. Every count and code is unaffected, and so is the
     latency COUNT -- one sample per request either way. The stalled request's
     own latency VALUE grows by the stall (measured: p99 ~1 ms -> ~20.7 ms),
     which is why the cross-run projection compares `latency_count` and not
@@ -9394,8 +9397,10 @@ def test_e2e_b1_diagnostics_boundary_1_check_survives_dispatcher_jitter():
     # The forcing is real, and bounded from BELOW only -- an upper bound, or a
     # comparison against the control's own peak, would put this test back on
     # the scheduler. `time.sleep` never returns early, so a longer stall can
-    # only raise this number (measured: 9 or 10 over 200 runs, against 1 or 2
-    # unstalled, so half the stall width is a bound with room to spare).
+    # only raise this number. On an IDLE host it measured 9 or 10 over 200
+    # runs, against 1 or 2 unstalled -- an observation of this host at rest,
+    # not a bound (see `E2EBD_STALL_SLOTS`), so half the stall width is
+    # asserted of the stalled run alone.
     assert stalled.max_backlog >= E2EBD_STALL_SLOTS // 2, stalled.max_backlog
     assert stalled.pre_dispatch_slip_ms == []
     _e2ebd_assert_boundary_1_preserved(stalled, control, offered=measured)
