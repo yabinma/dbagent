@@ -138,6 +138,17 @@ usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1|b1_product|b1_l
                   -- proves end to end that a container's published port is
                   actually reachable from both
 
+RELAY OVERRIDE: when this shell has no global-scope address, the five admitted
+targets -- preflight, b1, b1_product, b1_latency_basis, b1_topology_probe -- can
+still run, but only after this script has proved host-network reachability through
+your own Docker socket. Ask for the proof, and point TMPDIR at a directory the host
+daemon can bind-mount (the script sets neither for you):
+
+    DBAGENT_DOCKER_RELAY=prove TMPDIR=<directory-the-host-daemon-can-bind-mount> \
+      /opt/gitspace/dbagent/scripts/integration-test.sh preflight
+
+Every other target keeps the refusal below. See the preflight block in this file.
+
 NOTE: there is deliberately no pass-through for extra flags. This script runs
 UNSANDBOXED, and forwarding arbitrary arguments would reopen exactly what the
 narrow exemption exists to prevent (e.g. `go test -exec <anything>`).
@@ -151,18 +162,65 @@ EOF
 esac
 
 # ---------------------------------------------------------------------------
-# Preflight: refuse to run inside the sandbox.
+# Preflight: refuse to run inside the sandbox, unless an admitted target has
+# proved a route for itself.
 #
 # Without this the failure mode is a 60-second-per-package timeout ending in a Ryuk
 # message about an unreachable port, which reads like flaky infrastructure and sends
 # people looking at Docker. It is not flaky and Docker is fine -- the exclusion simply
 # did not apply. Fail in a second, and say so.
 #
-# The test is behavioural rather than a check for bubblewrap specifically: the sandbox's
-# namespace has no global-scope address at all, and a machine that can reach a published
-# container port always has one.
+# The legacy gate is behavioural rather than a check for bubblewrap specifically, and
+# it is deliberately narrow: the count of global-scope addresses is read from
+# /usr/bin/ip and from nowhere else, so whatever a caller's PATH calls `ip` is never
+# consulted. A count greater than zero is the ordinary host and CI; it takes the
+# existing `docker info` check, unchanged. A count of zero refuses exactly as it
+# always has, with one exception -- one of the five admitted targets (preflight, b1,
+# b1_product, b1_latency_basis, b1_topology_probe) whose caller asked for it with
+# DBAGENT_DOCKER_RELAY=prove AND for which this script has then proved host-network
+# reachability itself: a local unix socket, a mktemp directory the daemon can see
+# through a bind mount, and a `--network host` client that completed a TCP handshake
+# with a `--network host` listener started through the caller's own socket. The
+# request admits nothing on its own; only the proof does. That is the supported route
+# for a jailed reviewer whose Docker socket is relayed from the host, and it replaces
+# the PATH `ip` shim, which made the count non-zero by asserting a route no one had
+# observed.
 # ---------------------------------------------------------------------------
-if [ "$(ip -o addr show scope global 2>/dev/null | wc -l)" -eq 0 ]; then
+# RELAY_GATE_BEGIN
+# Function definitions only. tests/functional/test_integration_relay_preflight.py
+# sources this region verbatim, so nothing between the two markers may run at
+# source time; the single top-level call sits just after RELAY_GATE_END.
+#
+# Two house rules this region keeps deliberately, both of them load-bearing
+# elsewhere in the tree:
+#
+#   * no `||`-fallback that swallows a command's status. The launcher may carry
+#     none (tests/functional/test_manifests.py's rejected-escape inventory and
+#     tests/delivery/test_delivery_b1_profile.py's weakening inventory scan this
+#     whole file), and none is needed: the script runs without `set -e`, so a
+#     status no one reads is already ignored. Every command below whose status
+#     is not the verdict is followed by the check that IS the verdict.
+#   * continuation lines of the probe `docker run` commands are indented two
+#     spaces, not four. A four-space host-network continuation line is a pinned,
+#     must-be-unique literal of b1_run_driver further down this file, and a copy
+#     of it up here would take a manifest mutation's place and silence it.
+
+relay_address_count() {
+  if [ ! -x /usr/bin/ip ]; then
+    echo 0
+    return 0
+  fi
+  /usr/bin/ip -o addr show scope global 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+relay_target_admitted() {
+  case "$1" in
+    preflight|b1|b1_product|b1_latency_basis|b1_topology_probe) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+relay_legacy_refuse() {
   cat >&2 <<EOF
 integration-test.sh: REFUSING TO RUN -- this shell has no route to anything.
 
@@ -186,23 +244,227 @@ integration-test.sh: REFUSING TO RUN -- this shell has no route to anything.
   Background: ~/.claude/SANDBOX-NETWORK.md
 EOF
   exit 3
-fi
+}
 
-if ! docker info >/dev/null 2>&1; then
-  echo "integration-test.sh: cannot reach the Docker daemon (DOCKER_HOST=${DOCKER_HOST:-unset})" >&2
+relay_legacy_docker_info() {
+  if ! docker info >/dev/null 2>&1; then
+    echo "integration-test.sh: cannot reach the Docker daemon (DOCKER_HOST=${DOCKER_HOST:-unset})" >&2
+    exit 3
+  fi
+}
+
+# One first line, one reason from the closed list in the relay proof below, and
+# for two of those reasons one further line saying what the caller must change.
+relay_fail() {
+  echo "integration-test.sh: REFUSING TO RUN -- relay override did not prove host-network reachability ($1)." >&2
+  case "$1" in
+    relay_probe_image_absent)
+      echo "integration-test.sh: probe image postgres:16-alpine is not present locally; this preflight does not pull it." >&2 ;;
+    relay_probe_mount_invisible)
+      echo "integration-test.sh: the mktemp directory was not visible to the daemon through its bind mount; set TMPDIR to a directory the host daemon can see." >&2 ;;
+  esac
   exit 3
-fi
+}
+
+# Prints one path, or nothing, and never exits: the caller decides, in its own
+# shell, so a refusal is not swallowed by a command substitution.
+relay_docker_socket_path() {
+  case "${DOCKER_HOST:-}" in
+    "")        printf '%s\n' /var/run/docker.sock ;;
+    unix:///*) printf '%s\n' "${DOCKER_HOST#unix://}" ;;
+    *)         return 0 ;;
+  esac
+}
+
+# Idempotent, and installed as an EXIT trap before the first probe artefact
+# exists. The removal's own status is not a verdict; the second census is.
+relay_probe_cleanup() {
+  if [ -n "${srv_name:-}" ]; then
+    /usr/bin/docker rm -f "$srv_name" >/dev/null 2>&1
+  fi
+  if [ -n "${probe_id:-}" ]; then
+    ids="$(/usr/bin/docker ps -aq --filter "label=dbagent.relay-probe=${probe_id}" 2>/dev/null)"
+    if [ -n "$ids" ]; then
+      # shellcheck disable=SC2086
+      /usr/bin/docker rm -f $ids >/dev/null 2>&1
+      ids="$(/usr/bin/docker ps -aq --filter "label=dbagent.relay-probe=${probe_id}" 2>/dev/null)"
+      if [ -n "$ids" ]; then
+        RELAY_CLEANUP_FAILED=1
+      fi
+    fi
+  fi
+  if [ -n "${probe_dir:-}" ]; then
+    rm -rf "$probe_dir"
+  fi
+}
+
+# The listener: one container, host network, loopback only, one port, no
+# published port and no password.
+relay_probe_server() {
+  /usr/bin/timeout 30 /usr/bin/docker run -d --name "$srv_name" \
+  --network host \
+  --label "dbagent.relay-probe=${probe_id}" \
+  -e POSTGRES_HOST_AUTH_METHOD=trust \
+  postgres:16-alpine \
+  postgres -c listen_addresses=127.0.0.1 -c port="${probe_port}" >/dev/null
+}
+
+# The single client, run once after the real server logged its IPv4 listen line
+# and a ready line after it. Its non-zero status is the only producer of
+# relay_probe_unreachable: without --network host this same command fails, and
+# that failure is the missing host network.
+relay_probe_client() {
+  /usr/bin/timeout 10 /usr/bin/docker run --rm \
+  --network host \
+  --label "dbagent.relay-probe=${probe_id}" \
+  --entrypoint pg_isready \
+  postgres:16-alpine \
+  -h 127.0.0.1 -p "${probe_port}" -U postgres -t 2 \
+  >/dev/null
+}
+
+# The whole proof, one shot: unix socket, absolute docker client, local image,
+# bind-mount visibility of a mktemp directory, then one host-network listener
+# and one host-network client. No pull, no second port, no retry.
+relay_prove() {
+  sock="$(relay_docker_socket_path)"
+  if [ -z "$sock" ]; then
+    relay_fail relay_socket_not_unix
+  fi
+  if [ ! -S "$sock" ]; then
+    relay_fail relay_socket_absent
+  fi
+  if [ ! -x /usr/bin/docker ] || [ ! -x /usr/bin/timeout ]; then
+    relay_fail relay_probe_setup_failed
+  fi
+  if ! /usr/bin/timeout 5 /usr/bin/docker info >/dev/null 2>&1; then
+    relay_fail relay_docker_info_failed
+  fi
+  if ! /usr/bin/timeout 15 /usr/bin/docker image inspect postgres:16-alpine >/dev/null 2>&1; then
+    relay_fail relay_probe_image_absent
+  fi
+
+  probe_id="$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+  if [ "${#probe_id}" -ne 16 ]; then
+    relay_fail relay_probe_setup_failed
+  fi
+  srv_name="dbagent-relay-probe-${probe_id}"
+  probe_dir=""
+  RELAY_CLEANUP_FAILED=0
+  trap relay_probe_cleanup EXIT
+
+  probe_dir="$(mktemp -d -t dbagent-relay-XXXXXXXXXX)" || relay_fail relay_probe_setup_failed
+  printf 'visible\n' > "$probe_dir/sentinel"
+  mount_out="$(/usr/bin/timeout 15 /usr/bin/docker run --rm \
+  --label "dbagent.relay-probe=${probe_id}" \
+  -v "${probe_dir}:/probe:ro" \
+  --entrypoint /bin/cat \
+  postgres:16-alpine /probe/sentinel 2>/dev/null)"
+  if [ "$mount_out" != visible ]; then
+    relay_fail relay_probe_mount_invisible
+  fi
+
+  probe_port=$((20000 + (RANDOM % 12000)))
+  if ! relay_probe_server; then
+    relay_fail relay_probe_bind_failed
+  fi
+
+  # Readiness is the ORDERED pair. On a fresh data directory the image's
+  # entrypoint first runs a temporary server with listen_addresses='' which logs
+  # a ready line of its own; that server never logs an IPv4 listen line, so the
+  # pair cannot match until the real server is listening on this probe's port.
+  # Capture the log and match it; a pipe into `grep -q` can SIGPIPE the logger
+  # under this script's pipefail and turn a found line into a failure.
+  listen_line="listening on IPv4 address \"127.0.0.1\", port ${probe_port}"
+  ready_line="database system is ready to accept connections"
+  deadline=$((SECONDS + 20))
+  ready=0
+  running=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    running="$(/usr/bin/docker inspect -f '{{.State.Running}}' "$srv_name" 2>/dev/null)"
+    if [ "$running" != "true" ]; then
+      break
+    fi
+    logs="$(/usr/bin/docker logs "$srv_name" 2>&1)"
+    case "$logs" in
+      *"$listen_line"*"$ready_line"*) ready=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    if [ "$running" = "true" ]; then
+      relay_fail relay_probe_timeout
+    fi
+    relay_fail relay_probe_bind_failed
+  fi
+
+  if ! relay_probe_client; then
+    relay_fail relay_probe_unreachable
+  fi
+
+  relay_probe_cleanup
+  trap - EXIT
+  if [ "$RELAY_CLEANUP_FAILED" -ne 0 ]; then
+    relay_fail relay_probe_cleanup_failed
+  fi
+  return 0
+}
+
+relay_gate_counted() {
+  local count="$1" target="$2" request="$3"
+  if [ "$count" -gt 0 ]; then
+    relay_legacy_docker_info
+    PREFLIGHT_MODE=legacy
+    return 0
+  fi
+  if ! relay_target_admitted "$target"; then
+    relay_legacy_refuse
+  fi
+  case "$request" in
+    "") relay_legacy_refuse ;;
+    prove) ;;
+    *) relay_fail relay_request_invalid ;;
+  esac
+  if ! relay_prove; then
+    relay_fail relay_probe_setup_failed
+  fi
+  PREFLIGHT_MODE=relay
+  return 0
+}
+
+# Runs in the script's own shell: a refusal is an exit 3, and an exit inside a
+# command substitution would leave the script running.
+relay_gate() {
+  local count
+  count="$(relay_address_count)"
+  relay_gate_counted "$count" "$WHAT" "${DBAGENT_DOCKER_RELAY-}"
+}
+
+relay_print_preflight() {
+  if [ "$PREFLIGHT_MODE" = relay ]; then
+    echo "integration-test.sh: preflight OK (relay override)"
+    echo "  relay proof         : host-network reachability verified"
+    echo "  docker              : $(/usr/bin/docker version --format '{{.Server.Version}}' 2>/dev/null) via ${DOCKER_HOST:-default socket}"
+    echo "  admitted targets    : preflight b1 b1_product b1_latency_basis b1_topology_probe"
+  else
+    echo "integration-test.sh: preflight OK"
+    echo "  outside the sandbox : $(/usr/bin/ip -o addr show scope global | awk '{print $2}' | sort -u | tr '\n' ' ')"
+    echo "  docker              : $(docker version --format '{{.Server.Version}}' 2>/dev/null) via ${DOCKER_HOST:-default socket}"
+  fi
+  echo "  rca_common venv     : $([ -x libs/py/rca_common/.venv/bin/python ] && echo present || echo MISSING)"
+  echo "  worker venv         : $([ -x services/worker/.venv/bin/python ] && echo present || echo MISSING)"
+}
+# RELAY_GATE_END
+
+PREFLIGHT_MODE=legacy
+relay_gate
 
 # `preflight` stops here: everything above is the part that tells you whether a real run
 # CAN work. Worth its own target so that confirming the excludedCommands entry costs a
 # second instead of a full suite -- and so a failed exclusion is discovered before, not
 # five minutes into, the run it would have wrecked.
 if [ "$WHAT" = preflight ]; then
-  echo "integration-test.sh: preflight OK"
-  echo "  outside the sandbox : $(ip -o addr show scope global | awk '{print $2}' | sort -u | tr '\n' ' ')"
-  echo "  docker              : $(docker version --format '{{.Server.Version}}' 2>/dev/null) via ${DOCKER_HOST:-default socket}"
-  echo "  rca_common venv     : $([ -x libs/py/rca_common/.venv/bin/python ] && echo present || echo MISSING)"
-  echo "  worker venv         : $([ -x services/worker/.venv/bin/python ] && echo present || echo MISSING)"
+  relay_print_preflight
   exit 0
 fi
 
