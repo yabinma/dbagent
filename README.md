@@ -222,7 +222,10 @@ cd web && npm ci && npm test               # vitest + per-file coverage threshol
 
 **Functional** (checkpoint suite + the delivery-artifact tier). Needs Docker,
 and `helm` on PATH — a missing binary is a hard failure, never a skip. This
-tier runs from one combined venv:
+tier runs from one combined venv. The pytest command below is an intentional
+local superset: it also collects `tests/functional/test_manifests.py`, which CI
+ignores in this job and runs only in the independent `manifest-guard` job, so a
+local run keeps the manifest and CI-pin checks:
 
 ```bash
 python -m venv services/worker/.venv

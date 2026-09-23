@@ -5536,6 +5536,38 @@ def test_unit_go_combines_race_and_coverage():
     assert go_runs == [GUARDED_STEPS[UNIT_GO_JOB][0]]
 
 
+_LOCAL_GO_RUN_LINE = f"  {EXPECTED_UNIT_GO_COMMAND} || return 1\n"
+#: FP-CIR1-6 negative controls: mutations of the real launcher's Go line.
+_LOCAL_GO_MIRROR_MUTATIONS = [
+    ("go_line_loses_return_1", "local_mirror_go_command_drift",
+     lambda t: t.replace(_LOCAL_GO_RUN_LINE, f"  {EXPECTED_UNIT_GO_COMMAND}\n")),
+    ("retired_literal_reintroduced", "local_mirror_retired_literal",
+     lambda t: t.replace(_LOCAL_GO_RUN_LINE, f"  {RETIRED_UNIT_GO_COMMAND} || return 1\n")),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id, expected, mutator",
+    _LOCAL_GO_MIRROR_MUTATIONS,
+    ids=[c[0] for c in _LOCAL_GO_MIRROR_MUTATIONS],
+)
+def test_local_go_mirror_rejects_drift(case_id, expected, mutator):
+    """FP-CIR1-6 negative control: the local-mirror checker can go red.
+
+    The live scripts/integration-test.sh yields no failure; the same text with
+    its Go line mutated yields the named reason. A checker that always
+    returned no failures would pass the live case and fail this one.
+    """
+    ci_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    launcher = B1_LAUNCHER.read_text(encoding="utf-8")
+    assert launcher.count(_LOCAL_GO_RUN_LINE) == 1
+    assert _local_go_mirror_failures(launcher, ci_text) == []
+    mutated = mutator(launcher)
+    assert mutated != launcher, case_id
+    fails = _local_go_mirror_failures(mutated, ci_text)
+    assert expected in fails, f"{case_id}: {fails}"
+
+
 def test_go_functional_package_has_one_owner():
     """FP-CIR1-4 [function test]: tests/functional/m2_probe_link has ONE CI
     test owner, and the functional job still has what F15/F16 need.
