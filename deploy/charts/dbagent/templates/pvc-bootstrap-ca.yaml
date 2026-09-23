@@ -1,0 +1,19 @@
+{{- if and .Values.probeGateway.bootstrapCA.persistence.enabled (not .Values.probeGateway.bootstrapCA.existingSecret) }}
+{{- if gt (int .Values.probeGateway.replicaCount) 1 }}
+{{- fail "probeGateway.replicaCount > 1 requires probeGateway.bootstrapCA.existingSecret (shared CA); a PVC cannot be shared across replicas without RWX" }}
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dbagent.fullname" . }}-bootstrap-ca
+  labels:
+    {{- include "dbagent.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.probeGateway.bootstrapCA.persistence.storageClass }}
+  storageClassName: {{ .Values.probeGateway.bootstrapCA.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.probeGateway.bootstrapCA.persistence.size }}
+{{- end }}

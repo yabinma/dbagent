@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ToolResultEnvelope",
+  "title": "ToolResultEnvelope",
+  "description": "Uniform result envelope returned by every Toolpack tool (design.md Section 8.5).",
+  "type": "object",
+  "required": [
+    "tool",
+    "args",
+    "platform_key",
+    "probe_id",
+    "collected_at",
+    "exit_code",
+    "truncated",
+    "redacted",
+    "data"
+  ],
+  "properties": {
+    "tool": { "type": "string" },
+    "args": { "type": "object" },
+    "platform_key": { "type": "string" },
+    "probe_id": { "type": "string" },
+    "collected_at": { "type": "string", "format": "date-time" },
+    "exit_code": { "type": "integer" },
+    "truncated": { "type": "boolean" },
+    "redacted": { "type": "boolean" },
+    "data": {}
+  },
+  "additionalProperties": false
+}

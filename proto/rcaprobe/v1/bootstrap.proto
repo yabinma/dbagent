@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package rcaprobe.v1;
+
+option go_package = "github.com/yabinma/dbagent/gen/go/rcaprobe/v1;rcaprobev1";
+
+// Bootstrap is a SEPARATE protocol (i.e. not part of Appendix A's fixed
+// wire contract in probe.proto) implementing the "token -> mTLS client
+// certificate" step design.md Section 8.4 step 3 describes conceptually.
+// The concrete mechanism -- this file, `internal/bootstrapca`,
+// `services/probe-gateway/internal/bootstrapsrv`,
+// `probe/internal/bootstrapclient` -- was an M2 implementation decision,
+// formalized as normative in design.md Section 8.4a (D16) as of v1.3: a
+// CSR-based enrollment RPC, served on TWO listeners --
+// server-authenticated-only TLS (no client cert required -- that's
+// exactly what's being issued) for first-time enrollment, AND the mTLS
+// `ProbeGateway.Session` listener for renewal (see EnrollRequest.
+// bootstrap_token below).
+//
+// probe-gateway holds a self-signed "bootstrap CA" keypair, generated
+// idempotently at first start-up (mirroring the D14 signing-key bootstrap
+// pattern). It signs the probe's CSR into a client certificate after
+// verifying either (a) the presented bootstrap token is valid and
+// unconsumed for the given platform_key (first enrollment), or (b) the
+// RPC arrived over the mTLS Session listener with an already-verified,
+// unexpired client certificate whose CN equals platform_key (renewal,
+// Section 8.4a). The CA certificate is also returned so the probe can
+// trust the gateway's server certificate on the subsequent mTLS `Session`
+// connection (both are issued by the same bootstrap CA in this MVP
+// design).
+service Bootstrap {
+  rpc Enroll (EnrollRequest) returns (EnrollResponse);
+}
+
+message EnrollRequest {
+  string platform_key    = 1;
+  // One-time; consumed on first successful Enroll. Leave empty for
+  // renewal over the mTLS Session listener (design.md Section 8.4a): a
+  // verified, unexpired client certificate with CN == platform_key
+  // substitutes for the token in that case.
+  string bootstrap_token = 2;
+  bytes  csr_pem         = 3;  // PKCS#10 CertificateRequest, PEM-encoded
+}
+
+message EnrollResponse {
+  bytes  client_cert_pem = 1;  // signed by the bootstrap CA
+  bytes  ca_cert_pem     = 2;  // bootstrap CA certificate (PEM)
+}

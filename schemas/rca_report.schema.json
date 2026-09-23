@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "RCAReport",
+  "title": "RCAReport",
+  "description": "Structured RCA agent output; drives the investigation loop (design.md Section 4.2).",
+  "type": "object",
+  "required": ["status", "confidence"],
+  "properties": {
+    "status": { "enum": ["concluded", "need_more_data", "inconclusive"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "root_cause": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "enum": [
+            "resource",
+            "configuration",
+            "code_bug",
+            "data_issue",
+            "external_dependency",
+            "transient",
+            "capacity",
+            "unknown"
+          ]
+        },
+        "summary": { "type": "string" },
+        "detail": {
+          "type": "string",
+          "description": "Full causal-chain reasoning"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Supporting evidence_id list; conclusions must be traceable"
+        }
+      },
+      "additionalProperties": false
+    },
+    "rca_compact": {
+      "type": "string",
+      "maxLength": 1500,
+      "description": "Display-oriented digest: one-line root cause + 3-5 key evidence points + blast radius. Required when status=concluded; generated in the same model call as the full report."
+    },
+    "code_finding": {
+      "type": ["object", "null"],
+      "description": "Required when category=code_bug",
+      "properties": {
+        "file_path": { "type": "string" },
+        "symbol": { "type": "string" },
+        "running_version": { "type": "string" },
+        "fixed_in_version": {
+          "type": ["string", "null"],
+          "description": "Upstream version containing the fix, verified via diff_versions"
+        },
+        "fix_suggestion": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "missing_info": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["what", "why"],
+        "properties": {
+          "what": { "type": "string" },
+          "why": { "type": "string" },
+          "suggested_tools": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "raw_command_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "justification", "expected_evidence"],
+        "properties": {
+          "command": { "type": "string" },
+          "justification": { "type": "string" },
+          "expected_evidence": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "proposed_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "risk_level", "description"],
+        "properties": {
+          "kind": {
+            "enum": [
+              "ignore",
+              "playbook",
+              "manual_recommendation",
+              "code_fix_recommendation"
+            ]
+          },
+          "playbook_id": { "type": ["string", "null"] },
+          "playbook_params": { "type": "object" },
+          "risk_level": { "enum": ["R0", "R1", "R2", "R3"] },
+          "description": { "type": "string" },
+          "description_compact": {
+            "type": "string",
+            "maxLength": 800,
+            "description": "Digest: what/risk/expected effect, 1-2 sentences each"
+          },
+          "rollback_note": { "type": "string" },
+          "verification_plan": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Tool-call list for post-fix verification"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

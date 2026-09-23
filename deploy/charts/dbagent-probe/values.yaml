@@ -1,0 +1,31 @@
+image:
+  registry: ghcr.io/yabinma/dbagent
+  name: probe
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+platformKey: ""
+gatewayAddress: "dbagent-probe-gateway:8443"
+bootstrapAddress: "dbagent-probe-gateway:8444"
+bootstrapToken: ""
+bootstrapTokenExistingSecret: ""
+bootstrapCAPin: ""
+
+coordinatorLocator: "app=presto,role=coordinator"
+namespace: ""
+writeEnabled: false
+coordinatorPort: 8080
+coordinatorHTTPS: false
+
+platformCredentials:
+  existingSecret: ""
+
+state:
+  size: 64Mi
+  storageClass: ""
+
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { cpu: 500m, memory: 512Mi }

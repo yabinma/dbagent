@@ -1,0 +1,82 @@
+[
+  {
+    "queryId": "20260708_101512_00042_abcde",
+    "state": "QUEUED",
+    "query": "SELECT count(*) FROM tpch.sf1.lineitem",
+    "session": {"user": "etl_svc", "source": "airflow"},
+    "queryStats": {
+      "createTime": "2026-07-09T10:00:00Z",
+      "queuedTime": "4.32m",
+      "elapsedTime": "5.01m"
+    },
+    "resourceGroupId": "global"
+  },
+  {
+    "queryId": "20260708_101512_00043_abcde",
+    "state": "RUNNING",
+    "query": "SELECT 2",
+    "session": {"user": "analyst", "source": "adhoc"},
+    "queryStats": {
+      "createTime": "2026-07-09T10:05:00Z",
+      "queuedTime": "0.00s",
+      "elapsedTime": "1.20s"
+    },
+    "resourceGroupId": ["global", "adhoc"]
+  },
+  {
+    "queryId": "q-finished-recent",
+    "state": "FINISHED",
+    "query": "SELECT 1",
+    "session": {"user": "etl_svc", "source": "batch"},
+    "queryStats": {
+      "createTime": "2026-07-09T10:00:00Z",
+      "endTime": "2026-07-09T10:01:00Z",
+      "queuedTime": "0.01s",
+      "elapsedTime": "1.00s"
+    },
+    "resourceGroupId": "global"
+  },
+  {
+    "queryId": "q-finished-old",
+    "state": "FINISHED",
+    "query": "SELECT old",
+    "session": {"user": "batch"},
+    "queryStats": {
+      "createTime": "2026-07-09T08:00:00Z",
+      "endTime": "2026-07-09T08:05:00Z"
+    }
+  },
+  {
+    "queryId": "q-failed",
+    "state": "FAILED",
+    "query": "SELECT fail",
+    "errorCode": {"name": "EXCEEDED_LOCAL_MEMORY_LIMIT", "code": 123},
+    "session": {"user": "bad"},
+    "queryStats": {
+      "createTime": "2026-07-09T10:00:00Z",
+      "endTime": "2026-07-09T10:00:30Z"
+    }
+  },
+  {
+    "queryId": "q-runaway-old",
+    "state": "RUNNING",
+    "query": "SELECT runaway",
+    "session": {"user": "e2e"},
+    "queryStats": {
+      "createTime": "2026-07-09T08:00:00Z",
+      "elapsedTime": "2.00h"
+    }
+  },
+  {
+    "queryId": "q-minimal",
+    "state": "PLANNING"
+  },
+  {
+    "queryId": "q-bad-ended",
+    "state": "FINISHED",
+    "queryStats": {
+      "createTime": "2026-07-09T10:00:00Z",
+      "endTime": "not-a-timestamp"
+    }
+  }
+]

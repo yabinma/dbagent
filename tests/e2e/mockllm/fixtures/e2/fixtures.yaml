@@ -1,0 +1,13 @@
+# E2 broken catalog configuration (Section 13.3).
+- when: {agent_role: planner}
+  respond: planner.json
+  repeat: all
+- when: {agent_role: collector}
+  respond: collector.json
+  repeat: all
+- when: {agent_role: rca}
+  respond: rca.json
+  repeat: all
+- when: {agent_role: remediation}
+  respond: remediation.json
+  repeat: all

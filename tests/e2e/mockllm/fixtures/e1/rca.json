@@ -1,0 +1,1 @@
+{"status":"concluded","confidence":0.92,"root_cause":{"category":"resource","summary":"worker OOM due to undersized query.max-memory-per-node"},"rca_compact":"worker OOM / memory config"}

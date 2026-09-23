@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: presto-coordinator-config
+  labels: { app: presto, role: coordinator }
+data:
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=false
+    http-server.http.port=8080
+    discovery-server.enabled=true
+    discovery.uri=http://presto-coordinator:8080
+    query.max-memory=1GB
+    query.max-memory-per-node=128MB
+    query.max-total-memory-per-node=256MB
+  jvm.config: |
+    -server
+    -Xmx1G
+    -XX:MaxDirectMemorySize=256M
+    -XX:+UseG1GC
+    -XX:G1HeapRegionSize=32M
+    -XX:+UseGCOverheadLimit
+    -XX:+ExplicitGCInvokesConcurrent
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:+ExitOnOutOfMemoryError
+    -Djdk.attach.allowAttachSelf=true
+    --add-opens=java.base/java.io=ALL-UNNAMED
+    --add-opens=java.base/java.lang=ALL-UNNAMED
+    --add-opens=java.base/java.lang.ref=ALL-UNNAMED
+    --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+    --add-opens=java.base/java.net=ALL-UNNAMED
+    --add-opens=java.base/java.nio=ALL-UNNAMED
+    --add-opens=java.base/java.security=ALL-UNNAMED
+    --add-opens=java.base/javax.security.auth=ALL-UNNAMED
+    --add-opens=java.base/javax.security.auth.login=ALL-UNNAMED
+    --add-opens=java.base/java.text=ALL-UNNAMED
+    --add-opens=java.base/java.util=ALL-UNNAMED
+    --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+    --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+    --add-opens=java.base/java.util.regex=ALL-UNNAMED
+    --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED
+    --add-opens=java.base/sun.security.action=ALL-UNNAMED
+    --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+  node.properties: |
+    node.environment=e2e
+    node.data-dir=/tmp/presto
+    node.id=coordinator
+  log.properties: |
+    com.facebook.presto=INFO
+  catalog_tpch.properties: |
+    connector.name=tpch
+  # E3 (Section 13.5): one running query at a time, the rest QUEUED. Inert on
+  # its own -- it only takes effect once resource-groups.properties (below)
+  # selects the file resource-group manager, which is exactly the fault E3
+  # injects and then removes. This is the JSON payload that manager reads.
+  resource_groups.json: |
+    {
+      "rootGroups": [
+        {
+          "name": "global",
+          "softMemoryLimit": "80%",
+          "hardConcurrencyLimit": 1,
+          "maxQueued": 100,
+          "schedulingPolicy": "fair"
+        }
+      ],
+      "selectors": [
+        {
+          "group": "global"
+        }
+      ]
+    }
+  # resource-groups.properties is INTENTIONALLY ABSENT by default.
+  # Presto 0.298's InternalResourceGroupManager treats the mere *existence*
+  # of etc/resource-groups.properties as a request to configure resource
+  # groups and hard-fails when the file has no
+  # resource-groups.configuration-manager key. An empty file is therefore
+  # not inert — only an absent file is. E3 patches the Deployment to add
+  # the mount when it injects the fault and removes it on cleanup (mirroring
+  # E2's BROKEN_CATALOG_MOUNT pattern). Presto's resource-groups.configuration-
+  # manager and resource-groups.config-file properties MUST live in their own
+  # etc/resource-groups.properties file (plugin-config convention), never in
+  # config.properties.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: presto-worker-config
+  labels: { app: presto, role: worker }
+data:
+  config.properties: |
+    coordinator=false
+    http-server.http.port=8080
+    discovery.uri=http://presto-coordinator:8080
+    query.max-memory=1GB
+    query.max-memory-per-node=128MB
+    query.max-total-memory-per-node=256MB
+  jvm.config: |
+    -server
+    -Xmx1G
+    -XX:MaxDirectMemorySize=256M
+    -XX:+UseG1GC
+    -XX:G1HeapRegionSize=32M
+    -XX:+UseGCOverheadLimit
+    -XX:+ExplicitGCInvokesConcurrent
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:+ExitOnOutOfMemoryError
+    -Djdk.attach.allowAttachSelf=true
+    --add-opens=java.base/java.io=ALL-UNNAMED
+    --add-opens=java.base/java.lang=ALL-UNNAMED
+    --add-opens=java.base/java.lang.ref=ALL-UNNAMED
+    --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+    --add-opens=java.base/java.net=ALL-UNNAMED
+    --add-opens=java.base/java.nio=ALL-UNNAMED
+    --add-opens=java.base/java.security=ALL-UNNAMED
+    --add-opens=java.base/javax.security.auth=ALL-UNNAMED
+    --add-opens=java.base/javax.security.auth.login=ALL-UNNAMED
+    --add-opens=java.base/java.text=ALL-UNNAMED
+    --add-opens=java.base/java.util=ALL-UNNAMED
+    --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+    --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+    --add-opens=java.base/java.util.regex=ALL-UNNAMED
+    --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED
+    --add-opens=java.base/sun.security.action=ALL-UNNAMED
+    --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+  node.properties: |
+    node.environment=e2e
+    node.data-dir=/tmp/presto
+  log.properties: |
+    com.facebook.presto=INFO
+  catalog_tpch.properties: |
+    connector.name=tpch

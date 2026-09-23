@@ -1,0 +1,1 @@
+{"status":"concluded","confidence":0.91,"root_cause":{"category":"query","summary":"runaway query should be killed"},"rca_compact":"kill runaway query"}
