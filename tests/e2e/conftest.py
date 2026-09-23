@@ -14,7 +14,7 @@ PRESTO_URL = os.environ.get("E2E_PRESTO_URL", "http://127.0.0.1:30880")
 
 ADMIN_USER = os.environ.get("E2E_ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("E2E_ADMIN_PASS", "admin-e2e-password")
-# Generous vs the 30s B1 raced after probe deploy; stays inside the 420s phase.
+# Generous vs the 30s B1 raced after probe deploy; stays inside the 480s phase.
 PLATFORM_ONLINE_DEADLINE_S = float(os.environ.get("E2E_PLATFORM_ONLINE_DEADLINE_S", "180"))
 PLATFORM_ONLINE_POLL_S = 2.0
 

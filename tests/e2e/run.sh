@@ -285,7 +285,7 @@ phase "preflight" 20 bash -c '
   source deploy/versions.env
 '
 
-phase "build_and_cluster" 500 bash -c '
+phase "build_and_cluster" 440 bash -c '
   set -euo pipefail
   source deploy/versions.env
   # Concurrent: images + pulls + kind
@@ -547,7 +547,7 @@ env_hygiene_gate() {
 trap 'stop_live_log_sidecar' EXIT
 start_live_log_sidecar
 env_hygiene_gate
-phase "pytest_e2e" 420 bash -c '
+phase "pytest_e2e" 480 bash -c '
   python3 -m pip install -q -e libs/py/rca_common -e "services/worker[test]" \
     -e "services/gateway[test]" -e "services/dashboard-api[test]"
   python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys

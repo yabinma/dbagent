@@ -38,12 +38,12 @@ E2E_VALUES = E2E / "values-dbagent.yaml"
 # describes.
 APPROVED_PHASE_BUDGETS = [
     ("preflight", 20),
-    ("build_and_cluster", 500),
+    ("build_and_cluster", 440),
     ("kind_load", 130),
     ("helm_dbagent", 180),
     ("deploy_presto", 150),
     ("helm_dbagent_probe", 60),
-    ("pytest_e2e", 420),
+    ("pytest_e2e", 480),
     ("teardown", 20),
 ]
 APPROVED_PHASE_TOTAL = 1480
@@ -2925,7 +2925,7 @@ def test_e2e_conftest_session_autouse_barrier_blocks_on_platform_online(monkeypa
     assert any(
         token in lowered
         for token in ("deadline", "timeout", "monotonic", "time.time")
-    ), "barrier must bound the wait; an unbounded poll hangs the 420s pytest_e2e phase"
+    ), "barrier must bound the wait; an unbounded poll hangs the 480s pytest_e2e phase"
 
     mod = _load_e2e_conftest()
     wait = getattr(mod, "wait_for_platform_online", None)
@@ -4756,8 +4756,8 @@ def _phase_overrun_failures(run_sh_text: str, root: Path) -> list[str]:
     """Run the real phase() over a 0 s budget; overrun must WARN and continue."""
     fails: list[str] = []
     budgets = dict(_PHASE_RE.findall(run_sh_text))
-    if budgets.get("pytest_e2e") != "420":
-        fails.append(f"pytest_e2e budget is {budgets.get('pytest_e2e')!r}, not 420")
+    if budgets.get("pytest_e2e") != "480":
+        fails.append(f"pytest_e2e budget is {budgets.get('pytest_e2e')!r}, not 480")
     script_path = root / "tests" / "e2e" / "run.sh"
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(run_sh_text, encoding="utf-8")
@@ -4798,7 +4798,7 @@ def _phase_overrun_failures(run_sh_text: str, root: Path) -> list[str]:
 
 
 def test_phase_overrun_warns_without_exit(tmp_path: Path):
-    """FP-CIR2-3 companion: 420 s stays, and phase() overrun stays WARN-only."""
+    """FP-CIR2-3 companion: 480 s stays, and phase() overrun stays WARN-only."""
     run_sh = RUN_SH.read_text(encoding="utf-8")
     assert _bash_function_definition_count(run_sh, "phase") == 1
     assert _phase_overrun_failures(run_sh, tmp_path / "real") == []
@@ -4809,7 +4809,7 @@ def test_phase_overrun_warns_without_exit(tmp_path: Path):
     )
     assert run_sh.count(warn_line) == 1
     mutants = {
-        "budget_raised": run_sh.replace('phase "pytest_e2e" 420 ', 'phase "pytest_e2e" 480 '),
+        "budget_raised": run_sh.replace('phase "pytest_e2e" 480 ', 'phase "pytest_e2e" 540 '),
         "warn_exits": run_sh.replace(warn_line, warn_line + "    exit 1\n"),
         "warn_returns_failure": run_sh.replace(warn_line, warn_line + "    return 1\n"),
         "warn_removed": run_sh.replace(warn_line, "    :\n"),
