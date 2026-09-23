@@ -243,11 +243,37 @@ check_budget() {
   fi
 }
 
+# kind-deploy-tuning FP-KDT-3: the kind B1 burst writes one numeric p99 line
+# to /tmp/rca-e2e/b1-kind-p99.txt (tests/e2e/kind_b1_observation.py). pytest
+# captures a passing test's stdout, so run.sh prints the file itself after a
+# passing pytest_e2e phase. The optional positional path exists only so the
+# delivery test can call the real functions against a temporary file.
+# clear_kind_b1_p99_line removes that one file, so a stale line from an
+# earlier run can never stand in for this one.
+clear_kind_b1_p99_line() {
+  local path="${1:-/tmp/rca-e2e/b1-kind-p99.txt}"
+  rm -f -- "$path"
+}
+
+# require_kind_b1_p99_line prints the line's exact bytes. An absent or empty
+# file is an instrumentation failure (suppressed collection or a broken
+# emitter), not a latency verdict: under_150=false still passes here.
+require_kind_b1_p99_line() {
+  local path="${1:-/tmp/rca-e2e/b1-kind-p99.txt}"
+  if [[ ! -s "$path" ]]; then
+    echo "require_kind_b1_p99_line: missing kind B1 p99 line: ${path} is absent or empty (observation instrumentation failure, not a latency verdict)" >&2
+    return 1
+  fi
+  cat -- "$path"
+}
+
 # When sourced (e.g. delivery tests exercising phase/collect_failure_diagnostics),
 # stop after function definitions so the full e2e pipeline does not run.
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
   return 0
 fi
+
+clear_kind_b1_p99_line
 
 phase "preflight" 20 bash -c '
   for b in helm docker kind buf; do
@@ -523,6 +549,10 @@ phase "pytest_e2e" 420 bash -c '
     -e "services/gateway[test]" -e "services/dashboard-api[test]"
   python3 -m pytest tests/e2e -v --tb=short
 '
+# Not a phase: pytest and the baseline completed, so a missing line is a
+# missing carrier, not a cluster failure; set -e fails the job with the named
+# error, the EXIT trap still stops the sidecar and the failure upload runs.
+require_kind_b1_p99_line
 stop_live_log_sidecar
 
 if [[ "$KEEP_CLUSTER" != "1" ]]; then

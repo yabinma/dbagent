@@ -1,6 +1,6 @@
 """bench-on-demand: the launcher's retired targets, and the runbook (FP-BOD-2/6).
 
-Two function tests and the unit coverage of the launcher exits behind them.
+Three function tests and the unit coverage of the launcher exits behind them.
 Every literal is declared here, independently of the files it pins: a check
 derived from its own subject detects nothing.
 """
@@ -43,6 +43,27 @@ RUNBOOK_RELEASE_CLAUSES = (
     "Commit only that file",
     "Push the commit to `main`",
     "Tag that commit",
+)
+#: The clean-tree precondition: TRACKED changes only. The jail dotfiles at the
+#: repo root are untracked and never committed, so a bare porcelain check could
+#: never pass on the host that runs the procedure.
+RUNBOOK_PORCELAIN_BARE = "git status --porcelain"
+RUNBOOK_PORCELAIN_TRACKED = "git status --porcelain --untracked-files=no"
+#: The two sections that state the precondition.
+RUNBOOK_PRECONDITION_SECTIONS = ("## The two commands", "## Release steps")
+#: The B11 alternative for a sandboxed shell: the declared runner-image route.
+RUNBOOK_B11_HOST_VENV = "services/worker/.venv/bin/python -m pytest"
+#: The connection mode is load-bearing: inside a container testcontainers
+#: otherwise ignores the override and dials the Docker gateway (observed
+#: 2026-09-23: "connection to server at 172.17.0.1 ... Connection refused").
+RUNBOOK_B11_SANDBOX_TOKENS = (
+    "docker run --rm --network host",
+    "TESTCONTAINERS_CONNECTION_MODE=docker_host",
+    "TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1",
+    "TESTCONTAINERS_RYUK_DISABLED=true",
+    "dbagent-review-runner:latest",
+    RUNBOOK_B11_COMMAND,
+    "-v -s",
 )
 
 
@@ -144,3 +165,75 @@ def test_bench_on_demand_runbook_names_triggers_and_commands():
     # the record.
     for forbidden in ("--skip", "SKIP_BENCH", "without the record", "b1_latency_basis"):
         assert forbidden not in text, f"the runbook offers {forbidden!r}"
+
+
+def _runbook_section(text: str, heading: str) -> str:
+    """The body of one `## ` section, up to the next `## ` heading."""
+    start = text.index(heading)
+    end = text.find("\n## ", start + len(heading))
+    return text[start:] if end == -1 else text[start:end]
+
+
+def _fenced_blocks(text: str) -> list[str]:
+    """Every fenced code block's body, in document order."""
+    blocks = []
+    lines = text.splitlines()
+    opened = None
+    for number, line in enumerate(lines):
+        if line.startswith("```"):
+            if opened is None:
+                opened = number
+            else:
+                blocks.append("\n".join(lines[opened + 1:number]))
+                opened = None
+    return blocks
+
+
+def test_bench_on_demand_runbook_is_followable_from_this_host():
+    """FP-BOD-6 [function test]: the procedure can be followed where it runs.
+
+    Named for two wording defects (fix.md, 2026-09-23). The clean-tree
+    precondition must demand no TRACKED changes: a bare
+    `git status --porcelain` also lists the untracked jail dotfiles that are
+    never committed, so it never prints nothing on this host. Every occurrence
+    of the porcelain command is read, so one bare survivor in either section
+    is red.
+
+    And a sandboxed shell cannot reach a published testcontainers port, so the
+    B11 command must have its runner-image alternative. The tokens are read
+    from the ONE fenced block that holds `docker run`, so the host-venv block's
+    node id cannot satisfy the alternative's.
+    """
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    # (1) Every porcelain check is the tracked-only one, in both sections.
+    occurrences = []
+    at = text.find(RUNBOOK_PORCELAIN_BARE)
+    while at != -1:
+        occurrences.append(at)
+        at = text.find(RUNBOOK_PORCELAIN_BARE, at + 1)
+    assert len(occurrences) >= len(RUNBOOK_PRECONDITION_SECTIONS), occurrences
+    for at in occurrences:
+        found = text[at:at + len(RUNBOOK_PORCELAIN_TRACKED)]
+        assert found == RUNBOOK_PORCELAIN_TRACKED, (
+            f"a bare porcelain check at offset {at} still demands an empty "
+            f"untracked set: {text[at:at + 80]!r}"
+        )
+    for heading in RUNBOOK_PRECONDITION_SECTIONS:
+        section = _runbook_section(text, heading)
+        assert RUNBOOK_PORCELAIN_TRACKED in section, (
+            f"{heading!r} does not state the tracked-only precondition"
+        )
+    assert "never committed" in text, "the untracked-file allowance is unqualified"
+
+    # (2) The host-venv command stays primary; the runner-image route follows.
+    blocks = _fenced_blocks(text)
+    host = [b for b in blocks if RUNBOOK_B11_HOST_VENV in b and RUNBOOK_B11_COMMAND in b]
+    sandbox = [b for b in blocks if "docker run" in b]
+    assert len(host) == 1, "the host-venv B11 command is missing or repeated"
+    assert len(sandbox) == 1, f"expected one runner-image B11 block, found {len(sandbox)}"
+    assert blocks.index(host[0]) < blocks.index(sandbox[0]), (
+        "the runner-image route must follow the primary host-venv command"
+    )
+    for token in RUNBOOK_B11_SANDBOX_TOKENS:
+        assert token in sandbox[0], f"the runner-image B11 block omits {token!r}"

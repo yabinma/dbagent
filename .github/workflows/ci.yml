@@ -368,10 +368,12 @@ jobs:
         # bench-on-demand FP-BOD-1/5 (design.md §3.2): the B1 harness coverage
         # gate moves here out of the deleted `b1_write_coverage_driver`
         # container, and the tag-gate script's own branch-coverage run joins
-        # it. Both live in THIS step's body rather than in steps of their own,
-        # because FP-M6-31 A10(v) pins exactly one measured pytest invocation
-        # per guarded job, immediately after the hygiene gate above; a second
-        # step would move that invocation away from its gate. The default
+        # it; kind-deploy-tuning (§5 Unit tests) adds the kind p99 observation
+        # helper's branch-coverage run beside it. All live in THIS step's body
+        # rather than in steps of their own,
+        # because FP-M6-31 A10(v) pins exactly one measured pytest step per
+        # guarded job, immediately after the hygiene gate above; a second step
+        # would move those invocations away from their gate. The default
         # `bash -e` shell fails the step on the first non-zero command, so no
         # failure here is swallowed. The coverage bar stays 81 on the three
         # surviving files, its data file lives under RUNNER_TEMP rather than
@@ -388,6 +390,7 @@ jobs:
           services/worker/.venv/bin/python -m pytest \
             tests/functional/test_release_bench_record.py -v \
             --cov=check_release_bench_record --cov-branch --cov-fail-under=81
+          services/worker/.venv/bin/python -m pytest tests/delivery/test_kind_deploy_tuning.py -v --cov=tests.e2e.kind_b1_observation --cov-branch --cov-fail-under=81
           env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 \
             services/worker/.venv/bin/python -B -m coverage run --branch \
             --data-file="$RUNNER_TEMP/b1-harness.coverage" \

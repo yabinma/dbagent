@@ -33,12 +33,16 @@ closest candidate for a tag, it refuses that tag, which is the point.
 
 ## The two commands
 
-The tree must be clean before either command runs:
+The tree must have no tracked changes before either command runs:
 
 ```bash
-git status --porcelain      # prints nothing
-git rev-parse HEAD          # this is measured_sha
+git status --porcelain --untracked-files=no   # prints nothing
+git rev-parse HEAD                            # this is measured_sha
 ```
+
+Untracked files are allowed only if they are never committed; the jail
+dotfiles at the repository root (`.bashrc`, `.profile`, `.claude/`, …) are the
+known case.
 
 B1, the product profile (1000 requests/s offered for 30 s, gateway 4 CPUs /
 PostgreSQL 3 / driver 1):
@@ -53,6 +57,32 @@ B11, the seven-writer insert throughput:
 services/worker/.venv/bin/python -m pytest \
   tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput -v -s
 ```
+
+From a sandboxed shell (a network namespace with only loopback), the command
+above cannot reach the PostgreSQL port testcontainers publishes, and every DB
+fixture fails with "connection refused". Run the same node id inside the
+review-runner image on the host network instead. The image is
+`deploy/review-runner/Dockerfile`; the socket path is taken from `DOCKER_HOST`:
+
+```bash
+DOCKER_SOCK="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+DOCKER_SOCK="${DOCKER_SOCK#unix://}"
+docker run --rm --network host \
+  -e TESTCONTAINERS_CONNECTION_MODE=docker_host \
+  -e TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1 \
+  -e TESTCONTAINERS_RYUK_DISABLED=true \
+  -v "$DOCKER_SOCK":/var/run/docker.sock \
+  -v /opt/gitspace/dbagent:/workspace:ro -w /workspace \
+  dbagent-review-runner:latest \
+  python3 -B -X pycache_prefix=/tmp/pycache -m pytest -o cache_dir=/tmp/pytest-cache \
+  tests/benchmark/test_pg_scale.py::test_b11_audit_llm_insert_throughput -v -s
+```
+
+Both environment settings are needed: without
+`TESTCONTAINERS_CONNECTION_MODE=docker_host`, testcontainers inside a container
+ignores the override and dials the Docker gateway address. Ryuk is disabled, so
+check `docker ps -a` afterwards and remove any container a killed run left
+behind.
 
 ## The results file
 
@@ -74,8 +104,9 @@ Lines 2–7 are copied **verbatim** from the two runs' output.
 
 ## Release steps
 
-1. Confirm the tree is clean (`git status --porcelain` prints nothing) and
-   record `git rev-parse HEAD` as `measured_sha`.
+1. Confirm the tree has no tracked changes
+   (`git status --porcelain --untracked-files=no` prints nothing) and record
+   `git rev-parse HEAD` as `measured_sha`.
 2. Run `/opt/gitspace/dbagent/scripts/integration-test.sh b1_product`.
 3. Run the B11 node id above.
 4. Copy the six print lines into a new block in

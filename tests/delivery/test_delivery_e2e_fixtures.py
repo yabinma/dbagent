@@ -3932,3 +3932,100 @@ def test_e3_listed_failure_message_distinguishes_empty_vs_unwalked_payload():
     assert f"excerpt={unwalked_excerpt!r}" in msg_unwalked
     assert "evidence_id='ev-2'" in msg_unwalked
     assert f"payload_len={len(unwalked_payload)}" in msg_unwalked
+
+
+# ---------------------------------------------------------------------------
+# kind-deploy-tuning FP-KDT-1: e2e-only bundled PostgreSQL CPU.
+# ---------------------------------------------------------------------------
+
+KDT_E2E_PG_RESOURCES = {
+    "requests": {"cpu": "1000m", "memory": "256Mi"},
+    "limits": {"cpu": "2000m", "memory": "1Gi"},
+}
+KDT_CHART_PG_RESOURCES = {
+    "requests": {"cpu": "50m", "memory": "256Mi"},
+    "limits": {"cpu": "500m", "memory": "1Gi"},
+}
+
+
+def _rendered_bundled_postgres_resources(values: list[str], set_args: list[str] | None = None):
+    from delivery_helpers import CHARTS, helm_template, parse_manifests
+
+    docs = parse_manifests(helm_template(CHARTS / "dbagent", values=values, set_args=set_args))
+    pg = [
+        d for d in docs
+        if d.get("kind") == "Deployment"
+        and ((d.get("metadata") or {}).get("labels") or {}).get("app.kubernetes.io/component")
+        == "postgresql"
+    ]
+    assert len(pg) == 1, [d["metadata"]["name"] for d in pg]
+    containers = pg[0]["spec"]["template"]["spec"]["containers"]
+    assert [c["name"] for c in containers] == ["postgresql"], containers
+    return containers[0].get("resources")
+
+
+def _run_sh_dbagent_install_values(run_sh: str) -> list[str]:
+    """The `-f`/`--values`/`--set*` operands of run.sh's dbagent chart install."""
+    joined = run_sh.replace("\\\n", " ")
+    installs = [
+        ln for ln in joined.splitlines()
+        if re.search(r"\bhelm\s+upgrade\s+--install\s+dbagent\s+deploy/charts/dbagent\b", ln)
+    ]
+    assert len(installs) == 1, installs
+    tokens = installs[0].split()
+    operands: list[str] = []
+    for i, tok in enumerate(tokens):
+        if tok in ("-f", "--values"):
+            operands.append(f"-f {tokens[i + 1]}")
+        elif tok.startswith(("--values=", "--set", "--post-renderer")):
+            operands.append(tok)
+    return operands
+
+
+def test_kind_tuning_postgres_resources_are_e2e_only():
+    """FP-KDT-1 [function test]: 1000m/2000m CPU for kind's PostgreSQL, nowhere else.
+
+    Named for these failures: the overlay is absent; the chart default moved;
+    run.sh installs the dbagent chart with another values file (or a --set
+    that could override it); or Helm renders anything other than 1000m/2000m
+    CPU and 256Mi/1Gi memory for the bundled PostgreSQL Deployment under the
+    e2e overlay. The default chart and values-dev.yaml keep 50m/500m.
+    """
+    from delivery_helpers import CHARTS
+
+    overlay = yaml.safe_load(E2E_VALUES.read_text(encoding="utf-8"))
+    assert overlay["postgresql"]["bundled"] is True
+    assert overlay["postgresql"].get("resources") == KDT_E2E_PG_RESOURCES
+
+    chart_values = yaml.safe_load((CHARTS / "dbagent" / "values.yaml").read_text(encoding="utf-8"))
+    assert chart_values["postgresql"]["resources"] == KDT_CHART_PG_RESOURCES
+    dev_values = yaml.safe_load(
+        (CHARTS / "dbagent" / "values-dev.yaml").read_text(encoding="utf-8")
+    )
+    assert "resources" not in (dev_values.get("postgresql") or {})
+
+    run_sh = RUN_SH.read_text(encoding="utf-8")
+    assert _run_sh_dbagent_install_values(run_sh) == ["-f tests/e2e/values-dbagent.yaml"]
+    # The operand reader is not vacuous: a second values file or a --set is seen.
+    for mutant in (
+        run_sh.replace(
+            "-f tests/e2e/values-dbagent.yaml \\\n",
+            "-f tests/e2e/values-dbagent.yaml -f deploy/charts/dbagent/values-dev.yaml \\\n", 1),
+        run_sh.replace(
+            "-f tests/e2e/values-dbagent.yaml \\\n",
+            "-f tests/e2e/values-dbagent.yaml --set postgresql.resources.limits.cpu=500m \\\n", 1),
+        run_sh.replace(
+            "-f tests/e2e/values-dbagent.yaml \\\n", "-f deploy/charts/dbagent/values-dev.yaml \\\n", 1),
+    ):
+        assert mutant != run_sh
+        assert _run_sh_dbagent_install_values(mutant) != ["-f tests/e2e/values-dbagent.yaml"]
+
+    # Rendered: exactly the e2e values under the overlay run.sh installs...
+    assert _rendered_bundled_postgres_resources([str(E2E_VALUES)]) == KDT_E2E_PG_RESOURCES
+    # ...and the chart default under the dev overlay and the bare chart.
+    assert _rendered_bundled_postgres_resources(
+        [str(CHARTS / "dbagent" / "values-dev.yaml")]
+    ) == KDT_CHART_PG_RESOURCES
+    assert _rendered_bundled_postgres_resources(
+        [], set_args=["postgresql.bundled=true"]
+    ) == KDT_CHART_PG_RESOURCES

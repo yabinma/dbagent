@@ -2,6 +2,12 @@ temporal:
   mode: dev
 postgresql:
   bundled: true
+  # kind-deploy-tuning (FP-KDT-1): e2e-only CPU for the bundled PostgreSQL.
+  # The chart default (50m/500m) throttled it on every kind burst. Memory
+  # keeps the chart's 256Mi/1Gi; values.yaml and values-dev.yaml are untouched.
+  resources:
+    requests: { cpu: 1000m, memory: 256Mi }
+    limits: { cpu: 2000m, memory: 1Gi }
 minio:
   bundled: true
 modelGateway:

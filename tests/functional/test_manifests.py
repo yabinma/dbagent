@@ -290,9 +290,11 @@ EXPECTED_E2E_GITHUB_PATH_LINES = {
 }
 
 # bench-on-demand FP-BOD-1/5 (design.md §3.2): the functional job's measured
-# step. It carries THREE pytest invocations in one body -- the broad functional
-# run, the tag-gate script's own branch-coverage run, and the B1 harness
-# coverage phase that moved here out of the deleted driver container -- because
+# step. It carries FOUR pytest invocations in one body -- the broad functional
+# run, the tag-gate script's own branch-coverage run, the kind p99 observation
+# helper's branch-coverage run (kind-deploy-tuning §5 Unit tests), and the B1
+# harness coverage phase that moved here out of the deleted driver container
+# -- because
 # FP-M6-31 A10(v) pins exactly one measured pytest STEP per guarded job,
 # immediately after the hygiene gate.
 #
@@ -315,6 +317,7 @@ EXPECTED_FUNCTIONAL_PYTEST_RUN = (
     'services/worker/.venv/bin/python -m pytest \\\n'
     '  tests/functional/test_release_bench_record.py -v \\\n'
     '  --cov=check_release_bench_record --cov-branch --cov-fail-under=81\n'
+    'services/worker/.venv/bin/python -m pytest tests/delivery/test_kind_deploy_tuning.py -v --cov=tests.e2e.kind_b1_observation --cov-branch --cov-fail-under=81\n'
     'env -u PYTHON_VERSION -u PYTHON_PIP_VERSION -u PYTHON_GET_PIP_URL -u PYTHON_GET_PIP_SHA256 \\\n'
     '  services/worker/.venv/bin/python -B -m coverage run --branch \\\n'
     '  --data-file="$RUNNER_TEMP/b1-harness.coverage" \\\n'
@@ -2902,12 +2905,14 @@ def _covered_py_links(root: Path = REPO_ROOT) -> list[str]:
     return links
 
 
-#: bench-on-demand FP-BOD-8: the nested kind burst. It is deliberately NOT one
-#: of B1's threshold-bearing links -- it carries no latency comparison at all
-#: since the p99 tape was deleted -- so nothing in `thresholds.yaml` would
-#: otherwise carry `tests/e2e/` into the collection-suppression guard below.
-#: This constant does, explicitly: its eleven correctness clauses still fail
-#: the e2e job, and a suppressed collection would silence all eleven.
+#: bench-on-demand FP-BOD-8 / kind-deploy-tuning FP-KDT-5: the nested kind
+#: burst. It is deliberately NOT one of B1's threshold-bearing links -- the
+#: path contains eleven correctness gates and an observational latency
+#: reading (its p99 is compared with 150 ms, recorded and printed, never
+#: asserted) -- so nothing in `thresholds.yaml` would otherwise carry
+#: `tests/e2e/` into the collection-suppression guard below. This constant
+#: does, explicitly: a suppressed collection would silence all eleven gates
+#: and the reading with them.
 B1_NESTED_CORRECTNESS_LINK = (
     "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
 )
@@ -5861,10 +5866,14 @@ def test_b1_entry_matches_its_declared_contract():
 
     The expected object is the PRODUCT contract now: one measured profile, one
     `tier: on-demand` key, two links and a `notes` body that describes a
-    benchmark measured on a developer host. Every clause the CI-scale route,
-    the topology carrier, the CPU-basis oracle and the kind p99 tape used to
-    publish is pinned ABSENT below, so a half-revert that leaves one of them
-    in the manifest is red here rather than merely stale.
+    benchmark measured on a developer host. Every clause the CI-scale route
+    and the topology carrier, the CPU-basis oracle and the retired kind
+    diagnostics used to publish is pinned ABSENT below, so a half-revert that
+    leaves one of them in the manifest is red here rather than merely stale.
+    kind-deploy-tuning (FP-KDT-5) reinstates the kind p99 as a reported
+    reading with a one-run proof and an e2e-only PostgreSQL overlay; those
+    clauses are pinned PRESENT, and the "never measured" and "no resource
+    change" clauses they replace are gone.
     """
     data = yaml.safe_load((REPO_ROOT / "tests/benchmark/thresholds.yaml").read_text())
     b1 = next(e for e in data["benchmarks"] if e["id"] == "B1")
@@ -5925,8 +5934,18 @@ def test_b1_entry_matches_its_declared_contract():
         "nested",
         "refutes neither",
         "Eleven kind comparisons fail the e2e job",
-        "no longer measured, recorded or uploaded at all",
-        "changes no kind deployment resource",
+        # kind-deploy-tuning FP-KDT-5: observation, one-run proof, overlay
+        "is reported again, never gated",
+        "design/slices/kind-deploy-tuning/design.md",
+        "is compared with 150 ms as a reported",
+        "recorded with record_property and printed",
+        "It is not an ongoing job",
+        "a later kind p99 miss alone does not fail CI, does not refuse a release",
+        "product-capacity refutation",
+        "one-run proof requirement is one post-change live CI",
+        "e2e run whose kind p99 is below 150 ms",
+        "e2e-only overlay tests/e2e/values-dbagent.yaml",
+        "1000m and a CPU limit of 2000m",
         # the sizing ledger, kept as history (FP-BOD-9 / DW9)
         "B1-LATENCY-BASIS-1",
         "ingestGateway.sizingBasis.observations",
@@ -5967,7 +5986,6 @@ def test_b1_entry_matches_its_declared_contract():
         "CI_SCALE_SUSTAINED_FLOOR=450",
         "recorded, non-gating; reason: host-dependent, not in CI",
         "recorded as pytest observation",
-        "does not fail the kind job",
         "keeps p99 < 150 ms at full strength",
         "ratified GC-3 placement",
         "visible only in the uploaded e2e diagnostics artifact",
@@ -5976,38 +5994,174 @@ def test_b1_entry_matches_its_declared_contract():
         assert forbidden not in notes, f"B1 notes must not say {forbidden!r}"
 
 
-#: e2e-b1-kind-policy: every committed carrier of the observational-latency
-#: policy. `design/` is gitignored and absent in CI, so no clause below reads
-#: it: the deviation is pinned as a PATH STRING inside the manifest, never as a
-#: file this test opens.
-B1_KIND_POLICY_NOTES_CLAUSES: tuple[str, ...] = (
-    # the nested path is named, and named as a non-threshold link
-    "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile",
-    "one of the three threshold-bearing links above",
-    # the observational latency policy itself
-    "the kind\ndue-time p99 is still compared with 150 ms",
-    "recorded as pytest observation",
-    "does not fail the kind job",
-    # every retained failure class
-    "Eleven kind comparisons still fail it",
-    "platform\nONLINE",
-    "baseline served+errors==6000, errors==0, served==6000 and committed==served",
-    "sat_served+sat_errors==issued, sat_errors==0, gateway restart delta ==0",
-    "Unhealthy event count",
-    "sat_committed==sat_served, and the exact admissible audit-action tuple",
-    # the accepted cost, stated rather than hidden
-    "Accepted cost",
-    "no longer fails e2e",
-    "keeps p99 < 150 ms at full strength",
-    "ratified GC-3 placement",
-    "no CI job fails on ingest latency",
-    "visible only in the uploaded e2e diagnostics artifact",
-    # resources unchanged and undecided
-    "kind deployment resource",
-    # the routing strings
-    "design/slices/e2e-b1-kind-policy/design.md",
-    "design/frozen-deviations.md",
+# ---------------------------------------------------------------------------
+# kind-deploy-tuning FP-KDT-5 -- the committed statement of the kind policy.
+#
+# design/ is gitignored and absent in CI, so nothing below reads the slice;
+# its path appears only as a string inside the manifest.
+# ---------------------------------------------------------------------------
+
+#: B1's two threshold-bearing links and its product bar, unchanged by the slice.
+KDT_B1_TESTS = [
+    "services/gateway/tests/test_hmac_auth.py::test_b1_hmac_normalize_fingerprint_hot_path",
+    B1_PRODUCT_LINK,
+]
+KDT_B1_THRESHOLD = (
+    "product on-demand: served == offered and 0 errors at 1000 req/s offered "
+    "for 30s on the product-exclusive placement (gateway 4, PostgreSQL 3, "
+    "driver 1), each role's CPU set exclusive of the others; p99 < 150 ms is "
+    "printed as met or missed and is not the bar"
 )
+#: Whitespace-normalised clauses the B1 notes must carry.
+KDT_NOTE_REQUIRED = (
+    # the exact kind node path, and its eleven ongoing correctness gates
+    "The kind e2e path tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile is "
+    "deliberately not one of the threshold-bearing links above",
+    "Eleven kind comparisons fail the e2e job",
+    # the numeric observation, with 150 ms as a reported comparison
+    "The nested kind p99 is reported again, never gated",
+    "design/slices/kind-deploy-tuning/design.md",
+    "compared with 150 ms as a reported comparison",
+    "recorded with record_property and printed",
+    "B1 kind p99_ms=...,threshold_ms=150.0,under_150=true|false",
+    # never an ongoing job gate, never a release refusal or a refutation
+    "It is not an ongoing job gate",
+    "a later kind p99 miss alone does not fail CI, does not refuse a release and is "
+    "not a product-capacity refutation",
+    # the one-run proof
+    "one-run proof requirement is one post-change live CI e2e run whose kind p99 is "
+    "below 150 ms",
+    # the e2e-only overlay
+    "e2e-only overlay tests/e2e/values-dbagent.yaml gives the bundled PostgreSQL a CPU "
+    "request of 1000m and a CPU limit of 2000m",
+    "the chart default (50m/500m), values-dev.yaml and every other pod request/limit "
+    "are unchanged",
+)
+#: Clauses the notes must not carry: the retired "never measured / never
+#: tuned" policy, and any standing kind latency gate.
+KDT_NOTE_FORBIDDEN = (
+    "no longer measured",
+    "changes no kind deployment resource",
+    "untouched and undecided",
+    "recorded as pytest observation",
+    "visible only in the uploaded e2e diagnostics artifact",
+    "e2e-b1-diagnostics",
+    "keeps p99 < 150 ms at full strength",
+    "kind p99 gate",
+    "kind p99 fails",
+    "fails the e2e job on p99",
+    "fails the kind job on p99",
+)
+#: Workflow tokens that would make the kind reading a CI condition, a job
+#: summary or a success artifact.
+KDT_WORKFLOW_FORBIDDEN = (
+    "b1-kind-p99",
+    "under_150",
+    "b1_kind_p99_lt_150_ms",
+    "e2e-b1-diagnostics",
+    "GITHUB_STEP_SUMMARY",
+)
+
+
+def _kind_tuning_policy_failures(
+    data: dict, guard_links: "list[str]", workflow_text: str
+) -> "list[str]":
+    """Why the manifest no longer states the kind-deploy-tuning policy."""
+    fails: "list[str]" = []
+    entries = [e for e in data.get("benchmarks") or [] if e.get("id") == "B1"]
+    if len(entries) != 1:
+        return [f"expected one B1 entry, found {len(entries)}"]
+    b1 = entries[0]
+    if b1.get("status") != "covered":
+        fails.append(f"B1 status {b1.get('status')!r}, not covered")
+    if b1.get("tier") != "on-demand":
+        fails.append(f"B1 tier {b1.get('tier')!r}, not on-demand")
+    if b1.get("tests") != KDT_B1_TESTS:
+        fails.append(f"B1 threshold links changed: {b1.get('tests')}")
+    if b1.get("threshold") != KDT_B1_THRESHOLD:
+        fails.append("B1 product bar changed")
+    notes = _normalize_ws(b1.get("notes") or "")
+    for clause in KDT_NOTE_REQUIRED:
+        if _normalize_ws(clause) not in notes:
+            fails.append(f"B1 notes missing {clause!r}")
+    for clause in KDT_NOTE_FORBIDDEN:
+        if clause in notes:
+            fails.append(f"B1 notes still say {clause!r}")
+    if B1_NESTED_CORRECTNESS_LINK != (
+        "tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile"
+    ):
+        fails.append(f"the nested path moved: {B1_NESTED_CORRECTNESS_LINK!r}")
+    if guard_links.count(B1_NESTED_CORRECTNESS_LINK) != 1:
+        fails.append("the collection guard lost the exact nested kind path")
+    for token in KDT_WORKFLOW_FORBIDDEN:
+        if token in workflow_text:
+            fails.append(f"the workflow carries {token!r}: the kind reading became CI machinery")
+    return fails
+
+
+def test_kind_tuning_policy_is_explicit_without_ci_b1_gate():
+    """FP-KDT-5 [function test]: the kind p99 is reported, proved once, never gated.
+
+    Named for these failures: B1's two threshold links, covered/on-demand
+    status or product bar change; the notes still claim no kind measurement
+    or no kind resource change, or present a standing kind latency gate; the
+    collection guard loses the exact nested path; or the workflow turns the
+    reading into a condition, summary or artifact. The exact-object test
+    `test_b1_entry_matches_its_declared_contract` stays in agreement.
+    """
+    data = _load(REPO_ROOT / "tests/benchmark/thresholds.yaml")
+    guard_links = _collection_guard_links(REPO_ROOT)
+    workflow_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert _kind_tuning_policy_failures(data, guard_links, workflow_text) == []
+
+    import copy
+
+    def mutate(fn):
+        clone = copy.deepcopy(data)
+        fn(next(e for e in clone["benchmarks"] if e["id"] == "B1"))
+        return clone
+
+    def note_replace(old: str, new: str):
+        def apply(b1: dict) -> None:
+            normal = _normalize_ws(b1["notes"])
+            assert _normalize_ws(old) in normal, old
+            b1["notes"] = normal.replace(_normalize_ws(old), new, 1)
+        return apply
+
+    data_mutants = {
+        "status": lambda b1: b1.__setitem__("status", "partial"),
+        "tier": lambda b1: b1.pop("tier"),
+        "nested_link_added": lambda b1: b1["tests"].append(B1_NESTED_CORRECTNESS_LINK),
+        "link_dropped": lambda b1: b1["tests"].pop(0),
+        "bar": lambda b1: b1.__setitem__(
+            "threshold", KDT_B1_THRESHOLD.replace("is not the bar", "is the bar")),
+        "old_never_measured": note_replace(
+            "The nested kind p99 is reported again, never gated",
+            "The nested kind p99 is no longer measured, recorded or uploaded at all. "
+            "The nested kind p99 is reported again, never gated"),
+        "old_no_resource_change": note_replace(
+            "e2e-only overlay tests/e2e/values-dbagent.yaml",
+            "This changes no kind deployment resource. e2e-only overlay "
+            "tests/e2e/values-dbagent.yaml"),
+        "standing_gate": note_replace(
+            "It is not an ongoing job gate",
+            "The kind p99 gate fails the e2e job on p99 >= 150 ms. It is not an ongoing job gate"),
+        "no_one_run_proof": note_replace(
+            "one-run proof requirement is one post-change live CI e2e run whose kind p99 is "
+            "below 150 ms", "nothing further"),
+        "no_overlay": note_replace("1000m and a CPU limit of 2000m", "500m and 500m"),
+    }
+    for name, fn in data_mutants.items():
+        assert _kind_tuning_policy_failures(mutate(fn), guard_links, workflow_text) != [], name
+
+    without_nested = [l for l in guard_links if l != B1_NESTED_CORRECTNESS_LINK]
+    assert _kind_tuning_policy_failures(data, without_nested, workflow_text) != []
+    for token in KDT_WORKFLOW_FORBIDDEN:
+        assert _kind_tuning_policy_failures(
+            data, guard_links, workflow_text + f"\n# {token}\n"
+        ) != [], token
+
+
 
 
 

@@ -2,6 +2,10 @@
 
 Not collected by pytest. Open-loop baseline at BASE_RATE + closed-loop
 saturation of SATURATION_CLIENTS for BURST_SECONDS.
+
+The baseline's nearest-rank due-time p99 (PhaseResult.p99) is OBSERVATIONAL at
+the kind tier (kind-deploy-tuning FP-KDT-2): the live node reports it against
+P99_MS through tests/e2e/kind_b1_observation.py and never asserts on it.
 """
 from __future__ import annotations
 
@@ -843,8 +847,8 @@ async def run_open_loop_baseline(
         # FP-E2EB1D-1 — fail-soft boundary 1: the shipped helper is total for
         # these internally guaranteed inputs, but future drift must not abort
         # the baseline. On an exception the three diagnostic vectors are empty
-        # and every core value below is unchanged, so the same p99 assertion
-        # is reached. KeyboardInterrupt / SystemExit are not caught.
+        # and every core value below is unchanged, so the same observational
+        # p99 is reported. KeyboardInterrupt / SystemExit are not caught.
         try:
             pre_dispatch_slip_ms, start_lag_ms, attempt_duration_ms = derive_leg_vectors(
                 latencies,
@@ -957,11 +961,11 @@ async def run_closed_loop_saturation(
 def evaluate_baseline_correctness_clauses(result: PhaseResult) -> list[str]:
     """Baseline correctness clauses — no rate and no p99 comparison.
 
-    FP-IG-9 minus its clause 5: the e2e-b1-kind-policy slice makes the nested
-    kind due-time p99 observational, so the final oracle and every superseded
-    form share this correctness-only base. Forms 2-4 add their own historical
-    latency clauses on top; none of them reaches the removed p99 gate through
-    this call.
+    FP-IG-9 minus its clause 5: the nested kind due-time p99 is observational
+    (e2e-b1-kind-policy; reported again, never gated, by kind-deploy-tuning
+    FP-KDT-2), so the final oracle and every superseded form share this
+    correctness-only base. Forms 2-4 add their own historical latency clauses
+    on top; none of them reaches the removed p99 gate through this call.
     """
     fails: list[str] = []
     if result.served + result.errors != result.offered:

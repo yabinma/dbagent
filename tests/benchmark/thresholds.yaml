@@ -48,7 +48,7 @@ benchmarks:
     the unit-gateway job; `tier: on-demand` does not move it out of CI.
     The kind e2e path tests/e2e/test_e2e_load.py::test_b1_ingest_burst_profile is deliberately not
     one of the threshold-bearing links above; it stays a nested functional/deployment test
-    under its current resource model, exercising the sustained profile (open-loop baseline at
+    under the e2e resource model, exercising the sustained profile (open-loop baseline at
     200 req/s) and a closed-loop saturation phase against the shipped image and chart with real
     kubelet probes, asserting completion/accounting and 0 restarts / no Unhealthy events; three
     bare-container affinities neither bound nor describe that topology, so it implements neither
@@ -57,8 +57,17 @@ benchmarks:
     baseline served+errors==6000, errors==0, served==6000 and committed==served; saturation
     sat_served+sat_errors==issued, sat_errors==0, gateway restart delta ==0, Unhealthy event count
     ==0, sat_committed==sat_served, and the exact admissible audit-action tuple. The nested kind p99
-    is no longer measured, recorded or uploaded at all. This changes no kind deployment resource:
-    the chart, the e2e values overlay and every pod request/limit are untouched and undecided here.
+    is reported again, never gated (kind-deploy-tuning, design/slices/kind-deploy-tuning/design.md):
+    every completed baseline's nearest-rank due-time p99 is compared with 150 ms as a reported
+    comparison, the Boolean recorded with record_property and printed as the numeric line
+    `B1 kind p99_ms=...,threshold_ms=150.0,under_150=true|false`, which tests/e2e/run.sh prints
+    from /tmp/rca-e2e/b1-kind-p99.txt after a passing pytest_e2e phase. It is not an ongoing job
+    gate: a later kind p99 miss alone does not fail CI, does not refuse a release and is not a
+    product-capacity refutation. The slice's one-run proof requirement is one post-change live CI
+    e2e run whose kind p99 is below 150 ms, recorded once rather than asserted on every push. The
+    e2e-only overlay tests/e2e/values-dbagent.yaml gives the bundled PostgreSQL a CPU request of
+    1000m and a CPU limit of 2000m (memory 256Mi/1Gi unchanged); the chart default (50m/500m),
+    values-dev.yaml and every other pod request/limit are unchanged.
     max_lateness_ms is a reported diagnostic rather than a bar, and beyond the floor a finite-window
     burst certifies no sustained served-rate figure near the offered rate. Serving shape is uvicorn
     workers=4 (DBAGENT_GATEWAY_WORKERS / ingestGateway.workers); no shipped gateway configuration

@@ -1,13 +1,16 @@
 """FP-IG-9: B1 e2e link — nested-tier profile against shipped image and chart.
 
 Baseline: open-loop at BASE_RATE for BASE_SECONDS, failing on completion,
-errors and exact audit accounting. No rate comparison and NO LATENCY
-COMPARISON: bench-on-demand (FP-BOD-8) deleted the nested p99 observation, its
-diagnostic module and its success artifact once B1 stopped being a CI latency
-gate, so there is nothing left for the kind tape to stand in for. Saturation:
-closed-loop of SATURATION_CLIENTS for BURST_SECONDS (0 errors, 0 restarts, no
-Unhealthy, exact audit accounting). Eleven correctness clauses still fail the
-job.
+errors and exact audit accounting. No rate comparison, and the latency reading
+is OBSERVATIONAL: kind-deploy-tuning (FP-KDT-2/3) reads the completed
+baseline's nearest-rank due-time p99, compares it with P99_MS, records the
+Boolean with record_property and prints the numeric line (also written to
+/tmp/rca-e2e/b1-kind-p99.txt, which run.sh prints after a passing
+pytest_e2e phase). A p99 at or above P99_MS never fails, skips or retries
+this node; only a non-finite p99 or a failed write of the line does, as an
+observation-integrity error. Saturation: closed-loop of SATURATION_CLIENTS
+for BURST_SECONDS (0 errors, 0 restarts, no Unhealthy, exact audit
+accounting). Eleven correctness clauses still fail the job.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ import importlib.util
 import sys
 
 from tests.e2e.conftest import lookup_platform
+from tests.e2e.kind_b1_observation import emit_kind_b1_p99
 
 _PROFILE_PATH = Path(__file__).resolve().parent / "b1_e2e_profile.py"
 _spec = importlib.util.spec_from_file_location("b1_e2e_profile", _PROFILE_PATH)
@@ -275,7 +279,7 @@ def _unhealthy_events_since(
 
 
 @pytest.mark.e2e
-def test_b1_ingest_burst_profile(ingest_url, dashboard_url):
+def test_b1_ingest_burst_profile(ingest_url, dashboard_url, record_property):
     token = _admin_token(dashboard_url)
     # (1) platform ONLINE before any load
     platform_online = _platform_online(dashboard_url, token)
@@ -312,12 +316,19 @@ def test_b1_ingest_burst_profile(ingest_url, dashboard_url):
             on_prologue_complete=_after_prologue,
         )
     )
+    # FP-KDT-2/3: report the completed baseline's due-time p99 -- outside the
+    # measured window and before any correctness clause, so a later
+    # correctness failure still leaves the line in /tmp/rca-e2e. Observation
+    # only: the comparison with P99_MS is recorded and printed, never asserted.
+    emit_kind_b1_p99(
+        baseline.p99, P99_MS, record_property, Path("/tmp/rca-e2e/b1-kind-p99.txt")
+    )
     audit_after_base = _count_ingest_audit_rows(
         dashboard_url, token, datetime.now(timezone.utc) - timedelta(hours=1), cap=10**7
     )
     committed = audit_after_base - int(marks.get("audit_before", 0))
-    # (2)(3)(4)(6) fail the job. FP-BOD-8: no latency comparison, no recorded
-    # observation and no diagnostic emission happen here any more.
+    # (2)(3)(4)(6) fail the job. The p99 above is reported, not one of them
+    # (FP-KDT-4); no diagnostic emission happens here (FP-BOD-8).
     served = baseline.served
     errors = baseline.errors
     assert served + errors == 6000

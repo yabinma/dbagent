@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from delivery_helpers import kind_b1_p99_mutants, kind_b1_p99_observation_failures
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REF_PATH = REPO_ROOT / "services" / "gateway" / "tests" / "b1_reference_profile.py"
 E2E_PATH = REPO_ROOT / "tests" / "e2e" / "b1_e2e_profile.py"
@@ -1144,8 +1146,9 @@ LIVE_RUN_IMPL = "_run_b1_reference"
 # live B1 node left. Its `errors == 0` and `served == offered` are now real
 # gates, so they are inventory rows; `product_p99_lt_150_ms` is NOT, because a
 # truthful `missed` leaves the node green, and the kind due-time p99 is not
-# either -- that comparison, its recorded observation and the module behind it
-# are deleted. Admitting a non-failing node here would count it as a gate.
+# either -- it is an observational reading printed by `emit_kind_b1_p99`, so it
+# stays out of this inventory, and the retired 33-field diagnostic module
+# remains absent. Admitting a non-failing node here would count it as a gate.
 B1_FAILURE_INVENTORY: list[tuple[Path, str, frozenset[str], frozenset[type] | None, bool]] = [
     # --- FP-GC1-3 / FP-BOD-3 product reference: 7 B1 clauses + max_in_flight = 8 ---
     (REF_TEST, PRODUCT_REF_TEST, frozenset({"platform_online"}), frozenset({ast.Eq}), True),
@@ -4972,27 +4975,27 @@ def test_b1_product_run_fails_on_errors_and_shortfall_and_not_on_p99():
         ), anchor
 
 
-def test_e2e_kind_burst_keeps_eleven_clauses_without_p99_machinery():
-    """FP-BOD-8 [function test]: eleven clauses stay; the tape goes.
+def test_e2e_kind_burst_keeps_eleven_clauses_and_observes_p99():
+    """FP-KDT-4 [function test] (was FP-BOD-8): eleven gates plus one reading.
 
-    Named for three failures.
+    Named for four failures.
 
-    The first is a cleanup that drops a correctness assert while removing the
-    p99 hook. The eleven comparisons below are matched one-to-one against live
-    nodes, and each one is separately proved load-bearing by deleting it and
-    by weakening its operator.
+    The first is a change that drops or weakens a correctness assert. The
+    eleven comparisons below are matched one-to-one against live nodes, and
+    each one is separately proved load-bearing by deleting it and by
+    weakening its operator.
 
-    The second is the success-only diagnostic upload surviving. That artifact
-    existed to carry the 33-field diagnostic file the slice deletes; leaving
-    the step would upload a path nothing writes.
+    The second is the p99 joining the failure surface: a p99 row in the
+    inventory, or a p99-dependent assert, raise or pytest outcome in the node.
+    The observation and the eleven gates are distinct surfaces -- the reading
+    is one bare `emit_kind_b1_p99(baseline.p99, P99_MS, ...)` statement
+    immediately after the baseline returns and before the first baseline
+    correctness assert, and it is never an `assert`.
 
-    The third is the opposite mistake: removing the FAILURE log upload along
-    with it. That step is not this slice's to touch, and an e2e job that fails
-    without its pod logs is materially worse to debug.
-
-    Searching for the absence of the string `p99` is not this test: the
-    saturation path may still mention latency in a comment, and the eleven
-    asserts are the thing the test is for.
+    The third is the retired 33-field diagnostic module or its success-only
+    artifact coming back with the reading. The fourth is the opposite
+    mistake: removing the FAILURE log upload, which is also what carries the
+    observation file when a later clause fails.
     """
     load_src = E2E_TEST.read_text(encoding="utf-8")
 
@@ -5040,20 +5043,43 @@ def test_e2e_kind_burst_keeps_eleven_clauses_without_p99_machinery():
     with pytest.raises(AssertionError):
         _bod_statement_lines(load_src, frozenset({"no_such_clause"}))
 
-    # (4) The p99 machinery is gone from the function and from the tree: no
-    # recorded observation, no diagnostic session, no module.
+    # (4) The p99 is observed, as its own surface: one bare helper call from
+    # baseline.p99 and P99_MS, before the first baseline correctness assert,
+    # and no p99-dependent assert/raise/pytest outcome anywhere in the node.
+    assert kind_b1_p99_observation_failures(load_src) == []
     fn = _bod_function(ast.parse(load_src), "test_b1_ingest_burst_profile")
-    called = {
-        (node.func.id if isinstance(node.func, ast.Name) else
-         node.func.attr if isinstance(node.func, ast.Attribute) else "")
-        for node in ast.walk(fn) if isinstance(node, ast.Call)
-    }
-    assert "record_property" not in called, "the kind p99 observation is back"
+    observation = [
+        i for i, stmt in enumerate(fn.body)
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == "emit_kind_b1_p99"
+    ]
+    assert len(observation) == 1
+    base = observation[0] - 1
+    assert ast.unparse(fn.body[base]).startswith("baseline = asyncio.run("), (
+        "the observation does not directly follow the baseline"
+    )
+    first_baseline_assert = min(
+        i for i, stmt in enumerate(fn.body)
+        if isinstance(stmt, ast.Assert) and i > base
+    )
+    assert observation[0] < first_baseline_assert
+    # The reading is not one of the eleven matched failure nodes.
+    assert id(fn.body[observation[0]]) not in consumed
+    for name, mutated in kind_b1_p99_mutants(load_src):
+        assert mutated != load_src, f"mutant {name} no longer applies"
+        assert kind_b1_p99_observation_failures(mutated) != [], name
+        # A mutation of the reading never costs a correctness gate: the
+        # eleven stay matched one-to-one on every mutant.
+        mutant_nodes = _nodes_for_src(mutated, "test_b1_ingest_burst_profile")
+        taken: set[int] = set()
+        for _path, _name, names, ops, eq_ok in rows:
+            hit = _inventory_match(mutant_nodes, names, ops, eq_ok, consumed=taken)
+            assert hit is not None, (name, sorted(names))
+            taken.add(hit)
+    # ...and no diagnostic session or module came back with it.
     named = {node.id for node in ast.walk(fn) if isinstance(node, ast.Name)}
     assert "B1E2EDiagnosticSession" not in named, "the diagnostic session is back"
-    assert "record_property" not in {a.arg for a in fn.args.args}, (
-        "the node still takes the record_property fixture"
-    )
     assert "b1_e2e_diagnostics" not in load_src
     assert not E2EBK_DIAGNOSTIC_MODULE.exists(), "the diagnostic module is back"
 
@@ -5075,10 +5101,9 @@ def test_e2e_kind_burst_keeps_eleven_clauses_without_p99_machinery():
     assert failure.get("if") == "failure()", failure
     assert "/tmp/rca-e2e/**" in str(failure["with"]["path"]).split()
 
-    # (6) Kind resources are untouched: this slice changed no pod request or
-    # limit, including the bundled PostgreSQL's 500m CPU ceiling, which the
-    # e2e deployment throttles against on every run and which the slice
-    # explicitly leaves out of scope.
+    # (6) The DEFAULT chart keeps the bundled PostgreSQL at 50m/500m. The
+    # e2e-only 1000m/2000m overlay (kind-deploy-tuning FP-KDT-1) is checked,
+    # rendered, by its own function test in test_delivery_e2e_fixtures.py.
     chart = yaml.safe_load(
         (REPO_ROOT / "deploy" / "charts" / "dbagent" / "values.yaml").read_text(
             encoding="utf-8"
