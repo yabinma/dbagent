@@ -388,14 +388,14 @@ def test_images_job_builds_all_six_and_pushes_only_on_main_and_tags():
 
 
 # ---------------------------------------------------------------------------
-# FP-IG-26 / UT-IG-10 — sizing-ledger gate must not sit upstream of its producer
+# pytest-command parser for CI run: bodies. Resolves each pytest invocation's
+# positional roots (and --ignore / --ignore-glob operands) against the step's
+# working directory, so the temporal-workflow starter inventory below sees the
+# directories CI actually collects.
 # ---------------------------------------------------------------------------
 
-_FP_IG_23_DEF_RE = re.compile(
-    r"^def test_sizing_basis_provenance_is_on_reference_and_from_a_serving_run\b",
-    re.MULTILINE,
-)
-_PRODUCER_REL = "services/gateway/tests/test_b1_ingest_burst.py"
+#: pytest options that consume the following token, so that token is never
+#: read as a positional root.
 _PYTEST_VALUE_OPTIONS = frozenset(
     {
         "--ignore",
@@ -428,25 +428,6 @@ _PYTEST_VALUE_OPTIONS = frozenset(
 )
 
 
-def _locate_fp_ig_23_file() -> str:
-    """Resolve FP-IG-23's named test by scanning tests/delivery/*.py.
-
-    The path is not pinned so the resolution survives the file relocation
-    this pass itself performs (charts.py → test_delivery_sizing_ledger.py).
-    """
-    hits: list[Path] = []
-    delivery = REPO_ROOT / "tests" / "delivery"
-    for path in sorted(delivery.glob("*.py")):
-        if _FP_IG_23_DEF_RE.search(path.read_text(encoding="utf-8")):
-            hits.append(path)
-    assert hits, (
-        "FP-IG-23 named test not found under tests/delivery/*.py "
-        "(deletion cannot satisfy FP-IG-26 vacuously)"
-    )
-    assert len(hits) == 1, f"FP-IG-23 named test defined in more than one file: {hits}"
-    return hits[0].relative_to(REPO_ROOT).as_posix()
-
-
 def _norm_path(path: str) -> str:
     return posixpath.normpath(path)
 
@@ -460,15 +441,6 @@ def _resolve_against_workdir(path: str, workdir: str | None) -> str:
     if workdir in (None, "", "."):
         return _norm_path(path)
     return _norm_path(posixpath.join(workdir, path))
-
-
-def _path_is_under(path: str, ancestor: str) -> bool:
-    """Prefix rule: path is the ancestor or lives under it as a path prefix."""
-    p = _norm_path(path)
-    a = _norm_path(ancestor)
-    if p == a:
-        return True
-    return p.startswith(a.rstrip("/") + "/")
 
 
 def _step_working_directory(job: dict, step: dict) -> str | None:
@@ -652,170 +624,10 @@ def test_dashboard_api_pg_fixture_fails_closed_without_testcontainers(
         next(namespace["pg_dsn"]())
 
 
-_TRACKED_LAUNCHER_REL = "scripts/integration-test.sh"
-_LAUNCHER_FUNCTION_RE = re.compile(r"\A([A-Za-z0-9_]+)\(\)\s*\{\s*\Z")
-_LAUNCHER_WRAPPER_RE = re.compile(
-    r"\Abash\s+" + re.escape(_TRACKED_LAUNCHER_REL) + r"\s+([A-Za-z0-9_]+)\Z"
-)
-
-
-def _direct_edge_only_would_pass(workflow: dict, *, resolve_workdir: bool = True) -> bool:
-    """The check a direct-edge-only implementation would make.
-
-    UT-IG-10's transitive fixture exists to kill this: it must return True
-    for a two-level edge that the real (closure) check rejects.
-    """
-    gate_rel = _locate_fp_ig_23_file()
-    gate_hits = _jobs_collecting(workflow, gate_rel, resolve_workdir=resolve_workdir)
-    prod_hits = _jobs_collecting(
-        workflow, _PRODUCER_REL, resolve_workdir=resolve_workdir
-    )
-    gate_jobs = {name for name, _ in gate_hits}
-    prod_jobs = {name for name, _ in prod_hits}
-    if len(gate_jobs) != 1 or len(prod_jobs) != 1:
-        return False
-    consumer = next(iter(gate_jobs))
-    producer = next(iter(prod_jobs))
-    jobs = workflow.get("jobs") or {}
-    if consumer in _needs_of(jobs.get(producer) or {}):
-        return False
-    if consumer == producer:
-        gate_idx = min(idx for name, idx in gate_hits if name == consumer)
-        prod_idx = min(idx for name, idx in prod_hits if name == producer)
-        if not prod_idx < gate_idx:
-            return False
-    return True
-
-
-def _pytest_step(run: str, *, workdir: str | None = None) -> dict:
-    step: dict = {"run": run}
-    if workdir is not None:
-        step["working-directory"] = workdir
-    return step
-
-
-def _job(steps: list[dict], *, needs=None, defaults_wd: str | None = None) -> dict:
-    job: dict = {"steps": steps}
-    if needs is not None:
-        job["needs"] = needs
-    if defaults_wd is not None:
-        job["defaults"] = {"run": {"working-directory": defaults_wd}}
-    return job
-
-
-def _burst_run() -> str:
-    return "services/worker/.venv/bin/python -m pytest services/gateway/tests/test_b1_ingest_burst.py -v -s"
-
-
-def _gate_run() -> str:
-    return (
-        "services/worker/.venv/bin/python -m pytest "
-        f"{_locate_fp_ig_23_file()} -v"
-    )
-
-
-def _fixture_direct_edge() -> dict:
-    """Producer needs: consumer directly — the e81af43 shape."""
-    return {
-        "jobs": {
-            "functional": _job([_pytest_step("python -m pytest tests/delivery -v")]),
-            "benchmark": _job(
-                [_pytest_step(_burst_run())],
-                needs="functional",
-            ),
-        }
-    }
-
-
-def _fixture_transitive() -> dict:
-    """Two-level edge: benchmark → mid → functional. Direct-edge-only is green."""
-    return {
-        "jobs": {
-            "functional": _job([_pytest_step("python -m pytest tests/delivery -v")]),
-            "mid": _job([{"run": "echo noop"}], needs="functional"),
-            "benchmark": _job(
-                [_pytest_step(_burst_run())],
-                needs=["mid"],
-            ),
-        }
-    }
-
-
-def _fixture_same_job_inversion() -> dict:
-    """Gate step before burst step in the same job."""
-    return {
-        "jobs": {
-            "benchmark": _job(
-                [
-                    _pytest_step(_gate_run()),
-                    _pytest_step(_burst_run()),
-                ]
-            ),
-        }
-    }
-
-
-def _fixture_gate_nowhere() -> dict:
-    return {
-        "jobs": {
-            "benchmark": _job([_pytest_step(_burst_run())]),
-        }
-    }
-
-
-def _fixture_gate_twice() -> dict:
-    return {
-        "jobs": {
-            "functional": _job([_pytest_step("python -m pytest tests/delivery -v")]),
-            "other": _job([_pytest_step(_gate_run())]),
-            "benchmark": _job([_pytest_step(_burst_run())]),
-        }
-    }
-
-
-def _fixture_working_directory() -> dict:
-    """Unit-shaped job (wd-relative tests/ + --ignore) beside a same-job gate.
-
-    Green under the stated resolution rule; a working-directory-blind
-    resolver reads the unit job's tests/ as repository-root tests/ and
-    finds two collectors (DW1 discriminating control).
-    """
-    return {
-        "jobs": {
-            "unit-gateway": _job(
-                [
-                    _pytest_step(
-                        ".venv/bin/python -m pytest tests/ "
-                        "--cov=gateway --ignore=tests/test_b1_ingest_burst.py",
-                        workdir="services/gateway",
-                    )
-                ]
-            ),
-            "benchmark": _job(
-                [
-                    _pytest_step(_burst_run()),
-                    _pytest_step(_gate_run()),
-                ]
-            ),
-        }
-    }
-
-
-def _fixture_downstream_job() -> dict:
-    """Gate collected by a separate job with needs: [benchmark] — admissible."""
-    return {
-        "jobs": {
-            "benchmark": _job([_pytest_step(_burst_run())]),
-            "sizing-ledger": _job(
-                [_pytest_step(_gate_run())],
-                needs=["benchmark"],
-            ),
-        }
-    }
-
-
 # W1: one run: body may contain more than one pytest command. The parser must
-# emit one (roots, ignores) per command, not merge them.
+# emit one (roots, ignores) per command, not merge them; a merged pair would
+# qualify the first command's roots with the second command's --ignore. The
+# sizing-ledger path is only a sample --ignore operand here.
 _TWO_PYTEST_RUN = (
     "python -m pytest tests/delivery -v\n"
     "python -m pytest tests/functional "
@@ -827,25 +639,6 @@ _UNIT_GATEWAY_LEAKED_ROOTS = (
     "80",
     "gateway",
 )
-
-
-def _fixture_two_pytest_commands_in_one_run() -> dict:
-    """Two pytest commands in one run: body; first collects the gate.
-
-    Same-job siting (producer, then the two-command body). A parser that
-    merges the second command's --ignore onto the first command's roots
-    reports no collector — the fail-open W1 exists to close.
-    """
-    return {
-        "jobs": {
-            "benchmark": _job(
-                [
-                    _pytest_step(_burst_run()),
-                    _pytest_step(_TWO_PYTEST_RUN),
-                ]
-            ),
-        }
-    }
 
 
 def _unit_gateway_pytest_run() -> str:
@@ -902,43 +695,9 @@ def test_unit_gateway_pytest_roots_do_not_leak_trailing_command_tokens():
 
 # W1 residual (round 2): '&&' is a repo simple-command separator
 # (test_manifests._split_simple_commands) and is not banned in guarded
-# run: bodies. The ';'/newline-only splitter treats an &&-joined pair as
-# one command and goes fail-open on the deadlock FP-IG-26 exists to catch.
+# run: bodies. A ';'/newline-only splitter would treat an &&-joined pair as
+# one command and hand the second command's operands to the first.
 _TWO_PYTEST_RUN_AND_AND = _TWO_PYTEST_RUN.replace("\n", " && ")
-
-
-def _fixture_two_pytest_commands_joined_by_and_and() -> dict:
-    """Same-job twin of _fixture_two_pytest_commands_in_one_run, joined by &&."""
-    return {
-        "jobs": {
-            "benchmark": _job(
-                [
-                    _pytest_step(_burst_run()),
-                    _pytest_step(_TWO_PYTEST_RUN_AND_AND),
-                ]
-            ),
-        }
-    }
-
-
-def _and_and_joined_functional_collects_gate(workflow: dict) -> dict:
-    """Honest-looking edit of the shipped workflow.
-
-    Prepends a second pytest that collects tests/delivery onto functional[9],
-    joined by ' && '. Pytest then collects the gate in both functional and
-    benchmark; FP-IG-26 must go red. A parser that does not split on &&
-    applies the second command's --ignore to the first command and reports
-    only benchmark — a false green (the deadlock).
-    """
-    wf = copy.deepcopy(workflow)
-    step = wf["jobs"]["functional"]["steps"][9]
-    run = step.get("run")
-    assert isinstance(run, str), "functional[9] must be a run: step"
-    assert "test_delivery_sizing_ledger.py" in run, (
-        "functional[9] is not the sizing-ledger --ignore step"
-    )
-    step["run"] = "python -m pytest tests/delivery -v && " + run
-    return wf
 
 
 def test_pytest_invocations_splits_on_and_and_too():
@@ -971,9 +730,11 @@ def test_pytest_invocations_does_not_split_on_quoted_separator():
 
 # ---------------------------------------------------------------------------
 # bench-on-demand FP-BOD-1/2: the wrapper indirection is gone with the target.
-# CI no longer delegates any B1 run to `scripts/integration-test.sh`, there is
-# no live CI producer of sizing-ledger rows, and the FP-IG-26 producer check
-# and its resolution helpers were retired with it. The `images` job's tag gate
-# is pinned by test_manifests.py::test_release_record_gates_image_push.
+# CI no longer delegates any B1 run to `scripts/integration-test.sh` and there
+# is no live CI producer of sizing-ledger rows. The FP-IG-26 producer-order
+# check, its resolution helpers and its fixture builders are all retired
+# (b1-leftover-cleanup FP-LC-1); only the pytest-command parser above remains.
+# The `images` job's tag gate is pinned by
+# test_manifests.py::test_release_record_gates_image_push.
 # ---------------------------------------------------------------------------
 

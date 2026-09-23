@@ -7403,7 +7403,10 @@ def test_on_demand_tier_is_covered_asserted_and_absent_from_ci():
         ]
         assert named, entry["id"]
         for link in named:
-            assert _link_asserts_threshold(link, REPO_ROOT), link
+            # The helper returns (verdict, reason); a nonempty tuple is always
+            # truthy, so the verdict itself is what must be asserted.
+            ok, reason = _link_asserts_threshold(link, REPO_ROOT)
+            assert ok, f"{link}: {reason}"
             path = _resolve_test_file(link, REPO_ROOT)
             assert path is not None and path.is_file(), link
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -7453,6 +7456,42 @@ def test_on_demand_tier_is_covered_asserted_and_absent_from_ci():
                             f"ignores={sorted(str(i) for i in resolved_ignores)})"
                         )
     assert offences == [], offences
+
+
+def test_on_demand_tier_rejects_false_threshold_verdict(monkeypatch):
+    """FP-LC-3 [function test]: a `(False, reason)` verdict fails the caller.
+
+    `_link_asserts_threshold` returns a `(bool, reason)` tuple. A caller that
+    asserts the tuple itself is satisfied by `(False, reason)`, because a
+    nonempty tuple is truthy -- so the on-demand test would accept a linked
+    B1/B11 test that carries no threshold comparison at all.
+
+    The module global the caller resolves at call time is replaced with a fake
+    that returns a false verdict for the B1 product link and delegates every
+    other link to the real helper; the real on-demand test must then raise,
+    naming both the link and the reason. This observes the Boolean the caller
+    acts on, not its source text.
+    """
+    module = sys.modules[__name__]
+    original = module._link_asserts_threshold
+    sentinel_reason = "sentinel_false_threshold"
+    faked: "list[str]" = []
+
+    def false_for_product_link(link, root=REPO_ROOT):
+        if link == B1_PRODUCT_LINK:
+            faked.append(link)
+            return False, sentinel_reason
+        return original(link, root)
+
+    monkeypatch.setattr(module, "_link_asserts_threshold", false_for_product_link)
+    with pytest.raises(AssertionError) as excinfo:
+        test_on_demand_tier_is_covered_asserted_and_absent_from_ci()
+    # The sentinel link is one the on-demand test actually checks; a link it
+    # never reached would make the expected failure vacuous.
+    assert faked == [B1_PRODUCT_LINK]
+    message = str(excinfo.value)
+    assert B1_PRODUCT_LINK in message, message
+    assert sentinel_reason in message, message
 
 
 #: Review S1: the shapes a pinned body must refuse. Each is a real way to run
