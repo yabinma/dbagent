@@ -212,8 +212,10 @@ bash ../../../scripts/py-coverage-check.sh 80 rca_common
 **Unit — Go and web:**
 
 ```bash
-go test ./... -race -timeout 300s -p 1     # -p 1: packages spin up real Postgres testcontainers
-bash scripts/go-coverage-check.sh 80
+# One pass: -race and the coverage profile come from the same execution
+# (-p 1: packages spin up real Postgres testcontainers); the gate reads that file.
+go test ./... -race -coverprofile=/tmp/dbagent-ci-go.coverprofile -covermode=atomic -timeout 300s -p 1
+bash scripts/go-coverage-check.sh 80 /tmp/dbagent-ci-go.coverprofile
 
 cd web && npm ci && npm test               # vitest + per-file coverage thresholds
 ```
@@ -232,7 +234,9 @@ services/worker/.venv/bin/python -m pytest \
   tests/functional tests/delivery tests/mocks/llm -v \
   --ignore=tests/functional/m2_probe_link
 
-go test ./tests/functional/... -timeout 300s   # real probe + probe-gateway over real mTLS
+# Optional, isolated F8/F9 run (real probe + probe-gateway over real mTLS).
+# CI already runs this package inside unit-go's `go test ./... -race`.
+go test ./tests/functional/... -timeout 300s
 ```
 
 See [`tests/delivery/README.md`](tests/delivery/README.md) for what the

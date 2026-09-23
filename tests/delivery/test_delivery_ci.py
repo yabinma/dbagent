@@ -169,22 +169,186 @@ def test_web_unit_job_and_vite_enforce_per_file_coverage_above_80():
     assert "80" in name or "coverage" in name.lower()
 
 
-def test_go_unit_job_uses_strict_per_package_coverage_gate():
-    """W2: go-coverage-check.sh must be invoked; the script itself enforces
-    strict inequality against the threshold argument."""
-    from pathlib import Path
+#: ci-runtime-1 FP-CIR1-3/5/6: the unit-go route, restated as literals here
+#: rather than read from the workflow it protects.
+_UNIT_GO_PROFILE = "/tmp/dbagent-ci-go.coverprofile"
+_UNIT_GO_COMMAND = (
+    f"go test ./... -race -coverprofile={_UNIT_GO_PROFILE} "
+    "-covermode=atomic -timeout 300s -p 1"
+)
+_UNIT_GO_COVERAGE_RUN = f"bash scripts/go-coverage-check.sh 80 {_UNIT_GO_PROFILE}"
+_GO_COVERAGE_SCRIPT = REPO_ROOT / "scripts" / "go-coverage-check.sh"
 
+
+def test_go_unit_job_uses_strict_per_package_coverage_gate():
+    """W2 / ci-runtime-1 FP-CIR1-3, FP-CIR1-6: unit-go's one Go pass writes the
+    profile its coverage gate reads, and the gate is strict.
+
+    Named for a coverage step that measures something other than the -race
+    pass it follows: a second `go test` run, a different or stale profile, a
+    gate that can run after a failed test, or a lowered floor. unit-go runs
+    exactly one `go test` step (the combined literal), the IMMEDIATELY next
+    step is the gate on the same literal profile, neither step can be skipped
+    or made non-fatal, the script's CI (two-argument) branch launches no Go at
+    all, and the script's inequality is still strict.
+    """
     jobs = _load()["jobs"]
     assert "unit-go" in jobs
-    runs = "\n".join(
-        step.get("run") or "" for step in (jobs["unit-go"].get("steps") or [])
-    )
-    assert "go-coverage-check.sh" in runs
-    script = (
-        Path(__file__).resolve().parents[2] / "scripts" / "go-coverage-check.sh"
-    ).read_text(encoding="utf-8")
+    steps = jobs["unit-go"].get("steps") or []
+    go_steps = [
+        i for i, step in enumerate(steps)
+        if re.search(r"(^|\n)\s*go test\b", step.get("run") or "")
+    ]
+    assert len(go_steps) == 1, go_steps
+    gi = go_steps[0]
+    assert steps[gi]["run"].strip() == _UNIT_GO_COMMAND
+    assert gi + 1 < len(steps), "no coverage step after the Go pass"
+    assert steps[gi + 1]["run"].strip() == _UNIT_GO_COVERAGE_RUN
+    gate_steps = [i for i, s in enumerate(steps) if "go-coverage-check.sh" in (s.get("run") or "")]
+    assert gate_steps == [gi + 1], gate_steps
+    profile = re.search(r"-coverprofile=(\S+)", steps[gi]["run"]).group(1)
+    assert steps[gi + 1]["run"].split()[-1] == profile == _UNIT_GO_PROFILE
+    for index in (gi, gi + 1):
+        assert "if" not in steps[index], index
+        assert "continue-on-error" not in steps[index], index
+        assert "shell" not in steps[index], index
+    assert "continue-on-error" not in jobs["unit-go"] and "if" not in jobs["unit-go"]
+
+    script = _GO_COVERAGE_SCRIPT.read_text(encoding="utf-8")
     assert "pct > threshold" in script or "pct <= threshold" in script
     assert "strictly above" in script.lower() or "strict inequality" in script.lower()
+    # The two-argument (CI) branch reads a profile; only the else-branch runs Go.
+    ci_branch = script.split('if [ "$#" -eq 2 ]; then', 1)[1].split("\nelse\n", 1)[0]
+    assert not re.search(r"(^|\n)\s*go\s", ci_branch), "the CI branch runs a go command"
+    assert 'PROFILE="$2"' in ci_branch
+
+
+def _coverage_run(tmp_path: Path, *args: str) -> tuple[int, str, bool]:
+    """Run the coverage script with a `go` shim first on PATH.
+
+    The shim records that it was started and fails, so a run that reached Go
+    both leaves the marker and cannot print PASS. Returns (exit code, combined
+    output, whether Go was started).
+    """
+    import os
+    import subprocess
+
+    shim = tmp_path / "shim"
+    shim.mkdir(exist_ok=True)
+    marker = tmp_path / "go-was-started"
+    go = shim / "go"
+    go.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 97\n', encoding="utf-8")
+    go.chmod(0o755)
+    env = {**os.environ, "PATH": f"{shim}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    for key in list(env):
+        if key.startswith(("PYTHON", "PYTEST")):
+            env.pop(key)
+    if marker.exists():
+        marker.unlink()
+    done = subprocess.run(
+        ["bash", str(_GO_COVERAGE_SCRIPT), *args],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    return done.returncode, done.stdout + done.stderr, marker.exists()
+
+
+def _profile(tmp_path: Path, name: str, text: str) -> str:
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def _main_func_line(rel: str) -> int:
+    lines = (REPO_ROOT / rel).read_text(encoding="utf-8").splitlines()
+    return next(i for i, ln in enumerate(lines, start=1) if ln.startswith("func main()"))
+
+
+_MOD = "github.com/yabinma/dbagent/"
+
+
+def test_go_coverage_reuses_profile_fail_closed(tmp_path: Path):
+    """ci-runtime-1 FP-CIR1-5 [function test]: the CI path consumes a profile,
+    never starts Go, and fails closed on anything it cannot read in full.
+
+    Named for a coverage gate that turns bad input into a pass -- a missing,
+    empty, malformed, non-atomic or statement-free profile read as 100% --
+    or that quietly re-runs the suite. Every two-argument run below has a
+    `go` shim first on PATH that records being started; it never is. The
+    strict `>80%` arithmetic and the gen/go and `main()` exclusions are
+    exercised on tiny synthetic profiles; the one-argument local path still
+    starts Go to build its own profile, and a failing Go stops it before PASS.
+    """
+    main_go = "probe/cmd/probe/main.go"
+    main_line = _main_func_line(main_go)
+    valid = (
+        "mode: atomic\n"
+        f"{_MOD}probe/internal/a/x.go:1.1,2.2 9 1\n"
+        f"{_MOD}probe/internal/a/x.go:3.1,4.2 1 0\n"
+        # generated code: excluded entirely, so its misses cost nothing
+        f"{_MOD}gen/go/x/y.pb.go:1.1,9.9 500 0\n"
+        # main(): excluded by line range, so its misses cost nothing either
+        f"{_MOD}{main_go}:{main_line}.1,{main_line + 1}.2 400 0\n"
+        "\n"
+    )
+    code, out, started = _coverage_run(tmp_path, "80", _profile(tmp_path, "ok.out", valid))
+    assert (code, started) == (0, False), out
+    assert "PASS: every package and the repo total are strictly above 80" in out
+    assert "TOTAL (excluding generated code + main()): 9/10 = 90.0%" in out
+
+    # Strict inequality: exactly 80.0% is a failure, per package and in total.
+    at_80 = (
+        "mode: atomic\n"
+        f"{_MOD}probe/internal/a/x.go:1.1,2.2 8 3\n"
+        f"{_MOD}probe/internal/a/x.go:3.1,4.2 2 0\n"
+    )
+    code, out, started = _coverage_run(tmp_path, "80", _profile(tmp_path, "eighty.out", at_80))
+    assert code != 0 and not started, out
+    assert "FAIL" in out and "PASS" not in out
+
+    # The main() exclusion is the function only: an uncovered statement
+    # elsewhere in the same file still counts.
+    outside_main = valid + f"{_MOD}{main_go}:1.1,1.9 5 0\n"
+    code, out, started = _coverage_run(
+        tmp_path, "80", _profile(tmp_path, "outside.out", outside_main)
+    )
+    assert code != 0 and not started, out
+    assert "probe/cmd/probe" in out and "PASS" not in out
+
+    bad_inputs = {
+        "absent": str(tmp_path / "does-not-exist.out"),
+        "empty": _profile(tmp_path, "empty.out", ""),
+        "header_only": _profile(tmp_path, "header.out", "mode: atomic\n"),
+        "non_atomic": _profile(tmp_path, "set.out", valid.replace("mode: atomic", "mode: set")),
+        "no_header": _profile(tmp_path, "nohdr.out", valid.split("\n", 1)[1]),
+        "malformed_record": _profile(
+            tmp_path, "bad.out", valid + f"{_MOD}probe/internal/a/x.go:5.1 1 1\n"
+        ),
+        "truncated_record": _profile(
+            tmp_path, "trunc.out", valid + f"{_MOD}probe/internal/a/x.go:5.1,6.2 1\n"
+        ),
+        "only_generated_code": _profile(
+            tmp_path, "gen.out", f"mode: atomic\n{_MOD}gen/go/x/y.pb.go:1.1,9.9 5 5\n"
+        ),
+        "zero_statement_records": _profile(
+            tmp_path, "zero.out", f"mode: atomic\n{_MOD}probe/internal/a/x.go:1.1,2.2 0 3\n"
+        ),
+        "empty_path": "",
+    }
+    for label, path in bad_inputs.items():
+        code, out, started = _coverage_run(tmp_path, "80", path)
+        assert code != 0, (label, out)
+        assert not started, (label, out)
+        assert "PASS" not in out, (label, out)
+        assert "FAILED" in out, (label, out)
+
+    code, out, started = _coverage_run(tmp_path, "80", _profile(tmp_path, "x.out", valid), "extra")
+    assert code == 2 and not started, out
+
+    # The one-argument local route still generates its own profile with Go,
+    # and a failed Go run ends it before any verdict is printed.
+    code, out, started = _coverage_run(tmp_path, "80")
+    assert started, out
+    assert code != 0 and "PASS" not in out, out
 
 
 def test_python_unit_jobs_enforce_strict_per_module_coverage():

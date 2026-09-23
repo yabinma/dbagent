@@ -140,7 +140,14 @@ EXPECTED_CI_JOBS = {
     # `images` so a red record stops the push.
     "release-bench-record",
 }
-GO_TEST_JOBS = {"unit-go", "functional", "benchmark", "manifest-guard"}
+# ci-runtime-1 FP-CIR1-4: `functional` no longer runs `go test` directly --
+# unit-go's `go test ./...` owns tests/functional/m2_probe_link -- so it leaves
+# the direct-command inventory. It still installs Go and regenerates gen/go for
+# F15/F16's Python-launched `go build`/`go test` subprocesses, so it stays under
+# every toolchain protection (setup-go version, runner, forbidden Go env keys)
+# through GO_TOOLCHAIN_JOBS.
+GO_TEST_JOBS = {"unit-go", "benchmark", "manifest-guard"}
+GO_TOOLCHAIN_JOBS = GO_TEST_JOBS | {"functional"}
 GO_TOOLCHAIN_ENV_NAMES = {"CC", "CXX", "FC", "AR", "PKG_CONFIG"}
 PYTHON_OPT_JOBS = {"functional", "benchmark", "e2e", "manifest-guard"}
 RACE_SHORT_BAN_JOBS = {"functional", "benchmark", "manifest-guard"}
@@ -151,15 +158,13 @@ GUARDED_STEPS: dict[str, list[int]] = {
     "unit-gateway": [3],
     "unit-dashboard-api": [3],
     "unit-go": [7],
-    # bench-on-demand FP-BOD-1: index 9 is the measured pytest step, which is
-    # now an unparsed reviewable literal (see EXPECTED_FUNCTIONAL_PYTEST_RUN),
-    # so the guarded-step envelope covers the Go step alone.
-    "functional": [10],
-    # bench-on-demand FP-BOD-1: the two B1 wrapper steps are deleted, so the
-    # benchmark job has no bash-wrapper step left at all and its indices close
-    # up. Steps 16 and 17 are the A10(v) hygiene gate and the B2/B10 node-id
-    # pytest; 18 is the sizing-ledger provenance gate.
-    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18],
+    # ci-runtime-1 FP-CIR1-4/6: `functional` has no guarded step left. Index 9
+    # is the measured pytest step, an unparsed reviewable literal (see
+    # EXPECTED_FUNCTIONAL_PYTEST_RUN), and its direct Go step at 10 is deleted.
+    # ci-runtime-1 FP-CIR1-2: the benchmark job's manifest-validation step at
+    # 7 is deleted, so B3..B14 are 7..14, 15 is the A10(v) hygiene gate
+    # (unparsed), 16 is the B2/B10 node-id pytest and 17 the sizing-ledger gate.
+    "benchmark": [7, 8, 9, 10, 11, 12, 13, 14, 16, 17],
     "manifest-guard": [5, 6],
 }
 
@@ -193,9 +198,18 @@ EXPECTED_NEEDS_GRAPH: dict[str, tuple[str, ...]] = {
 }
 assert set(EXPECTED_NEEDS_GRAPH) == EXPECTED_CI_JOBS
 
+#: ci-runtime-1 FP-CIR1-3/5: the one literal profile path the unit-go Go
+#: command writes and the coverage step reads, restated here rather than read
+#: from the workflow it protects.
+CI_GO_COVERPROFILE = "/tmp/dbagent-ci-go.coverprofile"
+EXPECTED_UNIT_GO_COMMAND = (
+    f"go test ./... -race -coverprofile={CI_GO_COVERPROFILE} "
+    "-covermode=atomic -timeout 300s -p 1"
+)
+EXPECTED_UNIT_GO_COVERAGE_RUN = f"bash scripts/go-coverage-check.sh 80 {CI_GO_COVERPROFILE}"
+
 EXPECTED_GO_TEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
-    "unit-go": [(None, "go test ./... -race -timeout 300s -p 1")],
-    "functional": [(None, "go test ./tests/functional/... -v -timeout 300s")],
+    "unit-go": [(None, EXPECTED_UNIT_GO_COMMAND)],
     "benchmark": [
         (None, "go test ./services/probe-gateway/internal/gwserver/... -run TestB3 -v -timeout 60s"),
         (None, "go test ./services/probe-gateway/internal/gwserver/... -run TestB4 -v -timeout 60s"),
@@ -230,8 +244,9 @@ EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
         ".venv/bin/python -m pytest tests/ --cov=dashboard_api "
         "--cov-report=term-missing --cov-fail-under=81",
     )],
+    # ci-runtime-1 FP-CIR1-2: the manifest suite's tuple is gone from this
+    # job; `manifest-guard` below is its only CI owner.
     "benchmark": [
-        (None, "services/worker/.venv/bin/python -m pytest tests/functional/test_manifests.py -v"),
         (None, "services/worker/.venv/bin/python -m pytest "
          "libs/py/rca_common/tests/test_rawcmd.py::test_b6_static_validator_under_5ms -v"),
         (None, "services/worker/.venv/bin/python -m pytest "
@@ -313,7 +328,8 @@ EXPECTED_FUNCTIONAL_PYTEST_RUN = (
     '  tests/functional tests/delivery tests/mocks/llm -v \\\n'
     '  --ignore=tests/functional/m2_probe_link \\\n'
     '  --ignore=services/gateway/tests/test_b1_ingest_burst.py \\\n'
-    '  --ignore=tests/delivery/test_delivery_sizing_ledger.py\n'
+    '  --ignore=tests/delivery/test_delivery_sizing_ledger.py \\\n'
+    '  --ignore=tests/functional/test_manifests.py\n'
     'services/worker/.venv/bin/python -m pytest \\\n'
     '  tests/functional/test_release_bench_record.py -v \\\n'
     '  --cov=check_release_bench_record --cov-branch --cov-fail-under=81\n'
@@ -822,25 +838,76 @@ def _stmt_of(node: ast.AST, parents: dict[int, tuple[ast.AST, str]]) -> ast.AST:
     return cur
 
 
-def _resolve_module_binding(tree: ast.Module, name: str) -> ast.stmt | None:
+@dataclass
+class _ModuleIndex:
+    """ci-runtime-1 FP-CIR1-1: the whole-module facts of ONE parsed source.
+
+    Built once per ``_python_test_asserts_threshold`` call, right after its
+    ``ast.parse``, and dropped when the call returns. It is never cached by
+    path, filename, mtime or module global, so a second call on changed bytes
+    parses and indexes afresh and cannot inherit an earlier verdict. Before it
+    existed, every binding lookup re-walked the whole tree: one link check on
+    the 9,392-line B1 burst file ran ``_binding_occurrences`` 1,291 times and
+    ``_build_parent_map`` 923 times. The rules those walks feed are unchanged;
+    only the number of walks is.
+    """
+
+    tree: ast.Module
+    occurrences: dict[str, list[ast.AST]]
+    parents: dict[int, tuple[ast.AST, str]]
+    has_star_import: bool
+    body_ids: set[int]
+
+    @classmethod
+    def build(cls, tree: ast.Module) -> "_ModuleIndex":
+        # Exactly one binding walk, one parent-map walk and one star-import
+        # walk -- the §3.1 bound the benchmark test counts.
+        return cls(
+            tree=tree,
+            occurrences=_binding_occurrences(tree),
+            parents=_build_parent_map(tree),
+            has_star_import=_file_has_star_import(tree),
+            body_ids={id(stmt) for stmt in tree.body},
+        )
+
+
+def _index_for(tree: ast.Module, index: "_ModuleIndex | None") -> _ModuleIndex:
+    """The caller's index for *tree*, or a short-lived one when none was given.
+
+    Every pre-existing call shape without ``index`` stays valid and pays what it
+    paid before: a fresh walk of its own tree. An index built for a different
+    tree is a caller bug, never silently mixed in.
+    """
+    if index is None:
+        return _ModuleIndex.build(tree)
+    if index.tree is not tree:
+        raise ValueError("_ModuleIndex was built for a different AST")
+    return index
+
+
+def _resolve_module_binding(
+    tree: ast.Module, name: str, *, index: _ModuleIndex | None = None
+) -> ast.stmt | None:
     """(H): star poison; exactly one occurrence anywhere; must be direct tree.body."""
-    if _file_has_star_import(tree):
+    idx = _index_for(tree, index)
+    if idx.has_star_import:
         return None
-    occ = _binding_occurrences(tree)
-    nodes = occ.get(name) or []
+    nodes = idx.occurrences.get(name) or []
     if len(nodes) != 1:
         return None
-    parents = _build_parent_map(tree)
-    holder = _stmt_of(nodes[0], parents)
-    if holder not in tree.body:
+    holder = _stmt_of(nodes[0], idx.parents)
+    if id(holder) not in idx.body_ids:
         return None
     return holder  # type: ignore[return-value]
 
 
-def _numeric_name_bindings(tree: ast.Module) -> dict[str, ast.AST]:
+def _numeric_name_bindings(
+    tree: ast.Module, *, index: _ModuleIndex | None = None
+) -> dict[str, ast.AST]:
+    idx = _index_for(tree, index)
     result: dict[str, ast.AST] = {}
-    for name in _binding_occurrences(tree):
-        stmt = _resolve_module_binding(tree, name)
+    for name in idx.occurrences:
+        stmt = _resolve_module_binding(tree, name, index=idx)
         if stmt is None:
             continue
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -856,8 +923,10 @@ def _numeric_name_bindings(tree: ast.Module) -> dict[str, ast.AST]:
     return result
 
 
-def _resolves_to_pytest(tree: ast.Module, p: str) -> bool:
-    stmt = _resolve_module_binding(tree, p)
+def _resolves_to_pytest(
+    tree: ast.Module, p: str, *, index: _ModuleIndex | None = None
+) -> bool:
+    stmt = _resolve_module_binding(tree, p, index=index)
     if not isinstance(stmt, ast.Import):
         return False
     for a in stmt.names:
@@ -867,8 +936,10 @@ def _resolves_to_pytest(tree: ast.Module, p: str) -> bool:
     return False
 
 
-def _resolves_to_pytest_fail(tree: ast.Module, f: str) -> bool:
-    stmt = _resolve_module_binding(tree, f)
+def _resolves_to_pytest_fail(
+    tree: ast.Module, f: str, *, index: _ModuleIndex | None = None
+) -> bool:
+    stmt = _resolve_module_binding(tree, f, index=index)
     if not isinstance(stmt, ast.ImportFrom):
         return False
     if stmt.level != 0 or stmt.module != "pytest":
@@ -930,6 +1001,8 @@ def _operand_reasons(
     bindings: dict[str, ast.AST],
     tree: ast.Module,
     func: ast.AST,
+    *,
+    index: _ModuleIndex | None = None,
 ) -> str | None:
     """Row 8/9: both_operands_numeric or the no-numeric three-way split."""
     flags = [_is_numeric_term(op, bindings) for op in operands]
@@ -938,21 +1011,20 @@ def _operand_reasons(
     if any(flags):
         return None  # qualifies on operands
     # row 9: no numeric term
-    if _file_has_star_import(tree):
+    idx = _index_for(tree, index)
+    if idx.has_star_import:
         return "star_import"
     # any bare Name operand bound outside the linked function?
-    body_ids = {id(s) for s in tree.body}
     for op in operands:
         if not isinstance(op, ast.Name):
             continue
         name = op.id
-        occ = _binding_occurrences(tree).get(name) or []
+        occ = idx.occurrences.get(name) or []
         for n in occ:
             # binding outside the linked function: direct tree.body member
             # walk up to stmt
-            parents = _build_parent_map(tree)
-            holder = _stmt_of(n, parents)
-            if holder in tree.body:
+            holder = _stmt_of(n, idx.parents)
+            if id(holder) in idx.body_ids:
                 return "unresolved_identifier"
     return "no_numeric_term"
 
@@ -964,21 +1036,25 @@ def _is_threshold_compare_shape(node: ast.AST) -> bool:
     return all(isinstance(op, _ORDERED_OPS) for op in node.ops)
 
 
-def _stmt_explicitly_fails(stmt: ast.stmt, tree: ast.Module) -> bool:
+def _stmt_explicitly_fails(
+    stmt: ast.stmt, tree: ast.Module, *, index: _ModuleIndex | None = None
+) -> bool:
     if isinstance(stmt, ast.Raise):
         return True
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
         func = stmt.value.func
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            if func.attr == "fail" and _resolves_to_pytest(tree, func.value.id):
+            if func.attr == "fail" and _resolves_to_pytest(tree, func.value.id, index=index):
                 return True
-        if isinstance(func, ast.Name) and _resolves_to_pytest_fail(tree, func.id):
+        if isinstance(func, ast.Name) and _resolves_to_pytest_fail(tree, func.id, index=index):
             return True
     return False
 
 
-def _body_has_explicit_fail(body: list[ast.stmt], tree: ast.Module) -> bool:
-    return any(_stmt_explicitly_fails(s, tree) for s in body)
+def _body_has_explicit_fail(
+    body: list[ast.stmt], tree: ast.Module, *, index: _ModuleIndex | None = None
+) -> bool:
+    return any(_stmt_explicitly_fails(s, tree, index=index) for s in body)
 
 
 def _build_parent_map(tree: ast.AST) -> dict[int, tuple[ast.AST, str]]:
@@ -1408,19 +1484,23 @@ def _pytestmark_skips(tree: ast.Module) -> bool:
     return False
 
 
-def _is_block_exit(stmt: ast.stmt, tree: ast.Module) -> bool:
+def _is_block_exit(
+    stmt: ast.stmt, tree: ast.Module, *, index: _ModuleIndex | None = None
+) -> bool:
     if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
         return True
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
         func = stmt.value.func
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            if func.attr in {"skip", "xfail", "exit"} and _resolves_to_pytest(tree, func.value.id):
+            if func.attr in {"skip", "xfail", "exit"} and _resolves_to_pytest(
+                tree, func.value.id, index=index
+            ):
                 return True
         if isinstance(func, ast.Name):
             # bare skip/xfail/exit from from pytest import ...
             for name in ("skip", "xfail", "exit"):
                 if func.id == name or True:
-                    stmt_b = _resolve_module_binding(tree, func.id)
+                    stmt_b = _resolve_module_binding(tree, func.id, index=index)
                     if (
                         isinstance(stmt_b, ast.ImportFrom)
                         and stmt_b.level == 0
@@ -1433,7 +1513,14 @@ def _is_block_exit(stmt: ast.stmt, tree: ast.Module) -> bool:
     return False
 
 
-def _candidate_is_dead(node: ast.AST, func: ast.AST, parents: dict, tree: ast.Module) -> bool:
+def _candidate_is_dead(
+    node: ast.AST,
+    func: ast.AST,
+    parents: dict,
+    tree: ast.Module,
+    *,
+    index: _ModuleIndex | None = None,
+) -> bool:
     """(R)(1): preceded by unconditional block exit at any ancestor list level."""
     # Build statement-list membership
     cur: ast.AST = node
@@ -1448,13 +1535,17 @@ def _candidate_is_dead(node: ast.AST, func: ast.AST, parents: dict, tree: ast.Mo
             if isinstance(lst, list) and cur in lst:
                 idx = lst.index(cur)
                 for earlier in lst[:idx]:
-                    if isinstance(earlier, ast.stmt) and _is_block_exit(earlier, tree):
+                    if isinstance(earlier, ast.stmt) and _is_block_exit(
+                        earlier, tree, index=index
+                    ):
                         return True
         cur = parent
     return False
 
 
-def _failure_type_of_candidate(node: ast.AST, tree: ast.Module) -> str | None:
+def _failure_type_of_candidate(
+    node: ast.AST, tree: ast.Module, *, index: _ModuleIndex | None = None
+) -> str | None:
     """Return failure type name, or None for unknown (any handler disqualifies)."""
     if isinstance(node, ast.Assert):
         return "AssertionError"
@@ -1475,12 +1566,20 @@ def _failure_type_of_candidate(node: ast.AST, tree: ast.Module) -> str | None:
                 func = s.value.func
                 if isinstance(func, ast.Attribute) and func.attr == "fail":
                     return "BaseException"  # pytest.Failed
-                if isinstance(func, ast.Name) and _resolves_to_pytest_fail(tree, func.id):
+                if isinstance(func, ast.Name) and _resolves_to_pytest_fail(
+                    tree, func.id, index=index
+                ):
                     return "BaseException"
     return "AssertionError"
 
 
-def _handler_can_catch(handler: ast.ExceptHandler, fail_type: str | None, tree: ast.Module) -> bool:
+def _handler_can_catch(
+    handler: ast.ExceptHandler,
+    fail_type: str | None,
+    tree: ast.Module,
+    *,
+    index: _ModuleIndex | None = None,
+) -> bool:
     if handler.type is None:
         return True
     def final_name(t: ast.AST) -> str | None:
@@ -1506,7 +1605,7 @@ def _handler_can_catch(handler: ast.ExceptHandler, fail_type: str | None, tree: 
             return True
         # Name with a binding occurrence → unclassifiable alias
         if isinstance(t, ast.Name):
-            occ = _binding_occurrences(tree).get(t.id) or []
+            occ = _index_for(tree, index).occurrences.get(t.id) or []
             if occ:
                 return True
         return False
@@ -1521,16 +1620,21 @@ def _handler_reraises(handler: ast.ExceptHandler) -> bool:
 
 
 def _candidate_failure_is_swallowed(
-    node: ast.AST, func: ast.AST, parents: dict, tree: ast.Module
+    node: ast.AST,
+    func: ast.AST,
+    parents: dict,
+    tree: ast.Module,
+    *,
+    index: _ModuleIndex | None = None,
 ) -> bool:
     # (R)(2) try handlers
-    fail_type = _failure_type_of_candidate(node, tree)
+    fail_type = _failure_type_of_candidate(node, tree, index=index)
     for parent, field in _ancestor_chain(node, func, parents):
         if isinstance(parent, (ast.Try, getattr(ast, "TryStar", ast.Try))):
             if field != "body":
                 continue
             for h in parent.handlers:
-                if _handler_can_catch(h, fail_type, tree) and not _handler_reraises(h):
+                if _handler_can_catch(h, fail_type, tree, index=index) and not _handler_reraises(h):
                     return True
         # (R)(2b) suppressing with
         if isinstance(parent, (ast.With, ast.AsyncWith)) and field == "body":
@@ -1559,6 +1663,7 @@ def _python_qualifying_comparison(
     *,
     operators: tuple[type, ...],
     operand_rule: Callable[[ast.Compare], bool],
+    index: _ModuleIndex | None = None,
 ) -> list[ast.AST]:
     """Shared seam: §11.1.3 candidacy + reachability + *is-a-comparison* (FP-IG-19).
 
@@ -1574,6 +1679,12 @@ def _python_qualifying_comparison(
     ``operand_rule`` is applied to the comparison node. Equality admission and
     named-quantity matching are call-site concerns (FP-IG-19 only); the manifest
     checker passes the ordering set and the numeric-term rule.
+
+    ``index`` (ci-runtime-1 FP-CIR1-1) is the caller's per-source
+    ``_ModuleIndex`` for *tree*; the manifest checker passes its own. A caller
+    that omits it -- ``tests/delivery/test_delivery_b1_profile.py`` does -- gets
+    a short-lived index built here from *tree*, so neither call shape rebuilds
+    the whole-tree maps once per candidate.
     """
     if not isinstance(tree, ast.Module):
         return []
@@ -1585,7 +1696,8 @@ def _python_qualifying_comparison(
     if not matches:
         return []
     func = matches[0]
-    parents = _build_parent_map(tree)
+    idx = _index_for(tree, index)
+    parents = idx.parents
 
     def _is_cmp_over(node: ast.AST) -> bool:
         if not isinstance(node, ast.Compare) or not node.ops:
@@ -1603,7 +1715,7 @@ def _python_qualifying_comparison(
             test = node.test
             if not _is_cmp_over(test):
                 return False
-            if not _body_has_explicit_fail(node.body, tree):
+            if not _body_has_explicit_fail(node.body, tree, index=idx):
                 return False
             assert isinstance(test, ast.Compare)
             return bool(operand_rule(test))
@@ -1663,29 +1775,35 @@ def _python_test_asserts_threshold(
     # (R)(3) skipped
     if any(_is_skip_decorator(d) for d in func.decorator_list):
         return False, "skipped"
+
+    # ci-runtime-1 FP-CIR1-1: the whole-module walks happen here, once, for
+    # this parse of *src* only. Everything below reads the index.
+    index = _ModuleIndex.build(tree)
+
     if _pytestmark_skips(tree):
         # Module-scope ``from x import *`` is pytestmark-opaque (walker) *and*
         # poisons numeric-name resolution (H). Prefer the dedicated
         # ``star_import`` vocabulary token so the pinned (H) fixture keeps its
         # reason; the pytestmark default-deny still holds via the walker.
-        if _file_has_star_import(tree):
+        if index.has_star_import:
             return False, "star_import"
         return False, "skipped"
 
-    bindings = _numeric_name_bindings(tree)
-    parents = _build_parent_map(tree)
+    bindings = _numeric_name_bindings(tree, index=index)
+    parents = index.parents
 
     # Shared seam: candidacy + reachability + *is-a-comparison* (FP-IG-19).
     # Operand rule is the numeric-term rule; equality is NOT admitted here.
     def _manifest_operand_rule(cmp: ast.Compare) -> bool:
         operands: list[ast.AST] = [cmp.left, *cmp.comparators]
-        return _operand_reasons(operands, bindings, tree, func) is None
+        return _operand_reasons(operands, bindings, tree, func, index=index) is None
 
     qualifying = _python_qualifying_comparison(
         tree,
         name,
         operators=_ORDERED_OPS,
         operand_rule=_manifest_operand_rule,
+        index=index,
     )
     # Seam does not encode dead-after-return / swallowed; filter those here so
     # the shared core is the comparison qualifier and vocabulary stays intact.
@@ -1693,9 +1811,9 @@ def _python_test_asserts_threshold(
     # or fully-filtered seam must never be rescued into success by the
     # diagnostic fallback below.
     for node in qualifying:
-        if _candidate_is_dead(node, func, parents, tree):
+        if _candidate_is_dead(node, func, parents, tree, index=index):
             continue
-        if _candidate_failure_is_swallowed(node, func, parents, tree):
+        if _candidate_failure_is_swallowed(node, func, parents, tree, index=index):
             continue
         return True, None
 
@@ -1718,7 +1836,7 @@ def _python_test_asserts_threshold(
 
     first_reason: str | None = None
     for cand in candidates:
-        reason = _evaluate_candidate(cand, func, parents, tree, bindings)
+        reason = _evaluate_candidate(cand, func, parents, tree, bindings, index=index)
         if reason is None:
             # Qualifies under evaluate but was absent/filtered from the seam —
             # never accept; keep scanning for a vocabulary reason.
@@ -1734,16 +1852,19 @@ def _evaluate_candidate(
     parents: dict,
     tree: ast.Module,
     bindings: dict[str, ast.AST],
+    *,
+    index: _ModuleIndex | None = None,
 ) -> str | None:
     """Return None if qualifies, else first failing reason in (W)(3) order."""
+    idx = _index_for(tree, index)
     # 1 dead_candidate
-    if _candidate_is_dead(cand, func, parents, tree):
+    if _candidate_is_dead(cand, func, parents, tree, index=idx):
         return "dead_candidate"
     # 1a constantly dead branch
     if _in_constantly_dead_branch(cand, func, parents):
         return "not_a_threshold_comparison"
     # 2 swallowed
-    if _candidate_failure_is_swallowed(cand, func, parents, tree):
+    if _candidate_failure_is_swallowed(cand, func, parents, tree, index=idx):
         return "swallowed_candidate"
     # 3 form
     if isinstance(cand, ast.Assert):
@@ -1751,7 +1872,7 @@ def _evaluate_candidate(
         if not _is_threshold_compare_shape(test):
             return "not_a_threshold_comparison"
         operands: list[ast.AST] = [test.left, *test.comparators]
-        op_reason = _operand_reasons(operands, bindings, tree, func)
+        op_reason = _operand_reasons(operands, bindings, tree, func, index=idx)
         if op_reason is not None:
             return op_reason
         return None
@@ -1761,10 +1882,10 @@ def _evaluate_candidate(
         if not _is_threshold_compare_shape(test):
             return "not_a_threshold_comparison"
         # 5 fail branch
-        if not _body_has_explicit_fail(cand.body, tree):
+        if not _body_has_explicit_fail(cand.body, tree, index=idx):
             return "no_fail_in_branch"
         operands = [test.left, *test.comparators]
-        op_reason = _operand_reasons(operands, bindings, tree, func)
+        op_reason = _operand_reasons(operands, bindings, tree, func, index=idx)
         if op_reason is not None:
             return op_reason
         return None
@@ -2467,6 +2588,78 @@ def _words_from_commands(cmds: list[SimpleCommand]) -> list[Word]:
     return out
 
 
+#: ci-runtime-1 FP-CIR1-4/6: the job whose Python tests launch Go (F15's
+#: test_m6_go_config_env_interpolation.py, F16's test_m6_audit_completeness.py)
+#: and the index of its measured broad pytest, which the toolchain must precede.
+FUNCTIONAL_TOOLCHAIN_JOB = "functional"
+FUNCTIONAL_MEASURED_PYTEST_INDEX = 9
+FUNCTIONAL_BUF_VERSION = "1.47.2"
+FUNCTIONAL_CODEGEN_RUN = "bash scripts/gen-proto.sh"
+
+
+def _functional_toolchain_failures(
+    steps: list[dict], setup_idxs: list[int]
+) -> list[tuple[str, str]]:
+    """The functional job keeps setup-go, buf, the pinned protoc plugins and
+    codegen, in that order, all before its measured broad pytest.
+
+    `functional` has no direct `go test` any more, so nothing else in
+    `_ci_pin_failures` would notice these steps going missing -- and F15/F16's
+    Go subprocesses import generated `gen/go`. The setup-go version itself is
+    checked with every other GO_TOOLCHAIN_JOBS member. Reason tokens are the
+    existing toolchain ones: a missing piece is `missing_setup_go`, a piece in
+    the wrong place is `setup_go_ordering`.
+    """
+    out: list[tuple[str, str]] = []
+    buf_idxs = [
+        i for i, st in enumerate(steps)
+        if str(st.get("uses") or "").startswith("bufbuild/buf-setup-action@")
+    ]
+    protoc_idxs: list[int] = []
+    codegen_idxs: list[int] = []
+    for i, st in enumerate(steps):
+        run = _step_run(st)
+        if run is None:
+            continue
+        if run.strip() == FUNCTIONAL_CODEGEN_RUN:
+            codegen_idxs.append(i)
+        parsed = _parse_run(run)
+        if parsed is None:
+            continue
+        installs = {
+            c.args[1].literal_value
+            for c in parsed
+            if c.command_word is not None
+            and c.command_word.literal_value == "go"
+            and len(c.args) == 2
+            and c.args[0].literal_value == "install"
+        }
+        if installs == GO_INSTALL_TARGETS:
+            protoc_idxs.append(i)
+    for label, idxs in (
+        ("buf", buf_idxs), ("protoc plugins", protoc_idxs), ("codegen", codegen_idxs),
+    ):
+        if len(idxs) != 1:
+            out.append(("missing_setup_go", f"functional {label} x{len(idxs)}"))
+    if len(buf_idxs) == 1:
+        version = (steps[buf_idxs[0]].get("with") or {}).get("version")
+        if version != FUNCTIONAL_BUF_VERSION:
+            out.append(("missing_setup_go", f"functional buf version {version!r}"))
+    if out or len(setup_idxs) != 1:
+        return out
+    order = [setup_idxs[0], buf_idxs[0], protoc_idxs[0], codegen_idxs[0],
+             FUNCTIONAL_MEASURED_PYTEST_INDEX]
+    if order != sorted(order) or len(set(order)) != len(order):
+        out.append(("setup_go_ordering", f"functional toolchain order {order}"))
+    measured = (
+        _step_run(steps[FUNCTIONAL_MEASURED_PYTEST_INDEX])
+        if len(steps) > FUNCTIONAL_MEASURED_PYTEST_INDEX else None
+    )
+    if measured is None or measured.strip() != EXPECTED_FUNCTIONAL_PYTEST_RUN.strip():
+        out.append(("setup_go_ordering", "functional measured pytest moved"))
+    return out
+
+
 def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
     fails: list[str] = []
 
@@ -2617,9 +2810,9 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
     for jn, job in jobs.items():
         steps = _job_steps(job)
         # job env
-        if jn in GO_TEST_JOBS or jn in PYTHON_OPT_JOBS:
+        if jn in GO_TOOLCHAIN_JOBS or jn in PYTHON_OPT_JOBS:
             for k in _env_keys(job.get("env")):
-                if jn in GO_TEST_JOBS and _is_forbidden_go_env_key(k):
+                if jn in GO_TOOLCHAIN_JOBS and _is_forbidden_go_env_key(k):
                     add("go_env_key", f"{jn} {k}")
                 if jn in PYTHON_OPT_JOBS and _is_forbidden_py_env_key(k):
                     add("python_env_key", f"{jn} {k}")
@@ -2632,7 +2825,7 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
             uses = step.get("uses") or ""
             if isinstance(uses, str) and uses.startswith("actions/setup-go@"):
                 setup_idxs.append(i)
-                if jn in GO_TEST_JOBS:
+                if jn in GO_TOOLCHAIN_JOBS:
                     if "if" in step:
                         add("go_version_mismatch", f"{jn} setup-go if")
                     with_ = step.get("with") or {}
@@ -2645,9 +2838,9 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
                         add("go_version_mismatch", "toolchain")
 
             # step env
-            if jn in GO_TEST_JOBS or jn in PYTHON_OPT_JOBS:
+            if jn in GO_TOOLCHAIN_JOBS or jn in PYTHON_OPT_JOBS:
                 for k in _env_keys(step.get("env")):
-                    if jn in GO_TEST_JOBS and _is_forbidden_go_env_key(k):
+                    if jn in GO_TOOLCHAIN_JOBS and _is_forbidden_go_env_key(k):
                         add("go_env_key", f"{jn}[{i}] {k}")
                     if jn in PYTHON_OPT_JOBS and _is_forbidden_py_env_key(k):
                         add("python_env_key", f"{jn}[{i}] {k}")
@@ -2739,18 +2932,23 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
         if g_idxs:
             guarded_computed[jn] = g_idxs
 
-        if jn in GO_TEST_JOBS:
+        if jn in GO_TOOLCHAIN_JOBS:
             if len(setup_idxs) != 1:
                 add("missing_setup_go", jn)
             elif go_idxs and setup_idxs[0] >= min(go_idxs):
                 add("setup_go_ordering", jn)
-            elif not go_idxs:
+            elif jn in GO_TEST_JOBS and not go_idxs:
+                # A direct-`go test` job only: `functional` runs its Go through
+                # F15/F16's Python subprocesses and has no workflow Go command.
                 add("missing_setup_go", f"{jn} no go test")
             # runner
             if job.get("runs-on") != "ubuntu-latest":
                 add("go_runner_drift", jn)
             if "container" in job:
                 add("go_runner_drift", f"{jn} container")
+        if jn == FUNCTIONAL_TOOLCHAIN_JOB:
+            for token, msg in _functional_toolchain_failures(steps, setup_idxs):
+                add(token, msg)
 
     if go_test_jobs_found != GO_TEST_JOBS:
         add("go_test_job_inventory")
@@ -3248,10 +3446,11 @@ def test_manifest_checker_is_real_caller_of_shared_seam_with_identical_fixture_v
     calls: list[tuple] = []
     real_seam = mod._python_qualifying_comparison
 
-    def tracking_seam(tree, test_name, *, operators, operand_rule):
+    def tracking_seam(tree, test_name, *, operators, operand_rule, index=None):
         calls.append((test_name, operators, operand_rule))
         return real_seam(
-            tree, test_name, operators=operators, operand_rule=operand_rule
+            tree, test_name, operators=operators, operand_rule=operand_rule,
+            index=index,
         )
 
     monkeypatch.setattr(mod, "_python_qualifying_comparison", tracking_seam)
@@ -3311,7 +3510,7 @@ def test_manifest_checker_rejects_when_shared_seam_returns_empty(monkeypatch, tm
     mod = sys.modules[_python_test_asserts_threshold.__module__]
     calls: list[int] = []
 
-    def empty_seam(tree, test_name, *, operators, operand_rule):
+    def empty_seam(tree, test_name, *, operators, operand_rule, index=None):
         calls.append(1)
         return []
 
@@ -3761,8 +3960,11 @@ def test_threshold_assertion_fixture_count():
     assert len(LINK_LOOP_FIXTURES) == 9
     # bench-on-demand FP-BOD-1 retired one row with the B1 wrapper step it
     # mutated; the count is the remaining list, not a smaller integer over the
-    # same ids.
-    assert len(CI_PIN_FIXTURES) == 109
+    # same ids. ci-runtime-1 FP-CIR1-6 adds 14 rows (functional toolchain x8,
+    # benchmark manifest-step return x1, unit-go combined command x5) and
+    # retires none: the two rows that mutated the deleted functional Go step
+    # were redirected to the unit-go command.
+    assert len(CI_PIN_FIXTURES) == 123
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -3781,12 +3983,15 @@ def _load_wf() -> dict:
     return yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 
 
+# ci-runtime-1 FP-CIR1-6: every benchmark index below shifted down by one when
+# the manifest-validation step at 7 was deleted (B3..B14 are 7..14, hygiene 15,
+# B2/B10 16, sizing ledger 17).
 def _b5_step(wf: dict) -> dict:
-    return wf["jobs"]["benchmark"]["steps"][10]
+    return wf["jobs"]["benchmark"]["steps"][9]
 
 
 def _b9_step(wf: dict) -> dict:
-    return wf["jobs"]["benchmark"]["steps"][12]
+    return wf["jobs"]["benchmark"]["steps"][11]
 
 
 def _set_run(step: dict, text: str) -> None:
@@ -3831,12 +4036,17 @@ def _ci_pin_workflow_cases():
             "go test ./probe/internal/redact/... -run TestB5 -v -timeout 60s -race=true",
         ),
     )
+    # ci-runtime-1 FP-CIR1-4/6: the functional job's direct Go step is gone,
+    # so this mutation moves to the surviving owner of that package, unit-go's
+    # combined command. unit-go must carry -race, so it is outside
+    # RACE_SHORT_BAN_JOBS and the same unsafe edit is caught by the command's
+    # exact pin instead: the expected reason moves with the owner.
     add(
-        "short_flag_equals_true_in_functional",
-        "go_race_or_short_flag",
+        "short_flag_equals_true_in_unit_go",
+        "go_test_command_drift",
         lambda wf: _set_run(
-            wf["jobs"]["functional"]["steps"][10],
-            "go test ./tests/functional/... -v -timeout 300s -short=true",
+            wf["jobs"]["unit-go"]["steps"][7],
+            EXPECTED_UNIT_GO_COMMAND + " -short=true",
         ),
     )
     add(
@@ -4060,17 +4270,17 @@ def _ci_pin_workflow_cases():
 
     add("functional_pytest_gains_an_override_ini", "run_not_recognized", override_ini)
 
-    # Step 17 is the surviving benchmark pytest step (B2/B10 node ids) since
-    # the two B1 wrapper steps were deleted.
+    # Step 16 is the surviving benchmark pytest step (B2/B10 node ids) since
+    # the two B1 wrapper steps and (ci-runtime-1) the manifest step were deleted.
     def config_flag(wf):
-        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
-        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + " -c /tmp/alt.ini\n"
+        r = wf["jobs"]["benchmark"]["steps"][16]["run"]
+        wf["jobs"]["benchmark"]["steps"][16]["run"] = r.rstrip() + " -c /tmp/alt.ini\n"
 
     add("benchmark_pytest_gains_a_config_flag", "pytest_command_drift", config_flag)
 
     def deselect(wf):
-        r = wf["jobs"]["benchmark"]["steps"][17]["run"]
-        wf["jobs"]["benchmark"]["steps"][17]["run"] = r.rstrip() + (
+        r = wf["jobs"]["benchmark"]["steps"][16]["run"]
+        wf["jobs"]["benchmark"]["steps"][16]["run"] = r.rstrip() + (
             " --deselect tests/benchmark/test_pg_scale.py::test_b2_fingerprint_correlation_p99_under_20ms\n"
         )
 
@@ -4144,7 +4354,7 @@ def _ci_pin_workflow_cases():
         "pytest_failure_masked_by_an_or",
         "run_not_recognized",
         lambda wf: _set_run(
-            wf["jobs"]["benchmark"]["steps"][17],
+            wf["jobs"]["benchmark"]["steps"][16],
             "services/worker/.venv/bin/python -m pytest tests/benchmark/test_pg_scale.py -v -s || echo ok",
         ),
     )
@@ -4162,7 +4372,7 @@ def _ci_pin_workflow_cases():
         # substitutions embedded in the parameter value. Default-deny braced
         # grammar refuses @P (and all other @-transforms) as run_not_recognized
         # rather than accepting the step as readable. Count stays 104.
-        wf["jobs"]["benchmark"]["steps"][11]["run"] = (
+        wf["jobs"]["benchmark"]["steps"][10]["run"] = (
             "services/worker/.venv/bin/python -m pytest "
             "libs/py/rca_common/tests/test_rawcmd.py::test_b6_static_validator_under_5ms -v\n"
             "PAYLOAD='$(go env -w GOFLAGS=-exec=/bin/true)'\n"
@@ -4178,26 +4388,26 @@ def _ci_pin_workflow_cases():
     add("source_command_inside_a_guarded_step", "run_not_recognized", source_guarded)
 
     def redir(wf):
-        r = wf["jobs"]["benchmark"]["steps"][14]["run"]
-        wf["jobs"]["benchmark"]["steps"][14]["run"] = r.rstrip() + " > /tmp/b13.log\n"
+        r = wf["jobs"]["benchmark"]["steps"][13]["run"]
+        wf["jobs"]["benchmark"]["steps"][13]["run"] = r.rstrip() + " > /tmp/b13.log\n"
 
     add("guarded_step_redirects_its_output", "guarded_step_shape", redir)
 
     def assign_prefix(wf):
-        r = wf["jobs"]["benchmark"]["steps"][13]["run"]
+        r = wf["jobs"]["benchmark"]["steps"][12]["run"]
         # Prefix the first non-empty line with an assignment word (AK)(4).
         lines = r.splitlines(keepends=True)
         for i, ln in enumerate(lines):
             if ln.strip():
                 lines[i] = "TMPDIR=/tmp " + ln.lstrip()
                 break
-        wf["jobs"]["benchmark"]["steps"][13]["run"] = "".join(lines)
+        wf["jobs"]["benchmark"]["steps"][12]["run"] = "".join(lines)
 
     add("guarded_step_gains_an_assignment_prefix", "guarded_step_shape", assign_prefix)
 
     def ifs_smuggle(wf):
         r = "go test ./probe/internal/redact/... -run TestB5 -v -timeout 60s"
-        wf["jobs"]["benchmark"]["steps"][10]["run"] = "bash -c 'go${IFS}test${IFS}./x'\n" + r
+        wf["jobs"]["benchmark"]["steps"][9]["run"] = "bash -c 'go${IFS}test${IFS}./x'\n" + r
 
     add("inline_shell_program_smuggled_through_ifs", "command_operand_drift", ifs_smuggle)
     add(
@@ -4281,12 +4491,14 @@ def _ci_pin_workflow_cases():
         "go_test_command_drift",
         lambda wf: _set_run(_b9_step(wf), "go test -c ./probe/internal/adapter/presto"),
     )
+    # ci-runtime-1 FP-CIR1-4/6: redirected from the deleted functional Go
+    # step to the unit-go command that now runs that package. Same reason.
     add(
         "go_test_runs_under_a_no_op_exec",
         "go_test_command_drift",
         lambda wf: _set_run(
-            wf["jobs"]["functional"]["steps"][10],
-            "go test ./tests/functional/... -v -timeout 300s -exec /bin/true",
+            wf["jobs"]["unit-go"]["steps"][7],
+            EXPECTED_UNIT_GO_COMMAND + " -exec /bin/true",
         ),
     )
     add(
@@ -4426,6 +4638,96 @@ def _ci_pin_workflow_cases():
         "guard_context_drift",
         lambda wf: wf["jobs"]["images"].__setitem__("name", "manifest-guard"),
     )
+
+    # ci-runtime-1 FP-CIR1-4/6: `functional` left the direct Go inventory but
+    # not the toolchain protections -- F15/F16 still launch Go subprocesses
+    # against generated code. Each of these must stay red.
+    def functional_codegen_removed(wf):
+        steps = wf["jobs"]["functional"]["steps"]
+        wf["jobs"]["functional"]["steps"] = [
+            st for st in steps if (st.get("run") or "").strip() != FUNCTIONAL_CODEGEN_RUN
+        ]
+
+    add("functional_codegen_step_removed", "missing_setup_go", functional_codegen_removed)
+
+    def functional_setup_go_version(wf):
+        for st in wf["jobs"]["functional"]["steps"]:
+            if str(st.get("uses", "")).startswith("actions/setup-go@"):
+                st.setdefault("with", {})["go-version"] = "1.25.0"
+
+    add(
+        "functional_setup_go_version_disagrees_with_go_mod",
+        "go_version_mismatch",
+        functional_setup_go_version,
+    )
+
+    def functional_setup_go_removed(wf):
+        steps = wf["jobs"]["functional"]["steps"]
+        wf["jobs"]["functional"]["steps"] = [
+            st for st in steps if not str(st.get("uses", "")).startswith("actions/setup-go@")
+        ]
+
+    add("functional_setup_go_removed", "missing_setup_go", functional_setup_go_removed)
+
+    def functional_codegen_after_pytest(wf):
+        steps = wf["jobs"]["functional"]["steps"]
+        gen = [st for st in steps if (st.get("run") or "").strip() == FUNCTIONAL_CODEGEN_RUN][0]
+        wf["jobs"]["functional"]["steps"] = [st for st in steps if st is not gen] + [gen]
+
+    add("functional_codegen_moved_after_its_pytest", "setup_go_ordering",
+        functional_codegen_after_pytest)
+    def functional_buf_version(wf):
+        for st in wf["jobs"]["functional"]["steps"]:
+            if str(st.get("uses", "")).startswith("bufbuild/buf-setup-action@"):
+                st["with"]["version"] = "1.30.0"
+
+    add("functional_buf_version_changed", "missing_setup_go", functional_buf_version)
+    add(
+        "functional_goflags_env_at_job_scope",
+        "go_env_key",
+        lambda wf: wf["jobs"]["functional"].__setitem__("env", {"GOFLAGS": "-tags=integration"}),
+    )
+    add(
+        "functional_not_on_ubuntu_latest",
+        "go_runner_drift",
+        lambda wf: wf["jobs"]["functional"].__setitem__("runs-on", ["self-hosted", "linux"]),
+    )
+    add(
+        "functional_regains_a_direct_go_test_step",
+        "go_test_command_drift",
+        lambda wf: wf["jobs"]["functional"]["steps"].append(
+            {"run": "go test ./tests/functional/... -v -timeout 300s"}
+        ),
+    )
+    # ci-runtime-1 FP-CIR1-2: the benchmark job's deleted manifest step coming
+    # back is a second CI owner of the suite.
+    add(
+        "benchmark_regains_the_manifest_step",
+        "pytest_command_drift",
+        lambda wf: wf["jobs"]["benchmark"]["steps"].insert(
+            7,
+            {
+                "name": "Validate tests/benchmark/thresholds.yaml (manifest honesty)",
+                "run": "services/worker/.venv/bin/python -m pytest "
+                       "tests/functional/test_manifests.py -v\n",
+            },
+        ),
+    )
+    # ci-runtime-1 FP-CIR1-3: the combined unit-go command, each flag in turn.
+    for cid, cmd in (
+        ("unit_go_drops_the_race_detector",
+         EXPECTED_UNIT_GO_COMMAND.replace(" -race", "")),
+        ("unit_go_drops_the_coverage_mode",
+         EXPECTED_UNIT_GO_COMMAND.replace(" -covermode=atomic", "")),
+        ("unit_go_filters_its_tests_with_run",
+         EXPECTED_UNIT_GO_COMMAND + " -run TestNothing"),
+        ("unit_go_writes_a_different_profile",
+         EXPECTED_UNIT_GO_COMMAND.replace(CI_GO_COVERPROFILE, "/tmp/other.coverprofile")),
+        ("unit_go_second_full_go_test_pass",
+         EXPECTED_UNIT_GO_COMMAND + "\ngo test ./... -coverprofile=/tmp/x -covermode=atomic "
+         "-timeout 300s -p 1"),
+    ):
+        add(cid, "go_test_command_drift", lambda wf, c=cmd: _set_run(wf["jobs"]["unit-go"]["steps"][7], c))
     return cases
 
 
@@ -4664,6 +4966,14 @@ def test_ci_pins_the_checker_assumptions():
     wf = _load_wf()
     fails = _ci_pin_failures(wf, REPO_ROOT)
     assert fails == [], fails
+    # ci-runtime-1 FP-CIR1-2..6: one manifest-suite owner, one Go package pass
+    # feeding the coverage gate, one Go owner of m2_probe_link, and a local
+    # mirror that runs exactly the CI route.
+    assert _manifest_suite_owner_failures(wf) == []
+    assert _unit_go_route_failures(wf) == []
+    assert _go_test_owners_of(wf, M2_PROBE_LINK_PACKAGE) == ["unit-go[7]"]
+    ci_text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert _local_go_mirror_failures(B1_LAUNCHER.read_text(encoding="utf-8"), ci_text) == []
     run_sh = (REPO_ROOT / "tests/e2e/run.sh").read_text(encoding="utf-8")
     assert _e2e_runner_failures(run_sh) == []
     links = _collection_guard_links(REPO_ROOT)
@@ -4721,6 +5031,728 @@ def test_ci_pin_rejects_known_drift(case_id, kind, expected, mutator, tmp_path: 
             assert expected in fails, f"{case_id}: {fails}"
     else:
         raise AssertionError(kind)
+
+
+# ---------------------------------------------------------------------------
+# ci-runtime-1 (design/slices/ci-runtime-1/design.md): one CI owner for the
+# Python manifest suite, one Go package pass for race + coverage, and a
+# per-source AST index for the threshold checker.
+# ---------------------------------------------------------------------------
+
+#: FP-CIR1-2: the suite, its one CI owner, and that owner's three steps.
+MANIFEST_SUITE_FILE = "tests/functional/test_manifests.py"
+MANIFEST_OWNER_JOB = "manifest-guard"
+MANIFEST_OWNER_HYGIENE_INDEX = 4
+MANIFEST_OWNER_PYTEST_INDEX = 5
+MANIFEST_OWNER_GO_INDEX = 6
+EXPECTED_MANIFEST_OWNER_PYTEST = [
+    "services/worker/.venv/bin/python", "-m", "pytest", MANIFEST_SUITE_FILE, "-v",
+]
+EXPECTED_MANIFEST_OWNER_GO_RUN = "go test ./tests/functional/manifest_honesty/... -v -timeout 300s"
+#: The functional broad pytest's exact roots and ignores. The last ignore is
+#: the only one this slice added; everything else is unchanged.
+FUNCTIONAL_BROAD_ROOTS = [
+    "services/worker/tests", "services/gateway/tests", "services/dashboard-api/tests",
+    "tests/functional", "tests/delivery", "tests/mocks/llm",
+]
+FUNCTIONAL_BROAD_IGNORES = [
+    "tests/functional/m2_probe_link",
+    "services/gateway/tests/test_b1_ingest_burst.py",
+    "tests/delivery/test_delivery_sizing_ledger.py",
+    MANIFEST_SUITE_FILE,
+]
+#: pytest options that narrow what an owner collects without changing roots.
+_MANIFEST_SELECTION_NARROWING = frozenset({
+    "--deselect", "-k", "-m", "--lf", "--last-failed", "-x", "--exitfirst",
+    "--co", "--collect-only", "--maxfail", "--sw", "--stepwise",
+})
+#: FP-CIR1-3: flags that stop a `go test` from running the whole suite.
+_GO_TEST_FILTER_FLAGS = frozenset({"run", "skip", "exec", "list", "short", "c", "o"})
+UNIT_GO_JOB = "unit-go"
+M2_PROBE_LINK_PACKAGE = "tests/functional/m2_probe_link"
+#: FP-CIR1-4: the F15/F16 Python tests that launch Go against gen/go.
+F15_F16_GO_SUBPROCESS_TESTS = (
+    "tests/functional/test_m6_go_config_env_interpolation.py",
+    "tests/functional/test_m6_audit_completeness.py",
+)
+#: FP-CIR1-6: the retired unit-go literal. Any copy of it left in the local
+#: mirror is a stale owner of the old two-pass route.
+RETIRED_UNIT_GO_COMMAND = "go test ./... -race -timeout 300s -p 1"
+
+
+def _manifest_suite_collectors(workflow: dict) -> list[tuple[str, int, list[str]]]:
+    """Every workflow pytest command that would collect the manifest suite.
+
+    Roots are resolved against each step's working directory, a directory root
+    collects every file below it, and a command with no root collects from its
+    working directory. An `--ignore` of the file or of any directory above it
+    removes it. Anything this parser cannot read as an ignore is NOT treated as
+    one, so an unrecognised shape counts as a collector (fail closed).
+    """
+    target = (REPO_ROOT / MANIFEST_SUITE_FILE).resolve()
+    out: list[tuple[str, int, list[str]]] = []
+    for jn, job in (workflow.get("jobs") or {}).items():
+        for i, step in enumerate(_job_steps(job)):
+            run = _step_run(step)
+            if run is None:
+                continue
+            base = _bod_step_base(job, step)
+            for tokens in _bod_pytest_commands(run):
+                roots, ignores, _marker = _bod_pytest_operands(tokens)
+                ignored = [_bod_resolved(base, ig) for ig in ignores]
+                if any(target == ig or target.is_relative_to(ig) for ig in ignored):
+                    continue
+                for root in roots or ["."]:
+                    resolved = _bod_resolved(base, root)
+                    if resolved == target or target.is_relative_to(resolved):
+                        out.append((jn, i, tokens))
+                        break
+    return out
+
+
+def _manifest_suite_owner_failures(workflow: dict) -> list[str]:
+    """FP-CIR1-2: exactly one CI owner of the manifest suite, and it is intact."""
+    fails: list[str] = []
+    jobs = workflow.get("jobs") or {}
+    owner_at = (MANIFEST_OWNER_JOB, MANIFEST_OWNER_PYTEST_INDEX)
+    collectors = _manifest_suite_collectors(workflow)
+    for jn, i, _tokens in collectors:
+        if (jn, i) != owner_at:
+            fails.append(f"manifest_suite_extra_owner {jn}[{i}]")
+    owner_cmds = [tokens for jn, i, tokens in collectors if (jn, i) == owner_at]
+    if len(owner_cmds) != 1:
+        fails.append(f"manifest_suite_owner_missing x{len(owner_cmds)}")
+
+    guard = jobs.get(MANIFEST_OWNER_JOB)
+    if guard is None:
+        fails.append("manifest_suite_owner_missing job")
+    else:
+        for key in ("needs", "if", "strategy", "continue-on-error", "container"):
+            if key in guard:
+                fails.append(f"manifest_suite_owner_masked job {key}")
+        if guard.get("name") != MANIFEST_OWNER_JOB:
+            fails.append(f"manifest_suite_owner_masked name={guard.get('name')!r}")
+        steps = _job_steps(guard)
+        wanted = (MANIFEST_OWNER_HYGIENE_INDEX, MANIFEST_OWNER_PYTEST_INDEX,
+                  MANIFEST_OWNER_GO_INDEX)
+        if len(steps) != MANIFEST_OWNER_GO_INDEX + 1:
+            fails.append(f"manifest_suite_owner_drift steps={len(steps)}")
+        for idx in wanted:
+            if idx >= len(steps):
+                fails.append(f"manifest_suite_owner_drift missing [{idx}]")
+                continue
+            for key in ("if", "continue-on-error", "working-directory", "env", "shell"):
+                if key in steps[idx]:
+                    fails.append(f"manifest_suite_owner_masked [{idx}] {key}")
+        if MANIFEST_OWNER_PYTEST_INDEX < len(steps):
+            hygiene = _step_run(steps[MANIFEST_OWNER_HYGIENE_INDEX]) or ""
+            if hygiene.strip() != EXPECTED_CI_HYGIENE_RUN.strip():
+                fails.append("manifest_suite_hygiene_drift")
+            cmds = _bod_pytest_commands(_step_run(steps[MANIFEST_OWNER_PYTEST_INDEX]) or "")
+            if cmds != [EXPECTED_MANIFEST_OWNER_PYTEST]:
+                # Options AFTER `pytest` only: the interpreter's own `-m pytest`
+                # is not pytest's marker filter.
+                narrowed = sorted(
+                    {t.split("=", 1)[0] for c in cmds for t in c[c.index("pytest") + 1:]}
+                    & _MANIFEST_SELECTION_NARROWING
+                )
+                if narrowed:
+                    fails.append(f"manifest_suite_selection_narrowed {narrowed}")
+                else:
+                    fails.append(f"manifest_suite_owner_drift {cmds}")
+        if MANIFEST_OWNER_GO_INDEX < len(steps):
+            go_half = _step_run(steps[MANIFEST_OWNER_GO_INDEX]) or ""
+            if go_half.strip() != EXPECTED_MANIFEST_OWNER_GO_RUN:
+                fails.append("manifest_suite_go_half_drift")
+
+    # The functional broad pytest keeps its exact roots and ignores: the one
+    # added file-level ignore, never a wider or a different one.
+    functional = jobs.get(FUNCTIONAL_TOOLCHAIN_JOB) or {}
+    fsteps = _job_steps(functional)
+    broad = (
+        _bod_pytest_commands(_step_run(fsteps[FUNCTIONAL_MEASURED_PYTEST_INDEX]) or "")
+        if len(fsteps) > FUNCTIONAL_MEASURED_PYTEST_INDEX else []
+    )
+    if not broad:
+        fails.append("functional_collection_drift no broad pytest")
+    else:
+        roots, ignores, _marker = _bod_pytest_operands(broad[0])
+        if roots != FUNCTIONAL_BROAD_ROOTS or ignores != FUNCTIONAL_BROAD_IGNORES:
+            fails.append(f"functional_collection_drift roots={roots} ignores={ignores}")
+    return fails
+
+
+def _unit_go_route_failures(workflow: dict) -> list[str]:
+    """FP-CIR1-3/5: one complete `go test ./...` in unit-go; the coverage gate
+    reads the profile THAT command wrote, from the immediately next step."""
+    fails: list[str] = []
+    job = (workflow.get("jobs") or {}).get(UNIT_GO_JOB)
+    if job is None:
+        return ["unit_go_missing"]
+    for key in ("if", "continue-on-error", "strategy"):
+        if key in job:
+            fails.append(f"unit_go_masked job {key}")
+    steps = _job_steps(job)
+    go_cmds: list[tuple[int, SimpleCommand]] = []
+    cov_cmds: list[tuple[int, SimpleCommand]] = []
+    for i, step in enumerate(steps):
+        run = _step_run(step)
+        if run is None:
+            continue
+        parsed = _parse_run(run)
+        if parsed is None:
+            fails.append(f"unit_go_run_unparsed [{i}]")
+            continue
+        for cmd in parsed:
+            if _is_go_test_cmd(cmd):
+                go_cmds.append((i, cmd))
+            if (
+                cmd.command_word is not None
+                and cmd.command_word.literal_value == "bash"
+                and cmd.args
+                and cmd.args[0].literal_value == "scripts/go-coverage-check.sh"
+            ):
+                cov_cmds.append((i, cmd))
+    if len(go_cmds) != 1:
+        fails.append(f"unit_go_go_pass_count x{len(go_cmds)}")
+    if len(cov_cmds) != 1:
+        fails.append(f"unit_go_coverage_step_count x{len(cov_cmds)}")
+    if fails:
+        return fails
+
+    gi, gcmd = go_cmds[0]
+    ci, ccmd = cov_cmds[0]
+    words = [a.literal_value for a in gcmd.args]
+    flags = {_flag_name(a) for a in gcmd.args if _flag_name(a)}
+    positional = [w for w in words[1:] if not w.startswith("-")]
+    # `-timeout 300s` / `-p 1` take a value: drop those values from packages.
+    for opt in ("-timeout", "-p"):
+        if opt in words and words.index(opt) + 1 < len(words):
+            value = words[words.index(opt) + 1]
+            if value in positional:
+                positional.remove(value)
+    if "race" not in flags:
+        fails.append("unit_go_race_missing")
+    if "-covermode=atomic" not in words:
+        fails.append("unit_go_covermode_drift")
+    if positional != ["./..."]:
+        fails.append(f"unit_go_package_selection_narrowed {positional}")
+    filtered = sorted(flags & _GO_TEST_FILTER_FLAGS)
+    if filtered:
+        fails.append(f"unit_go_tests_filtered {filtered}")
+    profiles = [w.split("=", 1)[1] for w in words if w.startswith("-coverprofile=")]
+    if len(profiles) != 1:
+        fails.append(f"unit_go_profile_count x{len(profiles)}")
+    if _norm_cmd(gcmd) != EXPECTED_UNIT_GO_COMMAND:
+        fails.append(f"unit_go_command_drift {_norm_cmd(gcmd)!r}")
+    if "working-directory" in steps[gi]:
+        fails.append("unit_go_command_drift working-directory")
+
+    if ci != gi + 1:
+        fails.append(f"coverage_step_not_adjacent go=[{gi}] coverage=[{ci}]")
+    cov_args = [a.literal_value for a in ccmd.args]
+    if len(cov_args) == 2:
+        fails.append("coverage_reruns_go_tests (one-argument local path)")
+    elif len(cov_args) != 3:
+        fails.append(f"coverage_argument_drift {cov_args}")
+    else:
+        if cov_args[1] != "80":
+            fails.append(f"coverage_threshold_drift {cov_args[1]!r}")
+        if len(profiles) == 1 and cov_args[2] != profiles[0]:
+            fails.append(f"coverage_profile_mismatch {cov_args[2]!r} != {profiles[0]!r}")
+    if (_step_run(steps[ci]) or "").strip() != EXPECTED_UNIT_GO_COVERAGE_RUN:
+        fails.append("coverage_step_drift")
+    for idx in (gi, ci):
+        for key in ("if", "continue-on-error"):
+            if key in steps[idx]:
+                fails.append(f"unit_go_masked [{idx}] {key}")
+    return fails
+
+
+def _go_pattern_covers(pattern: str, package: str) -> bool:
+    """Does a `go test` package pattern (from the repo root) select *package*?"""
+    pattern = pattern.removeprefix("./")
+    if pattern in ("...", ""):
+        return True
+    if pattern.endswith("/..."):
+        prefix = pattern[: -len("/...")]
+        return package == prefix or package.startswith(prefix + "/")
+    return package == pattern
+
+
+def _go_test_owners_of(workflow: dict, package: str) -> list[str]:
+    """Every workflow `go test` command whose package selection covers *package*."""
+    owners: list[str] = []
+    for jn, rows in _collect_run_parse(workflow).items():
+        for i, _run, parsed in rows:
+            for cmd in parsed or []:
+                if not _is_go_test_cmd(cmd):
+                    continue
+                pats = [a.literal_value for a in cmd.args[1:] if a.literal_value.startswith("./")]
+                if any(_go_pattern_covers(p, package) for p in pats):
+                    owners.append(f"{jn}[{i}]")
+    return owners
+
+
+def _local_go_mirror_failures(launcher: str, ci_text: str) -> list[str]:
+    """FP-CIR1-6: scripts/integration-test.sh's `go` target is the CI route.
+
+    Both literals are pinned against ci.yml with `assert_matches_ci`, the Go
+    command runs first and returns before the checker on failure, and the
+    checker reads the same literal profile. The retired single-flag literal
+    must not survive anywhere in the launcher.
+    """
+    fails: list[str] = []
+    if "go_tests() {" not in launcher:
+        return ["local_mirror_missing go_tests"]
+    region = launcher.split("go_tests() {", 1)[1].split("\n}\n", 1)[0]
+    pinned = region.split("|| return 1", 1)[0]
+    for literal in (EXPECTED_UNIT_GO_COMMAND, EXPECTED_UNIT_GO_COVERAGE_RUN):
+        if "assert_matches_ci" not in pinned or f"'{literal}'" not in pinned:
+            fails.append(f"local_mirror_unpinned {literal!r}")
+        if literal not in ci_text:
+            fails.append(f"local_mirror_literal_not_in_ci {literal!r}")
+    body = [ln.strip() for ln in region.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    run_go = f"{EXPECTED_UNIT_GO_COMMAND} || return 1"
+    if run_go not in body:
+        fails.append("local_mirror_go_command_drift")
+    if not body or body[-1] != EXPECTED_UNIT_GO_COVERAGE_RUN:
+        fails.append("local_mirror_coverage_step_drift")
+    elif run_go in body and body.index(run_go) != len(body) - 2:
+        fails.append("local_mirror_coverage_not_after_go")
+    if RETIRED_UNIT_GO_COMMAND in launcher:
+        fails.append("local_mirror_retired_literal")
+    return fails
+
+
+def _mutate_step(job: str, index: int, **changes: Any) -> Callable[[dict], None]:
+    def mutate(wf: dict) -> None:
+        wf["jobs"][job]["steps"][index].update(changes)
+    return mutate
+
+
+def _mutate_run(job: str, index: int, edit: Callable[[str], str]) -> Callable[[dict], None]:
+    def mutate(wf: dict) -> None:
+        step = wf["jobs"][job]["steps"][index]
+        step["run"] = edit(step["run"])
+    return mutate
+
+
+def _drop_step(job: str, index: int) -> Callable[[dict], None]:
+    def mutate(wf: dict) -> None:
+        wf["jobs"][job]["steps"].pop(index)
+    return mutate
+
+
+_MANIFEST_OWNER_MUTATIONS: list[tuple[str, str, Callable[[dict], None]]] = [
+    ("guard_job_gains_a_condition", "manifest_suite_owner_masked",
+     lambda wf: wf["jobs"]["manifest-guard"].__setitem__("if", "github.event_name == 'push'")),
+    ("guard_job_gains_a_needs_edge", "manifest_suite_owner_masked",
+     lambda wf: wf["jobs"]["manifest-guard"].__setitem__("needs", "lint")),
+    ("guard_job_gains_a_matrix", "manifest_suite_owner_masked",
+     lambda wf: wf["jobs"]["manifest-guard"].__setitem__("strategy", {"matrix": {"n": [1]}})),
+    ("guard_job_renamed", "manifest_suite_owner_masked",
+     lambda wf: wf["jobs"]["manifest-guard"].__setitem__("name", "manifest honesty")),
+    ("guard_pytest_continues_on_error", "manifest_suite_owner_masked",
+     _mutate_step("manifest-guard", 5, **{"continue-on-error": True})),
+    ("guard_pytest_gains_a_step_condition", "manifest_suite_owner_masked",
+     _mutate_step("manifest-guard", 5, **{"if": "success()"})),
+    ("guard_pytest_gains_a_deselect", "manifest_suite_selection_narrowed",
+     _mutate_run("manifest-guard", 5, lambda r: r.rstrip() + " \\\n  --deselect "
+                 "tests/functional/test_manifests.py::test_ci_pins_the_checker_assumptions\n")),
+    ("guard_pytest_gains_a_keyword_filter", "manifest_suite_selection_narrowed",
+     _mutate_run("manifest-guard", 5, lambda r: r.rstrip() + " -k threshold\n")),
+    ("guard_pytest_masked_by_an_or", "manifest_suite_owner_drift",
+     _mutate_run("manifest-guard", 5, lambda r: r.rstrip() + " || true\n")),
+    ("guard_pytest_step_removed", "manifest_suite_owner_missing",
+     _drop_step("manifest-guard", 5)),
+    ("guard_hygiene_step_removed", "manifest_suite_owner_missing",
+     _drop_step("manifest-guard", 4)),
+    ("guard_go_half_removed", "manifest_suite_owner_drift",
+     _drop_step("manifest-guard", 6)),
+    ("guard_go_half_edited", "manifest_suite_go_half_drift",
+     _mutate_run("manifest-guard", 6, lambda r: r.replace("-timeout 300s", "-run TestNone -timeout 300s"))),
+    ("guard_job_removed", "manifest_suite_owner_missing",
+     lambda wf: wf["jobs"].pop("manifest-guard")),
+    ("functional_manifest_ignore_dropped", "manifest_suite_extra_owner",
+     _mutate_run("functional", 9, lambda r: r.replace(
+         " \\\n  --ignore=tests/functional/test_manifests.py", "", 1))),
+    ("functional_manifest_ignore_widened_to_its_directory", "functional_collection_drift",
+     _mutate_run("functional", 9, lambda r: r.replace(
+         "--ignore=tests/functional/test_manifests.py", "--ignore=tests/functional", 1))),
+    ("functional_manifest_ignore_retargeted", "manifest_suite_extra_owner",
+     _mutate_run("functional", 9, lambda r: r.replace(
+         "--ignore=tests/functional/test_manifests.py",
+         "--ignore=tests/functional/test_manifest.py", 1))),
+    ("benchmark_regains_the_manifest_step", "manifest_suite_extra_owner",
+     lambda wf: wf["jobs"]["benchmark"]["steps"].insert(7, {
+         "run": "services/worker/.venv/bin/python -m pytest tests/functional/test_manifests.py -v\n",
+     })),
+    ("another_job_collects_it_by_directory", "manifest_suite_extra_owner",
+     lambda wf: wf["jobs"]["benchmark"]["steps"].append({
+         "run": "services/worker/.venv/bin/python -m pytest tests/functional -v\n",
+     })),
+    ("another_job_collects_it_from_its_working_directory", "manifest_suite_extra_owner",
+     lambda wf: wf["jobs"]["benchmark"]["steps"].append({
+         "working-directory": "tests/functional",
+         "run": "../../services/worker/.venv/bin/python -m pytest test_manifests.py -v\n",
+     })),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id, expected, mutator",
+    _MANIFEST_OWNER_MUTATIONS,
+    ids=[c[0] for c in _MANIFEST_OWNER_MUTATIONS],
+)
+def test_manifest_suite_owner_rejects_drift(case_id, expected, mutator):
+    """FP-CIR1-2 drift: every way the suite could lose its one owner, gain a
+    second one, or be narrowed or masked in the owner, is a named failure."""
+    wf = copy.deepcopy(_load_wf())
+    mutator(wf)
+    tokens = [f.split(" ", 1)[0] for f in _manifest_suite_owner_failures(wf)]
+    assert expected in tokens, f"{case_id}: {tokens}"
+
+
+def test_manifest_suite_has_one_ci_owner():
+    """FP-CIR1-2 [function test]: the Python manifest suite has ONE CI owner.
+
+    Named for a workflow that runs tests/functional/test_manifests.py more
+    than once per event -- or not at all. Resolving roots, working
+    directories and ignores, exactly one pytest command collects it: the
+    independent `manifest-guard` job's, directly after its A10(v) hygiene
+    step and beside its Go honesty half. The functional broad pytest ignores
+    exactly that file (not its directory), and no benchmark step names it.
+    """
+    wf = _load_wf()
+    collectors = _manifest_suite_collectors(wf)
+    assert [(jn, i) for jn, i, _t in collectors] == [
+        (MANIFEST_OWNER_JOB, MANIFEST_OWNER_PYTEST_INDEX)
+    ], collectors
+    assert collectors[0][2] == EXPECTED_MANIFEST_OWNER_PYTEST
+    assert _manifest_suite_owner_failures(wf) == []
+    guard = wf["jobs"][MANIFEST_OWNER_JOB]
+    assert "needs" not in guard and "if" not in guard and "strategy" not in guard
+    steps = _job_steps(guard)
+    assert (_step_run(steps[MANIFEST_OWNER_HYGIENE_INDEX]) or "").strip() == \
+        EXPECTED_CI_HYGIENE_RUN.strip()
+    assert (_step_run(steps[MANIFEST_OWNER_GO_INDEX]) or "").strip() == \
+        EXPECTED_MANIFEST_OWNER_GO_RUN
+    # The file-level transfer, and nothing wider: the broad pytest still
+    # collects every OTHER file under tests/functional.
+    assert MANIFEST_SUITE_FILE in EXPECTED_FUNCTIONAL_PYTEST_RUN
+    assert "--ignore=tests/functional\n" not in EXPECTED_FUNCTIONAL_PYTEST_RUN
+    assert "--ignore=tests/functional " not in EXPECTED_FUNCTIONAL_PYTEST_RUN
+    bench_runs = "\n".join(_step_run(st) or "" for st in _job_steps(wf["jobs"]["benchmark"]))
+    assert MANIFEST_SUITE_FILE not in bench_runs
+    # The owner is still a required-shape pin in the CI-pin machinery too.
+    assert EXPECTED_PYTEST_COMMANDS[MANIFEST_OWNER_JOB] == [
+        (None, " ".join(EXPECTED_MANIFEST_OWNER_PYTEST))
+    ]
+    assert all(MANIFEST_SUITE_FILE not in cmd for _wd, cmd in EXPECTED_PYTEST_COMMANDS["benchmark"])
+
+
+_UNIT_GO_MUTATIONS: list[tuple[str, str, Callable[[dict], None]]] = [
+    ("second_full_go_test_step", "unit_go_go_pass_count",
+     lambda wf: wf["jobs"]["unit-go"]["steps"].insert(8, {"run": RETIRED_UNIT_GO_COMMAND})),
+    ("race_detector_dropped", "unit_go_race_missing",
+     _mutate_run("unit-go", 7, lambda r: r.replace(" -race", ""))),
+    ("coverage_mode_dropped", "unit_go_covermode_drift",
+     _mutate_run("unit-go", 7, lambda r: r.replace(" -covermode=atomic", ""))),
+    ("coverage_mode_set", "unit_go_covermode_drift",
+     _mutate_run("unit-go", 7, lambda r: r.replace("-covermode=atomic", "-covermode=set"))),
+    ("tests_filtered_with_run", "unit_go_tests_filtered",
+     _mutate_run("unit-go", 7, lambda r: r.rstrip() + " -run TestNothing\n")),
+    ("tests_run_under_a_no_op_exec", "unit_go_tests_filtered",
+     _mutate_run("unit-go", 7, lambda r: r.rstrip() + " -exec /bin/true\n")),
+    ("short_mode", "unit_go_tests_filtered",
+     _mutate_run("unit-go", 7, lambda r: r.rstrip() + " -short\n")),
+    ("package_selection_narrowed", "unit_go_package_selection_narrowed",
+     _mutate_run("unit-go", 7, lambda r: r.replace("./...", "./probe/...", 1))),
+    ("profile_path_mismatched", "coverage_profile_mismatch",
+     _mutate_run("unit-go", 8, lambda r: r.replace(CI_GO_COVERPROFILE, "/tmp/stale.coverprofile"))),
+    ("coverage_step_reruns_the_suite", "coverage_reruns_go_tests",
+     _mutate_run("unit-go", 8, lambda r: r.replace(" " + CI_GO_COVERPROFILE, ""))),
+    ("coverage_threshold_lowered", "coverage_threshold_drift",
+     _mutate_run("unit-go", 8, lambda r: r.replace(" 80 ", " 50 "))),
+    ("coverage_step_moved_before_go", "coverage_step_not_adjacent",
+     lambda wf: wf["jobs"]["unit-go"]["steps"].insert(7, wf["jobs"]["unit-go"]["steps"].pop(8))),
+    ("coverage_step_removed", "unit_go_coverage_step_count",
+     _drop_step("unit-go", 8)),
+    ("coverage_step_continues_on_error", "unit_go_masked",
+     _mutate_step("unit-go", 8, **{"continue-on-error": True})),
+    ("coverage_step_conditioned", "unit_go_masked",
+     _mutate_step("unit-go", 8, **{"if": "always()"})),
+    ("go_step_continues_on_error", "unit_go_masked",
+     _mutate_step("unit-go", 7, **{"continue-on-error": True})),
+    ("go_step_masked_by_an_or", "unit_go_run_unparsed",
+     _mutate_run("unit-go", 7, lambda r: r.rstrip() + " || true\n")),
+    ("serial_scheduling_dropped", "unit_go_command_drift",
+     _mutate_run("unit-go", 7, lambda r: r.replace(" -p 1", ""))),
+    ("timeout_changed", "unit_go_command_drift",
+     _mutate_run("unit-go", 7, lambda r: r.replace("300s", "30s"))),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id, expected, mutator",
+    _UNIT_GO_MUTATIONS,
+    ids=[c[0] for c in _UNIT_GO_MUTATIONS],
+)
+def test_unit_go_route_rejects_drift(case_id, expected, mutator):
+    """FP-CIR1-3/5 drift: a second full pass, a filter, a no-op exec, a dropped
+    -race, a missing coverage mode, a mismatched profile and every masking
+    envelope are named failures."""
+    wf = copy.deepcopy(_load_wf())
+    mutator(wf)
+    tokens = [f.split(" ", 1)[0] for f in _unit_go_route_failures(wf)]
+    assert expected in tokens, f"{case_id}: {tokens}"
+
+
+def test_unit_go_combines_race_and_coverage():
+    """FP-CIR1-3 [function test]: one complete Go package pass proves both bars.
+
+    Named for a unit-go job that runs the Go suite twice, or that stops
+    running it under -race, or whose coverage gate reads anything other than
+    the profile its own single pass wrote. The job has exactly one
+    `go test ./...` with -race, -coverprofile, -covermode=atomic, -timeout
+    300s and -p 1; the next step is the coverage gate on that same literal
+    profile; neither step (nor the job) carries `if` or `continue-on-error`.
+    """
+    wf = _load_wf()
+    assert _unit_go_route_failures(wf) == []
+    steps = _job_steps(wf["jobs"][UNIT_GO_JOB])
+    assert steps[GUARDED_STEPS[UNIT_GO_JOB][0]]["run"].strip() == EXPECTED_UNIT_GO_COMMAND
+    assert steps[GUARDED_STEPS[UNIT_GO_JOB][0] + 1]["run"].strip() == EXPECTED_UNIT_GO_COVERAGE_RUN
+    for flag in ("-race", f"-coverprofile={CI_GO_COVERPROFILE}", "-covermode=atomic",
+                 "-timeout 300s", "-p 1", "./..."):
+        assert flag in EXPECTED_UNIT_GO_COMMAND, flag
+    assert EXPECTED_GO_TEST_COMMANDS[UNIT_GO_JOB] == [(None, EXPECTED_UNIT_GO_COMMAND)]
+    # No step anywhere in the job starts a second Go test pass.
+    go_runs = [
+        i for i, _run, parsed in _collect_run_parse(wf)[UNIT_GO_JOB]
+        for cmd in (parsed or []) if _is_go_test_cmd(cmd)
+    ]
+    assert go_runs == [GUARDED_STEPS[UNIT_GO_JOB][0]]
+
+
+def test_go_functional_package_has_one_owner():
+    """FP-CIR1-4 [function test]: tests/functional/m2_probe_link has ONE CI
+    test owner, and the functional job still has what F15/F16 need.
+
+    Named for two regressions: the cross-service Go package running twice per
+    event (or silently in no job), and the functional job losing the Go
+    toolchain or codegen that F15/F16's Python tests shell out to. unit-go's
+    `./...` from the module root selects the package under -race, the 300 s
+    timeout and -p 1; no other workflow `go test` selects it; the functional
+    job runs no direct `go test` but keeps setup-go, buf, the protoc plugins
+    and gen-proto before the broad pytest that collects F15/F16.
+    """
+    wf = _load_wf()
+    pkg_dir = REPO_ROOT / M2_PROBE_LINK_PACKAGE
+    assert sorted(p.name for p in pkg_dir.glob("*_test.go")), "m2_probe_link has no Go tests"
+    # One module: nothing between the repo root and the package declares its
+    # own go.mod, so the root `./...` really reaches it.
+    assert (REPO_ROOT / "go.mod").is_file()
+    for parent in [pkg_dir, *pkg_dir.parents]:
+        if parent == REPO_ROOT:
+            break
+        assert not (parent / "go.mod").exists(), parent
+    assert _go_test_owners_of(wf, M2_PROBE_LINK_PACKAGE) == [
+        f"{UNIT_GO_JOB}[{GUARDED_STEPS[UNIT_GO_JOB][0]}]"
+    ]
+    assert _go_pattern_covers("./...", M2_PROBE_LINK_PACKAGE)
+    assert not _go_pattern_covers("./tests/functional/manifest_honesty/...", M2_PROBE_LINK_PACKAGE)
+    for flag in ("-race", "-timeout 300s", "-p 1"):
+        assert flag in EXPECTED_UNIT_GO_COMMAND
+    functional = wf["jobs"][FUNCTIONAL_TOOLCHAIN_JOB]
+    assert FUNCTIONAL_TOOLCHAIN_JOB not in EXPECTED_GO_TEST_COMMANDS
+    assert FUNCTIONAL_TOOLCHAIN_JOB not in GO_TEST_JOBS
+    assert FUNCTIONAL_TOOLCHAIN_JOB in GO_TOOLCHAIN_JOBS
+    fsteps = _job_steps(functional)
+    assert not any(
+        _is_go_test_cmd(cmd)
+        for _i, _run, parsed in _collect_run_parse(wf)[FUNCTIONAL_TOOLCHAIN_JOB]
+        for cmd in (parsed or [])
+    )
+    setup_idxs = [
+        i for i, st in enumerate(fsteps)
+        if str(st.get("uses") or "").startswith("actions/setup-go@")
+    ]
+    assert _functional_toolchain_failures(fsteps, setup_idxs) == []
+    assert fsteps[setup_idxs[0]]["with"]["go-version"] == _go_mod_version(REPO_ROOT)
+    # F15/F16 really launch Go, and the broad pytest really collects them.
+    broad = _bod_pytest_commands(fsteps[FUNCTIONAL_MEASURED_PYTEST_INDEX]["run"])[0]
+    roots, ignores, _marker = _bod_pytest_operands(broad)
+    for rel in F15_F16_GO_SUBPROCESS_TESTS:
+        src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert '"go"' in src or "'go'" in src, f"{rel} no longer launches Go"
+        target = (REPO_ROOT / rel).resolve()
+        assert any(target.is_relative_to(_bod_resolved("", r)) for r in roots), rel
+        assert not any(
+            target == _bod_resolved("", i) or target.is_relative_to(_bod_resolved("", i))
+            for i in ignores
+        ), rel
+
+
+def test_ci_pin_fixture_indices_name_their_targets():
+    """FP-CIR1-6: the fixed indices the drift fixtures mutate still point at
+    the step each fixture is named for. A shifted index would otherwise make a
+    fixture pass by mutating some other step for some other reason."""
+    wf = _load_wf()
+    bench = wf["jobs"]["benchmark"]["steps"]
+    expect = {
+        9: "TestB5", 11: "TestB9", 10: "test_b6_", 12: "test_b12_",
+        13: "test_b13_", 16: "test_b2_", 17: "test_delivery_sizing_ledger.py",
+    }
+    for idx, needle in expect.items():
+        assert needle in (bench[idx].get("run") or ""), (idx, needle)
+    assert (bench[15].get("run") or "").strip() == EXPECTED_CI_HYGIENE_RUN.strip()
+    functional = wf["jobs"]["functional"]["steps"]
+    assert len(functional) == FUNCTIONAL_MEASURED_PYTEST_INDEX + 1
+    assert functional[5]["run"].strip() == FUNCTIONAL_CODEGEN_RUN
+    assert "helm" in functional[7]["run"]
+    assert functional[8]["run"].strip() == EXPECTED_CI_HYGIENE_RUN.strip()
+    assert functional[9]["run"].strip() == EXPECTED_FUNCTIONAL_PYTEST_RUN.strip()
+    unit_go = wf["jobs"]["unit-go"]["steps"]
+    assert unit_go[7]["run"].strip() == EXPECTED_UNIT_GO_COMMAND
+    assert unit_go[8]["run"].strip() == EXPECTED_UNIT_GO_COVERAGE_RUN
+    assert len(unit_go) == 9
+
+
+# ---------------------------------------------------------------------------
+# FP-CIR1-1: the threshold checker's per-source AST index
+# ---------------------------------------------------------------------------
+
+_WALK_FUNCS = ("_binding_occurrences", "_build_parent_map", "_file_has_star_import")
+
+
+def _count_walks(monkeypatch) -> dict[str, int]:
+    """Instrument the three whole-module walks on the module the checker uses."""
+    mod = sys.modules[_python_test_asserts_threshold.__module__]
+    counts = {name: 0 for name in _WALK_FUNCS}
+    for name in _WALK_FUNCS:
+        real = getattr(mod, name)
+
+        def wrapped(*args, _real=real, _name=name, **kwargs):
+            counts[_name] += 1
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(mod, name, wrapped)
+    return counts
+
+
+def test_large_link_analysis_reuses_module_indexes(monkeypatch, capsys):
+    """FP-CIR1-1 [function + benchmark test]: one link check walks the module
+    at most once per kind, and still proves the real B1 link.
+
+    Named for the defect this slice removes: `_binding_occurrences` and
+    `_build_parent_map` re-run over the whole 9,392-line burst file for every
+    name looked up (1,291 and 923 times per check). Each of three calls parses
+    a fresh AST from the file's bytes, must return `(True, None)`, and may
+    walk the module for bindings, parents and star imports at most once each.
+    Elapsed time is printed as an observation; there is no wall-time cutoff.
+    """
+    path = _resolve_test_file(B1_PRODUCT_LINK, REPO_ROOT)
+    assert path is not None
+    name = _link_test_name(B1_PRODUCT_LINK)
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    nodes = sum(1 for _ in ast.walk(tree))
+    names = len(_binding_occurrences(tree))
+    counts = _count_walks(monkeypatch)
+    import time
+
+    lines = []
+    for run in range(3):
+        for key in counts:
+            counts[key] = 0
+        started = time.perf_counter()
+        verdict = _python_test_asserts_threshold(
+            path.read_text(encoding="utf-8"), name, path=path
+        )
+        elapsed = time.perf_counter() - started
+        lines.append(
+            f"CIR1-BENCH run={run + 1} elapsed_s={elapsed:.3f} ast_nodes={nodes} "
+            f"binding_names={names} walks={dict(counts)}"
+        )
+        assert verdict == (True, None), verdict
+        for key, n in counts.items():
+            assert n <= 1, (key, n)
+        # The index was actually built (the bound is not met by skipping work).
+        assert counts["_binding_occurrences"] == 1
+        assert counts["_build_parent_map"] == 1
+    with capsys.disabled():
+        print("\n" + "\n".join(lines))
+
+
+def test_threshold_checker_analyzes_changed_source_fresh(tmp_path: Path):
+    """FP-CIR1-1: no cross-call context. The same path, rewritten between calls
+    (with its mtime pinned back to the original), yields each version's own
+    verdict -- nothing is cached by path, filename, mtime or module global."""
+    link = "test_fresh.py::test_b99_ok"
+    path = tmp_path / "test_fresh.py"
+    good = _fx("p99 = 1.0\nassert p99 < 20.0\n")
+    dead = _fx("p99 = 1.0\nif False:\n    assert p99 < 20.0\n")
+    star = _fx("rate = 1.0\nassert rate >= BUDGET\n",
+               preamble="BUDGET = 1000.0\nfrom runtime_budget import *\n\n")
+    const = _fx("rate = 1.0\nassert rate >= BUDGET\n", preamble="BUDGET = 1000.0\n\n")
+    path.write_text(good, encoding="utf-8")
+    stamp = path.stat().st_mtime_ns
+    expected = [
+        (good, (True, None)),
+        (dead, (False, "not_a_threshold_comparison")),
+        (good, (True, None)),
+        (star, (False, "star_import")),
+        (const, (True, None)),
+    ]
+    for text, verdict in expected:
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, ns=(stamp, stamp))
+        assert _link_asserts_threshold(link, root=tmp_path) == verdict, text
+
+
+def test_module_index_keeps_the_direct_call_shapes():
+    """FP-CIR1-1: the helpers stay callable without an index, give the same
+    answers with one, and refuse an index built for a different tree."""
+    src = "import pytest\nfrom pytest import fail\nBUDGET = 1000.0\nBUDGET2 = 1\nBUDGET2 = 2\n"
+    tree = ast.parse(src)
+    index = _ModuleIndex.build(tree)
+    assert index.tree is tree and not index.has_star_import
+    assert index.body_ids == {id(s) for s in tree.body}
+    for name in ("pytest", "fail", "BUDGET", "BUDGET2", "missing"):
+        assert _resolve_module_binding(tree, name) is _resolve_module_binding(
+            tree, name, index=index
+        ), name
+    assert isinstance(_resolve_module_binding(tree, "BUDGET"), ast.Assign)
+    assert _resolve_module_binding(tree, "BUDGET2") is None
+    assert set(_numeric_name_bindings(tree)) == set(_numeric_name_bindings(tree, index=index)) == {
+        "BUDGET"
+    }
+    assert _resolves_to_pytest(tree, "pytest") and _resolves_to_pytest(tree, "pytest", index=index)
+    assert _resolves_to_pytest_fail(tree, "fail", index=index)
+    with pytest.raises(ValueError):
+        _resolve_module_binding(ast.parse(src), "BUDGET", index=index)
+    starred = ast.parse("from x import *\nBUDGET = 1.0\n")
+    assert _resolve_module_binding(starred, "BUDGET") is None
+    assert _ModuleIndex.build(starred).has_star_import
+
+
+def test_shared_seam_accepts_an_omitted_or_supplied_index():
+    """FP-CIR1-1: `_python_qualifying_comparison` keeps its external call
+    shape (tests/delivery/test_delivery_b1_profile.py omits `index`) and
+    returns the same candidates when the caller supplies one."""
+    src = _fx("p99 = 1.0\nassert p99 < 20.0\nif p99 > 30.0:\n    pytest.fail('x')\n",
+              preamble="import pytest\n\n")
+    tree = ast.parse(src)
+    rule = lambda cmp: True  # noqa: E731 -- comparison shape only
+    bare = _python_qualifying_comparison(tree, _TEST_NAME, operators=_ORDERED_OPS, operand_rule=rule)
+    indexed = _python_qualifying_comparison(
+        tree, _TEST_NAME, operators=_ORDERED_OPS, operand_rule=rule,
+        index=_ModuleIndex.build(tree),
+    )
+    # preamble (2 lines) + def line: the assert is line 5, the fail branch line 6
+    assert [n.lineno for n in bare] == [n.lineno for n in indexed] == [5, 6]
 
 
 # ---------------------------------------------------------------------------

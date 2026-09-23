@@ -7,7 +7,9 @@
 # deliver code, not stubbed out, so this workflow always reflects what
 # actually exists and is 100%-green-enforceable today. The benchmark job
 # covers every B* entry whose hot-path code has shipped (incl. B12 for M4
-# dashboard hot endpoints) plus the manifest sanity check for deferred ones.
+# dashboard hot endpoints). The manifest sanity check (tests/functional/
+# test_manifests.py) runs once per event, in the independent `manifest-guard`
+# job only (ci-runtime-1 FP-CIR1-2).
 #
 # Generated-code policy (design.md Section 11): `gen/go`, `gen/python`,
 # `libs/py/rca_common/rca_common/schemas/generated`, and
@@ -17,10 +19,13 @@
 # `schemas/generate-ts.js`. Every job below that actually compiles/imports
 # generated code regenerates it itself (toolchain installed in that same
 # job); jobs that don't touch generated code deliberately skip this step.
-# Today that means: `lint` (go vet) and every Go-testing job that builds
-# product code (`unit-go`, `functional`, `benchmark`) regenerate `gen/go`
-# (and, as a side effect of `scripts/gen-proto.sh` doing both in one pass,
-# `gen/python` too).
+# Today that means: `lint` (go vet), every Go-testing job that builds
+# product code (`unit-go`, `benchmark`), and `functional` -- whose Python
+# F15/F16 tests (`test_m6_go_config_env_interpolation.py`,
+# `test_m6_audit_completeness.py`) launch `go build` / `go test` subprocesses
+# against packages that import `gen/go` -- regenerate `gen/go` (and, as a
+# side effect of `scripts/gen-proto.sh` doing both in one pass, `gen/python`
+# too).
 # `manifest-guard` is the deliberate exception: it is a parser-only guard
 # (`go/ast`, `go/parser`, `gopkg.in/yaml.v3`) that reads sources as text and
 # imports no generated package, so it compiles and runs with no generated
@@ -285,10 +290,17 @@ jobs:
       # later container becomes unreachable -- observed failing 3 of 4 CI
       # runs with "connection refused" before this was added. Serializing
       # doesn't weaken the race detector or any assertion, just scheduling.
-      - name: go test -race (100% pass rate)
-        run: go test ./... -race -timeout 300s -p 1
+      #
+      # ci-runtime-1 FP-CIR1-3/4: ONE package pass proves both Go bars. The
+      # same -race execution writes the atomic coverage profile, and the next
+      # step reads that exact file instead of running the suite a second time.
+      # `./...` includes tests/functional/m2_probe_link (F8/F9), which is why
+      # the functional job no longer runs it directly. A failing test fails
+      # this step, and the default `bash -e` shell never reaches the checker.
+      - name: go test -race -coverprofile (100% pass rate, one pass)
+        run: go test ./... -race -coverprofile=/tmp/dbagent-ci-go.coverprofile -covermode=atomic -timeout 300s -p 1
       - name: per-package coverage gate (>80%, excluding generated code + main())
-        run: bash scripts/go-coverage-check.sh 80
+        run: bash scripts/go-coverage-check.sh 80 /tmp/dbagent-ci-go.coverprofile
 
   functional:
     name: functional tests (M1–M6 + manifest checks)
@@ -333,8 +345,8 @@ jobs:
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Regenerate gen/go + gen/python from proto/ (scripts/gen-proto.sh;
-          needed by the Go cross-service functional tests below, which build
-          real probe/probe-gateway binaries)
+          needed by F15/F16 below, whose Python tests launch go build / go test
+          subprocesses against packages that import gen/go)
         run: bash scripts/gen-proto.sh
       - name: Install rca_common + worker + gateway + dashboard-api (test extras)
         run: |
@@ -379,6 +391,11 @@ jobs:
         # surviving files, its data file lives under RUNNER_TEMP rather than
         # /run/dbagent-b1, and its --include paths are repository-relative
         # rather than /workspace.
+        #
+        # ci-runtime-1 FP-CIR1-2: the broad pytest's last --ignore names ONE
+        # file, tests/functional/test_manifests.py. Its tests are not skipped:
+        # they run once per event in the independent `manifest-guard` job, a
+        # required status check with no needs/if.
         run: |
           services/worker/.venv/bin/python -m pytest \
             services/worker/tests services/gateway/tests \
@@ -386,7 +403,8 @@ jobs:
             tests/functional tests/delivery tests/mocks/llm -v \
             --ignore=tests/functional/m2_probe_link \
             --ignore=services/gateway/tests/test_b1_ingest_burst.py \
-            --ignore=tests/delivery/test_delivery_sizing_ledger.py
+            --ignore=tests/delivery/test_delivery_sizing_ledger.py \
+            --ignore=tests/functional/test_manifests.py
           services/worker/.venv/bin/python -m pytest \
             tests/functional/test_release_bench_record.py -v \
             --cov=check_release_bench_record --cov-branch --cov-fail-under=81
@@ -400,9 +418,10 @@ jobs:
           services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/b1_reference_profile.py
           services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=services/gateway/tests/test_b1_ingest_burst.py
           services/worker/.venv/bin/python -B -m coverage report --data-file="$RUNNER_TEMP/b1-harness.coverage" --fail-under=81 --include=scripts/b1-affinity-helper.py
-      - name: Run Go cross-service functional tests (F8/F9; real probe +
-          probe-gateway binaries over real mTLS + ephemeral Postgres)
-        run: go test ./tests/functional/... -v -timeout 300s
+      # ci-runtime-1 FP-CIR1-4: the direct `go test ./tests/functional/...`
+      # step is gone. unit-go's `go test ./... -race ... -p 1` already runs
+      # tests/functional/m2_probe_link (F8/F9); manifest-guard keeps its own
+      # independent Go honesty half.
 
   benchmark:
     name: benchmark (B3–B6/B9/B12–B14 + M3/M4 Python benches; manifest check)
@@ -440,10 +459,10 @@ jobs:
           services/worker/.venv/bin/pip install -e "services/worker[test]"
           services/worker/.venv/bin/pip install -e "services/gateway[test]"
           services/worker/.venv/bin/pip install -e "services/dashboard-api[test]"
-      - name: Validate tests/benchmark/thresholds.yaml (manifest honesty)
-        run: |
-          services/worker/.venv/bin/python -m pytest \
-            tests/functional/test_manifests.py -v
+      # ci-runtime-1 FP-CIR1-2: no manifest-validation step here. The
+      # thresholds.yaml honesty rule is asserted by the independent, required
+      # `manifest-guard` job on every event, so this job no longer repeats
+      # the same suite.
       - name: B3 -- probe-gateway 100-concurrent-session dispatch p99
         run: go test ./services/probe-gateway/internal/gwserver/... -run TestB3 -v -timeout 60s
       - name: B4 -- chunked result streaming (1 MiB / 256 KiB chunks, 50 concurrent tasks)

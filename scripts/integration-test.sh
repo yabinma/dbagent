@@ -112,7 +112,9 @@ usage: scripts/integration-test.sh [all|go|py|preflight|smoke|b1_product|d0_2a|d
                   write path -- see docs/runbooks/bench-on-demand.md. A host that
                   cannot host it gets this target's non-zero refusal; there is no
                   recorded route that exits 0 without measuring anything.
-  go              go test ./... -race -timeout 300s -p 1
+  go              go test ./... -race -coverprofile=... -covermode=atomic
+                  -timeout 300s -p 1 (one pass), then the >80% per-package
+                  coverage gate on that same profile -- exactly as CI's unit-go
   py              the functional/service pytest tiers that use testcontainers
   preflight       run only the checks, no tests -- confirms in ~1s that the
                   sandbox exclusion is live and Docker is reachable
@@ -510,9 +512,17 @@ run_step() {
 #
 # registry/pg_test.go shells out to libs/py/rca_common/.venv/bin/python -m alembic, so
 # that venv must exist with the [test] extra installed.
+#
+# ci-runtime-1 FP-CIR1-3/5: one -race pass writes the coverage profile, and the
+# coverage gate reads that same file. Both literals are pinned against ci.yml. The
+# profile path is the same literal /tmp path CI uses, so the anti-drift check stays
+# exact; a profile left behind by an earlier run can never turn a failed Go run green,
+# because the checker is not reached after a non-zero Go result.
 # ---------------------------------------------------------------------------
 go_tests() {
-  assert_matches_ci 'go test ./... -race -timeout 300s -p 1' || return 1
+  assert_matches_ci \
+    'go test ./... -race -coverprofile=/tmp/dbagent-ci-go.coverprofile -covermode=atomic -timeout 300s -p 1' \
+    'bash scripts/go-coverage-check.sh 80 /tmp/dbagent-ci-go.coverprofile' || return 1
   if [ ! -x libs/py/rca_common/.venv/bin/python ]; then
     echo "missing libs/py/rca_common/.venv -- registry/pg_test.go needs it for alembic." >&2
     echo "  python -m venv libs/py/rca_common/.venv && libs/py/rca_common/.venv/bin/pip install -e 'libs/py/rca_common[test]'" >&2
@@ -522,16 +532,21 @@ go_tests() {
     echo "libs/py/rca_common/.venv exists but has no alembic -- reinstall with the [test] extra." >&2
     return 1
   fi
-  go test ./... -race -timeout 300s -p 1
+  go test ./... -race -coverprofile=/tmp/dbagent-ci-go.coverprofile -covermode=atomic -timeout 300s -p 1 || return 1
+  bash scripts/go-coverage-check.sh 80 /tmp/dbagent-ci-go.coverprofile
 }
 
 # ---------------------------------------------------------------------------
 # Python
 #
-# Mirrors ci.yml's "Run Python functional tests" step, including its --ignore set (those
-# tiers run in their own CI jobs with their own fixtures) and the FP-M6-31 A10(v)
+# Mirrors ci.yml's "Run Python functional tests" step and the FP-M6-31 A10(v)
 # environment-hygiene precondition: no PYTHON*/PYTEST* variable may be set for the
-# measured invocation, or the guard's own assertions are meaningless.
+# measured invocation, or the guard's own assertions are meaningless. It carries that
+# step's --ignore set (those tiers run in their own CI jobs with their own fixtures)
+# EXCEPT one entry: CI's broad pytest also ignores tests/functional/test_manifests.py,
+# because the independent manifest-guard job owns it there (ci-runtime-1 FP-CIR1-2).
+# This local route is an intentional superset and still collects it once, so a local
+# run keeps the manifest and CI-pin checks.
 # ---------------------------------------------------------------------------
 py_tests() {
   assert_matches_ci \
@@ -1051,10 +1066,10 @@ smoke_test() {
 
 case "$WHAT" in
   smoke)     run_step "Smoke (one testcontainers test per runtime: Go + Python)" smoke_test ;;
-  all)       run_step "Go (go test ./... -race -p 1)" go_tests
+  all)       run_step "Go (go test ./... -race + coverage, one pass, -p 1; >80% gate)" go_tests
              run_step "Python (functional + service tiers)" py_tests
              run_step "B1 product promise (on-demand, gating)" b1_product ;;
-  go)        run_step "Go (go test ./... -race -p 1)" go_tests ;;
+  go)        run_step "Go (go test ./... -race + coverage, one pass, -p 1; >80% gate)" go_tests ;;
   py|python) run_step "Python (functional + service tiers)" py_tests ;;
   d0_2a)     run_step "D0.2-a direct _ingest_txn replay (diagnostic)" d0_2a ;;
   d0_2c)     run_step "D0.2-c HTTP sweep, _ingest_txn stubbed to calibrated sleep (diagnostic)" d0_2c ;;
