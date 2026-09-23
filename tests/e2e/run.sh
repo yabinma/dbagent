@@ -244,10 +244,13 @@ check_budget() {
 }
 
 # kind-deploy-tuning FP-KDT-3: the kind B1 burst writes one numeric p99 line
-# to /tmp/rca-e2e/b1-kind-p99.txt (tests/e2e/kind_b1_observation.py). pytest
-# captures a passing test's stdout, so run.sh prints the file itself after a
-# passing pytest_e2e phase. The optional positional path exists only so the
-# delivery test can call the real functions against a temporary file.
+# to /tmp/rca-e2e/b1-kind-p99.txt (tests/e2e/kind_b1_observation.py). run.sh
+# prints the file itself after a passing pytest_e2e phase. pytest_e2e runs with
+# --capture=tee-sys (ci-runtime-2), so pytest also echoes the line; the carrier
+# below stays required, because it -- not pytest's echo -- is the pinned,
+# fail-closed proof the line was written, so the line appears twice in the log.
+# The optional positional path exists only so the delivery test can call the
+# real functions against a temporary file.
 # clear_kind_b1_p99_line removes that one file, so a stale line from an
 # earlier run can never stand in for this one.
 clear_kind_b1_p99_line() {
@@ -547,7 +550,7 @@ env_hygiene_gate
 phase "pytest_e2e" 420 bash -c '
   python3 -m pip install -q -e libs/py/rca_common -e "services/worker[test]" \
     -e "services/gateway[test]" -e "services/dashboard-api[test]"
-  python3 -m pytest tests/e2e -v --tb=short
+  python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys
 '
 # Not a phase: pytest and the baseline completed, so a missing line is a
 # missing carrier, not a cluster failure; set -e fails the job with the named

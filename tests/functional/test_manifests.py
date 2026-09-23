@@ -287,7 +287,10 @@ assert set(GUARDED_STEPS) == GO_TEST_JOBS | set(EXPECTED_PYTEST_COMMANDS)
 # `test_ci_does_not_run_b1_or_b11` names it by target.
 EXPECTED_BASH_WRAPPER_COMMANDS: dict[str, list[tuple[int, str]]] = {}
 
-EXPECTED_E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short"
+# ci-runtime-2 FP-CIR2-3: `--capture=tee-sys` streams passing e2e tests'
+# CI_E2E_STEP timing records into the job log while pytest keeps its failure
+# capture. Dropping it loses the measurement route (e2e_command_drift).
+EXPECTED_E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys"
 EXPECTED_E2E_HYGIENE_COMMAND = (
     'bad="$(awk \'BEGIN { for (k in ENVIRON) { p = substr(k, 1, 6); '
     'if (p != "PYTHON" && p != "PYTEST") continue; print k } }\')"; '
@@ -3963,8 +3966,9 @@ def test_threshold_assertion_fixture_count():
     # same ids. ci-runtime-1 FP-CIR1-6 adds 14 rows (functional toolchain x8,
     # benchmark manifest-step return x1, unit-go combined command x5) and
     # retires none: the two rows that mutated the deleted functional Go step
-    # were redirected to the unit-go command.
-    assert len(CI_PIN_FIXTURES) == 123
+    # were redirected to the unit-go command. ci-runtime-2 FP-CIR2-3 adds
+    # run_sh_pytest_drops_tee_capture and retires none.
+    assert len(CI_PIN_FIXTURES) == 124
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -4734,8 +4738,16 @@ def _ci_pin_workflow_cases():
 def _ci_pin_runner_cases():
     def mut_O(t: str) -> str:
         return t.replace(
-            "python3 -m pytest tests/e2e -v --tb=short",
-            "python3 -O -m pytest tests/e2e -v --tb=short",
+            "python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys",
+            "python3 -O -m pytest tests/e2e -v --tb=short --capture=tee-sys",
+        )
+
+    def mut_drop_tee(t: str) -> str:
+        # ci-runtime-2 FP-CIR2-3: the command without the capture mode that
+        # streams CI_E2E_STEP records must be red.
+        return t.replace(
+            "python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys\n",
+            "python3 -m pytest tests/e2e -v --tb=short\n",
         )
 
     def mut_export(t: str) -> str:
@@ -4749,6 +4761,7 @@ def _ci_pin_runner_cases():
 
     return [
         ("run_sh_pytest_gains_dash_O", "runner", "e2e_command_drift", mut_O),
+        ("run_sh_pytest_drops_tee_capture", "runner", "e2e_command_drift", mut_drop_tee),
         ("run_sh_exports_pythonoptimize", "runner", "python_env_key", mut_export),
         ("run_sh_hygiene_gate_deleted", "runner", "missing_e2e_hygiene_gate", mut_del_gate),
         (

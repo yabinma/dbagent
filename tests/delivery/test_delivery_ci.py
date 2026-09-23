@@ -79,6 +79,48 @@ def test_e2e_job_gate_order_and_timeout():
     assert "tags" in iff or "refs/tags" in iff
     assert "pull_request" in iff
     assert "refs/heads/main" in iff
+    # ci-runtime-2 FP-CIR2-3: the only route to the instrumented pytest_e2e
+    # command is one unconditional `bash tests/e2e/run.sh` step; a skipped,
+    # tolerated, duplicated or redirected run would hide the timing records
+    # (and the phase budget) without failing the job.
+    assert _e2e_run_step_failures(e2e) == []
+    step = next(s for s in e2e["steps"] if "tests/e2e/run.sh" in str(s.get("run") or ""))
+    mutants = {
+        "step_if_false": lambda j: _e2e_run_step(j).update({"if": "false"}),
+        "step_continue_on_error": lambda j: _e2e_run_step(j).update({"continue-on-error": True}),
+        "job_continue_on_error": lambda j: j.update({"continue-on-error": True}),
+        "second_invocation": lambda j: j["steps"].append(copy.deepcopy(step)),
+        "other_script": lambda j: _e2e_run_step(j).update({"run": "bash tests/e2e/other.sh"}),
+        "extra_args": lambda j: _e2e_run_step(j).update(
+            {"run": "PYTEST_ADDOPTS=-s bash tests/e2e/run.sh"}
+        ),
+    }
+    for name, mutate in mutants.items():
+        job = copy.deepcopy(e2e)
+        mutate(job)
+        assert _e2e_run_step_failures(job) != [], f"{name} must be red"
+
+
+def _e2e_run_step(job: dict) -> dict:
+    return next(s for s in job["steps"] if "tests/e2e/" in str(s.get("run") or ""))
+
+
+def _e2e_run_step_failures(job: dict) -> list[str]:
+    """One unconditional `bash tests/e2e/run.sh` step in the e2e job."""
+    fails: list[str] = []
+    if "continue-on-error" in job:
+        fails.append("e2e job tolerates failure")
+    steps = job.get("steps") or []
+    runs = [s for s in steps if "tests/e2e/" in str(s.get("run") or "")]
+    if len(runs) != 1:
+        fails.append(f"expected one tests/e2e step, found {len(runs)}")
+    for s in runs:
+        if str(s.get("run") or "").strip() != "bash tests/e2e/run.sh":
+            fails.append(f"e2e step runs {s.get('run')!r}")
+        for key in ("if", "continue-on-error"):
+            if key in s:
+                fails.append(f"e2e run step carries {key}: {s[key]!r}")
+    return fails
 
 
 # Code review round 5, C8: the worker job ran

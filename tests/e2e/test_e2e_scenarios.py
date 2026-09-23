@@ -6,11 +6,13 @@ asserts outcomes through the real dashboard-api HTTP surface.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -337,33 +339,74 @@ def _put_configmap_key(configmap: str, key: str, content: str) -> None:
         )
 
 
+def _emit_step_record(line: str) -> None:
+    """Print one ``CI_E2E_STEP`` record (ci-runtime-2 FP-CIR2-1/2).
+
+    Timing is telemetry: a broken or closed output stream loses the record
+    and never changes the test's result.
+    """
+    try:
+        print(line, file=sys.stdout, flush=True)
+    except Exception:  # noqa: BLE001 - telemetry loss, not a test outcome
+        pass
+
+
+@contextlib.contextmanager
+def _timed_step(label: str):
+    """Non-gating elapsed-time span around existing e2e work.
+
+    Emits ``CI_E2E_STEP event=start label=<label>`` on entry and exactly one
+    ``CI_E2E_STEP event=end label=<label> result=<ok|error> elapsed_s=<s>``
+    on exit, measured with the monotonic ``time.perf_counter``. An exception
+    from the timed body propagates unchanged. Nested spans are inclusive.
+    Callers pass fixed labels only (never payloads, IDs or cluster JSON).
+    """
+    _emit_step_record(f"CI_E2E_STEP event=start label={label}")
+    started = time.perf_counter()
+    result = "error"
+    try:
+        yield
+        result = "ok"
+    finally:
+        elapsed = time.perf_counter() - started
+        _emit_step_record(
+            f"CI_E2E_STEP event=end label={label} result={result} "
+            f"elapsed_s={elapsed:.3f}"
+        )
+
+
 def _restart_and_wait(workload: str, timeout: str = "120s") -> None:
-    _kubectl_ok("rollout", "restart", workload)
-    _kubectl_ok("rollout", "status", workload, f"--timeout={timeout}")
+    with _timed_step("restart.rollout_restart"):
+        _kubectl_ok("rollout", "restart", workload)
+    with _timed_step("restart.rollout_status"):
+        _kubectl_ok("rollout", "status", workload, f"--timeout={timeout}")
     # D2: same blind spot as deploy_presto — require restartCount==0 after a
     # short settle so a crashlooping pod cannot pass rollout status alone.
     if "presto-coordinator" in workload:
-        time.sleep(15)
-        _kubectl_ok(
-            "wait",
-            "--for=condition=Ready",
-            "pod",
-            "-l",
-            "app=presto,role=coordinator",
-            f"--timeout={timeout}",
-        )
-        out = _kubectl_ok(
-            "get",
-            "pod",
-            "-l",
-            "app=presto,role=coordinator",
-            "-o",
-            "jsonpath={.items[0].status.containerStatuses[0].restartCount}",
-        ).stdout.strip()
-        assert out == "0", (
-            f"{workload} restartCount={out!r} after settle (expected 0); "
-            "coordinator is crashlooping"
-        )
+        with _timed_step("restart.coordinator_settle"):
+            time.sleep(15)
+        with _timed_step("restart.coordinator_ready"):
+            _kubectl_ok(
+                "wait",
+                "--for=condition=Ready",
+                "pod",
+                "-l",
+                "app=presto,role=coordinator",
+                f"--timeout={timeout}",
+            )
+        with _timed_step("restart.coordinator_restart_count"):
+            out = _kubectl_ok(
+                "get",
+                "pod",
+                "-l",
+                "app=presto,role=coordinator",
+                "-o",
+                "jsonpath={.items[0].status.containerStatuses[0].restartCount}",
+            ).stdout.strip()
+            assert out == "0", (
+                f"{workload} restartCount={out!r} after settle (expected 0); "
+                "coordinator is crashlooping"
+            )
 
 
 def _worker_pod_ips() -> set[str]:
@@ -1214,67 +1257,72 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
     try:
         before = _e1_read_memory_properties()
         assert before[MEMORY_PROP] != STARVED_MEMORY
-        _patch_configmap_property(
-            WORKER_CONFIGMAP, "config.properties", MEMORY_PROP, STARVED_MEMORY
-        )
-        _restart_and_wait(WORKER_WORKLOAD)
+        with _timed_step("e1.fault_patch"):
+            _patch_configmap_property(
+                WORKER_CONFIGMAP, "config.properties", MEMORY_PROP, STARVED_MEMORY
+            )
+        with _timed_step("e1.fault_restart"):
+            _restart_and_wait(WORKER_WORKLOAD)
         mounted = _mounted_property(WORKER_WORKLOAD, PRESTO_CONFIG_PATH, MEMORY_PROP)
         assert mounted == STARVED_MEMORY, (
             f"the starved value never reached the worker container: {mounted!r}"
         )
-        _wait_presto_workers_discovered(presto_url)
+        with _timed_step("e1.worker_discovery"):
+            _wait_presto_workers_discovered(presto_url)
 
         # Trip the fault with the required heavy tpch query (Section 13.1). A hash
         # aggregation over sf1.lineitem cannot fit in 1MB per node.  Code review
         # round 6, C3: accepting FINISHED/GONE let a normally completed query
         # establish no memory fault while the canned alert still drove RCA.
-        result = _presto_query(
-            presto_url,
-            "SELECT orderkey, count(*) AS n FROM tpch.sf1.lineitem "
-            "GROUP BY orderkey ORDER BY n DESC LIMIT 10",
-        )
-        state = str(result.get("state") or "").upper()
-        assert state == "FAILED", (
-            f"E1 requires the heavy query to FAIL under the 1MB limit; got "
-            f"state={state!r} result={result}"
-        )
-        # Presto 0.298 names local-memory exhaustion EXCEEDED_LOCAL_MEMORY_LIMIT
-        # exactly. A generic word like "exceeded" alone is not a memory fault —
-        # e.g. execution-time limits (code review round 7, C2).
-        assert _is_presto_local_memory_limit_failure(result), (
-            f"E1 requires Presto error code {PRESTO_LOCAL_MEMORY_LIMIT_ERROR} "
-            f"(query.max-memory-per-node starve); got error names="
-            f"{_presto_error_names(result)} result={result}"
-        )
+        with _timed_step("e1.trip_query"):
+            result = _presto_query(
+                presto_url,
+                "SELECT orderkey, count(*) AS n FROM tpch.sf1.lineitem "
+                "GROUP BY orderkey ORDER BY n DESC LIMIT 10",
+            )
+            state = str(result.get("state") or "").upper()
+            assert state == "FAILED", (
+                f"E1 requires the heavy query to FAIL under the 1MB limit; got "
+                f"state={state!r} result={result}"
+            )
+            # Presto 0.298 names local-memory exhaustion EXCEEDED_LOCAL_MEMORY_LIMIT
+            # exactly. A generic word like "exceeded" alone is not a memory fault —
+            # e.g. execution-time limits (code review round 7, C2).
+            assert _is_presto_local_memory_limit_failure(result), (
+                f"E1 requires Presto error code {PRESTO_LOCAL_MEMORY_LIMIT_ERROR} "
+                f"(query.max-memory-per-node starve); got error names="
+                f"{_presto_error_names(result)} result={result}"
+            )
 
-        opened = _post_alert(
-            ingest_url,
-            summary="worker OOM / query.max-memory-per-node exceeded",
-            extra={"labels": {"scenario": "e1_oom"}},
-        )
-        inv_id = opened.get("investigation_id")
-        assert inv_id, opened
+        with _timed_step("e1.case_processing"):
+            opened = _post_alert(
+                ingest_url,
+                summary="worker OOM / query.max-memory-per-node exceeded",
+                extra={"labels": {"scenario": "e1_oom"}},
+            )
+            inv_id = opened.get("investigation_id")
+            assert inv_id, opened
 
-        _wait_case(
-            dashboard_url,
-            token,
-            investigation_id=inv_id,
-            statuses={"AWAITING_APPROVAL", "EXECUTING", "VERIFYING", "RESOLVED"},
-            timeout=200,
-        )
+            _wait_case(
+                dashboard_url,
+                token,
+                investigation_id=inv_id,
+                statuses={"AWAITING_APPROVAL", "EXECUTING", "VERIFYING", "RESOLVED"},
+                timeout=200,
+            )
 
-        # Approve remediation when proposed.
-        deadline = time.time() + 120
-        while time.time() < deadline:
+            # Approve remediation when proposed.
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                detail = _case_detail(dashboard_url, token, inv_id)
+                status = detail.get("status")
+                if status == "AWAITING_APPROVAL":
+                    _approve_pending(dashboard_url, token, inv_id)
+                if status == "RESOLVED":
+                    break
+                time.sleep(3)
+
             detail = _case_detail(dashboard_url, token, inv_id)
-            status = detail.get("status")
-            if status == "AWAITING_APPROVAL":
-                _approve_pending(dashboard_url, token, inv_id)
-            if status == "RESOLVED":
-                break
-            time.sleep(3)
-
-        detail = _case_detail(dashboard_url, token, inv_id)
         cat = ((detail.get("rca_report") or {}).get("root_cause") or {}).get("category")
         assert cat in {"resource", "configuration"}, f"RCA category={cat!r} detail={detail}"
 
@@ -1364,7 +1412,8 @@ def test_e1_worker_oom_to_resolved(dashboard_url, ingest_url, presto_url):
             )
     finally:
         if before is not None:
-            _e1_cleanup_fault(before[MEMORY_PROP])
+            with _timed_step("e1.cleanup"):
+                _e1_cleanup_fault(before[MEMORY_PROP])
 
 
 WEBHOOK_CAPTURE_URL = os.environ.get(
@@ -1429,40 +1478,42 @@ def test_e2_broken_catalog_redacted(dashboard_url, ingest_url, presto_url):
         f"connector.name=postgresql\n"
         f"connection-url=jdbc:postgresql://x?password={sentinel}\n"
     )
-    _put_configmap_key(COORDINATOR_CONFIGMAP, BROKEN_CATALOG_KEY, broken)
+    with _timed_step("e2.catalog_setup"):
+        _put_configmap_key(COORDINATOR_CONFIGMAP, BROKEN_CATALOG_KEY, broken)
 
-    # Patch coordinator Deployment to mount that key (idempotent).
-    # Fail closed: a scenario whose fault was never injected proves nothing
-    # about redaction, so every kubectl step here is asserted.
-    get = _kubectl_ok("get", "deploy", "presto-coordinator", "-o", "json")
-    assert get.stdout, "empty deployment JSON for presto-coordinator"
-    dep = json.loads(get.stdout)
-    spec = dep.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
-    volumes = {v.get("name") for v in spec.get("volumes") or []}
-    assert "config" in volumes, (
-        f"presto-coordinator has no 'config' volume to mount the catalog from: {volumes}"
-    )
-    containers = [c for c in (spec.get("containers") or []) if c.get("name") == "presto"]
-    assert containers, "presto-coordinator has no container named 'presto'"
-    for c in containers:
-        mounts = c.setdefault("volumeMounts", [])
-        if not any(m.get("mountPath") == BROKEN_CATALOG_MOUNT for m in mounts):
-            mounts.append(
-                {
-                    "name": "config",
-                    "mountPath": BROKEN_CATALOG_MOUNT,
-                    "subPath": BROKEN_CATALOG_KEY,
-                }
-            )
-    apply_dep = subprocess.run(
-        ["kubectl", "-n", "dbagent", "apply", "-f", "-"],
-        input=json.dumps(dep),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert apply_dep.returncode == 0, apply_dep.stderr
-    _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
+        # Patch coordinator Deployment to mount that key (idempotent).
+        # Fail closed: a scenario whose fault was never injected proves nothing
+        # about redaction, so every kubectl step here is asserted.
+        get = _kubectl_ok("get", "deploy", "presto-coordinator", "-o", "json")
+        assert get.stdout, "empty deployment JSON for presto-coordinator"
+        dep = json.loads(get.stdout)
+        spec = dep.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
+        volumes = {v.get("name") for v in spec.get("volumes") or []}
+        assert "config" in volumes, (
+            f"presto-coordinator has no 'config' volume to mount the catalog from: {volumes}"
+        )
+        containers = [c for c in (spec.get("containers") or []) if c.get("name") == "presto"]
+        assert containers, "presto-coordinator has no container named 'presto'"
+        for c in containers:
+            mounts = c.setdefault("volumeMounts", [])
+            if not any(m.get("mountPath") == BROKEN_CATALOG_MOUNT for m in mounts):
+                mounts.append(
+                    {
+                        "name": "config",
+                        "mountPath": BROKEN_CATALOG_MOUNT,
+                        "subPath": BROKEN_CATALOG_KEY,
+                    }
+                )
+        apply_dep = subprocess.run(
+            ["kubectl", "-n", "dbagent", "apply", "-f", "-"],
+            input=json.dumps(dep),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert apply_dep.returncode == 0, apply_dep.stderr
+    with _timed_step("e2.fault_restart"):
+        _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
 
     # Prove the sentinel is present on the coordinator (fault really injected).
     check = _kubectl_ok(
@@ -1474,147 +1525,149 @@ def test_e2_broken_catalog_redacted(dashboard_url, ingest_url, presto_url):
     )
     assert sentinel in (check.stdout or ""), "sentinel not mounted into coordinator"
 
-    opened = _post_alert(
-        ingest_url,
-        summary="catalog broken.properties failed connection-url password leak check",
-        extra={"labels": {"scenario": "e2_catalog"}},
-    )
-    inv_id = opened.get("investigation_id")
-    assert inv_id
+    with _timed_step("e2.case_processing"):
+        opened = _post_alert(
+            ingest_url,
+            summary="catalog broken.properties failed connection-url password leak check",
+            extra={"labels": {"scenario": "e2_catalog"}},
+        )
+        inv_id = opened.get("investigation_id")
+        assert inv_id
 
-    # E2's remediation fixture proposes a playbook so the real worker fires
-    # approval_requested (CLOSED_SUMMARY alone is not a notification event —
-    # design.md §9.5.3).  Deny it to land on CLOSED_SUMMARY as the scenario
-    # requires, then assert the capture holds a payload for this case with
-    # the sentinel absent from the actual received bytes (code review round 6, C4).
-    _wait_case(
-        dashboard_url,
-        token,
-        investigation_id=inv_id,
-        statuses={"AWAITING_APPROVAL", "CLOSED_SUMMARY", "RESOLVED", "NEEDS_HUMAN"},
-        timeout=180,
-    )
-    deadline = time.time() + 90
-    while time.time() < deadline:
+        # E2's remediation fixture proposes a playbook so the real worker fires
+        # approval_requested (CLOSED_SUMMARY alone is not a notification event —
+        # design.md §9.5.3).  Deny it to land on CLOSED_SUMMARY as the scenario
+        # requires, then assert the capture holds a payload for this case with
+        # the sentinel absent from the actual received bytes (code review round 6, C4).
+        _wait_case(
+            dashboard_url,
+            token,
+            investigation_id=inv_id,
+            statuses={"AWAITING_APPROVAL", "CLOSED_SUMMARY", "RESOLVED", "NEEDS_HUMAN"},
+            timeout=180,
+        )
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            detail = _case_detail(dashboard_url, token, inv_id)
+            status = detail.get("status")
+            if status == "AWAITING_APPROVAL":
+                _approve_pending(
+                    dashboard_url,
+                    token,
+                    inv_id,
+                    decision="denied",
+                    comment="e2 deny — redaction scenario only",
+                )
+            if status == "CLOSED_SUMMARY":
+                break
+            time.sleep(3)
         detail = _case_detail(dashboard_url, token, inv_id)
-        status = detail.get("status")
-        if status == "AWAITING_APPROVAL":
-            _approve_pending(
-                dashboard_url,
-                token,
-                inv_id,
-                decision="denied",
-                comment="e2 deny — redaction scenario only",
+        assert detail.get("status") == "CLOSED_SUMMARY", detail.get("status")
+
+    with _timed_step("e2.redaction_checks"):
+        blob = json.dumps(detail)
+        assert sentinel not in blob, "sentinel leaked into investigation detail"
+
+        notif_bodies = _wait_notification_for(inv_id, timeout=60)
+        # Marker-bearing subject description reaches the notification path via
+        # digest/summary; the sanitizer must replace it with ***REDACTED*** so
+        # both the placeholder and the raw marker are asserted (round 7, C3).
+        redacted_any = False
+        for body in notif_bodies:
+            assert sentinel not in body, (
+                f"sentinel present in a notification payload for {inv_id}: {body[:500]}"
             )
-        if status == "CLOSED_SUMMARY":
-            break
-        time.sleep(3)
-    detail = _case_detail(dashboard_url, token, inv_id)
-    assert detail.get("status") == "CLOSED_SUMMARY", detail.get("status")
-
-    blob = json.dumps(detail)
-    assert sentinel not in blob, "sentinel leaked into investigation detail"
-
-    notif_bodies = _wait_notification_for(inv_id, timeout=60)
-    # Marker-bearing subject description reaches the notification path via
-    # digest/summary; the sanitizer must replace it with ***REDACTED*** so
-    # both the placeholder and the raw marker are asserted (round 7, C3).
-    redacted_any = False
-    for body in notif_bodies:
-        assert sentinel not in body, (
-            f"sentinel present in a notification payload for {inv_id}: {body[:500]}"
-        )
-        if "***REDACTED***" in body:
-            redacted_any = True
-    assert redacted_any, (
-        f"notification payloads for {inv_id} never carried the redaction "
-        f"placeholder — marker-bearing digest was not sanitized: "
-        f"{[b[:300] for b in notif_bodies]}"
-    )
-
-    # The case surfaces are summaries; redaction has to hold in the artefacts
-    # they *reference*. Every response below is asserted (a non-200 used to
-    # skip the sentinel check entirely) and every referenced object is
-    # downloaded and searched (code review round 5, C3).
-    refs = _evidence_refs(dashboard_url, token, inv_id)
-    assert refs, "E2 collected no evidence; redaction was never exercised"
-
-    collected: list[tuple[dict, dict, str]] = []
-    for ref in refs:
-        assert sentinel not in json.dumps(ref), f"sentinel in evidence reference {ref}"
-        evidence_id = ref["evidence_id"]
-        record = _evidence_record(dashboard_url, token, evidence_id)
-        assert sentinel not in json.dumps(record), (
-            f"sentinel in evidence record {evidence_id}"
-        )
-        payload = _evidence_payload(dashboard_url, token, evidence_id)
-        assert payload, f"evidence {evidence_id} stored an empty payload"
-        assert sentinel not in payload, (
-            f"sentinel present in the stored evidence object for {evidence_id} "
-            f"(tool={record.get('tool_name')!r}, {len(payload)} bytes)"
-        )
-        collected.append((ref, record, payload))
-
-    # The file the sentinel lives in must actually have been read: "the
-    # sentinel is absent" is worth nothing if nothing ever collected it.
-    catalog = [
-        (record, payload)
-        for _ref, record, payload in collected
-        if record.get("tool_name") == "presto_config"
-        and (record.get("args") or {}).get("file") == "catalog:broken"
-    ]
-    assert catalog, (
-        "E2 never collected the broken catalog through presto_config; "
-        f"tools collected={[r.get('tool_name') for _x, r, _y in collected]}"
-    )
-    for record, payload in catalog:
-        assert record.get("redacted") is True, (
-            f"evidence {record.get('evidence_id')} read the credential-bearing "
-            f"catalog but is not flagged redacted: {record}"
-        )
-        assert "connection-url" in payload, (
-            f"the collected catalog payload is not the broken catalog: {payload[:400]}"
-        )
-        assert "***REDACTED***" in payload, (
-            f"the credential was not replaced by the redaction placeholder: {payload[:400]}"
+            if "***REDACTED***" in body:
+                redacted_any = True
+        assert redacted_any, (
+            f"notification payloads for {inv_id} never carried the redaction "
+            f"placeholder — marker-bearing digest was not sanitized: "
+            f"{[b[:300] for b in notif_bodies]}"
         )
 
-    calls = _llm_calls(dashboard_url, token, inv_id)
-    assert calls, "E2 made no LLM calls; the prompt surface was never exercised"
-    downloaded = 0
-    for call in calls:
-        role = call.get("agent_role")
-        # The remediation fixture plants password=<sentinel> so the approval
-        # notification digest exercises the sanitizer (round 7, C3).  That
-        # planted response is intentionally marker-bearing; prompts and every
-        # other role must still be clean.
-        row_blob = json.dumps(call)
-        if role != "remediation":
-            assert sentinel not in row_blob, f"sentinel in llm-call row {call}"
-        urls = {"prompt_url": call.get("prompt_url")}
-        if not call.get("error"):
-            urls["response_url"] = call.get("response_url")
-        for field, url in urls.items():
-            assert url, f"llm-call {call.get('call_id')} has no {field}"
-            body = _fetch_object(url)
-            assert body, f"llm-call {call.get('call_id')} {field} stored no bytes"
-            if role == "remediation" and field == "response_url":
-                assert sentinel in body, (
-                    "remediation fixture must plant the marker for the "
-                    "notification redaction path"
+        # The case surfaces are summaries; redaction has to hold in the artefacts
+        # they *reference*. Every response below is asserted (a non-200 used to
+        # skip the sentinel check entirely) and every referenced object is
+        # downloaded and searched (code review round 5, C3).
+        refs = _evidence_refs(dashboard_url, token, inv_id)
+        assert refs, "E2 collected no evidence; redaction was never exercised"
+
+        collected: list[tuple[dict, dict, str]] = []
+        for ref in refs:
+            assert sentinel not in json.dumps(ref), f"sentinel in evidence reference {ref}"
+            evidence_id = ref["evidence_id"]
+            record = _evidence_record(dashboard_url, token, evidence_id)
+            assert sentinel not in json.dumps(record), (
+                f"sentinel in evidence record {evidence_id}"
+            )
+            payload = _evidence_payload(dashboard_url, token, evidence_id)
+            assert payload, f"evidence {evidence_id} stored an empty payload"
+            assert sentinel not in payload, (
+                f"sentinel present in the stored evidence object for {evidence_id} "
+                f"(tool={record.get('tool_name')!r}, {len(payload)} bytes)"
+            )
+            collected.append((ref, record, payload))
+
+        # The file the sentinel lives in must actually have been read: "the
+        # sentinel is absent" is worth nothing if nothing ever collected it.
+        catalog = [
+            (record, payload)
+            for _ref, record, payload in collected
+            if record.get("tool_name") == "presto_config"
+            and (record.get("args") or {}).get("file") == "catalog:broken"
+        ]
+        assert catalog, (
+            "E2 never collected the broken catalog through presto_config; "
+            f"tools collected={[r.get('tool_name') for _x, r, _y in collected]}"
+        )
+        for record, payload in catalog:
+            assert record.get("redacted") is True, (
+                f"evidence {record.get('evidence_id')} read the credential-bearing "
+                f"catalog but is not flagged redacted: {record}"
+            )
+            assert "connection-url" in payload, (
+                f"the collected catalog payload is not the broken catalog: {payload[:400]}"
+            )
+            assert "***REDACTED***" in payload, (
+                f"the credential was not replaced by the redaction placeholder: {payload[:400]}"
+            )
+
+        calls = _llm_calls(dashboard_url, token, inv_id)
+        assert calls, "E2 made no LLM calls; the prompt surface was never exercised"
+        downloaded = 0
+        for call in calls:
+            role = call.get("agent_role")
+            # The remediation fixture plants password=<sentinel> so the approval
+            # notification digest exercises the sanitizer (round 7, C3).  That
+            # planted response is intentionally marker-bearing; prompts and every
+            # other role must still be clean.
+            row_blob = json.dumps(call)
+            if role != "remediation":
+                assert sentinel not in row_blob, f"sentinel in llm-call row {call}"
+            urls = {"prompt_url": call.get("prompt_url")}
+            if not call.get("error"):
+                urls["response_url"] = call.get("response_url")
+            for field, url in urls.items():
+                assert url, f"llm-call {call.get('call_id')} has no {field}"
+                body = _fetch_object(url)
+                assert body, f"llm-call {call.get('call_id')} {field} stored no bytes"
+                if role == "remediation" and field == "response_url":
+                    assert sentinel in body, (
+                        "remediation fixture must plant the marker for the "
+                        "notification redaction path"
+                    )
+                    downloaded += 1
+                    continue
+                assert sentinel not in body, (
+                    f"sentinel present in the stored {field} of llm-call "
+                    f"{call.get('call_id')} (agent_role={role!r})"
                 )
                 downloaded += 1
-                continue
-            assert sentinel not in body, (
-                f"sentinel present in the stored {field} of llm-call "
-                f"{call.get('call_id')} (agent_role={role!r})"
-            )
-            downloaded += 1
-    assert downloaded >= 2, f"only {downloaded} LLM artefact(s) were inspected"
+        assert downloaded >= 2, f"only {downloaded} LLM artefact(s) were inspected"
 
-    entries = _audit_entries(dashboard_url, token, inv_id)
-    assert entries, "expected audit rows for the redaction case"
-    assert sentinel not in json.dumps(entries), "sentinel leaked into the audit trail"
+        entries = _audit_entries(dashboard_url, token, inv_id)
+        assert entries, "expected audit rows for the redaction case"
+        assert sentinel not in json.dumps(entries), "sentinel leaked into the audit trail"
 
     cat = ((detail.get("rca_report") or {}).get("root_cause") or {}).get("category")
     assert cat == "configuration", f"RCA category={cat!r}"
@@ -1818,13 +1871,15 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
     # still tears down whatever cluster state was mutated (W1: cleanup is
     # state-observed, not dependent on post-success flags).
     try:
-        _put_configmap_key(
-            COORDINATOR_CONFIGMAP,
-            RESOURCE_GROUPS_PROPERTIES_KEY,
-            f"{RESOURCE_GROUP_MANAGER_PROP}=file\n{RESOURCE_GROUP_FILE_PROP}={RESOURCE_GROUP_FILE}\n",
-        )
-        _patch_coordinator_rg_mount(present=True)
-        _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
+        with _timed_step("e3.resource_group_setup"):
+            _put_configmap_key(
+                COORDINATOR_CONFIGMAP,
+                RESOURCE_GROUPS_PROPERTIES_KEY,
+                f"{RESOURCE_GROUP_MANAGER_PROP}=file\n{RESOURCE_GROUP_FILE_PROP}={RESOURCE_GROUP_FILE}\n",
+            )
+            _patch_coordinator_rg_mount(present=True)
+        with _timed_step("e3.fault_restart"):
+            _restart_and_wait(COORDINATOR_WORKLOAD, timeout="180s")
 
         mounted = _mounted_property(
             COORDINATOR_WORKLOAD, RESOURCE_GROUPS_PROPERTIES_PATH, RESOURCE_GROUP_MANAGER_PROP
@@ -1833,51 +1888,55 @@ def test_e3_queue_saturation_closed_summary(dashboard_url, ingest_url, presto_ur
             f"resource-group constraint never reached the coordinator: {mounted!r}"
         )
 
-        submitted = [
-            _submit_query(presto_url, E3_LONG_QUERY)
-            for _ in range(E3_CONCURRENT_QUERIES)
-        ]
-        assert len(set(submitted)) == E3_CONCURRENT_QUERIES, submitted
+        with _timed_step("e3.queue_establishment"):
+            submitted = [
+                _submit_query(presto_url, E3_LONG_QUERY)
+                for _ in range(E3_CONCURRENT_QUERIES)
+            ]
+            assert len(set(submitted)) == E3_CONCURRENT_QUERIES, submitted
 
-        states = _wait_for_states(presto_url, "QUEUED", at_least=1, timeout=90)
-        queued = [
-            qid
-            for qid, state in states.items()
-            if state == "QUEUED" and qid in set(submitted)
-        ]
-        assert queued, (
-            "E3 fault not established: none of this scenario's queries is "
-            f"QUEUED on the coordinator; submitted={submitted} states={states}"
-        )
+            states = _wait_for_states(presto_url, "QUEUED", at_least=1, timeout=90)
+            queued = [
+                qid
+                for qid, state in states.items()
+                if state == "QUEUED" and qid in set(submitted)
+            ]
+            assert queued, (
+                "E3 fault not established: none of this scenario's queries is "
+                f"QUEUED on the coordinator; submitted={submitted} states={states}"
+            )
 
-        _assert_v1_query_contract(presto_url)
+            _assert_v1_query_contract(presto_url)
 
-        opened = _post_alert(
-            ingest_url,
-            summary=(
-                f"queue saturation: {len(queued)} queries QUEUED behind the "
-                "global resource group"
-            ),
-            extra={"labels": {"scenario": "e3_queue"}},
-        )
-        inv_id = opened.get("investigation_id")
-        assert inv_id
-        _e3_assert_case(dashboard_url, token, inv_id, queued=queued)
+        with _timed_step("e3.case_processing"):
+            opened = _post_alert(
+                ingest_url,
+                summary=(
+                    f"queue saturation: {len(queued)} queries QUEUED behind the "
+                    "global resource group"
+                ),
+                extra={"labels": {"scenario": "e3_queue"}},
+            )
+            inv_id = opened.get("investigation_id")
+            assert inv_id
+            _e3_assert_case(dashboard_url, token, inv_id, queued=queued)
     finally:
-        _e3_cleanup_fault()
+        with _timed_step("e3.cleanup"):
+            _e3_cleanup_fault()
 
-    drained_deadline = time.time() + 120
-    remaining = {}
-    while time.time() < drained_deadline:
-        remaining = {
-            qid: state
-            for qid, state in _query_states(presto_url).items()
-            if state == "QUEUED"
-        }
-        if not remaining:
-            break
-        time.sleep(3)
-    assert not remaining, f"queued backlog did not drain after recovery: {remaining}"
+    with _timed_step("e3.drain"):
+        drained_deadline = time.time() + 120
+        remaining = {}
+        while time.time() < drained_deadline:
+            remaining = {
+                qid: state
+                for qid, state in _query_states(presto_url).items()
+                if state == "QUEUED"
+            }
+            if not remaining:
+                break
+            time.sleep(3)
+        assert not remaining, f"queued backlog did not drain after recovery: {remaining}"
 
 
 def _e3_assert_case(

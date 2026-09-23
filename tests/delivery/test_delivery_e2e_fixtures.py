@@ -4029,3 +4029,718 @@ def test_kind_tuning_postgres_resources_are_e2e_only():
     assert _rendered_bundled_postgres_resources(
         [], set_args=["postgresql.bundled=true"]
     ) == KDT_CHART_PG_RESOURCES
+
+
+# ---------------------------------------------------------------------------
+# ci-runtime-2 — non-gating e2e step timing (FP-CIR2-1/2/3)
+# ---------------------------------------------------------------------------
+
+_STEP_RECORD_RE = re.compile(
+    r"^CI_E2E_STEP event=(?P<event>start|end) label=(?P<label>[a-z0-9_.]+)"
+    r"(?: result=(?P<result>ok|error) elapsed_s=(?P<elapsed>\d+\.\d{3}))?$"
+)
+
+# design/slices/ci-runtime-2 §3.1: restart substeps in their existing order.
+CIR2_RESTART_LABELS = [
+    "restart.rollout_restart",
+    "restart.rollout_status",
+    "restart.coordinator_settle",
+    "restart.coordinator_ready",
+    "restart.coordinator_restart_count",
+]
+CIR2_WORKER_ONLY_LABELS = CIR2_RESTART_LABELS[:2]
+
+# §3.2: per scenario, the ordered stage spans.
+CIR2_SCENARIO_LABELS = {
+    "test_e1_worker_oom_to_resolved": [
+        "e1.fault_patch",
+        "e1.fault_restart",
+        "e1.worker_discovery",
+        "e1.trip_query",
+        "e1.case_processing",
+        "e1.cleanup",
+    ],
+    "test_e2_broken_catalog_redacted": [
+        "e2.catalog_setup",
+        "e2.fault_restart",
+        "e2.case_processing",
+        "e2.redaction_checks",
+    ],
+    "test_e3_queue_saturation_closed_summary": [
+        "e3.resource_group_setup",
+        "e3.fault_restart",
+        "e3.queue_establishment",
+        "e3.case_processing",
+        "e3.cleanup",
+        "e3.drain",
+    ],
+}
+
+# The existing work each span must enclose (callee names inside its body).
+CIR2_SPAN_CALLS = {
+    "e1.fault_patch": {"_patch_configmap_property"},
+    "e1.fault_restart": {"_restart_and_wait"},
+    "e1.worker_discovery": {"_wait_presto_workers_discovered"},
+    "e1.trip_query": {"_presto_query", "_is_presto_local_memory_limit_failure"},
+    "e1.case_processing": {"_post_alert", "_wait_case", "_approve_pending", "_case_detail"},
+    "e1.cleanup": {"_e1_cleanup_fault"},
+    "e2.catalog_setup": {"_put_configmap_key", "_kubectl_ok", "run"},
+    "e2.fault_restart": {"_restart_and_wait"},
+    "e2.case_processing": {"_post_alert", "_wait_case", "_approve_pending", "_case_detail"},
+    "e2.redaction_checks": {
+        "_wait_notification_for",
+        "_evidence_refs",
+        "_evidence_record",
+        "_evidence_payload",
+        "_llm_calls",
+        "_fetch_object",
+        "_audit_entries",
+    },
+    "e3.resource_group_setup": {"_put_configmap_key", "_patch_coordinator_rg_mount"},
+    "e3.fault_restart": {"_restart_and_wait"},
+    "e3.queue_establishment": {"_submit_query", "_wait_for_states", "_assert_v1_query_contract"},
+    "e3.case_processing": {"_post_alert", "_e3_assert_case"},
+    "e3.cleanup": {"_e3_cleanup_fault"},
+    "e3.drain": {"_query_states"},
+}
+CIR2_FINALLY_SPANS = {"e1.cleanup", "e3.cleanup"}
+E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys"
+
+
+class _LineRecorder:
+    """A stdout stand-in that records complete lines into a shared event log."""
+
+    def __init__(self, events: list):
+        self.events = events
+        self._buf = ""
+
+    def write(self, text: str) -> int:
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self.events.append(("out", line))
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
+class _BrokenStream:
+    """A stdout stand-in whose every write fails, recording each attempt."""
+
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+        self.attempts: list[str] = []
+
+    def write(self, text: str) -> int:
+        self.attempts.append(text)
+        raise self.exc
+
+    def flush(self) -> None:
+        raise self.exc
+
+
+def _fake_clock(step: float = 1.25):
+    ticks = {"n": 0}
+
+    def perf_counter() -> float:
+        ticks["n"] += 1
+        return 100.0 + step * ticks["n"]
+
+    return perf_counter, ticks
+
+
+def _step_records(lines: list[str]) -> list[dict]:
+    records = []
+    for line in lines:
+        if not line.startswith("CI_E2E_STEP"):
+            continue
+        m = _STEP_RECORD_RE.match(line)
+        assert m, f"malformed CI_E2E_STEP record: {line!r}"
+        records.append(m.groupdict())
+    return records
+
+
+def _time_sleep_forbidden(_s):
+    raise AssertionError("_timed_step must not sleep")
+
+
+def test_timed_step_uses_monotonic_clock_and_emits_once(monkeypatch, capsys):
+    """FP-CIR2-1/2 [unit]: start/end grammar, perf_counter duration, one end record."""
+    import types
+
+    mod = _load_e2e_scenarios_module()
+    perf_counter, ticks = _fake_clock(step=1.25)
+
+    def wall_clock_forbidden():
+        raise AssertionError("_timed_step must use the monotonic perf_counter")
+
+    monkeypatch.setattr(
+        mod,
+        "time",
+        types.SimpleNamespace(
+            perf_counter=perf_counter, time=wall_clock_forbidden, sleep=_time_sleep_forbidden
+        ),
+    )
+    ran = []
+    with mod._timed_step("e1.case_processing"):
+        ran.append("body")
+    assert ran == ["body"]
+    assert ticks["n"] == 2, "exactly one clock read at start and one at end"
+
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        "CI_E2E_STEP event=start label=e1.case_processing",
+        "CI_E2E_STEP event=end label=e1.case_processing result=ok elapsed_s=1.250",
+    ], out
+    records = _step_records(out)
+    ends = [r for r in records if r["event"] == "end"]
+    assert len(ends) == 1 and ends[0]["result"] == "ok"
+    assert float(ends[0]["elapsed"]) >= 0
+
+    # Real clock: nonnegative three-decimal duration, still exactly one end.
+    mod2 = _load_e2e_scenarios_module()
+    with mod2._timed_step("e3.drain"):
+        pass
+    records = _step_records(capsys.readouterr().out.splitlines())
+    assert [r["event"] for r in records] == ["start", "end"]
+    assert records[1]["label"] == "e3.drain" and records[1]["result"] == "ok"
+    assert float(records[1]["elapsed"]) >= 0.0
+
+
+
+def test_timed_step_preserves_failure_and_ignores_output_error(monkeypatch, capsys):
+    """FP-CIR2-1/2 [unit]: the original exception escapes; a broken stream is telemetry loss."""
+    import io
+    import types
+
+    mod = _load_e2e_scenarios_module()
+    perf_counter, _ticks = _fake_clock(step=0.5)
+    monkeypatch.setattr(mod, "time", types.SimpleNamespace(perf_counter=perf_counter))
+
+    class Boom(Exception):
+        pass
+
+    original = Boom("original failure")
+    with pytest.raises(Boom) as ei:
+        with mod._timed_step("e2.case_processing"):
+            raise original
+    assert ei.value is original, "the timed exception must propagate unchanged"
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        "CI_E2E_STEP event=start label=e2.case_processing",
+        "CI_E2E_STEP event=end label=e2.case_processing result=error elapsed_s=0.500",
+    ], out
+
+    # An AssertionError (the scenarios' own failure type) is not swallowed either.
+    with pytest.raises(AssertionError, match="restartCount"):
+        with mod._timed_step("restart.coordinator_restart_count"):
+            raise AssertionError("restartCount='2'")
+    records = _step_records(capsys.readouterr().out.splitlines())
+    assert [(r["event"], r["result"]) for r in records] == [("start", None), ("end", "error")]
+
+    # Broken output streams: the body's result wins, every time.
+    for exc in (BrokenPipeError("pipe closed"), OSError("disk full"), ValueError("closed file")):
+        broken = _BrokenStream(exc)
+        monkeypatch.setattr(mod, "sys", types.SimpleNamespace(stdout=broken))
+        ran = []
+        with mod._timed_step("e3.cleanup"):
+            ran.append("body")
+        assert ran == ["body"], "an output error must not skip the timed work"
+        assert len(broken.attempts) == 2, broken.attempts
+        assert broken.attempts[0] == "CI_E2E_STEP event=start label=e3.cleanup"
+        assert broken.attempts[1].startswith(
+            "CI_E2E_STEP event=end label=e3.cleanup result=ok elapsed_s="
+        )
+
+        broken = _BrokenStream(exc)
+        monkeypatch.setattr(mod, "sys", types.SimpleNamespace(stdout=broken))
+        failure = Boom("body failed")
+        with pytest.raises(Boom) as ei:
+            with mod._timed_step("e3.cleanup"):
+                raise failure
+        assert ei.value is failure, "an output error must not replace the original failure"
+        end_attempts = [a for a in broken.attempts if "event=end" in a]
+        assert len(end_attempts) == 1 and "result=error" in end_attempts[0], broken.attempts
+
+    # A closed real stream (ValueError from print) is also telemetry loss.
+    closed = io.StringIO()
+    closed.close()
+    monkeypatch.setattr(mod, "sys", types.SimpleNamespace(stdout=closed))
+    with mod._timed_step("e1.cleanup"):
+        pass
+
+
+def _restart_harness(monkeypatch, mod, *, restart_count: str = "0", fail_on=None):
+    """Monkeypatch kubectl, sleep, perf_counter and stdout into one event log."""
+    import types
+    from subprocess import CompletedProcess
+
+    events: list[tuple[str, object]] = []
+    perf_counter, _ticks = _fake_clock(step=0.25)
+
+    def sleep(seconds):
+        events.append(("sleep", seconds))
+
+    def kubectl_ok(*args):
+        events.append(("kubectl", args))
+        if fail_on is not None and args[:2] == fail_on:
+            raise RuntimeError(f"kubectl {' '.join(args)} failed")
+        if args[:1] == ("get",):
+            return CompletedProcess(args, 0, f"{restart_count}\n", "")
+        return CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(mod, "time", types.SimpleNamespace(perf_counter=perf_counter, sleep=sleep))
+    monkeypatch.setattr(mod, "sys", types.SimpleNamespace(stdout=_LineRecorder(events)))
+    monkeypatch.setattr(mod, "_kubectl_ok", kubectl_ok)
+    return events
+
+
+def _spans_with_work(events: list) -> list[tuple[str, str | None, list]]:
+    """Group the event log into (label, result, work-inside-span)."""
+    spans: list[tuple[str, str | None, list]] = []
+    open_label = None
+    work: list = []
+    for kind, value in events:
+        if kind == "out":
+            rec = _STEP_RECORD_RE.match(value)
+            assert rec, f"non-record output from _restart_and_wait: {value!r}"
+            if rec["event"] == "start":
+                assert open_label is None, f"restart spans must not overlap: {events}"
+                open_label, work = rec["label"], []
+            else:
+                assert rec["label"] == open_label, events
+                spans.append((open_label, rec["result"], work))
+                open_label = None
+        else:
+            assert open_label is not None, f"{kind} {value!r} ran outside every span"
+            work.append((kind, value))
+    assert open_label is None, f"span {open_label} never ended"
+    return spans
+
+
+def test_restart_timing_covers_worker_and_coordinator_paths(monkeypatch):
+    """FP-CIR2-1 [function test]: the actual _restart_and_wait, both workload types.
+
+    Ordered labels; settle/Ready/count only for the coordinator; the unchanged
+    15 s sleep; every kubectl call inside its own span; the original
+    restartCount failure escapes with an error record.
+    """
+    mod = _load_e2e_scenarios_module()
+
+    # Worker: two spans, no settle, the default 120s timeout.
+    events = _restart_harness(monkeypatch, mod)
+    mod._restart_and_wait(mod.WORKER_WORKLOAD)
+    spans = _spans_with_work(events)
+    assert [(label, result) for label, result, _w in spans] == [
+        (label, "ok") for label in CIR2_WORKER_ONLY_LABELS
+    ]
+    assert spans[0][2] == [("kubectl", ("rollout", "restart", mod.WORKER_WORKLOAD))]
+    assert spans[1][2] == [
+        ("kubectl", ("rollout", "status", mod.WORKER_WORKLOAD, "--timeout=120s"))
+    ]
+    assert not any(kind == "sleep" for kind, _v in events), "worker restarts never settle"
+
+    # Coordinator: five spans in order, 15 s settle, Ready, restartCount == 0.
+    events = _restart_harness(monkeypatch, mod)
+    mod._restart_and_wait(mod.COORDINATOR_WORKLOAD, timeout="180s")
+    spans = _spans_with_work(events)
+    assert [(label, result) for label, result, _w in spans] == [
+        (label, "ok") for label in CIR2_RESTART_LABELS
+    ]
+    work = {label: w for label, _r, w in spans}
+    assert work["restart.rollout_restart"] == [
+        ("kubectl", ("rollout", "restart", mod.COORDINATOR_WORKLOAD))
+    ]
+    assert work["restart.rollout_status"] == [
+        ("kubectl", ("rollout", "status", mod.COORDINATOR_WORKLOAD, "--timeout=180s"))
+    ]
+    assert work["restart.coordinator_settle"] == [("sleep", 15)]
+    assert work["restart.coordinator_ready"] == [
+        (
+            "kubectl",
+            (
+                "wait",
+                "--for=condition=Ready",
+                "pod",
+                "-l",
+                "app=presto,role=coordinator",
+                "--timeout=180s",
+            ),
+        )
+    ]
+    (count_call,) = work["restart.coordinator_restart_count"]
+    assert count_call[1][:4] == ("get", "pod", "-l", "app=presto,role=coordinator")
+    assert "restartCount" in count_call[1][-1]
+
+    # A crashlooping coordinator: the original assertion escapes, recorded as error.
+    events = _restart_harness(monkeypatch, mod, restart_count="3")
+    with pytest.raises(AssertionError, match=r"restartCount='3'.*crashlooping"):
+        mod._restart_and_wait(mod.COORDINATOR_WORKLOAD, timeout="180s")
+    spans = _spans_with_work(events)
+    assert [(label, result) for label, result, _w in spans] == [
+        ("restart.rollout_restart", "ok"),
+        ("restart.rollout_status", "ok"),
+        ("restart.coordinator_settle", "ok"),
+        ("restart.coordinator_ready", "ok"),
+        ("restart.coordinator_restart_count", "error"),
+    ]
+
+    # A failed rollout status: its own error record, nothing after it runs.
+    events = _restart_harness(monkeypatch, mod, fail_on=("rollout", "status"))
+    with pytest.raises(RuntimeError, match="rollout status"):
+        mod._restart_and_wait(mod.COORDINATOR_WORKLOAD, timeout="180s")
+    spans = _spans_with_work(events)
+    assert [(label, result) for label, result, _w in spans] == [
+        ("restart.rollout_restart", "ok"),
+        ("restart.rollout_status", "error"),
+    ]
+    assert not any(kind == "sleep" for kind, _v in events)
+
+
+def _timed_step_label(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Call) or not _is_name(node.func, "_timed_step"):
+        return None
+    if len(node.args) != 1 or node.keywords:
+        return "<non-literal>"
+    arg = node.args[0]
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return "<non-literal>"
+
+
+def _timed_withs(func: ast.AST) -> list[tuple[str, ast.With]]:
+    found = []
+    for node in ast.walk(func):
+        if isinstance(node, ast.With):
+            for item in node.items:
+                label = _timed_step_label(item.context_expr)
+                if label is not None:
+                    found.append((label, node))
+    return sorted(found, key=lambda pair: (pair[1].lineno, pair[1].col_offset))
+
+
+def _called_names(nodes) -> list[str]:
+    names = []
+    for stmt in nodes:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    names.append(node.func.id)
+                elif isinstance(node.func, ast.Attribute):
+                    names.append(node.func.attr)
+    return names
+
+
+def _in_finally(target: ast.AST, func: ast.AST) -> bool:
+    for node in ast.walk(func):
+        if isinstance(node, ast.Try):
+            for stmt in node.finalbody:
+                if any(sub is target for sub in ast.walk(stmt)):
+                    return True
+    return False
+
+
+def _is_restart_count_assert(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Assert)
+        and isinstance(node.test, ast.Compare)
+        and _is_name(node.test.left, "out")
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Eq)
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == "0"
+    )
+
+
+def _timing_span_failures(source: str) -> list[str]:
+    """§3.1/§3.2 structure: every span present, in order, around the existing work."""
+    fails: list[str] = []
+    tree = ast.parse(source)
+    allowed = set(CIR2_RESTART_LABELS)
+    for labels in CIR2_SCENARIO_LABELS.values():
+        allowed |= set(labels)
+    for label, _node in _timed_withs(tree):
+        if label not in allowed:
+            fails.append(f"unlisted or non-literal timing label {label!r}")
+
+    # §3.1: _restart_and_wait keeps its signature, order, settle and D2 check.
+    restart = _func_def_from_tree(tree, "_restart_and_wait")
+    if restart is None:
+        return fails + ["_restart_and_wait missing"]
+    params = [a.arg for a in restart.args.args]
+    defaults = [d.value for d in restart.args.defaults if isinstance(d, ast.Constant)]
+    if params != ["workload", "timeout"] or defaults != ["120s"]:
+        fails.append(f"_restart_and_wait signature changed: {params} {defaults}")
+    spans = _timed_withs(restart)
+    if [label for label, _n in spans] != CIR2_RESTART_LABELS:
+        fails.append(f"restart spans {[label for label, _n in spans]}")
+    body = {label: node for label, node in spans}
+    coordinator_if = next(
+        (
+            n
+            for n in restart.body
+            if isinstance(n, ast.If)
+            and "presto-coordinator" in (ast.get_source_segment(source, n.test) or "")
+        ),
+        None,
+    )
+    if coordinator_if is None:
+        fails.append("coordinator-only branch missing")
+    for label in CIR2_RESTART_LABELS[2:]:
+        node = body.get(label)
+        if node is None or coordinator_if is None:
+            continue
+        if not any(node is sub for sub in ast.walk(coordinator_if)):
+            fails.append(f"{label} must be coordinator-only")
+    for label in CIR2_WORKER_ONLY_LABELS:
+        node = body.get(label)
+        if node is not None and node not in restart.body:
+            fails.append(f"{label} must run for every workload")
+    expectations = {
+        "restart.rollout_restart": ("_kubectl_ok", "restart"),
+        "restart.rollout_status": ("_kubectl_ok", "status"),
+        "restart.coordinator_ready": ("_kubectl_ok", "--for=condition=Ready"),
+        "restart.coordinator_restart_count": ("_kubectl_ok", "restartCount"),
+    }
+    for label, (callee, needle) in expectations.items():
+        node = body.get(label)
+        seg = ast.get_source_segment(source, node) if node is not None else ""
+        if node is None or callee not in _called_names(node.body) or needle not in seg:
+            fails.append(f"{label} no longer encloses its {needle} call")
+    settle = body.get("restart.coordinator_settle")
+    sleeps = [
+        n
+        for n in (ast.walk(settle) if settle is not None else [])
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "sleep"
+        and len(n.args) == 1
+        and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value == 15
+    ]
+    if len(sleeps) != 1:
+        fails.append("restart.coordinator_settle must keep time.sleep(15)")
+    count = body.get("restart.coordinator_restart_count")
+    if count is None or not any(_is_restart_count_assert(n) for n in ast.walk(count)):
+        fails.append("restart.coordinator_restart_count lost the restartCount == '0' assertion")
+    if sum(_is_restart_count_assert(n) for n in ast.walk(restart)) != 1:
+        fails.append("_restart_and_wait must carry exactly one restartCount assertion")
+
+    # §3.2: scenario spans, in order, each around its existing work.
+    for func_name, labels in CIR2_SCENARIO_LABELS.items():
+        func = _func_def_from_tree(tree, func_name)
+        if func is None:
+            fails.append(f"{func_name} missing")
+            continue
+        spans = _timed_withs(func)
+        got = [label for label, _n in spans]
+        if got != labels:
+            fails.append(f"{func_name} spans {got} != {labels}")
+        for label, node in spans:
+            need = CIR2_SPAN_CALLS.get(label, set())
+            missing = need - set(_called_names(node.body))
+            if missing:
+                fails.append(f"{label} no longer encloses {sorted(missing)}")
+            if (label in CIR2_FINALLY_SPANS) != _in_finally(node, func):
+                fails.append(f"{label} finally placement changed")
+        # Five scenario restarts overall: one fault restart per scenario here.
+        restarts = _called_names(func.body).count("_restart_and_wait")
+        if restarts != 1:
+            fails.append(f"{func_name} calls _restart_and_wait {restarts} times, expected 1")
+    e1 = _func_def_from_tree(tree, "test_e1_worker_oom_to_resolved")
+    if e1 is not None:
+        guarded = [
+            n
+            for n in ast.walk(e1)
+            if isinstance(n, ast.If)
+            and (ast.get_source_segment(source, n.test) or "") == "before is not None"
+            and "_e1_cleanup_fault" in _called_names(n.body)
+        ]
+        if len(guarded) != 1 or not _in_finally(guarded[0], e1):
+            fails.append("e1.cleanup lost its `before is not None` finally guard")
+    for helper in ("_e1_cleanup_fault", "_e3_cleanup_fault"):
+        node = _func_def_from_tree(tree, helper)
+        if node is None or _called_names(node.body).count("_restart_and_wait") != 1:
+            fails.append(f"{helper} must keep its one cleanup restart")
+    e3 = _func_def_from_tree(tree, "test_e3_queue_saturation_closed_summary")
+    drain = next((n for label, n in _timed_withs(e3) if label == "e3.drain"), None) if e3 else None
+    if drain is None or not any(
+        isinstance(n, ast.Assert)
+        and isinstance(n.test, ast.UnaryOp)
+        and isinstance(n.test.op, ast.Not)
+        and _is_name(n.test.operand, "remaining")
+        for n in ast.walk(drain)
+    ):
+        fails.append("e3.drain lost its `not remaining` assertion")
+    return fails
+
+
+_CIR2_SPAN_MUTANTS = {
+    "e1_cleanup_call_removed": (
+        "_e1_cleanup_fault(before[MEMORY_PROP])\n",
+        "pass\n",
+    ),
+    "e3_cleanup_call_removed": ("            _e3_cleanup_fault()\n", "            pass\n"),
+    "restart_count_assertion_removed": (
+        '            assert out == "0", (\n',
+        '            assert out == out or "0", (\n',
+    ),
+    "settle_shortened": ("time.sleep(15)", "time.sleep(1)"),
+    "settle_span_dropped_label": (
+        '_timed_step("restart.coordinator_settle")',
+        '_timed_step("restart.settle")',
+    ),
+    "e2_redaction_span_relabelled": (
+        '_timed_step("e2.redaction_checks")',
+        '_timed_step("e2.redaction")',
+    ),
+    "e1_worker_discovery_call_removed": (
+        "            _wait_presto_workers_discovered(presto_url)\n",
+        "            pass\n",
+    ),
+    "e3_drain_assert_removed": (
+        '        assert not remaining, f"queued backlog did not drain after recovery: {remaining}"\n',
+        "        pass\n",
+    ),
+    "label_not_literal": (
+        '_timed_step("e1.trip_query")',
+        '_timed_step("e1." + "trip_query")',
+    ),
+}
+
+
+@pytest.mark.parametrize("mutant", [None, *_CIR2_SPAN_MUTANTS], ids=["real", *_CIR2_SPAN_MUTANTS])
+def test_e1_e2_e3_timing_spans_preserve_scenario_calls(mutant):
+    """FP-CIR2-2 [function test]: every §3.1/§3.2 span boundary around the existing calls.
+
+    The real source passes; each negative fixture (a removed cleanup call, a
+    weakened restart-count assertion, a shortened settle, a lost span) is red.
+    """
+    source = _E2E_SCENARIOS_PATH.read_text(encoding="utf-8")
+    if mutant is None:
+        assert _timing_span_failures(source) == []
+        return
+    old, new = _CIR2_SPAN_MUTANTS[mutant]
+    assert source.count(old) == 1, f"{mutant}: anchor {old!r} not unique"
+    mutated = source.replace(old, new, 1)
+    assert _timing_span_failures(mutated) != [], f"{mutant} must be red"
+
+
+def _pytest_e2e_phase_block(run_sh: str) -> list[str]:
+    lines = run_sh.splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.startswith('phase "pytest_e2e" ')]
+    assert len(starts) == 1, f"expected one pytest_e2e phase, found {len(starts)}"
+    start = starts[0]
+    assert lines[start].endswith("bash -c '"), lines[start]
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "'")
+    return lines[start + 1 : end]
+
+
+def _pytest_e2e_command_failures(run_sh: str) -> list[str]:
+    fails: list[str] = []
+    try:
+        between = _hygiene_gate_to_pytest_e2e_span(run_sh)
+    except AssertionError as exc:
+        return [f"hygiene gate: {exc}"]
+    if between.strip():
+        fails.append(f"statement between hygiene gate and pytest_e2e: {between!r}")
+    try:
+        block = _pytest_e2e_phase_block(run_sh)
+    except (AssertionError, StopIteration) as exc:
+        return fails + [f"phase block: {exc!r}"]
+    if [ln.strip() for ln in block].count(E2E_PYTEST_COMMAND) != 1:
+        fails.append(f"pytest_e2e must run {E2E_PYTEST_COMMAND!r} exactly once: {block}")
+    count = len(re.findall(r"-m\s+pytest\b", run_sh.replace("\\\n", " ")))
+    if count != 1:
+        fails.append(f"run.sh carries {count} pytest invocations")
+    return fails
+
+
+def test_pytest_e2e_command_once_after_hygiene_gate():
+    """FP-CIR2-3 [function test]: one tee-sys pytest call, directly after the hygiene gate."""
+    run_sh = RUN_SH.read_text(encoding="utf-8")
+    assert _pytest_e2e_command_failures(run_sh) == []
+    mutants = {
+        "capture_dropped": run_sh.replace(
+            E2E_PYTEST_COMMAND + "\n", "python3 -m pytest tests/e2e -v --tb=short\n"
+        ),
+        "capture_disabled": run_sh.replace(E2E_PYTEST_COMMAND + "\n", E2E_PYTEST_COMMAND + " -s\n"),
+        "second_pytest": run_sh.replace(
+            E2E_PYTEST_COMMAND + "\n", E2E_PYTEST_COMMAND + "\n  python3 -m pytest tests/e2e -k e1\n"
+        ),
+        "statement_between": run_sh.replace(
+            "env_hygiene_gate\nphase", "env_hygiene_gate\nexport PYTEST_ADDOPTS=-s\nphase"
+        ),
+        "gate_deleted": run_sh.replace("\nenv_hygiene_gate\n", "\n"),
+    }
+    for name, mutated in mutants.items():
+        assert mutated != run_sh, f"{name}: mutation did not apply"
+        assert _pytest_e2e_command_failures(mutated) != [], f"{name} must be red"
+
+
+def _phase_overrun_failures(run_sh_text: str, root: Path) -> list[str]:
+    """Run the real phase() over a 0 s budget; overrun must WARN and continue."""
+    fails: list[str] = []
+    budgets = dict(_PHASE_RE.findall(run_sh_text))
+    if budgets.get("pytest_e2e") != "420":
+        fails.append(f"pytest_e2e budget is {budgets.get('pytest_e2e')!r}, not 420")
+    script_path = root / "tests" / "e2e" / "run.sh"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(run_sh_text, encoding="utf-8")
+    versions = root / "deploy" / "versions.env"
+    versions.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(REPO_ROOT / "deploy" / "versions.env", versions)
+    script = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        source "{script_path}"
+        phase "overrun_probe" 0 sleep 1.2
+        echo AFTER_OVERRUN_PHASE
+        """
+    )
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate()
+        return fails + ["sourcing run.sh did not return at its guard"]
+    if proc.returncode != 0:
+        fails.append(f"overrun exited {proc.returncode}: {stdout}{stderr}")
+    if "WARN: phase overrun_probe overran budget" not in stdout:
+        fails.append(f"overrun did not WARN: {stdout!r}")
+    if "AFTER_OVERRUN_PHASE" not in stdout:
+        fails.append("the run did not continue after an overrun")
+    if "phase overrun_probe FAILED" in stdout:
+        fails.append("an overrun was reported as a phase failure")
+    return fails
+
+
+def test_phase_overrun_warns_without_exit(tmp_path: Path):
+    """FP-CIR2-3 companion: 420 s stays, and phase() overrun stays WARN-only."""
+    run_sh = RUN_SH.read_text(encoding="utf-8")
+    assert _bash_function_definition_count(run_sh, "phase") == 1
+    assert _phase_overrun_failures(run_sh, tmp_path / "real") == []
+
+    warn_line = (
+        '    echo "WARN: phase $name overran budget (${elapsed}s > ${budget}s)" '
+        '| tee -a "$PHASE_LOG"\n'
+    )
+    assert run_sh.count(warn_line) == 1
+    mutants = {
+        "budget_raised": run_sh.replace('phase "pytest_e2e" 420 ', 'phase "pytest_e2e" 480 '),
+        "warn_exits": run_sh.replace(warn_line, warn_line + "    exit 1\n"),
+        "warn_returns_failure": run_sh.replace(warn_line, warn_line + "    return 1\n"),
+        "warn_removed": run_sh.replace(warn_line, "    :\n"),
+    }
+    for name, mutated in mutants.items():
+        assert mutated != run_sh, f"{name}: mutation did not apply"
+        assert _phase_overrun_failures(mutated, tmp_path / name) != [], f"{name} must be red"
