@@ -5,6 +5,24 @@ metadata:
   labels: { app: presto, role: worker }
 spec:
   replicas: 2
+  # ci-runtime-3 FP-CIR3-1: both replacements start in one overlapping wave
+  # (at most 3 controller-counted worker pods; a 4th, Terminating, old pod may
+  # briefly hold node memory) while one old Ready worker is retained until a
+  # new one is Ready. Pinned by tests/delivery/test_delivery_e2e_fixtures.py::
+  # test_presto_worker_parallel_rollout_policy.
+  # Known, accepted risk (audit DW1): the other old worker is SIGTERM'd at the
+  # rollout's start, and Presto keeps it schedulable until its failure detector
+  # lists it in /v1/node/failed. E1's product-side verify_fix (one shot, 15 s
+  # after its own restart) can land its canary SELECT 1 on that dying worker.
+  # A red E1 showing verification_failed -> NEEDS_HUMAN on the canary is this
+  # case: check the worker pod events/logs and /v1/node/failed timing first.
+  # E1's finally-path restart usually starts while that product rollout is
+  # still in flight; the one-available floor holds across both.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels: { app: presto, role: worker }
   template:

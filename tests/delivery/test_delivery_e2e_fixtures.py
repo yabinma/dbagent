@@ -1509,6 +1509,79 @@ def test_presto_e2e_deployments_declare_cpu_and_memory_resources():
             )
 
 
+def _is_int(value: object) -> bool:
+    """A YAML integer: rejects bools (an int subclass) and "1"/"25%" strings."""
+    return type(value) is int
+
+
+def test_presto_worker_parallel_rollout_policy():
+    """FP-CIR3-1: the kind worker replacements overlap, one Ready worker kept.
+
+    Pins the explicit RollingUpdate maxSurge 1 / maxUnavailable 1 on the
+    two-replica presto-worker Deployment. Reverting to the implicit (serial)
+    default, letting both old workers go (maxUnavailable 2 / surge 0), a larger
+    surge, or a worker memory change that invalidates the ci-runtime-3 §3.1
+    capacity argument (peak O + 6Gi requests) all fail here.
+    """
+    path = E2E / "presto" / "worker.yaml"
+    workers = [
+        doc
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8"))
+        if doc
+        and doc.get("kind") == "Deployment"
+        and (doc.get("metadata") or {}).get("name") == "presto-worker"
+    ]
+    assert len(workers) == 1, (
+        f"{path.name}: expected exactly one presto-worker Deployment, "
+        f"found {len(workers)}"
+    )
+    spec = workers[0].get("spec") or {}
+
+    replicas = spec.get("replicas")
+    assert _is_int(replicas) and replicas == 2, (
+        f"{path.name}: presto-worker spec.replicas must be the integer 2; "
+        f"got {replicas!r}"
+    )
+
+    strategy = spec.get("strategy") or {}
+    assert strategy.get("type") == "RollingUpdate", (
+        f"{path.name}: presto-worker must declare strategy.type RollingUpdate "
+        f"explicitly (the implicit default replaces workers serially); "
+        f"got {strategy!r}"
+    )
+    rolling = strategy.get("rollingUpdate") or {}
+    for key in ("maxSurge", "maxUnavailable"):
+        value = rolling.get(key)
+        assert _is_int(value) and value == 1, (
+            f"{path.name}: presto-worker strategy.rollingUpdate.{key} must be "
+            f"the integer 1 (not a percentage string or bool); got {value!r}"
+        )
+
+    containers = (
+        ((spec.get("template") or {}).get("spec") or {}).get("containers") or []
+    )
+    presto = [c for c in containers if c.get("name") == "presto"]
+    assert len(presto) == 1, (
+        f"{path.name}: presto-worker must have exactly one 'presto' container; "
+        f"found {[c.get('name') for c in containers]!r}"
+    )
+    resources = presto[0].get("resources") or {}
+    requests = resources.get("requests") or {}
+    limits = resources.get("limits") or {}
+    assert "memory" in requests and _parse_memory_bytes(
+        requests["memory"]
+    ) == _parse_memory_bytes("1536Mi"), (
+        f"{path.name}: presto-worker requests.memory must stay 1536Mi (the "
+        f"rollout capacity basis); got {requests.get('memory')!r}"
+    )
+    assert "memory" in limits and _parse_memory_bytes(
+        limits["memory"]
+    ) == _parse_memory_bytes("2Gi"), (
+        f"{path.name}: presto-worker limits.memory must stay 2Gi (the "
+        f"rollout capacity basis); got {limits.get('memory')!r}"
+    )
+
+
 def test_presto_worker_deployment_has_http_readiness_probe():
     """E1 regression: worker rollout must not pass before Presto listens.
 
