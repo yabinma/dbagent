@@ -222,10 +222,14 @@ cd web && npm ci && npm test               # vitest + per-file coverage threshol
 
 **Functional** (checkpoint suite + the delivery-artifact tier). Needs Docker,
 and `helm` on PATH — a missing binary is a hard failure, never a skip. This
-tier runs from one combined venv. The pytest command below is an intentional
+tier runs from one combined venv. The pytest command below carries every
+`--ignore` of CI's broad functional pytest except one, so it is an intentional
 local superset: it also collects `tests/functional/test_manifests.py`, which CI
 ignores in this job and runs only in the independent `manifest-guard` job, so a
-local run keeps the manifest and CI-pin checks:
+local run keeps the manifest and CI-pin checks. The other two ignored files run
+elsewhere in CI: the non-live `services/gateway/tests/test_b1_ingest_burst.py`
+nodes in a later coverage run of the same `functional` step, and
+`tests/delivery/test_delivery_sizing_ledger.py` in the `benchmark` job:
 
 ```bash
 python -m venv services/worker/.venv
@@ -235,7 +239,9 @@ services/worker/.venv/bin/pip install -e libs/py/rca_common \
 services/worker/.venv/bin/python -m pytest \
   services/worker/tests services/gateway/tests services/dashboard-api/tests \
   tests/functional tests/delivery tests/mocks/llm -v \
-  --ignore=tests/functional/m2_probe_link
+  --ignore=tests/functional/m2_probe_link \
+  --ignore=services/gateway/tests/test_b1_ingest_burst.py \
+  --ignore=tests/delivery/test_delivery_sizing_ledger.py
 
 # Optional, isolated F8/F9 run (real probe + probe-gateway over real mTLS).
 # CI already runs this package inside unit-go's `go test ./... -race`.

@@ -11,6 +11,7 @@ Two classes of defect this tier catches before a 25-minute cluster run does:
 from __future__ import annotations
 
 import ast
+import copy
 import importlib.util
 import json
 import os
@@ -4177,6 +4178,52 @@ CIR2_SPAN_CALLS = {
     "e3.drain": {"_query_states"},
 }
 CIR2_FINALLY_SPANS = {"e1.cleanup", "e3.cleanup"}
+
+# §3.1/§3.2 "the listed first and last operations are timing boundaries": each
+# span's first and last body statement, as `_span_boundary_stmt` renders it (call
+# arguments and assert messages elided). Moving residual work into a span, or a
+# boundary statement out of one, changes what the timing measures and is red.
+CIR2_SPAN_BOUNDARIES = {
+    "restart.rollout_restart": ("_kubectl_ok(...)", "_kubectl_ok(...)"),
+    "restart.rollout_status": ("_kubectl_ok(...)", "_kubectl_ok(...)"),
+    "restart.coordinator_settle": ("time.sleep(...)", "time.sleep(...)"),
+    "restart.coordinator_ready": ("_kubectl_ok(...)", "_kubectl_ok(...)"),
+    "restart.coordinator_restart_count": (
+        "out = _kubectl_ok(...).stdout.strip()",
+        "assert out == '0'",
+    ),
+    "e1.fault_patch": ("_patch_configmap_property(...)", "_patch_configmap_property(...)"),
+    "e1.fault_restart": ("_restart_and_wait(...)", "_restart_and_wait(...)"),
+    "e1.worker_discovery": (
+        "_wait_presto_workers_discovered(...)",
+        "_wait_presto_workers_discovered(...)",
+    ),
+    "e1.trip_query": (
+        "result = _presto_query(...)",
+        "assert _is_presto_local_memory_limit_failure(...)",
+    ),
+    "e1.case_processing": ("opened = _post_alert(...)", "detail = _case_detail(...)"),
+    "e1.cleanup": ("_e1_cleanup_fault(...)", "_e1_cleanup_fault(...)"),
+    "e2.catalog_setup": ("_put_configmap_key(...)", "assert apply_dep.returncode == 0"),
+    "e2.fault_restart": ("_restart_and_wait(...)", "_restart_and_wait(...)"),
+    "e2.case_processing": (
+        "opened = _post_alert(...)",
+        "assert detail.get(...) == 'CLOSED_SUMMARY'",
+    ),
+    "e2.redaction_checks": (
+        "blob = json.dumps(...)",
+        "assert sentinel not in json.dumps(...)",
+    ),
+    "e3.resource_group_setup": ("_put_configmap_key(...)", "_patch_coordinator_rg_mount(...)"),
+    "e3.fault_restart": ("_restart_and_wait(...)", "_restart_and_wait(...)"),
+    "e3.queue_establishment": (
+        "submitted = [_submit_query(...) for _ in range(...)]",
+        "_assert_v1_query_contract(...)",
+    ),
+    "e3.case_processing": ("opened = _post_alert(...)", "_e3_assert_case(...)"),
+    "e3.cleanup": ("_e3_cleanup_fault()", "_e3_cleanup_fault()"),
+    "e3.drain": ("drained_deadline = time.time() + 120", "assert not remaining"),
+}
 E2E_PYTEST_COMMAND = "python3 -m pytest tests/e2e -v --tb=short --capture=tee-sys"
 
 
@@ -4526,6 +4573,23 @@ def _is_restart_count_assert(node: ast.AST) -> bool:
     )
 
 
+class _ElideCallArgs(ast.NodeTransformer):
+    def visit_Call(self, node: ast.Call) -> ast.Call:
+        self.generic_visit(node)
+        if node.args or node.keywords:
+            node.args = [ast.Constant(value=Ellipsis)]
+            node.keywords = []
+        return node
+
+
+def _span_boundary_stmt(stmt: ast.stmt) -> str:
+    """One boundary statement: call arguments and assert message elided, header line only."""
+    node = copy.deepcopy(stmt)
+    if isinstance(node, ast.Assert):
+        node.msg = None
+    return ast.unparse(_ElideCallArgs().visit(node)).splitlines()[0]
+
+
 def _timing_span_failures(source: str) -> list[str]:
     """§3.1/§3.2 structure: every span present, in order, around the existing work."""
     fails: list[str] = []
@@ -4533,9 +4597,15 @@ def _timing_span_failures(source: str) -> list[str]:
     allowed = set(CIR2_RESTART_LABELS)
     for labels in CIR2_SCENARIO_LABELS.values():
         allowed |= set(labels)
-    for label, _node in _timed_withs(tree):
+    for label, node in _timed_withs(tree):
         if label not in allowed:
             fails.append(f"unlisted or non-literal timing label {label!r}")
+            continue
+        want = CIR2_SPAN_BOUNDARIES[label]
+        got = (_span_boundary_stmt(node.body[0]), _span_boundary_stmt(node.body[-1]))
+        for edge, g, w in zip(("first", "last"), got, want):
+            if g != w:
+                fails.append(f"{label} {edge} statement {g!r} != {w!r}")
 
     # §3.1: _restart_and_wait keeps its signature, order, settle and D2 check.
     restart = _func_def_from_tree(tree, "_restart_and_wait")
@@ -4680,6 +4750,35 @@ _CIR2_SPAN_MUTANTS = {
         '_timed_step("e1.trip_query")',
         '_timed_step("e1." + "trip_query")',
     ),
+    # Span boundaries (fix.md item 1): every callee stays inside the span, so
+    # only a pinned first/last statement can see these moves.
+    "e1_residual_pulled_into_case_processing": (
+        "            detail = _case_detail(dashboard_url, token, inv_id)\n"
+        '        cat = ((detail.get("rca_report") or {}).get("root_cause") or {}).get("category")\n'
+        '        assert cat in {"resource", "configuration"}, f"RCA category={cat!r} detail={detail}"\n',
+        "            detail = _case_detail(dashboard_url, token, inv_id)\n"
+        '            cat = ((detail.get("rca_report") or {}).get("root_cause") or {}).get("category")\n'
+        '            assert cat in {"resource", "configuration"}, f"RCA category={cat!r} detail={detail}"\n',
+    ),
+    "e1_last_statement_moved_out_of_case_processing": (
+        "            detail = _case_detail(dashboard_url, token, inv_id)\n"
+        '        cat = ((detail.get("rca_report")',
+        "        detail = _case_detail(dashboard_url, token, inv_id)\n"
+        '        cat = ((detail.get("rca_report")',
+    ),
+    "e3_first_statement_moved_out_of_drain": (
+        '    with _timed_step("e3.drain"):\n'
+        "        drained_deadline = time.time() + 120\n",
+        "    drained_deadline = time.time() + 120\n"
+        '    with _timed_step("e3.drain"):\n',
+    ),
+}
+
+# The boundary fixtures must be red FOR the boundary, not for a side effect.
+_CIR2_BOUNDARY_MUTANT_REASONS = {
+    "e1_residual_pulled_into_case_processing": "e1.case_processing last statement",
+    "e1_last_statement_moved_out_of_case_processing": "e1.case_processing last statement",
+    "e3_first_statement_moved_out_of_drain": "e3.drain first statement",
 }
 
 
@@ -4688,16 +4787,24 @@ def test_e1_e2_e3_timing_spans_preserve_scenario_calls(mutant):
     """FP-CIR2-2 [function test]: every §3.1/§3.2 span boundary around the existing calls.
 
     The real source passes; each negative fixture (a removed cleanup call, a
-    weakened restart-count assertion, a shortened settle, a lost span) is red.
+    weakened restart-count assertion, a shortened settle, a lost span, residual
+    work pulled into a span, a boundary statement moved out of one) is red.
     """
     source = _E2E_SCENARIOS_PATH.read_text(encoding="utf-8")
     if mutant is None:
+        every_label = set(CIR2_RESTART_LABELS).union(*CIR2_SCENARIO_LABELS.values())
+        assert set(CIR2_SPAN_BOUNDARIES) == every_label
         assert _timing_span_failures(source) == []
         return
     old, new = _CIR2_SPAN_MUTANTS[mutant]
     assert source.count(old) == 1, f"{mutant}: anchor {old!r} not unique"
     mutated = source.replace(old, new, 1)
-    assert _timing_span_failures(mutated) != [], f"{mutant} must be red"
+    ast.parse(mutated)  # a fixture must stay valid Python, or it proves nothing
+    fails = _timing_span_failures(mutated)
+    assert fails != [], f"{mutant} must be red"
+    reason = _CIR2_BOUNDARY_MUTANT_REASONS.get(mutant)
+    if reason is not None:
+        assert any(reason in f for f in fails), f"{mutant} red for the wrong reason: {fails}"
 
 
 def _pytest_e2e_phase_block(run_sh: str) -> list[str]:
