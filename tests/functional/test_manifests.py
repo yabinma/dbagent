@@ -161,6 +161,8 @@ GUARDED_STEPS: dict[str, list[int]] = {
     # ci-runtime-1 FP-CIR1-4/6: `functional` has no guarded step left. Index 9
     # is the measured pytest step, an unparsed reviewable literal (see
     # EXPECTED_FUNCTIONAL_PYTEST_RUN), and its direct Go step at 10 is deleted.
+    # ci-go-mod-prefetch FP-GMP-3: the measured pytest is now index 10, after
+    # the unguarded `go mod download` setup step at 8 and the hygiene gate at 9.
     # ci-runtime-1 FP-CIR1-2: the benchmark job's manifest-validation step at
     # 7 is deleted, so B3..B14 are 7..14, 15 is the A10(v) hygiene gate
     # (unparsed), 16 is the B2/B10 node-id pytest and 17 the sizing-ledger gate.
@@ -221,6 +223,16 @@ EXPECTED_GO_TEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
     ],
 }
 assert set(EXPECTED_GO_TEST_COMMANDS) == GO_TEST_JOBS
+
+#: ci-go-mod-prefetch FP-GMP-3: the one `go mod` command in the whole
+#: workflow, collected across ALL jobs by the same parser and normalizer as
+#: EXPECTED_GO_TEST_COMMANDS. Every other job must run zero `go mod` commands,
+#: so a second-job copy, a duplicate, a working directory or a widened command
+#: is inventory drift. Restated here, never learned from the workflow.
+EXPECTED_GO_MOD_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
+    "functional": [(None, "go mod download")],
+}
+assert set(EXPECTED_GO_MOD_COMMANDS) == {"functional"}
 
 EXPECTED_PYTEST_COMMANDS: dict[str, list[tuple[str | None, str]]] = {
     "unit-rca-common": [(
@@ -2322,6 +2334,18 @@ def _is_go_test_cmd(cmd: SimpleCommand) -> bool:
     return cmd.args[0].literal_value == "test" and not cmd.args[0].is_dynamic
 
 
+def _is_go_mod_cmd(cmd: SimpleCommand) -> bool:
+    """ci-go-mod-prefetch FP-GMP-3: any `go mod ...`, whatever follows, so a
+    widened or foreign sub-command is still counted by the inventory."""
+    if cmd.command_word is None:
+        return False
+    if cmd.command_word.literal_value != "go":
+        return False
+    if not cmd.args:
+        return False
+    return cmd.args[0].literal_value == "mod" and not cmd.args[0].is_dynamic
+
+
 def _is_pytest_cmd(cmd: SimpleCommand) -> bool:
     if cmd.command_word is None:
         return False
@@ -2371,8 +2395,17 @@ def _check_operands(cmd: SimpleCommand) -> bool:
         if args[0].is_dynamic:
             return False
         first = args[0].literal_value
-        if first not in {"test", "install", "env", "vet"}:
+        if first not in {"test", "install", "env", "vet", "mod"}:
             return False
+        # ci-go-mod-prefetch FP-GMP-3: clause (AT)'s closed grammar admits
+        # exactly `go mod download` -- two non-dynamic words, no module
+        # argument, no option, no other `mod` sub-command.
+        if first == "mod":
+            if [a.literal_value for a in args] != ["mod", "download"]:
+                return False
+            if any(a.is_dynamic or _option_word(a) for a in args):
+                return False
+            return True
         if first == "env":
             if [a.literal_value for a in args] != ["env", "GOPATH"]:
                 return False
@@ -2595,23 +2628,44 @@ def _words_from_commands(cmds: list[SimpleCommand]) -> list[Word]:
 #: test_m6_go_config_env_interpolation.py, F16's test_m6_audit_completeness.py)
 #: and the index of its measured broad pytest, which the toolchain must precede.
 FUNCTIONAL_TOOLCHAIN_JOB = "functional"
-FUNCTIONAL_MEASURED_PYTEST_INDEX = 9
+#: ci-go-mod-prefetch FP-GMP-3: 9 -> 10 when the module prefetch step was
+#: inserted at 8, after Helm (7) and before the A10(v) hygiene gate (now 9).
+FUNCTIONAL_MEASURED_PYTEST_INDEX = 10
 FUNCTIONAL_BUF_VERSION = "1.47.2"
 FUNCTIONAL_CODEGEN_RUN = "bash scripts/gen-proto.sh"
+#: ci-go-mod-prefetch FP-GMP-3: the Helm install is located by this one
+#: checked literal from its body, and must be the unique such step at index 7.
+FUNCTIONAL_HELM_MOVE = "sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm"
+FUNCTIONAL_HELM_INDEX = 7
+#: ci-go-mod-prefetch FP-GMP-1a: the module prefetch, restated from design
+#: §3.1 rather than read from the workflow it protects. The step is exactly
+#: this mapping -- no env, if, working-directory, shell or step-level uses.
+FUNCTIONAL_GO_MOD_PREFETCH_RUN = "go mod download"
+FUNCTIONAL_GO_MOD_PREFETCH_STEP = {
+    "name": "Download Go modules for F15/F16",
+    "run": FUNCTIONAL_GO_MOD_PREFETCH_RUN,
+}
+FUNCTIONAL_GO_MOD_PREFETCH_INDEX = 8
+FUNCTIONAL_HYGIENE_INDEX = 9
+assert FUNCTIONAL_HELM_INDEX < FUNCTIONAL_GO_MOD_PREFETCH_INDEX < FUNCTIONAL_HYGIENE_INDEX
+assert FUNCTIONAL_HYGIENE_INDEX == FUNCTIONAL_MEASURED_PYTEST_INDEX - 1
 
 
 def _functional_toolchain_failures(
     steps: list[dict], setup_idxs: list[int]
 ) -> list[tuple[str, str]]:
-    """The functional job keeps setup-go, buf, the pinned protoc plugins and
-    codegen, in that order, all before its measured broad pytest.
+    """The functional job keeps setup-go, buf, the pinned protoc plugins,
+    codegen, Helm, the Go module prefetch and the A10(v) hygiene gate, in that
+    order, all before its measured broad pytest.
 
     `functional` has no direct `go test` any more, so nothing else in
     `_ci_pin_failures` would notice these steps going missing -- and F15/F16's
-    Go subprocesses import generated `gen/go`. The setup-go version itself is
-    checked with every other GO_TOOLCHAIN_JOBS member. Reason tokens are the
-    existing toolchain ones: a missing piece is `missing_setup_go`, a piece in
-    the wrong place is `setup_go_ordering`.
+    Go subprocesses import generated `gen/go` and read the module cache the
+    prefetch fills. The setup-go version itself is checked with every other
+    GO_TOOLCHAIN_JOBS member. Reason tokens are the existing toolchain ones: a
+    missing piece is `missing_setup_go`, a piece in the wrong place is
+    `setup_go_ordering`; a prefetch step whose mapping is not exactly
+    FUNCTIONAL_GO_MOD_PREFETCH_STEP is `step_envelope_drift`.
     """
     out: list[tuple[str, str]] = []
     buf_idxs = [
@@ -2620,12 +2674,21 @@ def _functional_toolchain_failures(
     ]
     protoc_idxs: list[int] = []
     codegen_idxs: list[int] = []
+    helm_idxs: list[int] = []
+    prefetch_idxs: list[int] = []
+    hygiene_idxs: list[int] = []
     for i, st in enumerate(steps):
         run = _step_run(st)
         if run is None:
             continue
         if run.strip() == FUNCTIONAL_CODEGEN_RUN:
             codegen_idxs.append(i)
+        if FUNCTIONAL_HELM_MOVE in run:
+            helm_idxs.append(i)
+        if run.strip() == FUNCTIONAL_GO_MOD_PREFETCH_RUN:
+            prefetch_idxs.append(i)
+        if run.strip() == EXPECTED_CI_HYGIENE_RUN.strip():
+            hygiene_idxs.append(i)
         parsed = _parse_run(run)
         if parsed is None:
             continue
@@ -2641,19 +2704,40 @@ def _functional_toolchain_failures(
             protoc_idxs.append(i)
     for label, idxs in (
         ("buf", buf_idxs), ("protoc plugins", protoc_idxs), ("codegen", codegen_idxs),
+        ("helm", helm_idxs), ("module prefetch", prefetch_idxs),
     ):
         if len(idxs) != 1:
             out.append(("missing_setup_go", f"functional {label} x{len(idxs)}"))
+    if len(hygiene_idxs) != 1:
+        out.append(("setup_go_ordering", f"functional hygiene gate x{len(hygiene_idxs)}"))
     if len(buf_idxs) == 1:
         version = (steps[buf_idxs[0]].get("with") or {}).get("version")
         if version != FUNCTIONAL_BUF_VERSION:
             out.append(("missing_setup_go", f"functional buf version {version!r}"))
+    # FP-GMP-1a: the prefetch step is exactly the §3.1 mapping. An added
+    # env/if/working-directory/shell/uses/continue-on-error or a renamed step
+    # is envelope drift here as well as under whichever generic pin applies.
+    if len(prefetch_idxs) == 1 and steps[prefetch_idxs[0]] != FUNCTIONAL_GO_MOD_PREFETCH_STEP:
+        out.append((
+            "step_envelope_drift",
+            f"functional module prefetch step {sorted(steps[prefetch_idxs[0]])}",
+        ))
     if out or len(setup_idxs) != 1:
         return out
     order = [setup_idxs[0], buf_idxs[0], protoc_idxs[0], codegen_idxs[0],
+             helm_idxs[0], prefetch_idxs[0], hygiene_idxs[0],
              FUNCTIONAL_MEASURED_PYTEST_INDEX]
     if order != sorted(order) or len(set(order)) != len(order):
         out.append(("setup_go_ordering", f"functional toolchain order {order}"))
+    for label, got, want in (
+        ("helm", helm_idxs[0], FUNCTIONAL_HELM_INDEX),
+        ("module prefetch", prefetch_idxs[0], FUNCTIONAL_GO_MOD_PREFETCH_INDEX),
+        ("hygiene gate", hygiene_idxs[0], FUNCTIONAL_HYGIENE_INDEX),
+    ):
+        if got != want:
+            out.append(("setup_go_ordering", f"functional {label} at {got} != {want}"))
+    if hygiene_idxs[0] != FUNCTIONAL_MEASURED_PYTEST_INDEX - 1:
+        out.append(("setup_go_ordering", "functional hygiene gate not adjacent to its pytest"))
     measured = (
         _step_run(steps[FUNCTIONAL_MEASURED_PYTEST_INDEX])
         if len(steps) > FUNCTIONAL_MEASURED_PYTEST_INDEX else None
@@ -2806,6 +2890,7 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
     guarded_computed: dict[str, list[int]] = {}
     pytest_cmds: dict[str, list[tuple[str | None, str]]] = {}
     go_test_cmds: dict[str, list[tuple[str | None, str]]] = {}
+    go_mod_cmds: dict[str, list[tuple[str | None, str]]] = {}
 
     go_version = _go_mod_version(root)
     toolchain = _go_mod_toolchain(root)
@@ -2899,6 +2984,14 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
             has_go_test = False
             has_pytest = False
             for cmd in all_cmds:
+                if _is_go_mod_cmd(cmd):
+                    # ci-go-mod-prefetch FP-GMP-3: same normalizer as the
+                    # go-test inventory; an inline assignment or a dynamic
+                    # word can never equal the static pin.
+                    norm = _norm_cmd(cmd)
+                    if cmd.assignments or any(w.is_dynamic for w in [cmd.command_word, *cmd.args] if w):
+                        norm = f"<unparsed> {norm}"
+                    go_mod_cmds.setdefault(jn, []).append((step.get("working-directory"), norm))
                 if _is_go_test_cmd(cmd):
                     has_go_test = True
                     # static + no assignments
@@ -2975,6 +3068,14 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
     for jn in go_test_cmds:
         if jn not in EXPECTED_GO_TEST_COMMANDS:
             add("go_test_command_drift", f"extra {jn}")
+
+    # ci-go-mod-prefetch FP-GMP-3: the `go mod` inventory over EVERY job --
+    # exactly EXPECTED_GO_MOD_COMMANDS, zero anywhere else. It reports the
+    # existing Go command-inventory token (the closed CI_PIN_REASONS set is
+    # frozen-spec vocabulary and gains no member for this ordinary pin update).
+    for jn in sorted(set(go_mod_cmds) | set(EXPECTED_GO_MOD_COMMANDS)):
+        if go_mod_cmds.get(jn, []) != EXPECTED_GO_MOD_COMMANDS.get(jn, []):
+            add("go_test_command_drift", f"go mod {jn}")
 
     # e2e GITHUB_PATH job-wide
     e2e = jobs.get("e2e")
@@ -3967,8 +4068,10 @@ def test_threshold_assertion_fixture_count():
     # benchmark manifest-step return x1, unit-go combined command x5) and
     # retires none: the two rows that mutated the deleted functional Go step
     # were redirected to the unit-go command. ci-runtime-2 FP-CIR2-3 adds
-    # run_sh_pytest_drops_tee_capture and retires none.
-    assert len(CI_PIN_FIXTURES) == 124
+    # run_sh_pytest_drops_tee_capture and retires none. ci-go-mod-prefetch
+    # FP-GMP-3 adds 24 rows (module prefetch x22, Helm pin x2) and retires
+    # none; four existing functional rows only moved their index 9 -> 10.
+    assert len(CI_PIN_FIXTURES) == 148
     for _cid, reason, _b in THRESHOLD_ASSERTION_FIXTURES:
         assert reason in THRESHOLD_REASONS
     for _cid, tok, _n, _b in LINK_LOOP_FIXTURES:
@@ -4267,8 +4370,8 @@ def _ci_pin_workflow_cases():
     # `pytest_command_drift` -- and it is BYTE equality, so an added `-o`
     # override, a widened `--ignore` and a prepended `source` are all caught.
     def override_ini(wf):
-        r = wf["jobs"]["functional"]["steps"][9]["run"]
-        wf["jobs"]["functional"]["steps"][9]["run"] = (
+        r = wf["jobs"]["functional"]["steps"][10]["run"]
+        wf["jobs"]["functional"]["steps"][10]["run"] = (
             r.rstrip() + ' -o "python_functions=test_ci_*"\n'
         )
 
@@ -4299,8 +4402,8 @@ def _ci_pin_workflow_cases():
     # target. There is nothing for a wrapper-shape fixture to mutate here.
 
     def ignore_wide(wf):
-        r = wf["jobs"]["functional"]["steps"][9]["run"]
-        wf["jobs"]["functional"]["steps"][9]["run"] = r.rstrip() + " --ignore=tests/functional\n"
+        r = wf["jobs"]["functional"]["steps"][10]["run"]
+        wf["jobs"]["functional"]["steps"][10]["run"] = r.rstrip() + " --ignore=tests/functional\n"
 
     add("functional_pytest_ignore_widened", "run_not_recognized", ignore_wide)
     add(
@@ -4316,7 +4419,7 @@ def _ci_pin_workflow_cases():
     add(
         "guarded_step_gains_continue_on_error",
         "step_envelope_drift",
-        lambda wf: wf["jobs"]["functional"]["steps"][9].__setitem__("continue-on-error", True),
+        lambda wf: wf["jobs"]["functional"]["steps"][10].__setitem__("continue-on-error", True),
     )
     add(
         "go_test_job_gains_continue_on_error",
@@ -4386,8 +4489,8 @@ def _ci_pin_workflow_cases():
     add("pytest_wrapped_in_a_command_substitution", "run_not_recognized", wrap_b6)
 
     def source_guarded(wf):
-        r = wf["jobs"]["functional"]["steps"][9]["run"]
-        wf["jobs"]["functional"]["steps"][9]["run"] = "source deploy/versions.env\n" + r
+        r = wf["jobs"]["functional"]["steps"][10]["run"]
+        wf["jobs"]["functional"]["steps"][10]["run"] = "source deploy/versions.env\n" + r
 
     add("source_command_inside_a_guarded_step", "run_not_recognized", source_guarded)
 
@@ -4686,6 +4789,104 @@ def _ci_pin_workflow_cases():
                 st["with"]["version"] = "1.30.0"
 
     add("functional_buf_version_changed", "missing_setup_go", functional_buf_version)
+
+    # ci-go-mod-prefetch FP-GMP-1a/3: the module prefetch step. Missing, moved,
+    # duplicated, copied into another job, conditional, masked, widened,
+    # relocated, renamed or given a Go environment key -- each stays red, and
+    # every generic pin applies to it with no exception.
+    def _prefetch(wf):
+        return next(
+            st for st in wf["jobs"]["functional"]["steps"]
+            if st == FUNCTIONAL_GO_MOD_PREFETCH_STEP
+        )
+
+    def _without_prefetch(wf):
+        p = _prefetch(wf)
+        return p, [st for st in wf["jobs"]["functional"]["steps"] if st is not p]
+
+    def functional_prefetch_removed(wf):
+        _p, rest = _without_prefetch(wf)
+        wf["jobs"]["functional"]["steps"] = rest
+
+    def functional_prefetch_after_hygiene(wf):
+        p, rest = _without_prefetch(wf)
+        # between the hygiene gate and its measured pytest
+        rest.insert(FUNCTIONAL_HYGIENE_INDEX, p)
+        wf["jobs"]["functional"]["steps"] = rest
+
+    def functional_prefetch_before_codegen(wf):
+        p, rest = _without_prefetch(wf)
+        rest.insert(5, p)
+        wf["jobs"]["functional"]["steps"] = rest
+
+    def functional_prefetch_duplicated(wf):
+        wf["jobs"]["functional"]["steps"].insert(
+            FUNCTIONAL_GO_MOD_PREFETCH_INDEX, dict(FUNCTIONAL_GO_MOD_PREFETCH_STEP)
+        )
+
+    def prefetch_in_job(job):
+        return lambda wf: wf["jobs"][job]["steps"].append(dict(FUNCTIONAL_GO_MOD_PREFETCH_STEP))
+
+    def prefetch_set(key, value):
+        return lambda wf: _prefetch(wf).__setitem__(key, value)
+
+    def functional_helm_removed(wf):
+        wf["jobs"]["functional"]["steps"] = [
+            st for st in wf["jobs"]["functional"]["steps"]
+            if FUNCTIONAL_HELM_MOVE not in (st.get("run") or "")
+        ]
+
+    def functional_helm_after_prefetch(wf):
+        steps = wf["jobs"]["functional"]["steps"]
+        helm = next(st for st in steps if FUNCTIONAL_HELM_MOVE in (st.get("run") or ""))
+        rest = [st for st in steps if st is not helm]
+        rest.insert(FUNCTIONAL_GO_MOD_PREFETCH_INDEX, helm)
+        wf["jobs"]["functional"]["steps"] = rest
+
+    add("functional_module_prefetch_removed", "missing_setup_go", functional_prefetch_removed)
+    add("functional_module_prefetch_after_hygiene_gate", "setup_go_ordering",
+        functional_prefetch_after_hygiene)
+    add("functional_module_prefetch_before_codegen", "setup_go_ordering",
+        functional_prefetch_before_codegen)
+    add("functional_module_prefetch_duplicated", "go_test_command_drift",
+        functional_prefetch_duplicated)
+    add("benchmark_gains_a_module_prefetch", "go_test_command_drift", prefetch_in_job("benchmark"))
+    add("lint_gains_a_module_prefetch", "go_test_command_drift", prefetch_in_job("lint"))
+    add("functional_module_prefetch_tolerates_failure", "step_envelope_drift",
+        prefetch_set("continue-on-error", True))
+    add("functional_module_prefetch_conditional", "step_envelope_drift",
+        prefetch_set("if", "github.event_name == 'push'"))
+    add("functional_module_prefetch_working_directory", "go_test_command_drift",
+        prefetch_set("working-directory", "probe"))
+    add("functional_module_prefetch_renamed", "step_envelope_drift",
+        prefetch_set("name", "Download Go modules"))
+    add("functional_module_prefetch_step_gomodcache", "go_env_key",
+        prefetch_set("env", {"GOMODCACHE": "/tmp/go-mod"}))
+    add("functional_module_prefetch_step_cgo_key", "go_env_key",
+        prefetch_set("env", {"CGO_ENABLED": "0"}))
+    add("functional_module_prefetch_step_toolchain_key", "go_env_key",
+        prefetch_set("env", {"CC": "clang"}))
+    add("functional_module_prefetch_inline_goflags", "go_env_key",
+        prefetch_set("run", "GOFLAGS=-mod=mod go mod download"))
+    add("functional_gomodcache_at_job_scope", "go_env_key",
+        lambda wf: wf["jobs"]["functional"].__setitem__("env", {"GOMODCACHE": "/tmp/go-mod"}))
+    add("workflow_gomodcache", "go_env_key",
+        lambda wf: wf.__setitem__("env", {"GOMODCACHE": "/tmp/go-mod"}))
+    add("functional_module_prefetch_gains_an_option", "command_operand_drift",
+        prefetch_set("run", "go mod download -x"))
+    add("functional_module_prefetch_gains_a_module_operand", "command_operand_drift",
+        prefetch_set("run", "go mod download all"))
+    add("functional_module_prefetch_becomes_tidy", "command_operand_drift",
+        prefetch_set("run", "go mod tidy"))
+    add("functional_module_prefetch_dynamic_operand", "command_operand_drift",
+        prefetch_set("run", "go mod $GO_MOD_VERB"))
+    add("functional_module_prefetch_masked_or_true", "run_not_recognized",
+        prefetch_set("run", "go mod download || true"))
+    add("functional_module_prefetch_wrapped", "run_not_recognized",
+        prefetch_set("run", "env go mod download"))
+    add("functional_helm_step_removed", "missing_setup_go", functional_helm_removed)
+    add("functional_helm_moved_after_the_prefetch", "setup_go_ordering",
+        functional_helm_after_prefetch)
     add(
         "functional_goflags_env_at_job_scope",
         "go_env_key",
@@ -5388,13 +5589,13 @@ _MANIFEST_OWNER_MUTATIONS: list[tuple[str, str, Callable[[dict], None]]] = [
     ("guard_job_removed", "manifest_suite_owner_missing",
      lambda wf: wf["jobs"].pop("manifest-guard")),
     ("functional_manifest_ignore_dropped", "manifest_suite_extra_owner",
-     _mutate_run("functional", 9, lambda r: r.replace(
+     _mutate_run("functional", 10, lambda r: r.replace(
          " \\\n  --ignore=tests/functional/test_manifests.py", "", 1))),
     ("functional_manifest_ignore_widened_to_its_directory", "functional_collection_drift",
-     _mutate_run("functional", 9, lambda r: r.replace(
+     _mutate_run("functional", 10, lambda r: r.replace(
          "--ignore=tests/functional/test_manifests.py", "--ignore=tests/functional", 1))),
     ("functional_manifest_ignore_retargeted", "manifest_suite_extra_owner",
-     _mutate_run("functional", 9, lambda r: r.replace(
+     _mutate_run("functional", 10, lambda r: r.replace(
          "--ignore=tests/functional/test_manifests.py",
          "--ignore=tests/functional/test_manifest.py", 1))),
     ("benchmark_regains_the_manifest_step", "manifest_suite_extra_owner",
@@ -5656,13 +5857,400 @@ def test_ci_pin_fixture_indices_name_their_targets():
     functional = wf["jobs"]["functional"]["steps"]
     assert len(functional) == FUNCTIONAL_MEASURED_PYTEST_INDEX + 1
     assert functional[5]["run"].strip() == FUNCTIONAL_CODEGEN_RUN
-    assert "helm" in functional[7]["run"]
-    assert functional[8]["run"].strip() == EXPECTED_CI_HYGIENE_RUN.strip()
-    assert functional[9]["run"].strip() == EXPECTED_FUNCTIONAL_PYTEST_RUN.strip()
+    # ci-go-mod-prefetch FP-GMP-3: Helm stays at 7, the prefetch is 8, and
+    # the hygiene gate and measured pytest moved 8 -> 9 and 9 -> 10.
+    assert FUNCTIONAL_HELM_MOVE in functional[7]["run"]
+    assert functional[8] == FUNCTIONAL_GO_MOD_PREFETCH_STEP
+    assert functional[9]["run"].strip() == EXPECTED_CI_HYGIENE_RUN.strip()
+    assert functional[10]["run"].strip() == EXPECTED_FUNCTIONAL_PYTEST_RUN.strip()
+    assert (FUNCTIONAL_HELM_INDEX, FUNCTIONAL_GO_MOD_PREFETCH_INDEX,
+            FUNCTIONAL_HYGIENE_INDEX, FUNCTIONAL_MEASURED_PYTEST_INDEX) == (7, 8, 9, 10)
     unit_go = wf["jobs"]["unit-go"]["steps"]
     assert unit_go[7]["run"].strip() == EXPECTED_UNIT_GO_COMMAND
     assert unit_go[8]["run"].strip() == EXPECTED_UNIT_GO_COVERAGE_RUN
     assert len(unit_go) == 9
+
+
+# ---------------------------------------------------------------------------
+# ci-go-mod-prefetch (design/slices/ci-go-mod-prefetch/design.md): the
+# functional job downloads Go modules in a setup step, so a module-proxy error
+# fails setup instead of a measured F15/F16 test; F15/F16's Go subprocesses
+# read the same inherited module cache.
+# ---------------------------------------------------------------------------
+
+#: FP-GMP-1a: the mutants the function test re-runs itself -- missing, moved
+#: and masked. Every other prefetch mutant runs in test_ci_pin_rejects_known_drift.
+FUNCTIONAL_PREFETCH_FUNCTION_MUTANTS = (
+    "functional_module_prefetch_removed",
+    "functional_module_prefetch_after_hygiene_gate",
+    "functional_module_prefetch_before_codegen",
+    "functional_module_prefetch_masked_or_true",
+    "functional_module_prefetch_tolerates_failure",
+    "functional_module_prefetch_conditional",
+)
+
+
+def test_functional_go_modules_download_before_pytest():
+    """FP-GMP-1a [function test]: the real workflow runs exactly one literal
+    `go mod download` step at functional index 8 -- after setup-go, buf, the
+    protoc plugins, codegen and Helm, before the A10(v) hygiene gate at 9 and
+    the measured pytest at 10 -- with exactly `name` and `run`, and nothing
+    else in the workflow runs a `go mod` command. Its missing, moved and
+    masked mutants are rejected by the CI pin itself."""
+    wf = _load_wf()
+    steps = _job_steps(wf["jobs"][FUNCTIONAL_TOOLCHAIN_JOB])
+    hits = [
+        i for i, st in enumerate(steps)
+        if (_step_run(st) or "").strip() == FUNCTIONAL_GO_MOD_PREFETCH_RUN
+    ]
+    assert hits == [FUNCTIONAL_GO_MOD_PREFETCH_INDEX], hits
+    step = steps[FUNCTIONAL_GO_MOD_PREFETCH_INDEX]
+    assert step == FUNCTIONAL_GO_MOD_PREFETCH_STEP, step
+    assert step["run"] == "go mod download"
+    assert set(step) == {"name", "run"}
+
+    setup = [i for i, st in enumerate(steps)
+             if str(st.get("uses") or "").startswith("actions/setup-go@")]
+    buf = [i for i, st in enumerate(steps)
+           if str(st.get("uses") or "").startswith("bufbuild/buf-setup-action@")]
+    codegen = [i for i, st in enumerate(steps)
+               if (_step_run(st) or "").strip() == FUNCTIONAL_CODEGEN_RUN]
+    helm = [i for i, st in enumerate(steps) if FUNCTIONAL_HELM_MOVE in (_step_run(st) or "")]
+    hygiene = [i for i, st in enumerate(steps)
+               if (_step_run(st) or "").strip() == EXPECTED_CI_HYGIENE_RUN.strip()]
+    assert len(setup) == len(buf) == len(codegen) == 1
+    assert helm == [FUNCTIONAL_HELM_INDEX]
+    assert hygiene == [FUNCTIONAL_HYGIENE_INDEX]
+    assert setup[0] < buf[0] < codegen[0] < helm[0] < FUNCTIONAL_GO_MOD_PREFETCH_INDEX
+    assert FUNCTIONAL_GO_MOD_PREFETCH_INDEX + 1 == hygiene[0]
+    assert hygiene[0] + 1 == FUNCTIONAL_MEASURED_PYTEST_INDEX
+    assert (steps[FUNCTIONAL_MEASURED_PYTEST_INDEX]["run"].strip()
+            == EXPECTED_FUNCTIONAL_PYTEST_RUN.strip())
+    assert _functional_toolchain_failures(steps, setup) == []
+    assert _ci_pin_failures(wf, REPO_ROOT) == []
+
+    # The one `go mod` command in the workflow, by the go-test parser.
+    found = {
+        jn: [(_step_run(_job_steps(wf["jobs"][jn])[i]) or "").strip()
+             for i, _run, parsed in rows
+             for cmd in (parsed or []) if _is_go_mod_cmd(cmd)]
+        for jn, rows in _collect_run_parse(wf).items()
+    }
+    assert {jn: cmds for jn, cmds in found.items() if cmds} == {
+        FUNCTIONAL_TOOLCHAIN_JOB: [FUNCTIONAL_GO_MOD_PREFETCH_RUN]
+    }
+
+    for cid in FUNCTIONAL_PREFETCH_FUNCTION_MUTANTS:
+        _cid, kind, expected, mutator = next(r for r in CI_PIN_FIXTURES if r[0] == cid)
+        assert kind == "workflow"
+        mutated = _load_wf()
+        mutator(mutated)
+        fails = _ci_pin_failures(mutated, REPO_ROOT)
+        assert expected in fails, f"{cid}: {fails}"
+
+
+def _go_mod_requirements(root: Path) -> set[str]:
+    """`module@version` for every `require` in root/go.mod, block or single."""
+    reqs: set[str] = set()
+    in_block = False
+    for raw in (root / "go.mod").read_text(encoding="utf-8").splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if in_block:
+            if line == ")":
+                in_block = False
+                continue
+            parts = line.split()
+        elif line.split()[0] == "require":
+            rest = line[len("require"):].strip()
+            if rest == "(":
+                in_block = True
+                continue
+            parts = rest.split()
+        else:
+            continue
+        if len(parts) >= 2:
+            reqs.add(f"{parts[0]}@{parts[1]}")
+    return reqs
+
+
+_GO_PROXY_REFUSAL_RE = re.compile(
+    r"^go: (?P<mod>\S+@\S+): module lookup disabled by GOPROXY=off$"
+)
+
+
+def _go_proxy_refusals(stderr: str, requirements: set[str]) -> list[str]:
+    """FP-GMP-1b: the `go.mod` requirements stderr says the disabled proxy
+    refused. Any other failure -- wrong toolchain, unwritable cache, a parse
+    error, a module go.mod does not require -- yields nothing."""
+    out: list[str] = []
+    for line in stderr.splitlines():
+        m = _GO_PROXY_REFUSAL_RE.match(line.strip())
+        if m and m.group("mod") in requirements:
+            out.append(m.group("mod"))
+    return out
+
+
+def test_go_mod_download_fails_closed_with_proxy_off(tmp_path: Path):
+    """FP-GMP-1b [function test]: the real pinned prefetch command, run from
+    the repository root against a verified empty, writable module cache with
+    the proxy disabled, exits nonzero AND names a go.mod requirement the
+    disabled proxy refused. A missing Go, a wrong toolchain, an unwritable
+    cache or any other unrelated error cannot satisfy both halves."""
+    reqs = _go_mod_requirements(REPO_ROOT)
+    assert reqs, "go.mod declares no requirements"
+    # The classifier itself refuses unrelated failures.
+    some_req = sorted(reqs)[0]
+    for unrelated in (
+        "go: go.mod requires go >= 9.99 (running go 1.26.4; GOTOOLCHAIN=local)",
+        "go: could not create module cache: mkdir /nope: permission denied",
+        "go: errors parsing go.mod:\ngo.mod:3: unknown directive: bogus",
+        "go: example.invalid/not-required@v0.0.1: module lookup disabled by GOPROXY=off",
+        f"go: {some_req}: reading https://proxy.golang.org: 502 Bad Gateway",
+        "exec: \"go\": executable file not found in $PATH",
+    ):
+        assert _go_proxy_refusals(unrelated, reqs) == [], unrelated
+    assert _go_proxy_refusals(
+        f"go: {some_req}: module lookup disabled by GOPROXY=off\n", reqs
+    ) == [some_req]
+
+    # The command is the real workflow step's, checked against the constant.
+    steps = _job_steps(_load_wf()["jobs"][FUNCTIONAL_TOOLCHAIN_JOB])
+    prefetch = [st for st in steps
+                if (_step_run(st) or "").strip() == FUNCTIONAL_GO_MOD_PREFETCH_RUN]
+    assert prefetch == [FUNCTIONAL_GO_MOD_PREFETCH_STEP], prefetch
+    argv = prefetch[0]["run"].split()
+    assert argv == ["go", "mod", "download"]
+
+    cache = tmp_path / "gomodcache"
+    cache.mkdir()
+    env = os.environ.copy()
+    env.update({
+        "GOPROXY": "off",
+        "GOTOOLCHAIN": "local",
+        "GOWORK": "off",
+        "GOSUMDB": "off",
+        "GOFLAGS": "",
+        "GOMODCACHE": str(cache),
+        # Hermeticity only: an ambient private-module pattern would route a
+        # lookup around the disabled proxy to its VCS origin.
+        "GOPRIVATE": "",
+        "GONOPROXY": "",
+    })
+    shown = subprocess.run(
+        ["go", "env", "GOPROXY", "GOMODCACHE"],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert shown.returncode == 0, shown.stderr
+    assert shown.stdout.splitlines() == ["off", str(cache)], shown.stdout
+
+    probe = cache / ".fp-gmp-1b-write-probe"
+    probe.write_text("probe", encoding="utf-8")
+    probe.unlink()
+    assert list(cache.iterdir()) == []
+    proc = subprocess.run(
+        argv, cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _go_proxy_refusals(proc.stderr, reqs), proc.stderr
+
+
+#: FP-GMP-2: how many Go subprocesses each F15/F16 file launches (`_build` and
+#: two `go test` calls in F15; `_run_go_f16_test` in F16).
+F15_F16_GO_SUBPROCESS_CALLS = {
+    "tests/functional/test_m6_go_config_env_interpolation.py": 3,
+    "tests/functional/test_m6_audit_completeness.py": 1,
+}
+assert tuple(F15_F16_GO_SUBPROCESS_CALLS) == F15_F16_GO_SUBPROCESS_TESTS
+_MODULE_CACHE_KEY = "GOMODCACHE"
+_RETIRED_MODULE_CACHE_FALLBACK = "/tmp/go-mod"
+_ENV_BULK_WRITERS = frozenset({"update", "clear", "popitem"})
+
+
+def _is_os_environ_copy(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and not node.args and not node.keywords
+        and isinstance(node.func, ast.Attribute) and node.func.attr == "copy"
+        and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "environ"
+        and isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == "os"
+    )
+
+
+def _is_go_subprocess_run(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
+        and bool(node.args) and isinstance(node.args[0], ast.List)
+        and bool(node.args[0].elts)
+        and isinstance(node.args[0].elts[0], ast.Constant)
+        and node.args[0].elts[0].value == "go"
+    )
+
+
+def _names_module_cache(node: ast.AST) -> bool:
+    return (
+        (isinstance(node, ast.Constant) and node.value == _MODULE_CACHE_KEY)
+        or (isinstance(node, ast.keyword) and node.arg == _MODULE_CACHE_KEY)
+    )
+
+
+def _env_write_is_opaque(node: ast.AST) -> bool:
+    """A write to `env` whose key cannot be read statically."""
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        and isinstance(node.value, ast.Name) and node.value.id == "env"
+    ):
+        return not isinstance(node.slice, ast.Constant)
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "env"
+        and node.func.attr in _ENV_BULK_WRITERS
+    )
+
+
+def _f15_f16_module_cache_failures(root: Path) -> list[str]:
+    """FP-GMP-2: every F15/F16 Go subprocess inherits GOMODCACHE unchanged.
+
+    Per call site: `env` is last bound to `os.environ.copy()` before the call,
+    nothing between that binding and the call names GOMODCACHE or writes `env`
+    through an unreadable key, and the call passes `env=env`. Per file: no
+    GOMODCACHE name and no `/tmp/go-mod` literal anywhere, so no module-level
+    or helper fallback can stand in for a call-site one.
+    """
+    fails: list[str] = []
+    for rel, expected_calls in F15_F16_GO_SUBPROCESS_CALLS.items():
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if _names_module_cache(node):
+                fails.append(f"{rel}:{getattr(node, 'lineno', '?')} names {_MODULE_CACHE_KEY}")
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and _RETIRED_MODULE_CACHE_FALLBACK in node.value):
+                fails.append(f"{rel}:{node.lineno} supplies {_RETIRED_MODULE_CACHE_FALLBACK}")
+        parents: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        calls = [n for n in ast.walk(tree) if _is_go_subprocess_run(n)]
+        if len(calls) != expected_calls:
+            fails.append(f"{rel}: {len(calls)} Go subprocess calls != {expected_calls}")
+        for call in calls:
+            where = f"{rel}:{call.lineno}"
+            func: ast.AST | None = parents.get(call)
+            while func is not None and not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func = parents.get(func)
+            if func is None:
+                fails.append(f"{where} is outside a function")
+                continue
+            env_kw = [k for k in call.keywords if k.arg == "env"]
+            if not (len(env_kw) == 1 and isinstance(env_kw[0].value, ast.Name)
+                    and env_kw[0].value.id == "env"):
+                fails.append(f"{where} does not pass env=env")
+                continue
+            bindings = [
+                n for n in ast.walk(func)
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr))
+                and n.lineno < call.lineno
+                and any(isinstance(t, ast.Name) and t.id == "env"
+                        for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))
+            ]
+            if not bindings:
+                fails.append(f"{where} env is never bound")
+                continue
+            binding = max(bindings, key=lambda n: n.lineno)
+            if not (isinstance(binding, ast.Assign) and _is_os_environ_copy(binding.value)):
+                fails.append(f"{where} env is not bound to os.environ.copy()")
+                continue
+            for node in ast.walk(func):
+                line = getattr(node, "lineno", None)
+                if line is None or not binding.lineno < line <= call.lineno:
+                    continue
+                if _names_module_cache(node) or _env_write_is_opaque(node):
+                    fails.append(f"{where} rewrites env's {_MODULE_CACHE_KEY} at line {line}")
+    return fails
+
+
+def _go_call_statements(src: str) -> list[ast.stmt]:
+    """The statement holding each Go subprocess call, in source order."""
+    tree = ast.parse(src)
+    out: list[ast.stmt] = []
+    for stmt in ast.walk(tree):
+        if isinstance(stmt, ast.stmt) and not isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+        ):
+            if any(_is_go_subprocess_run(n) for n in ast.walk(stmt)) and not any(
+                isinstance(c, ast.stmt) for c in ast.walk(stmt) if c is not stmt
+            ):
+                out.append(stmt)
+    return sorted(out, key=lambda s: s.lineno)
+
+
+def _insert_before(src: str, stmt: ast.stmt, text: str) -> str:
+    lines = src.splitlines(keepends=True)
+    lines.insert(stmt.lineno - 1, " " * stmt.col_offset + text + "\n")
+    return "".join(lines)
+
+
+def _f15_f16_module_cache_mutants(rel: str, src: str) -> list[tuple[str, str]]:
+    """(label, mutated source) for one F15/F16 file: the retired fallback put
+    back at every Go call site in turn, plus other shapes of override."""
+    stmts = _go_call_statements(src)
+    mutants: list[tuple[str, str]] = []
+    for n, stmt in enumerate(stmts):
+        mutants.append((
+            f"call{n}_fallback_restored",
+            _insert_before(src, stmt, 'env["GOMODCACHE"] = env.get("GOMODCACHE", "/tmp/go-mod")'),
+        ))
+    first = stmts[0]
+    for label, text in (
+        ("setdefault_fallback", 'env.setdefault("GOMODCACHE", "/tmp/go-mod")'),
+        ("other_path", 'env["GOMODCACHE"] = "/var/cache/go-mod"'),
+        ("deleted", 'env.pop("GOMODCACHE", None)'),
+        ("bulk_update", "env.update(_CACHE_OVERRIDE)"),
+        ("rebound", 'env = {**os.environ, "GOMODCACHE": "/tmp/go-mod"}'),
+    ):
+        mutants.append((label, _insert_before(src, first, text)))
+    mutants.append((
+        "module_level_fallback",
+        src.replace("\nimport os\n", '\nimport os\nos.environ.setdefault("GOMODCACHE", "/tmp/go-mod")\n', 1),
+    ))
+    mutants.append(("env_not_passed", src.replace("env=env,", "", 1)))
+    return mutants
+
+
+def test_f15_f16_go_subprocesses_inherit_module_cache(tmp_path: Path):
+    """FP-GMP-2 [function test]: every Go subprocess F15/F16 launch inherits
+    the parent's GOMODCACHE -- the cache the functional job's `go mod download`
+    step filled -- with no `/tmp/go-mod` or other module-cache fallback.
+    Reintroducing one at any call site, in either file, one file at a time,
+    is rejected."""
+    assert _f15_f16_module_cache_failures(REPO_ROOT) == []
+    sources = {rel: (REPO_ROOT / rel).read_text(encoding="utf-8")
+               for rel in F15_F16_GO_SUBPROCESS_TESTS}
+    for rel, n in F15_F16_GO_SUBPROCESS_CALLS.items():
+        assert len(_go_call_statements(sources[rel])) == n, rel
+        # The existing GOCACHE handling is untouched: every call site keeps it.
+        assert sources[rel].count('env["GOCACHE"]') == n, rel
+    seen = 0
+    for target in F15_F16_GO_SUBPROCESS_TESTS:
+        for label, mutated in _f15_f16_module_cache_mutants(target, sources[target]):
+            assert mutated != sources[target], (target, label)
+            ast.parse(mutated)
+            root = tmp_path / f"m{seen}"
+            for rel, src in sources.items():
+                dest = root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(mutated if rel == target else src, encoding="utf-8")
+            fails = _f15_f16_module_cache_failures(root)
+            assert fails, (target, label)
+            assert all(f.startswith(target) for f in fails), (target, label, fails)
+            seen += 1
+    # 4 call sites + 7 shapes per file.
+    assert seen == 4 + 7 * 2
 
 
 # ---------------------------------------------------------------------------

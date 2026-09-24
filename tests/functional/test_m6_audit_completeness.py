@@ -421,7 +421,6 @@ def _run_go_f16_test(postgres_dsn: str, test_name: str, *, audit: bool, refresh:
     if refresh:
         env["F16_REFRESH_DSN"] = dsn
     env["GOCACHE"] = env.get("GOCACHE", "/tmp/go-cache")
-    env["GOMODCACHE"] = env.get("GOMODCACHE", "/tmp/go-mod")
     proc = subprocess.run(
         [
             "go",

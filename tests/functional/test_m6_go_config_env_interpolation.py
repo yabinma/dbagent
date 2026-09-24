@@ -14,7 +14,6 @@ REPO = Path(__file__).resolve().parents[2]
 def _build(bin_path: Path, package: str) -> None:
     env = os.environ.copy()
     env["GOCACHE"] = "/tmp/go-cache"
-    env["GOMODCACHE"] = env.get("GOMODCACHE", "/tmp/go-mod")
     env["CGO_ENABLED"] = "0"
     proc = subprocess.run(
         ["go", "build", "-o", str(bin_path), package],
@@ -37,7 +36,6 @@ def test_probe_config_interpolates_bootstrap_token(tmp_path):
     # Package-level Load asserts the resolved value (not just "no parse error").
     env = os.environ.copy()
     env["GOCACHE"] = "/tmp/go-cache"
-    env["GOMODCACHE"] = env.get("GOMODCACHE", "/tmp/go-mod")
     env["BOOTSTRAP_TOKEN"] = "tok-from-env-f15"
     proc = subprocess.run(
         [
@@ -93,7 +91,6 @@ def test_probe_gateway_config_interpolates_postgres_dsn(tmp_path):
     """Real probe-gateway config.Load resolves ${PG_DSN} with YAML-significant chars."""
     env = os.environ.copy()
     env["GOCACHE"] = "/tmp/go-cache"
-    env["GOMODCACHE"] = env.get("GOMODCACHE", "/tmp/go-mod")
     # HASH_PW / adversarial values are set inside the unit test via t.Setenv;
     # also set here so a subprocess-visible env matches production compose shape.
     env["HASH_PW"] = "p@ss #word"
