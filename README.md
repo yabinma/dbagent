@@ -248,6 +248,47 @@ services/worker/.venv/bin/python -m pytest \
 go test ./tests/functional/... -timeout 300s
 ```
 
+*Go module cache for F15/F16.* F15
+(`tests/functional/test_m6_go_config_env_interpolation.py`) and F16
+(`tests/functional/test_m6_audit_completeness.py`) launch `go build` /
+`go test` subprocesses that inherit the caller's `GOMODCACHE` unchanged, or
+Go's default (`go env GOMODCACHE`) when it is unset. The tests never choose
+another cache path and never skip work based on what the cache holds. CI's
+`functional` job fills that cache with a `go mod download` setup step before
+its hygiene gate and pytest, so a module-proxy error fails setup, not a test.
+Do the same locally before the tier: `go mod download` from the repository
+root.
+
+Inside a jail or sandbox whose default module-cache location is not writable,
+the launcher or caller owns the cache: create or mount an absolute, writable
+directory, export `GOMODCACHE` to it **into the jail and into the pytest
+process**, and make the current module graph available there, either by a
+successful `go mod download` while a module source is reachable or by mounting
+a prefilled cache. Check it before starting pytest, and stop at setup if any
+check fails:
+
+```bash
+export GOMODCACHE=/abs/writable/go-mod   # stays set for the pytest below
+mkdir -p "$GOMODCACHE"
+touch "$GOMODCACHE/.write-probe" && rm "$GOMODCACHE/.write-probe" \
+  || { echo "GOMODCACHE is not writable; stopping at setup" >&2; exit 1; }
+[ "$(go env GOMODCACHE)" = "$GOMODCACHE" ] \
+  || { echo "GOMODCACHE does not reach go env; stopping at setup" >&2; exit 1; }
+# Module source reachable: fill the cache. Prefilled mount, no source:
+# GOPROXY=off go mod download   (proves the mount holds the whole graph)
+go mod download \
+  || { echo "cannot provide Go modules; stopping at setup" >&2; exit 1; }
+services/worker/.venv/bin/python -m pytest \
+  tests/functional/test_m6_go_config_env_interpolation.py -v
+```
+
+This is local runner configuration, never an `env:` entry in
+`.github/workflows/ci.yml` (its Go jobs declare no `GO*` key).
+`scripts/integration-test.sh py` inherits the caller's environment and needs
+nothing cache-specific. The review-runner image is one example of
+environment-owned setup: `deploy/review-runner/Dockerfile` sets
+`GOMODCACHE=/opt/review-go/pkg/mod` and preloads it at image build.
+
 See [`tests/delivery/README.md`](tests/delivery/README.md) for what the
 delivery tier asserts (Dockerfiles, charts, compose files, docs, `ci.yml`).
 

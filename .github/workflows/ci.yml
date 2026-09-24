@@ -365,6 +365,15 @@ jobs:
           tar -xzf /tmp/helm.tgz -C /tmp
           sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
           helm version
+      # ci-go-mod-prefetch FP-GMP-1a: F15/F16's Python tests launch go build /
+      # go test subprocesses. Their modules are fetched here, in setup, into
+      # Go's ordinary module cache for this job, which those subprocesses
+      # inherit; a module-proxy error fails this step before the measured
+      # pytest starts, instead of surfacing as a product test failure. No
+      # condition, retry or failure tolerance: the default shell's nonzero exit
+      # fails the job. Pinned exactly in tests/functional/test_manifests.py.
+      - name: Download Go modules for F15/F16
+        run: go mod download
       # FP-M6-31 A10(v): runtime env hygiene immediately before the guard's own
       # pytest process (ordinary import mode; a PYTHONPATH would own the guard).
       - name: FP-M6-31 A10(v) environment hygiene before functional pytest
