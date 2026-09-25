@@ -512,8 +512,8 @@ postgresql:
 
 minio:
   bundled: false
-  image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
-  mcImage: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+  image: ghcr.io/yabinma/mirror/minio:RELEASE.2024-12-18T13-15-44Z
+  mcImage: ghcr.io/yabinma/mirror/mc:RELEASE.2025-08-13T08-35-41Z
   rootUser: minioadmin
   rootPassword: minioadmin
   bucket: dbagent

@@ -10,6 +10,10 @@ docker compose -f deploy/compose/control-plane.yml --profile apps up -d
 
 Pins live in `deploy/versions.env`. Application images must be built first via `deploy/docker/build.sh`.
 
+**The bundled MinIO (`minio`, `minio-init`) is dev/e2e only**: a frozen, unpatched image, pulled from the
+project's own GHCR mirror (MinIO no longer publishes it; the exact references are `MINIO_IMAGE` and
+`MINIO_MC_IMAGE` in `deploy/versions.env`). Production points `storage.s3.*` at its own S3/MinIO.
+
 The compose project is `dbagent-control-plane`, and the application database,
 user and password all default to `dbagent` (design.md §11.2.3 C.4). **Changing
 `POSTGRES_DB` does not rename anything inside an already-initialized volume — it

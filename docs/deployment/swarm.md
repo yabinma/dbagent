@@ -108,6 +108,10 @@ external* Presto overlay network so Swarm service DNS resolves
 `<COORDINATOR_SERVICE>`, and reaching probe-gateway through an `extra_hosts`
 entry so the gateway certificate's SAN matches without DNS.
 
+The control plane's bundled MinIO is dev/e2e only: a frozen, unpatched image
+served from the project's own GHCR mirror (`MINIO_IMAGE` in
+`deploy/versions.env`). Production points `storage.s3.*` at its own S3/MinIO.
+
 ## Probe config
 
 Docker config, mounted at `/etc/dbagent-probe/config.yaml`:

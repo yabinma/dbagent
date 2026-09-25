@@ -81,7 +81,7 @@ services:
       - "8088:8080"
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
+    image: ghcr.io/yabinma/mirror/minio:RELEASE.2024-12-18T13-15-44Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -98,7 +98,7 @@ services:
       retries: 10
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: ghcr.io/yabinma/mirror/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy
