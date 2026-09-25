@@ -38,6 +38,16 @@ from testcontainers.postgres import PostgresContainer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RCA_COMMON_DIR = REPO_ROOT / "libs" / "py" / "rca_common"
+VERSIONS_ENV = REPO_ROOT / "deploy" / "versions.env"
+
+
+def versions_env_pin(key):
+    """Return ``key``'s value from deploy/versions.env, the single pin source."""
+    for line in VERSIONS_ENV.read_text(encoding="utf-8").splitlines():
+        name, sep, value = line.strip().partition("=")
+        if sep and not name.startswith("#") and name.strip() == key:
+            return value.strip()
+    raise RuntimeError(f"deploy/versions.env does not pin {key}")
 
 
 def _free_port() -> int:
@@ -109,8 +119,10 @@ def minio_endpoint() -> str:
     the `dbagent` bucket pre-created."""
     access_key = "minioadmin"
     secret_key = "minioadmin"
+    # The pinned MinIO release from the project's GHCR mirror (MinIO withdrew
+    # its public images from Docker Hub and quay.io); never a floating tag.
     container = (
-        DockerContainer("quay.io/minio/minio:latest")
+        DockerContainer(versions_env_pin("MINIO_IMAGE"))
         .with_exposed_ports(9000)
         .with_env("MINIO_ROOT_USER", access_key)
         .with_env("MINIO_ROOT_PASSWORD", secret_key)

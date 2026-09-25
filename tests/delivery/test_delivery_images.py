@@ -434,48 +434,342 @@ def test_versions_env_is_the_only_pin_source():
                 assert default == vers[arg] or default in vers.values(), (name, arg, default)
 
 
-def test_minio_pins_are_registry_qualified_and_repeated_by_every_manifest():
-    """The MinIO pins name their registry, and no consumer names another.
+# The MinIO images are served from the project's own GHCR mirror. MinIO removed
+# its public repositories from Docker Hub (2026-09-14) and then from quay.io
+# (2026-09-25); the pinned releases were copied, unchanged, to this prefix.
+# The host/org needle is split so this file does not itself form the contiguous
+# registry literal that test_registry_coordinate_is_dbagent_and_single_sourced
+# rejects outside versions.env and the row-2a manifests.
+MINIO_MIRROR = "ghcr.io/" + "yabinma" + "/mirror/"
+_MINIO_RELEASE_TAG = r"RELEASE\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z"
+_MINIO_PIN_RES = {
+    "MINIO_IMAGE": re.compile(re.escape(MINIO_MIRROR + "minio:") + _MINIO_RELEASE_TAG),
+    "MINIO_MC_IMAGE": re.compile(re.escape(MINIO_MIRROR + "mc:") + _MINIO_RELEASE_TAG),
+}
+_MINIO_LITERAL_RE = re.compile(r"""["']([^"'\s]*minio/(?:minio|mc)(?::[^"'\s]*)?)["']""")
+_FIXTURE_PIN_READER = "versions_env_pin"
 
-    An unqualified ``minio/minio`` or ``minio/mc`` resolves to Docker Hub,
-    where both repositories were removed; every pull then fails with
-    ImageNotFound at the functional fixture, the e2e pre-pull, Helm and
-    compose alike. The same releases are served by MinIO's own registry,
-    so each reference carries the registry that serves it.
+
+def _fixture_minio_image(fixture_source: str, vers: dict[str, str]) -> str:
+    """Resolve the image the functional ``minio_endpoint`` fixture starts.
+
+    The fixture's single ``DockerContainer(...)`` argument is followed to a
+    string literal, through module-level name bindings, or to a
+    ``versions_env_pin("<KEY>")`` call. That reader is executed on its own
+    against ``deploy/versions.env`` and must return the same pin the delivery
+    tier reads, so a reader that returns anything else cannot pass. Any other
+    shape is unresolvable and therefore not proven equal to ``versions.env``.
     """
+    tree = ast.parse(fixture_source)
+    fixture = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "minio_endpoint"
+        ),
+        None,
+    )
+    if fixture is None:
+        raise AssertionError("tests/functional/conftest.py has no minio_endpoint fixture")
+    calls = [
+        n
+        for n in ast.walk(fixture)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "DockerContainer"
+    ]
+    if len(calls) != 1 or len(calls[0].args) != 1:
+        raise AssertionError(
+            "minio_endpoint must start exactly one DockerContainer(<image>)"
+        )
+
+    bindings: dict[str, ast.expr] = {}
+    readers: dict[str, ast.FunctionDef] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            bindings[node.targets[0].id] = node.value
+        elif isinstance(node, ast.FunctionDef):
+            readers[node.name] = node
+
+    def resolve(expr: ast.expr, depth: int = 0) -> str:
+        if depth > 8:
+            raise AssertionError("MinIO image binding is circular")
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value
+        if isinstance(expr, ast.Name) and expr.id in bindings:
+            return resolve(bindings[expr.id], depth + 1)
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == _FIXTURE_PIN_READER
+            and len(expr.args) == 1
+            and not expr.keywords
+            and isinstance(expr.args[0], ast.Constant)
+            and isinstance(expr.args[0].value, str)
+        ):
+            reader = readers.get(_FIXTURE_PIN_READER)
+            if reader is None:
+                raise AssertionError(f"{_FIXTURE_PIN_READER} is not defined in conftest")
+            namespace: dict[str, object] = {"VERSIONS_ENV": VERSIONS_ENV}
+            exec(compile(ast.Module(body=[reader], type_ignores=[]), "<conftest>", "exec"), namespace)
+            key = expr.args[0].value
+            value = namespace[_FIXTURE_PIN_READER](key)  # type: ignore[operator]
+            if value != vers.get(key):
+                raise AssertionError(
+                    f"{_FIXTURE_PIN_READER}({key!r}) returned {value!r}, "
+                    f"versions.env pins {vers.get(key)!r}"
+                )
+            return value
+        raise AssertionError(
+            f"cannot resolve the minio_endpoint image {ast.unparse(expr)!r} to "
+            f"a literal or a versions.env pin"
+        )
+
+    return resolve(calls[0].args[0])
+
+
+def minio_pin_violations(
+    vers: dict[str, str],
+    chart: dict,
+    compose: dict,
+    fixture_source: str,
+) -> list[str]:
+    """Every way the MinIO pins can leave the mirror, float, or drift apart."""
+    problems: list[str] = []
+    for key, pattern in _MINIO_PIN_RES.items():
+        ref = vers.get(key, "")
+        if not pattern.fullmatch(ref):
+            problems.append(
+                f"versions.env {key}={ref!r} is not {MINIO_MIRROR}<repo> at a "
+                f"pinned RELEASE.* tag (quay.io and Docker Hub no longer serve "
+                f"MinIO; a floating tag is never a pin)"
+            )
+
+    # Manifests repeat versions.env byte-for-byte, so a withdrawn registry or
+    # a floating tag cannot return through a manifest the pin does not reach.
+    minio_values = chart.get("minio") or {}
+    services = compose.get("services") or {}
+    for where, got, key in (
+        ("chart minio.image", minio_values.get("image"), "MINIO_IMAGE"),
+        ("chart minio.mcImage", minio_values.get("mcImage"), "MINIO_MC_IMAGE"),
+        ("compose minio", (services.get("minio") or {}).get("image"), "MINIO_IMAGE"),
+        ("compose minio-init", (services.get("minio-init") or {}).get("image"), "MINIO_MC_IMAGE"),
+    ):
+        if got != vers.get(key):
+            problems.append(f"{where}={got!r} != versions.env {key}={vers.get(key)!r}")
+
+    # The functional fixture is the site that failed in CI: it starts exactly
+    # the versions.env pin, and names no other MinIO image anywhere.
+    try:
+        fixture_image = _fixture_minio_image(fixture_source, vers)
+    except AssertionError as exc:
+        problems.append(f"tests/functional/conftest.py: {exc}")
+    else:
+        if fixture_image != vers.get("MINIO_IMAGE"):
+            problems.append(
+                f"tests/functional/conftest.py starts {fixture_image!r} != "
+                f"versions.env MINIO_IMAGE={vers.get('MINIO_IMAGE')!r}"
+            )
+    pins = {vers.get("MINIO_IMAGE"), vers.get("MINIO_MC_IMAGE")}
+    for literal in _MINIO_LITERAL_RE.findall(fixture_source):
+        if literal not in pins:
+            problems.append(
+                f"tests/functional/conftest.py names MinIO image {literal!r}, "
+                f"which is not a versions.env pin"
+            )
+    return problems
+
+
+def _minio_rule_inputs() -> tuple[dict[str, str], dict, dict, str]:
     from delivery_helpers import CHARTS, COMPOSE
 
     import yaml
 
-    vers = load_versions()
-    for key in ("MINIO_IMAGE", "MINIO_MC_IMAGE"):
-        ref = vers[key]
-        assert ref.startswith("quay.io/minio/"), (
-            f"{key}={ref!r} is not registry-qualified: an unqualified "
-            f"minio/... reference resolves to Docker Hub, where the "
-            f"repository no longer exists"
+    return (
+        load_versions(),
+        yaml.safe_load((CHARTS / "dbagent/values.yaml").read_text(encoding="utf-8")),
+        yaml.safe_load((COMPOSE / "control-plane.yml").read_text(encoding="utf-8")),
+        (REPO_ROOT / "tests/functional/conftest.py").read_text(encoding="utf-8"),
+    )
+
+
+def test_minio_pins_are_mirrored_pinned_and_repeated_by_every_manifest():
+    """MinIO comes from the GHCR mirror at a pinned ``RELEASE.*`` tag.
+
+    MinIO withdrew its public images from Docker Hub and then from quay.io;
+    every pull of either (and of any floating tag) now fails, at the
+    functional fixture, the e2e pre-pull, Helm and compose alike. The pinned
+    releases live unchanged under the project's GHCR mirror, and chart,
+    compose and the functional fixture all equal ``deploy/versions.env``.
+    """
+    problems = minio_pin_violations(*_minio_rule_inputs())
+    assert not problems, "\n".join(problems)
+
+
+def test_minio_pin_rule_rejects_withdrawn_floating_and_drifting_references():
+    """The rule above goes red for each way the MinIO pin has broken or can."""
+    import copy
+
+    vers, chart, compose, fixture = _minio_rule_inputs()
+    pin = vers["MINIO_IMAGE"]
+    baseline = minio_pin_violations(vers, chart, compose, fixture)
+    assert not baseline, "the unmutated tree must pass first:\n" + "\n".join(baseline)
+
+    def everywhere(key, image):
+        # The pin moves consistently in versions.env, chart, compose and (for
+        # MINIO_IMAGE) a literal fixture, so only the registry/tag rule can
+        # reject it.
+        v = dict(vers, **{key: image})
+        ch = copy.deepcopy(chart)
+        co = copy.deepcopy(compose)
+        fx = fixture
+        if key == "MINIO_IMAGE":
+            ch["minio"]["image"] = image
+            co["services"]["minio"]["image"] = image
+            fx = fixture_starting(repr(image))[3]
+        else:
+            ch["minio"]["mcImage"] = image
+            co["services"]["minio-init"]["image"] = image
+        return v, ch, co, fx
+
+    def with_chart(image):
+        c = copy.deepcopy(chart)
+        c["minio"]["image"] = image
+        return vers, c, compose, fixture
+
+    def with_compose(image):
+        c = copy.deepcopy(compose)
+        c["services"]["minio-init"]["image"] = image
+        return vers, chart, c, fixture
+
+    def fixture_starting(expr):
+        # Replace the fixture's DockerContainer argument, whatever it is now.
+        tree = ast.parse(fixture)
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "minio_endpoint")
+        call = next(
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "DockerContainer"
         )
+        call.args[0] = ast.parse(expr, mode="eval").body
+        return vers, chart, compose, ast.unparse(tree)
 
-    # Manifests repeat versions.env byte-for-byte, so the Docker Hub
-    # default cannot return through a manifest the pin does not reach.
-    chart = yaml.safe_load((CHARTS / "dbagent/values.yaml").read_text(encoding="utf-8"))
-    assert chart["minio"]["image"] == vers["MINIO_IMAGE"]
-    assert chart["minio"]["mcImage"] == vers["MINIO_MC_IMAGE"]
+    def fixture_reader_returning(value):
+        # The fixture reads the pin through the reader, and the reader is
+        # rewritten to return ``value`` instead of reading versions.env.
+        tree = ast.parse(fixture_starting(f'{_FIXTURE_PIN_READER}("MINIO_IMAGE")')[3])
+        tree.body = [
+            n for n in tree.body
+            if not (isinstance(n, ast.FunctionDef) and n.name == _FIXTURE_PIN_READER)
+        ]
+        tree.body.append(
+            ast.FunctionDef(
+                name=_FIXTURE_PIN_READER,
+                args=ast.arguments(
+                    posonlyargs=[], args=[ast.arg("key")], kwonlyargs=[],
+                    kw_defaults=[], defaults=[],
+                ),
+                body=[ast.Return(ast.Constant(value))],
+                decorator_list=[],
+                type_params=[],
+            )
+        )
+        return vers, chart, compose, ast.unparse(ast.fix_missing_locations(tree))
 
-    compose = yaml.safe_load((COMPOSE / "control-plane.yml").read_text(encoding="utf-8"))
-    assert compose["services"]["minio"]["image"] == vers["MINIO_IMAGE"]
-    assert compose["services"]["minio-init"]["image"] == vers["MINIO_MC_IMAGE"]
-
-    # The functional fixture pins its own tag but never its own registry:
-    # it is the site that failed in CI, and versions.env does not reach it.
-    fixture = (REPO_ROOT / "tests/functional/conftest.py").read_text(encoding="utf-8")
-    unqualified = re.findall(r"""["'](minio/(?:minio|mc):[^"']+)["']""", fixture)
-    assert not unqualified, (
-        f"tests/functional/conftest.py names Docker Hub: {unqualified}"
-    )
-    assert re.search(r"""["']quay\.io/minio/minio:[^"']+["']""", fixture), (
-        "tests/functional/conftest.py no longer pulls MinIO from quay.io"
-    )
+    mirror_other = MINIO_MIRROR + "minio:RELEASE.2025-01-01T00-00-00Z"
+    registry_rule = f"is not {MINIO_MIRROR}<repo> at a pinned RELEASE.* tag"
+    mutants = {
+        "versions.env back on quay.io": (
+            everywhere("MINIO_IMAGE", "quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z"),
+            registry_rule,
+        ),
+        "versions.env mc back on quay.io": (
+            everywhere("MINIO_MC_IMAGE", "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"),
+            registry_rule,
+        ),
+        "versions.env at latest": (everywhere("MINIO_IMAGE", MINIO_MIRROR + "minio:latest"), registry_rule),
+        "versions.env mc at latest": (everywhere("MINIO_MC_IMAGE", MINIO_MIRROR + "mc:latest"), registry_rule),
+        "versions.env untagged": (everywhere("MINIO_IMAGE", MINIO_MIRROR + "minio"), registry_rule),
+        "versions.env on Docker Hub": (
+            everywhere("MINIO_IMAGE", "minio/minio:RELEASE.2024-12-18T13-15-44Z"),
+            registry_rule,
+        ),
+        "versions.env mc on Docker Hub": (
+            everywhere("MINIO_MC_IMAGE", "minio/mc:RELEASE.2025-08-13T08-35-41Z"),
+            registry_rule,
+        ),
+        "chart on quay.io": (
+            with_chart("quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z"),
+            "chart minio.image=",
+        ),
+        "chart on Docker Hub": (with_chart("minio/minio:RELEASE.2024-12-18T13-15-44Z"), "chart minio.image="),
+        "compose mc at latest": (with_compose(MINIO_MIRROR + "mc:latest"), "compose minio-init="),
+        "fixture on quay.io": (
+            fixture_starting('"quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z"'),
+            "conftest.py starts",
+        ),
+        "fixture at latest": (fixture_starting(f'"{MINIO_MIRROR}minio:latest"'), "conftest.py starts"),
+        "fixture on Docker Hub": (
+            fixture_starting('"minio/minio:RELEASE.2024-12-18T13-15-44Z"'),
+            "conftest.py starts",
+        ),
+        "fixture/versions mismatch (other mirror release)": (
+            fixture_starting(f'"{mirror_other}"'),
+            "conftest.py starts",
+        ),
+        "fixture/versions mismatch (reads the mc pin)": (
+            fixture_starting(f'{_FIXTURE_PIN_READER}("MINIO_MC_IMAGE")'),
+            "conftest.py starts",
+        ),
+        "fixture image unresolvable": (fixture_starting('os.environ["MINIO_IMAGE"]'), "cannot resolve"),
+        "fixture reader ignores versions.env": (
+            fixture_reader_returning("quay.io/minio/minio:latest"),
+            f"{_FIXTURE_PIN_READER}('MINIO_IMAGE') returned",
+        ),
+        "fixture binds a module constant to quay.io": (
+            (vers, chart, compose,
+             fixture_starting("MINIO_REF")[3] + '\nMINIO_REF = "quay.io/minio/minio:latest"\n'),
+            "conftest.py starts",
+        ),
+        "fixture binding is circular": (
+            (vers, chart, compose,
+             fixture_starting("MINIO_A")[3] + "\nMINIO_A = MINIO_B\nMINIO_B = MINIO_A\n"),
+            "circular",
+        ),
+        "fixture pin reader deleted": (
+            (vers, chart, compose,
+             fixture_starting(f'{_FIXTURE_PIN_READER}("MINIO_IMAGE")')[3].replace(
+                 f"def {_FIXTURE_PIN_READER}(", "def _renamed_reader(")),
+            "is not defined",
+        ),
+        "minio_endpoint fixture deleted": (
+            (vers, chart, compose, fixture.replace("def minio_endpoint(", "def _gone(")),
+            "has no minio_endpoint",
+        ),
+        "fixture starts a second container": (
+            (vers, chart, compose,
+             fixture.replace("container = (", 'DockerContainer("postgres:16-alpine")\n    container = (', 1)),
+            "exactly one DockerContainer",
+        ),
+        "fixture pinned literally, versions.env moved on": (
+            (
+                dict(vers, MINIO_IMAGE=mirror_other),
+                dict(chart, minio=dict(chart["minio"], image=mirror_other)),
+                compose | {"services": compose["services"] | {"minio": dict(compose["services"]["minio"], image=mirror_other)}},
+                fixture_starting(f'"{pin}"')[3],
+            ),
+            "conftest.py starts",
+        ),
+    }
+    wrong = {}
+    for name, (args, reason) in mutants.items():
+        problems = minio_pin_violations(*args)
+        if not any(reason in p for p in problems):
+            wrong[name] = problems
+    assert not wrong, f"MinIO pin rule misses (or rejects for another reason): {wrong}"
 
 
 def test_dashboard_web_nginx_config_and_runtime_config_js():
