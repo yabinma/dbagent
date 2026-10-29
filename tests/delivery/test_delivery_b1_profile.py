@@ -3910,7 +3910,7 @@ def test_gc5_fixed_workload_pool_schema_and_sizing_boundaries():
     } == _gc5_other_benchmark_entries(), "another benchmark entry moved"
     ci = yaml.safe_load(GC5_CI_YML.read_text(encoding="utf-8"))
     for name, job in ci["jobs"].items():
-        assert job.get("runs-on") == "ubuntu-latest", (name, job.get("runs-on"))
+        assert job.get("runs-on") == "ubuntu-24.04", (name, job.get("runs-on"))
     launcher = GC5_LAUNCHER.read_text(encoding="utf-8")
     for line in GC2_LAUNCHER_AFFINITY_LINES:
         assert line in launcher, line

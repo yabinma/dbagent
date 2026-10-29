@@ -3038,7 +3038,7 @@ def _ci_pin_failures(workflow: dict, root: Path = REPO_ROOT) -> list[str]:
                 # F15/F16's Python subprocesses and has no workflow Go command.
                 add("missing_setup_go", f"{jn} no go test")
             # runner
-            if job.get("runs-on") != "ubuntu-latest":
+            if job.get("runs-on") != "ubuntu-24.04":
                 add("go_runner_drift", jn)
             if "container" in job:
                 add("go_runner_drift", f"{jn} container")
@@ -4225,7 +4225,7 @@ def _ci_pin_workflow_cases():
         step = [s for s in steps if "TestB5" in str(s.get("run", ""))][0]
         wf["jobs"]["benchmark"]["steps"] = [s for s in steps if s is not step]
         wf["jobs"]["benchmark-go"] = {
-            "runs-on": "ubuntu-latest",
+            "runs-on": "ubuntu-24.04",
             "steps": [
                 {"uses": "actions/checkout@v4"},
                 {"uses": "actions/setup-go@v5", "with": {"go-version": "1.26.4"}},
@@ -8203,7 +8203,7 @@ def test_release_record_gates_image_push():
     record = jobs.get(BOD_RECORD_JOB)
     assert record is not None, f"the {BOD_RECORD_JOB} job is missing"
     assert record.get("if") == "startsWith(github.ref, 'refs/tags/v')", record.get("if")
-    assert record.get("runs-on") == "ubuntu-latest", record.get("runs-on")
+    assert record.get("runs-on") == "ubuntu-24.04", record.get("runs-on")
     steps = _job_steps(record)
     checkout = steps[0]
     assert checkout.get("uses", "").startswith("actions/checkout"), checkout
