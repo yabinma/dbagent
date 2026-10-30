@@ -59,7 +59,7 @@ on:
 jobs:
   lint:
     name: lint / typecheck (rca_common, worker, probe, probe-gateway)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -112,7 +112,7 @@ jobs:
   # this name.
   manifest-guard:
     name: manifest-guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -143,7 +143,7 @@ jobs:
 
   unit-rca-common:
     name: unit tests - rca_common (>80% coverage per module)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -165,7 +165,7 @@ jobs:
 
   unit-worker:
     name: unit tests - worker (>80% coverage per module)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -187,7 +187,7 @@ jobs:
 
   unit-gateway:
     name: unit tests - ingest-gateway (>80% coverage)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -210,7 +210,7 @@ jobs:
 
   unit-dashboard-api:
     name: unit tests - dashboard-api (>80% coverage)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -232,7 +232,7 @@ jobs:
 
   unit-web:
     name: unit tests - dashboard-web (vitest, >80% coverage per file)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -250,7 +250,7 @@ jobs:
 
   unit-go:
     name: unit tests - probe, probe-gateway (>80% coverage per package)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -304,7 +304,7 @@ jobs:
 
   functional:
     name: functional tests (M1–M6)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       [
         unit-rca-common,
@@ -434,7 +434,7 @@ jobs:
 
   benchmark:
     name: benchmark (B3–B6/B9/B12–B14 + M3/M4 Python benches)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: functional
     steps:
       - uses: actions/checkout@v4
@@ -547,7 +547,7 @@ jobs:
   # CPUs and every runner here is a four-vCPU ubuntu-latest.
   release-bench-record:
     name: release bench record (v* tags)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       # fetch-depth: 0 plus an explicit fetch of the release branch: the script
@@ -563,7 +563,7 @@ jobs:
 
   images:
     name: build product images (six)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [lint, release-bench-record]
     # `always()` is what lets this job run on a pull request, where
     # `release-bench-record` is skipped. A FAILED record job is neither
@@ -619,7 +619,7 @@ jobs:
 
   e2e:
     name: e2e (kind + Presto 0.298 + Section 13 scenarios)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: functional
     timeout-minutes: 30
     if: >

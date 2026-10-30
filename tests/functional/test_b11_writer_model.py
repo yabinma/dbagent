@@ -2903,7 +2903,7 @@ for workflow_rel in workflows:
         if job is None:
             errors.append("(iv) missing job %s in %s" % (job_name, workflow_rel))
             continue
-        if job.get("runs-on") != "ubuntu-latest":
+        if job.get("runs-on") != "ubuntu-24.04":
             errors.append("(iv) job %s runs-on %r" % (job_name, job.get("runs-on")))
         if "container" in job:
             errors.append("(iv) job %s declares container:" % job_name)
