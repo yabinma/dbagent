@@ -452,18 +452,116 @@ def _node_uri_host(uri: str) -> str | None:
     return urlparse(uri).hostname
 
 
+PRESTO_RUNTIME_NODES_SQL = (
+    "SELECT node_id, http_uri, coordinator, state FROM system.runtime.nodes"
+)
+# Presto 0.298 runs this statement's SINGLE output stage on a random ACTIVE
+# worker, so while a departed worker is still in the active set the read itself
+# can be placed there and never start (the same PLANNED stall as the E1 trip
+# query, nightly 42202909825).  One gate poll abandons (DELETEs) its read after
+# this long and counts as "not discovered yet"; the gate's own deadline is
+# unchanged and still bounds every poll.
+PRESTO_RUNTIME_NODES_READ_BUDGET_S = 10.0
+
+
+def _presto_runtime_active_workers(
+    base: str, deadline: float
+) -> tuple[dict[str, str] | None, str]:
+    """Active non-coordinator rows of system.runtime.nodes, as host -> node id.
+
+    Returns ``(None, detail)`` when this poll could not read the table.
+    """
+    # Every request of this read gets only what is left of the read's budget
+    # as its timeout, so a socket that never answers cannot hold the poll past
+    # the budget (or the gate deadline).
+    now = time.time()
+    stop = min(now + PRESTO_RUNTIME_NODES_READ_BUDGET_S, deadline)
+    if stop <= now:
+        return None, "system.runtime.nodes not read: the gate deadline has passed"
+    rows: list = []
+    try:
+        r = httpx.post(
+            f"{base}/v1/statement",
+            content=PRESTO_RUNTIME_NODES_SQL,
+            headers={"X-Presto-User": "e2e"},
+            timeout=stop - now,
+        )
+        if r.status_code != 200:
+            return None, (
+                f"system.runtime.nodes POST returned status {r.status_code}: "
+                f"{r.text}"
+            )
+        body = r.json()
+        while True:
+            if body.get("error"):
+                return None, (
+                    f"system.runtime.nodes statement failed: {body['error']!r}"
+                )
+            rows.extend(body.get("data") or [])
+            next_uri = body.get("nextUri")
+            if not next_uri:
+                break
+            next_uri = _rewrite_cluster_internal_origin(next_uri, base)
+            now = time.time()
+            if now >= stop:
+                detail = (
+                    f"system.runtime.nodes statement {body.get('id')!r} did not "
+                    f"finish within {PRESTO_RUNTIME_NODES_READ_BUDGET_S}s "
+                    "(placed on a worker that is not running it?); abandoned"
+                )
+                try:
+                    cancel = httpx.delete(next_uri, timeout=30)
+                except httpx.HTTPError as exc:
+                    detail += f"; cancel failed: {exc!r}"
+                else:
+                    if not 200 <= cancel.status_code < 300:
+                        detail += (
+                            f"; cancel returned status {cancel.status_code}: "
+                            f"{cancel.text}"
+                        )
+                return None, detail
+            nxt = httpx.get(next_uri, timeout=stop - now)
+            if nxt.status_code != 200:
+                return None, (
+                    f"system.runtime.nodes nextUri returned status "
+                    f"{nxt.status_code}: {nxt.text}"
+                )
+            body = nxt.json()
+    except httpx.HTTPError as exc:
+        return None, f"system.runtime.nodes request failed: {exc!r}"
+
+    active: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 4:
+            continue
+        node_id, http_uri, coordinator, state = row[:4]
+        if coordinator is True or str(state).lower() != "active":
+            continue
+        host = _node_uri_host(str(http_uri or ""))
+        if host:
+            active[host] = str(node_id)
+    return active, ""
+
+
 def _wait_presto_workers_discovered(
     presto_url: str, *, timeout: float = 120.0
 ) -> None:
-    """Wait until the coordinator will schedule on the current worker IPs.
+    """Wait until the coordinator will schedule on the current worker IPs only.
 
     Presto 0.298 keeps failed nodes in GET /v1/node until expirationGraceInterval
-    (default 10 min). DiscoveryNodeManager excludes GET /v1/node/failed hosts
-    from scheduling. Live workers = /v1/node hosts minus /v1/node/failed hosts.
+    (default 10 min); live per the failure detector = /v1/node hosts minus
+    /v1/node/failed hosts.  That is NOT the scheduler's view: the scheduler
+    places tasks from DiscoveryNodeManager's active set, which re-reads the
+    failure detector only on its own refresh timer (5 s), so a host can be in
+    /v1/node/failed and still receive tasks (nightly 42202909825).
+    system.runtime.nodes serves that same active set (NodeSystemTable reads
+    InternalNodeManager.getAllNodes()), so its active worker rows must also be
+    exactly the current Ready worker pod IPs.
     """
     base = presto_url.rstrip("/")
     deadline = time.time() + timeout
     last_detail = ""
+    last_runtime = "no system.runtime.nodes reading yet"
     while time.time() < deadline:
         expected = _worker_pod_ips()
         if len(expected) < 2:
@@ -518,16 +616,36 @@ def _wait_presto_workers_discovered(
 
         stale = sorted(live_hosts - expected)
         missing = sorted(expected - live_hosts)
-        if len(live_hosts) >= 2 and not stale and not missing:
-            return
-
-        last_detail = (
+        rest_detail = (
             f"expected worker IPs {sorted(expected)!r}; "
             f"live worker hosts {sorted(live_hosts)!r}; "
             f"/v1/node worker hosts {sorted(node_hosts)!r}; "
             f"/v1/node/failed worker hosts {sorted(failed_hosts)!r}; "
             f"stale={stale!r} missing={missing!r}"
         )
+        if len(live_hosts) < 2 or stale or missing:
+            last_detail = rest_detail
+            time.sleep(2)
+            continue
+
+        runtime, runtime_error = _presto_runtime_active_workers(base, deadline)
+        if runtime is None:
+            last_detail = f"{rest_detail}; {runtime_error}; last {last_runtime}"
+            time.sleep(2)
+            continue
+        runtime_hosts = set(runtime)
+        runtime_stale = sorted(runtime_hosts - expected)
+        runtime_missing = sorted(expected - runtime_hosts)
+        if not runtime_stale and not runtime_missing:
+            return
+
+        last_runtime = (
+            f"system.runtime.nodes active worker hosts {sorted(runtime_hosts)!r}; "
+            f"runtime_stale={runtime_stale!r} "
+            f"(node ids {[runtime[h] for h in runtime_stale]!r}) "
+            f"runtime_missing={runtime_missing!r}"
+        )
+        last_detail = f"{rest_detail}; {last_runtime}"
         time.sleep(2)
 
     raise AssertionError(

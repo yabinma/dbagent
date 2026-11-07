@@ -510,14 +510,140 @@ def _stats_nodes(hosts: set[str]) -> list[dict]:
     return [{"uri": f"http://{host}:8080/v1/status"} for host in sorted(hosts)]
 
 
+PRESTO_RUNTIME_NODES_SQL = (
+    "SELECT node_id, http_uri, coordinator, state FROM system.runtime.nodes"
+)
+_FAKE_COORDINATOR_HOST = "10.244.0.10"
+
+
+def _runtime_node_rows(
+    workers: set[str] | dict[str, str],
+    *,
+    state: str = "active",
+) -> list[list]:
+    """Presto 0.298 system.runtime.nodes rows: [node_id, http_uri, coordinator, state].
+
+    ``workers`` maps host -> node id (a set gets synthetic ids).  Every
+    reading also carries the coordinator's own active row, which the gate must
+    ignore.
+    """
+    if not isinstance(workers, dict):
+        workers = {host: f"node-{host}" for host in workers}
+    rows: list[list] = [
+        ["coordinator-node", f"http://{_FAKE_COORDINATOR_HOST}:8080", True, "active"]
+    ]
+    rows += [
+        [node_id, f"http://{host}:8080", False, state]
+        for host, node_id in sorted(workers.items())
+    ]
+    return rows
+
+
+class _FakeRuntimeNodesStatements:
+    """Presto statement protocol, serving only the gate's system.runtime.nodes read.
+
+    ``polls`` holds one row list per submitted statement (the last repeats).
+    Like Presto 0.298, POST /v1/statement returns a queued page with a nextUri
+    and no data; the nextUri GET returns the rows and no further nextUri.  A
+    statement id listed in ``stuck`` never finishes: each of its nextUri GETs
+    advances ``clock`` by one second (Presto's long poll) and returns another
+    nextUri with no data, like a statement placed on a departed worker.
+    """
+
+    def __init__(self, polls, *, stuck=(), clock=None, delete_status=204):
+        self.polls = list(polls)
+        self.stuck = set(stuck)
+        self.clock = clock
+        self.delete_status = delete_status
+        self.posts: list[str] = []
+        self.deletes: list[str] = []
+        # (method, clock time at the call, request timeout passed)
+        self.timeouts: list[tuple[str, float | None, object]] = []
+
+    def _now(self) -> float | None:
+        return None if self.clock is None else self.clock["t"]
+
+    @staticmethod
+    def handles(url: str) -> bool:
+        return "/v1/statement/" in url
+
+    def post(self, url: str, *, content=None, **kwargs):
+        if not url.endswith("/v1/statement"):
+            raise AssertionError(f"unexpected POST {url!r}")
+        assert content == PRESTO_RUNTIME_NODES_SQL, content
+        self.timeouts.append(("POST", self._now(), kwargs.get("timeout")))
+        qid = f"q{len(self.posts)}"
+        self.posts.append(qid)
+        return _FakeResponse(
+            {
+                "id": qid,
+                "nextUri": f"http://presto.example/v1/statement/queued/{qid}/1",
+                "stats": {"state": "QUEUED"},
+            }
+        )
+
+    def get(self, url: str, **kwargs):
+        self.timeouts.append(("GET", self._now(), kwargs.get("timeout")))
+        qid = url.split("/")[-2]
+        if qid in self.stuck:
+            if self.clock is not None:
+                self.clock["t"] += 1.0
+            return _FakeResponse(
+                {
+                    "id": qid,
+                    "nextUri": f"http://presto.example/v1/statement/executing/{qid}/2",
+                    "stats": {"state": "RUNNING"},
+                }
+            )
+        rows = self.polls[min(int(qid[1:]), len(self.polls) - 1)]
+        return _FakeResponse(
+            {
+                "id": qid,
+                "columns": [
+                    {"name": "node_id"},
+                    {"name": "http_uri"},
+                    {"name": "coordinator"},
+                    {"name": "state"},
+                ],
+                "data": rows,
+                "stats": {"state": "FINISHED"},
+            }
+        )
+
+    def delete(self, url: str, **_k):
+        self.deletes.append(url)
+        return _FakeResponse({}, status_code=self.delete_status)
+
+
+def _install_runtime_nodes(monkeypatch, mod, statements: _FakeRuntimeNodesStatements):
+    """Fake the gate's statement calls (POST, and DELETE for an abandoned read)."""
+    monkeypatch.setattr(mod.httpx, "post", statements.post)
+    monkeypatch.setattr(mod.httpx, "delete", statements.delete)
+
+
+def _sleep_driven_clock(monkeypatch, mod, start: float = 1000.0) -> dict:
+    """A fake clock that only moves when the gate sleeps (or a fake long-polls)."""
+    clock = {"t": start}
+
+    def fake_sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(mod.time, "sleep", fake_sleep)
+    return clock
+
+
 def _fake_presto_node_get(
     node_hosts: set[str],
     failed_hosts: set[str] | None = None,
+    statements: _FakeRuntimeNodesStatements | None = None,
 ):
-    """Route httpx.get to /v1/node and /v1/node/failed fakes."""
+    """Route httpx.get to /v1/node, /v1/node/failed and statement nextUri fakes."""
     failed = failed_hosts if failed_hosts is not None else set()
 
-    def fake_get(url: str, **_k):
+    def fake_get(url: str, **kwargs):
+        if statements is not None and statements.handles(url):
+            return statements.get(url, **kwargs)
         if url.endswith("/v1/node/failed"):
             return _FakeResponse(_stats_nodes(failed))
         if url.endswith("/v1/node"):
@@ -535,19 +661,26 @@ def test_wait_presto_workers_discovered_accepts_matching_ips(monkeypatch):
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
 
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        _fake_presto_node_get(current_ips),
+        _fake_presto_node_get(current_ips, statements=statements),
     )
+    _install_runtime_nodes(monkeypatch, mod, statements)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+    assert statements.posts == ["q0"], statements.posts
 
 
 def test_wait_presto_workers_discovered_ignores_failed_stale_uris(monkeypatch):
-    """CI E1: stale stats in /v1/node but /v1/node/failed must not block."""
+    """CI E1: stale stats in /v1/node but /v1/node/failed must not block.
+
+    Holds only once the scheduler's own view (system.runtime.nodes) has
+    dropped the stale hosts too; the fake says so.
+    """
     mod = _scenarios_module()
     current_ips = {"10.244.0.27", "10.244.0.28"}
     stale_ips = {"10.244.0.23", "10.244.0.24"}
@@ -556,15 +689,113 @@ def test_wait_presto_workers_discovered_ignores_failed_stale_uris(monkeypatch):
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
 
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        _fake_presto_node_get(node_hosts, failed_hosts=stale_ips),
+        _fake_presto_node_get(
+            node_hosts, failed_hosts=stale_ips, statements=statements
+        ),
     )
+    _install_runtime_nodes(monkeypatch, mod, statements)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+    assert statements.posts == ["q0"], statements.posts
+
+
+# Nightly 42202909825 (2026-11-06): the departed worker 10.244.0.23 was already
+# in /v1/node/failed, but DiscoveryNodeManager's active set -- the one the
+# scheduler places tasks from, and the one system.runtime.nodes serves -- still
+# held it, so both E1 trip-query tasks went to it and never started.
+_DEPARTED_HOST = "10.244.0.23"
+_DEPARTED_NODE_ID = "70d4cec0-170c-4fee-a3c7-7aa812c499d1"
+_ROLLOUT_IPS = {"10.244.0.27", "10.244.0.28"}
+
+
+def _rollout_overlap_workers(*, departed_still_active: bool) -> dict[str, str]:
+    workers = {
+        "10.244.0.27": "e01e1bcf-0000-0000-0000-000000000027",
+        "10.244.0.28": "1ace517b-0000-0000-0000-000000000028",
+    }
+    if departed_still_active:
+        workers[_DEPARTED_HOST] = _DEPARTED_NODE_ID
+    return workers
+
+
+def test_wait_presto_workers_discovered_rejects_failed_host_still_in_runtime_nodes(
+    monkeypatch,
+):
+    """A /v1/node/failed host the scheduler still lists as active must time out."""
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    statements = _FakeRuntimeNodesStatements(
+        [_runtime_node_rows(_rollout_overlap_workers(departed_still_active=True))]
+    )
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(
+            {_DEPARTED_HOST, *_ROLLOUT_IPS},
+            failed_hosts={_DEPARTED_HOST},
+            statements=statements,
+        ),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+    _sleep_driven_clock(monkeypatch, mod)
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            r"(?s)worker discovery.*system\.runtime\.nodes.*"
+            r"runtime_stale=\['10\.244\.0\.23'\].*70d4cec0-170c-4fee-a3c7-7aa812c499d1"
+        ),
+    ):
+        mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+    assert len(statements.posts) >= 2, (
+        "the gate must keep re-reading system.runtime.nodes until its deadline; "
+        f"statements submitted: {statements.posts!r}"
+    )
+
+
+def test_wait_presto_workers_discovered_returns_after_runtime_nodes_drops_failed_host(
+    monkeypatch,
+):
+    """The gate opens on the first poll whose system.runtime.nodes omits .23."""
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    still_active = _runtime_node_rows(
+        _rollout_overlap_workers(departed_still_active=True)
+    )
+    dropped = _runtime_node_rows(_rollout_overlap_workers(departed_still_active=False))
+    statements = _FakeRuntimeNodesStatements([still_active, still_active, dropped])
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(
+            {_DEPARTED_HOST, *_ROLLOUT_IPS},
+            failed_hosts={_DEPARTED_HOST},
+            statements=statements,
+        ),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+    _sleep_driven_clock(monkeypatch, mod)
+
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=60.0)
+    assert statements.posts == ["q0", "q1", "q2"], (
+        "the gate must return on the poll whose system.runtime.nodes no longer "
+        f"lists {_DEPARTED_HOST}, not before and not after; "
+        f"statements submitted: {statements.posts!r}"
+    )
 
 
 def test_wait_presto_workers_discovered_rejects_warming_workers_in_failed(
@@ -577,12 +808,17 @@ def test_wait_presto_workers_discovered_rejects_warming_workers_in_failed(
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
 
+    # The scheduler's view is satisfied, so only the named condition decides.
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        _fake_presto_node_get(current_ips, failed_hosts=current_ips),
+        _fake_presto_node_get(
+            current_ips, failed_hosts=current_ips, statements=statements
+        ),
     )
+    _install_runtime_nodes(monkeypatch, mod, statements)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     clock = {"t": 1000.0}
@@ -597,6 +833,7 @@ def test_wait_presto_workers_discovered_rejects_warming_workers_in_failed(
         mod._wait_presto_workers_discovered(
             "http://presto.example", timeout=10.0
         )
+    assert statements.posts == [], "the REST condition must reject before the read"
 
 
 def test_wait_presto_workers_discovered_rejects_still_active_stale_uris(
@@ -611,12 +848,15 @@ def test_wait_presto_workers_discovered_rejects_still_active_stale_uris(
     class _FakeProc:
         stdout = _fake_worker_pod_list_json(current_ips)
 
+    # The scheduler's view is satisfied, so only the named condition decides.
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        _fake_presto_node_get(node_hosts, failed_hosts=set()),
+        _fake_presto_node_get(node_hosts, failed_hosts=set(), statements=statements),
     )
+    _install_runtime_nodes(monkeypatch, mod, statements)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     clock = {"t": 1000.0}
@@ -631,6 +871,7 @@ def test_wait_presto_workers_discovered_rejects_still_active_stale_uris(
         mod._wait_presto_workers_discovered(
             "http://presto.example", timeout=10.0
         )
+    assert statements.posts == [], "the REST condition must reject before the read"
 
 
 def test_wait_presto_workers_discovered_rejects_terminating_pod_ips(monkeypatch):
@@ -666,12 +907,15 @@ def test_wait_presto_workers_discovered_rejects_terminating_pod_ips(monkeypatch)
     class _FakeProc:
         stdout = json.dumps(kubectl_json)
 
+    # The scheduler's view is satisfied, so only the named condition decides.
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(
         mod.httpx,
         "get",
-        _fake_presto_node_get(node_hosts),
+        _fake_presto_node_get(node_hosts, statements=statements),
     )
+    _install_runtime_nodes(monkeypatch, mod, statements)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     clock = {"t": 1000.0}
@@ -686,6 +930,7 @@ def test_wait_presto_workers_discovered_rejects_terminating_pod_ips(monkeypatch)
         mod._wait_presto_workers_discovered(
             "http://presto.example", timeout=10.0
         )
+    assert statements.posts == [], "the REST condition must reject before the read"
 
 
 def test_wait_presto_workers_discovered_retries_httpx_connection_error(
@@ -701,22 +946,315 @@ def test_wait_presto_workers_discovered_retries_httpx_connection_error(
         stdout = _fake_worker_pod_list_json(current_ips)
 
     calls = {"n": 0}
-    router = _fake_presto_node_get(current_ips)
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
+    router = _fake_presto_node_get(current_ips, statements=statements)
 
     def fake_get(url: str, **_k):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise httpx.ConnectError("connection refused")
+        if not statements.handles(url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("connection refused")
         return router(url)
 
     monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
     monkeypatch.setattr(mod.httpx, "get", fake_get)
+    _install_runtime_nodes(monkeypatch, mod, statements)
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
     mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
     assert calls["n"] == 3, (
         "helper must retry after a transient connect error "
         "(1 failed + /v1/node + /v1/node/failed)"
+    )
+    assert statements.posts == ["q0"], statements.posts
+
+
+def test_wait_presto_workers_discovered_rejects_missing_host_in_runtime_nodes(
+    monkeypatch,
+):
+    """A current pod IP not yet active in system.runtime.nodes must time out."""
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    statements = _FakeRuntimeNodesStatements(
+        [
+            # .28 is listed, but not schedulable yet (shutting_down/inactive
+            # rows are not in the scheduler's active set); a short row or one
+            # without a URI host names no worker either.
+            _runtime_node_rows({"10.244.0.27"})
+            + [
+                ["n28", "http://10.244.0.28:8080", False, "inactive"],
+                ["n28"],
+                ["n-blank", "", False, "active"],
+            ]
+        ]
+    )
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(_ROLLOUT_IPS, statements=statements),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+    _sleep_driven_clock(monkeypatch, mod)
+
+    with pytest.raises(
+        AssertionError,
+        match=r"(?s)worker discovery.*runtime_stale=\[\].*runtime_missing=\['10\.244\.0\.28'\]",
+    ):
+        mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+
+
+def test_wait_presto_workers_discovered_abandons_unfinished_runtime_nodes_read(
+    monkeypatch,
+):
+    """A read placed on the departed worker never finishes: cancel it, poll again.
+
+    Presto 0.298 places the statement's output stage on a random active worker
+    (reproduced against prestodb/presto:0.298), so one poll's read can stall
+    exactly like the E1 trip query.  The poll is abandoned within the read
+    budget, the statement is DELETEd, and the next poll decides.
+    """
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    clock = _sleep_driven_clock(monkeypatch, mod)
+    still_active = _runtime_node_rows(
+        _rollout_overlap_workers(departed_still_active=True)
+    )
+    dropped = _runtime_node_rows(_rollout_overlap_workers(departed_still_active=False))
+    statements = _FakeRuntimeNodesStatements(
+        [still_active, None, dropped], stuck={"q1"}, clock=clock
+    )
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(
+            {_DEPARTED_HOST, *_ROLLOUT_IPS},
+            failed_hosts={_DEPARTED_HOST},
+            statements=statements,
+        ),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+
+    start = clock["t"]
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=60.0)
+    assert statements.posts == ["q0", "q1", "q2"], statements.posts
+    assert statements.deletes == [
+        "http://presto.example/v1/statement/executing/q1/2"
+    ], statements.deletes
+    # q0 (2 s sleep) + q1 abandoned at the read budget (2 s sleep) + q2.
+    budget = mod.PRESTO_RUNTIME_NODES_READ_BUDGET_S
+    assert clock["t"] - start <= 2 + budget + 1 + 2, clock["t"] - start
+
+
+def test_wait_presto_workers_discovered_abandoned_read_keeps_last_stale_reading(
+    monkeypatch,
+):
+    """Timing out on an unfinished read still names the last stale host seen."""
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    clock = _sleep_driven_clock(monkeypatch, mod)
+    statements = _FakeRuntimeNodesStatements(
+        [_runtime_node_rows(_rollout_overlap_workers(departed_still_active=True))],
+        stuck={f"q{i}" for i in range(1, 50)},
+        clock=clock,
+    )
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(
+            {_DEPARTED_HOST, *_ROLLOUT_IPS},
+            failed_hosts={_DEPARTED_HOST},
+            statements=statements,
+        ),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            r"(?s)did not finish within.*abandoned.*"
+            r"runtime_stale=\['10\.244\.0\.23'\]"
+        ),
+    ):
+        mod._wait_presto_workers_discovered("http://presto.example", timeout=30.0)
+    assert statements.deletes, "every abandoned read must be cancelled"
+
+
+def test_wait_presto_workers_discovered_runtime_nodes_requests_stay_inside_read_budget(
+    monkeypatch,
+):
+    """No POST/GET of one read may outlive that read's budget (review S1).
+
+    The budget is checked between long polls; a socket that never answers
+    would otherwise hold the poll for the per-request timeout instead.  So
+    every request's timeout must end no later than the read's own stop time.
+    """
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    clock = _sleep_driven_clock(monkeypatch, mod)
+    dropped = _runtime_node_rows(_rollout_overlap_workers(departed_still_active=False))
+    statements = _FakeRuntimeNodesStatements(
+        [None, dropped], stuck={"q0"}, clock=clock
+    )
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(
+            {_DEPARTED_HOST, *_ROLLOUT_IPS},
+            failed_hosts={_DEPARTED_HOST},
+            statements=statements,
+        ),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=60.0)
+    budget = mod.PRESTO_RUNTIME_NODES_READ_BUDGET_S
+    assert statements.posts == ["q0", "q1"], statements.posts
+    read_start = None
+    for method, at, timeout in statements.timeouts:
+        if method == "POST":
+            read_start = at
+        assert isinstance(timeout, (int, float)) and timeout > 0, (method, timeout)
+        assert at + timeout <= read_start + budget + 1e-9, (
+            f"{method} at t={at - read_start:.1f}s into the read was given "
+            f"timeout={timeout}; the read's budget ends at {budget}s"
+        )
+
+
+def test_wait_presto_workers_discovered_skips_runtime_read_after_deadline(
+    monkeypatch,
+):
+    """With no budget left before the gate deadline, no read is started."""
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.25", "10.244.0.26"}
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    statements = _FakeRuntimeNodesStatements([_runtime_node_rows(current_ips)])
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx, "get", _fake_presto_node_get(current_ips, statements=statements)
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    # Every clock read advances 5 s: the deadline (start + 10) passes between
+    # the loop's check and the read's own budget computation.
+    clock = {"t": 1000.0}
+
+    def fake_time() -> float:
+        clock["t"] += 5.0
+        return clock["t"]
+
+    monkeypatch.setattr(mod.time, "time", fake_time)
+
+    with pytest.raises(AssertionError, match=r"(?s)not read: the gate deadline has passed"):
+        mod._wait_presto_workers_discovered("http://presto.example", timeout=10.0)
+    assert statements.posts == [], statements.posts
+
+
+def test_wait_presto_workers_discovered_reports_non_success_cancel_status(
+    monkeypatch,
+):
+    """A cancel DELETE answered with HTTP 500 is named, not silent (review S2)."""
+    mod = _scenarios_module()
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(_ROLLOUT_IPS)
+
+    clock = _sleep_driven_clock(monkeypatch, mod)
+    statements = _FakeRuntimeNodesStatements(
+        [None],
+        stuck={f"q{i}" for i in range(50)},
+        clock=clock,
+        delete_status=500,
+    )
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(
+        mod.httpx,
+        "get",
+        _fake_presto_node_get(_ROLLOUT_IPS, statements=statements),
+    )
+    _install_runtime_nodes(monkeypatch, mod, statements)
+
+    with pytest.raises(
+        AssertionError,
+        match=r"(?s)did not finish within.*abandoned; cancel returned status 500",
+    ):
+        mod._wait_presto_workers_discovered("http://presto.example", timeout=30.0)
+    assert statements.deletes, "every abandoned read must be cancelled"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["post_status", "post_connect", "error_body", "next_status", "cancel_fails"],
+)
+def test_wait_presto_workers_discovered_runtime_nodes_read_failures_poll_again(
+    monkeypatch, failure
+):
+    """A failed system.runtime.nodes read is "not yet", never success."""
+    import httpx
+
+    mod = _scenarios_module()
+    current_ips = {"10.244.0.25", "10.244.0.26"}
+
+    class _FakeProc:
+        stdout = _fake_worker_pod_list_json(current_ips)
+
+    clock = _sleep_driven_clock(monkeypatch, mod)
+    statements = _FakeRuntimeNodesStatements(
+        [_runtime_node_rows(current_ips)],
+        stuck={"q0"} if failure == "cancel_fails" else (),
+        clock=clock,
+    )
+    router = _fake_presto_node_get(current_ips, statements=statements)
+    attempts = {"n": 0}
+
+    def fake_post(url, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] > 1:
+            return statements.post(url, **kwargs)
+        if failure == "post_status":
+            return _FakeResponse({"message": "busy"}, status_code=503)
+        if failure == "post_connect":
+            raise httpx.ConnectError("connection refused")
+        response = statements.post(url, **kwargs)
+        if failure == "error_body":
+            return _FakeResponse({"id": "q0", "error": {"message": "boom"}})
+        return response
+
+    def fake_get(url: str, **_k):
+        if failure == "next_status" and url.endswith("/queued/q0/1"):
+            return _FakeResponse({"message": "gone"}, status_code=410)
+        return router(url)
+
+    def fake_delete(url: str, **_k):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(mod, "_kubectl_ok", lambda *_a, **_k: _FakeProc())
+    monkeypatch.setattr(mod.httpx, "get", fake_get)
+    monkeypatch.setattr(mod.httpx, "post", fake_post)
+    monkeypatch.setattr(mod.httpx, "delete", fake_delete)
+
+    mod._wait_presto_workers_discovered("http://presto.example", timeout=60.0)
+    assert attempts["n"] == 2, (
+        f"the gate must not return on the failed read ({failure}); "
+        f"reads attempted: {attempts['n']}"
     )
 
 
